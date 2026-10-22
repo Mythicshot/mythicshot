@@ -1,0 +1,11 @@
+[package]
+name = "mythicshot-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Screen and window capture for Mythicshot, with one interface over each OS"
+
+[dependencies]
+xcap = "0.9"
+image = { version = "0.25", default-features = false }

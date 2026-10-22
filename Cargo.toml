@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["spikes/phase0"]
+members = ["crates/app", "crates/capture", "spikes/phase0"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [workspace.package]
 version = "0.0.0"
