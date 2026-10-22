@@ -1,0 +1,21 @@
+[package]
+name = "phase0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Phase 0 test build: capture, recording, input hooks, capture exclusion and GIF encoding"
+
+[dependencies]
+xcap = "0.9"
+pinray = "0.2"
+rdev = "0.5"
+gifski = { version = "1.34", default-features = false }
+imgref = "1"
+rgb = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+eframe = { version = "0.37", features = ["glow"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
