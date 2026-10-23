@@ -28,7 +28,7 @@ On Linux, install the development packages listed in `.github/workflows/ci.yml` 
 
 ### Windows installer
 
-The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. It needs [WiX 5](https://www.nuget.org/packages/wix) as a .NET tool (`dotnet tool install --global wix --version 5.0.2`):
+The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. It needs WiX 5 as a .NET tool (`dotnet tool install --global wix --version 5.0.2`):
 
 ```sh
 cargo build --release -p mythicshot
