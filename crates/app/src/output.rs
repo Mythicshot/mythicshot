@@ -16,10 +16,8 @@ pub struct Delivered {
 pub fn deliver(img: &RgbaImage, settings: &Settings) -> Result<Delivered, String> {
     let mut done = Delivered { file: None, clipboard: false };
     if settings.save_to_file {
-        std::fs::create_dir_all(&settings.output_dir).map_err(|e| format!("could not create {}: {e}", settings.output_dir.display()))?;
-        let name = format!("Mythicshot {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S"));
-        let path = unique(settings.output_dir.join(name));
-        img.save(&path).map_err(|e| format!("could not save {}: {e}", path.display()))?;
+        let path = capture_path(&settings.output_dir)?;
+        save_image(img, &path)?;
         done.file = Some(path);
     }
     if settings.copy_to_clipboard {
@@ -27,6 +25,20 @@ pub fn deliver(img: &RgbaImage, settings: &Settings) -> Result<Delivered, String
         done.clipboard = true;
     }
     Ok(done)
+}
+
+/// A new, unused `Mythicshot <date time>.png` path in `dir`.
+pub fn capture_path(dir: &std::path::Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let name = format!("Mythicshot {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S"));
+    Ok(unique(dir.join(name)))
+}
+
+/// Save as PNG, or JPEG when the extension says so (JPEG has no transparency).
+pub fn save_image(img: &RgbaImage, path: &std::path::Path) -> Result<(), String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let result = if ext == "jpg" || ext == "jpeg" { image::DynamicImage::ImageRgba8(img.clone()).to_rgb8().save(path) } else { img.save(path) };
+    result.map_err(|e| format!("could not save {}: {e}", path.display()))
 }
 
 pub fn copy_to_clipboard(img: &RgbaImage) -> Result<(), String> {

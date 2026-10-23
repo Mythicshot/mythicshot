@@ -18,7 +18,9 @@ pub enum Command {
     /// Index into `xcap::Monitor::all()` order at the time the menu was built.
     Display(usize),
     FromClipboard,
+    OpenFile,
     ToggleClipboard,
+    ToggleEditor,
     ToggleMagnifier,
     Preferences,
     OpenFolder,
@@ -43,6 +45,7 @@ pub struct Tray {
     labelled: Vec<(Action, MenuItem)>,
     clipboard: CheckMenuItem,
     magnifier: CheckMenuItem,
+    editor: CheckMenuItem,
 }
 
 fn label(text: &str, binding: &str) -> String {
@@ -66,7 +69,7 @@ impl Tray {
         let all_screens = item(&label("All screens", settings.binding(Action::CaptureFullScreen)), Command::FullScreen, true);
         let display_items: Vec<MenuItem> = displays.iter().enumerate().map(|(i, name)| item(name, Command::Display(i), true)).collect();
         let from_clipboard = item("Capture from clipboard", Command::FromClipboard, true);
-        let open_file = MenuItem::new("Open image from file…\t(editor: Phase 2)", false, None);
+        let open_file = item("Open image from file…", Command::OpenFile, true);
         let record = item(&label("Record GIF (Phase 4)", settings.binding(Action::RecordRegion)), Command::Record, true);
         let prefs = item("Preferences…", Command::Preferences, true);
         let folder = item("Open captures folder", Command::OpenFolder, true);
@@ -74,6 +77,8 @@ impl Tray {
 
         let clipboard = CheckMenuItem::new("Copy to clipboard", true, settings.copy_to_clipboard, None);
         let magnifier = CheckMenuItem::new("Show magnifier", true, settings.magnifier, None);
+        let editor = CheckMenuItem::new("Open captures in the editor", true, settings.open_editor, None);
+        commands.insert(editor.id().clone(), Command::ToggleEditor);
         commands.insert(clipboard.id().clone(), Command::ToggleClipboard);
         commands.insert(magnifier.id().clone(), Command::ToggleMagnifier);
 
@@ -83,6 +88,7 @@ impl Tray {
             full.append(d).map_err(|e| e.to_string())?;
         }
         let quick = Submenu::new("Quick preferences", true);
+        quick.append(&editor).map_err(|e| e.to_string())?;
         quick.append(&clipboard).map_err(|e| e.to_string())?;
         quick.append(&magnifier).map_err(|e| e.to_string())?;
 
@@ -114,7 +120,7 @@ impl Tray {
             .build()
             .map_err(|e| e.to_string())?;
 
-        Ok(Self { _icon: icon, commands, labelled, clipboard, magnifier })
+        Ok(Self { _icon: icon, commands, labelled, clipboard, magnifier, editor })
     }
 
     pub fn command(&self, id: &MenuId) -> Option<Command> {
@@ -133,6 +139,7 @@ impl Tray {
         }
         self.clipboard.set_checked(settings.copy_to_clipboard);
         self.magnifier.set_checked(settings.magnifier);
+        self.editor.set_checked(settings.open_editor);
     }
 }
 

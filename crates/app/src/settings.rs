@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::hotkeys::Action;
+use crate::hotkeys::{Action, EditorAction};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +20,10 @@ pub struct Settings {
     /// Action → shortcut in `global-hotkey` syntax, for example `shift+PrintScreen`.
     /// An empty string means the action has no shortcut.
     pub hotkeys: BTreeMap<Action, String>,
+    /// Open each capture in the editor instead of saving it straight away.
+    pub open_editor: bool,
+    /// Editor action → shortcut, same syntax as `hotkeys`.
+    pub editor_keys: BTreeMap<EditorAction, String>,
 }
 
 impl Default for Settings {
@@ -34,6 +38,8 @@ impl Default for Settings {
             magnifier: true,
             last_region: None,
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
+            open_editor: true,
+            editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
         }
     }
 }
@@ -59,6 +65,9 @@ impl Settings {
         for a in Action::ALL {
             s.hotkeys.entry(*a).or_insert_with(|| a.default_binding().to_string());
         }
+        for a in EditorAction::ALL {
+            s.editor_keys.entry(*a).or_insert_with(|| a.default_binding().to_string());
+        }
         s
     }
 
@@ -79,5 +88,9 @@ impl Settings {
 
     pub fn binding(&self, action: Action) -> &str {
         self.hotkeys.get(&action).map(String::as_str).unwrap_or("")
+    }
+
+    pub fn editor_binding(&self, action: EditorAction) -> &str {
+        self.editor_keys.get(&action).map(String::as_str).unwrap_or("")
     }
 }

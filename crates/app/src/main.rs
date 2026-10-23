@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod editor_ui;
 mod hotkeys;
 mod output;
 mod overlay;
@@ -15,6 +16,7 @@ mod settings;
 mod settings_ui;
 mod tray;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -26,10 +28,10 @@ use mythicshot_capture::{PxRect, grab_desktop};
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 
-use hotkeys::{Action, Hotkeys, Recorded, ShortcutRecorder};
+use hotkeys::{Action, EditorAction, Hotkeys, Recorded, ShortcutRecorder};
 use overlay::{Outcome, Overlay};
 use settings::Settings;
-use settings_ui::{SettingsState, UiAction};
+use settings_ui::{Bind, SettingsState, UiAction};
 use tray::{Command, Tray};
 
 enum AppEvent {
@@ -52,10 +54,14 @@ struct App {
     settings_shared: Arc<std::sync::Mutex<settings_ui::Shared>>,
     recorder: ShortcutRecorder,
     key_hook_started: bool,
+    /// Open editors; the flag is true until the window has been shown once.
+    editors: Vec<(editor_ui::EditorWindow, bool)>,
+    icon: Arc<egui::IconData>,
     listening: Arc<AtomicBool>,
     snipping_tool: Option<bool>,
     status: Option<(String, Instant)>,
     hidden_at_start: bool,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     started: Instant,
 }
 
@@ -108,7 +114,7 @@ impl App {
         let tray = Tray::new(&settings, &displays).expect("create tray icon");
         let settings_shared = Arc::new(std::sync::Mutex::new(settings_ui::Shared {
             settings: settings.clone(),
-            errors: hotkeys.errors.clone(),
+            errors: HashMap::new(),
             snipping_tool: None,
             state: SettingsState::default(),
             actions: Vec::new(),
@@ -129,6 +135,8 @@ impl App {
             settings_shared,
             recorder: ShortcutRecorder::default(),
             key_hook_started: false,
+            editors: Vec::new(),
+            icon: Arc::new(egui::IconData { rgba: tray::icon_rgba(64).0, width: 64, height: 64 }),
             listening: Arc::new(AtomicBool::new(false)),
             snipping_tool: platform::snipping_tool_owns_prtsc(),
             status: None,
@@ -171,11 +179,16 @@ impl App {
             Command::Record => self.notify("GIF recording arrives in Phase 4".into()),
             Command::Display(i) => self.capture_now(move |d| d.monitors.get(i).map(|m| m.rect)),
             Command::FromClipboard => match output::image_from_clipboard() {
-                Ok(img) => self.deliver(&img),
+                Ok(img) => self.open_editor(img, "Clipboard image".into()),
                 Err(e) => self.notify(e),
             },
             Command::ToggleClipboard => {
                 self.settings.copy_to_clipboard = !self.settings.copy_to_clipboard;
+                self.settings_changed();
+            }
+            Command::OpenFile => self.open_file(),
+            Command::ToggleEditor => {
+                self.settings.open_editor = !self.settings.open_editor;
                 self.settings_changed();
             }
             Command::ToggleMagnifier => {
@@ -212,7 +225,7 @@ impl App {
             Err(e) => return self.notify(format!("Capture failed: {e}")),
         };
         match pick(&desktop).and_then(|r| desktop.crop(r)) {
-            Some(img) => self.deliver(&img),
+            Some(img) => self.captured(img),
             None => self.notify("Nothing to capture there".into()),
         }
     }
@@ -225,8 +238,42 @@ impl App {
             if let Some(img) = ov.desktop.crop(rect) {
                 self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
                 self.settings.save();
-                self.deliver(&img);
+                self.captured(img);
             }
+        }
+    }
+
+    /// A new capture: open it in the editor, or save/copy it straight away.
+    fn captured(&mut self, img: image::RgbaImage) {
+        if self.settings.open_editor {
+            let title = format!("Capture {}", chrono::Local::now().format("%H-%M-%S"));
+            self.open_editor(img, title);
+        } else {
+            self.deliver(&img);
+        }
+    }
+
+    fn open_editor(&mut self, img: image::RgbaImage, title: String) {
+        let editor = editor_ui::Editor::new(img, title, self.settings.editor_keys.clone(), self.settings.output_dir.clone());
+        self.editors.push((editor_ui::EditorWindow::new(editor), true));
+    }
+
+    fn open_file(&mut self) {
+        let picked = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir).pick_file();
+        let Some(path) = picked else { return };
+        match image::open(&path) {
+            Ok(img) => {
+                let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.open_editor(img.to_rgba8(), title);
+            }
+            Err(e) => self.notify(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
+    fn show_editors(&mut self, ctx: &egui::Context) {
+        self.editors.retain(|(w, _)| !w.is_closed());
+        for (w, first) in &mut self.editors {
+            w.show(ctx, self.icon.clone(), std::mem::take(first));
         }
     }
 
@@ -254,15 +301,50 @@ impl App {
     fn settings_changed(&mut self) {
         self.settings.save();
         self.tray.sync(&self.settings);
+        for (w, _) in &self.editors {
+            if let Ok(mut e) = w.editor.lock() {
+                e.keys = self.settings.editor_keys.clone();
+                e.output_dir = self.settings.output_dir.clone();
+            }
+        }
     }
 
-    fn set_binding(&mut self, action: Action, binding: String) {
-        self.settings.hotkeys.insert(action, binding.clone());
-        self.hotkeys.apply(action, &binding);
+    fn set_binding(&mut self, bind: Bind, binding: String) {
+        match bind {
+            Bind::Global(action) => {
+                self.settings.hotkeys.insert(action, binding.clone());
+                self.hotkeys.apply(action, &binding);
+            }
+            Bind::Editor(action) => {
+                self.settings.editor_keys.insert(action, binding);
+            }
+        }
         self.settings_changed();
     }
 
-    fn listen(&mut self, ctx: &egui::Context, action: Option<Action>) {
+    /// Errors for the Hotkeys tab: global shortcuts the OS refused, and editor
+    /// shortcuts used twice (the second one would never fire).
+    fn binding_errors(&self) -> HashMap<Bind, String> {
+        let mut errors: HashMap<Bind, String> = self.hotkeys.errors.iter().map(|(a, e)| (Bind::Global(*a), e.clone())).collect();
+        let mut seen: HashMap<String, EditorAction> = HashMap::new();
+        for a in EditorAction::ALL {
+            let b = self.settings.editor_binding(*a).to_ascii_lowercase();
+            if b.is_empty() {
+                continue;
+            }
+            match seen.get(&b) {
+                Some(first) => {
+                    errors.insert(Bind::Editor(*a), format!("Already used by \"{}\"", first.label()));
+                }
+                None => {
+                    seen.insert(b, *a);
+                }
+            }
+        }
+        errors
+    }
+
+    fn listen(&mut self, ctx: &egui::Context, action: Option<Bind>) {
         self.settings_state.listening = action;
         self.recorder = ShortcutRecorder::default();
         self.listening.store(action.is_some(), Ordering::Relaxed);
@@ -310,7 +392,7 @@ impl App {
             .with_title("Mythicshot settings")
             .with_inner_size([860.0, 560.0])
             .with_min_inner_size([640.0, 420.0])
-            .with_icon(Arc::new(egui::IconData { rgba: tray::icon_rgba(64).0, width: 64, height: 64 }));
+            .with_icon(self.icon.clone());
         // Pull what the settings window did since our last frame.
         let (actions, close, edited, tab) = {
             let mut s = self.settings_shared.lock().expect("settings state");
@@ -328,7 +410,10 @@ impl App {
                 UiAction::ResetAll => {
                     self.stop_listening();
                     for a in Action::ALL {
-                        self.set_binding(*a, a.default_binding().to_string());
+                        self.set_binding(Bind::Global(*a), a.default_binding().to_string());
+                    }
+                    for a in EditorAction::ALL {
+                        self.set_binding(Bind::Editor(*a), a.default_binding().to_string());
                     }
                 }
                 UiAction::OpenSettingsFolder => {
@@ -342,6 +427,7 @@ impl App {
                     self.settings.save_to_file = edited.save_to_file;
                     self.settings.copy_to_clipboard = edited.copy_to_clipboard;
                     self.settings.magnifier = edited.magnifier;
+                    self.settings.open_editor = edited.open_editor;
                     self.settings_changed();
                 }
             }
@@ -356,7 +442,7 @@ impl App {
         {
             let mut s = self.settings_shared.lock().expect("settings state");
             s.settings = self.settings.clone();
-            s.errors = self.hotkeys.errors.clone();
+            s.errors = self.binding_errors();
             s.snipping_tool = self.snipping_tool;
             s.state.listening = self.settings_state.listening;
             s.focus |= std::mem::take(&mut self.focus_settings);
@@ -381,6 +467,17 @@ impl eframe::App for App {
         }
         self.handle_events(&ctx);
 
+        // Test hook: open an image file in the editor at start.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("MYTHICSHOT_TEST_OPEN") {
+            static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DONE.swap(true, Ordering::Relaxed) {
+                if let Ok(img) = image::open(&path) {
+                    self.open_editor(img.to_rgba8(), "Test image".into());
+                }
+            }
+        }
+
         // Test hook: open Preferences the way the tray does, N ms after start.
         #[cfg(debug_assertions)]
         if let Some(ms) = std::env::var("MYTHICSHOT_TEST_PREFS_MS").ok().and_then(|v| v.parse::<u128>().ok()) {
@@ -396,6 +493,7 @@ impl eframe::App for App {
                 outcome => self.finish_overlay(&ctx, outcome),
             }
         }
+        self.show_editors(&ctx);
         if self.settings_open {
             self.settings_window(&ctx);
         }

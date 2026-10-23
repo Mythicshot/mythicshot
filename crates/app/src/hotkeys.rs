@@ -49,6 +49,119 @@ impl Action {
     }
 }
 
+/// Shortcuts inside the editor window. Unlike [`Action`] these are not
+/// registered with the OS; the editor checks them only while it has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorAction {
+    Select,
+    Rectangle,
+    Ellipse,
+    Line,
+    Arrow,
+    Freehand,
+    Text,
+    Bubble,
+    Step,
+    Highlight,
+    Obfuscate,
+    Crop,
+    Undo,
+    Redo,
+    Delete,
+    Copy,
+    Save,
+}
+
+impl EditorAction {
+    pub const ALL: &'static [EditorAction] = &[
+        EditorAction::Select,
+        EditorAction::Rectangle,
+        EditorAction::Ellipse,
+        EditorAction::Line,
+        EditorAction::Arrow,
+        EditorAction::Freehand,
+        EditorAction::Text,
+        EditorAction::Bubble,
+        EditorAction::Step,
+        EditorAction::Highlight,
+        EditorAction::Obfuscate,
+        EditorAction::Crop,
+        EditorAction::Undo,
+        EditorAction::Redo,
+        EditorAction::Delete,
+        EditorAction::Copy,
+        EditorAction::Save,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EditorAction::Select => "Select tool",
+            EditorAction::Rectangle => "Rectangle tool",
+            EditorAction::Ellipse => "Ellipse tool",
+            EditorAction::Line => "Line tool",
+            EditorAction::Arrow => "Arrow tool",
+            EditorAction::Freehand => "Freehand tool",
+            EditorAction::Text => "Text tool",
+            EditorAction::Bubble => "Speech bubble tool",
+            EditorAction::Step => "Step label tool",
+            EditorAction::Highlight => "Highlight tool",
+            EditorAction::Obfuscate => "Obfuscate tool",
+            EditorAction::Crop => "Crop tool",
+            EditorAction::Undo => "Undo",
+            EditorAction::Redo => "Redo",
+            EditorAction::Delete => "Delete selected",
+            EditorAction::Copy => "Copy image",
+            EditorAction::Save => "Save",
+        }
+    }
+
+    pub fn default_binding(self) -> &'static str {
+        match self {
+            EditorAction::Select => "KeyV",
+            EditorAction::Rectangle => "KeyR",
+            EditorAction::Ellipse => "KeyE",
+            EditorAction::Line => "KeyL",
+            EditorAction::Arrow => "KeyA",
+            EditorAction::Freehand => "KeyF",
+            EditorAction::Text => "KeyT",
+            EditorAction::Bubble => "KeyS",
+            EditorAction::Step => "KeyN",
+            EditorAction::Highlight => "KeyH",
+            EditorAction::Obfuscate => "KeyB",
+            EditorAction::Crop => "KeyC",
+            EditorAction::Undo => "control+KeyZ",
+            EditorAction::Redo => "control+KeyY",
+            EditorAction::Delete => "Delete",
+            EditorAction::Copy => "control+KeyC",
+            EditorAction::Save => "control+KeyS",
+        }
+    }
+}
+
+/// A shortcut string in egui terms, for matching key presses in a window.
+pub fn egui_shortcut(binding: &str) -> Option<(eframe::egui::Modifiers, eframe::egui::Key)> {
+    use eframe::egui::{Key, Modifiers};
+    let mut mods = Modifiers::NONE;
+    let mut key = None;
+    for part in binding.split('+') {
+        match part.to_ascii_lowercase().as_str() {
+            "control" | "ctrl" => mods.ctrl = true,
+            "shift" => mods.shift = true,
+            "alt" | "option" => mods.alt = true,
+            "meta" | "super" | "cmd" | "command" => mods.mac_cmd = true,
+            _ => {
+                let name = part.strip_prefix("Key").or_else(|| part.strip_prefix("Digit")).unwrap_or(part);
+                key = Key::from_name(name);
+            }
+        }
+    }
+    if mods.ctrl {
+        mods.command = true;
+    }
+    key.map(|k| (mods, k))
+}
+
 /// `control+shift+KeyS` → `Ctrl+Shift+S`, the way the menu and settings show it.
 pub fn display(binding: &str) -> String {
     if binding.is_empty() {
@@ -314,6 +427,15 @@ mod tests {
         for a in Action::ALL.iter().filter(|a| !a.default_binding().is_empty()) {
             HotKey::from_str(a.default_binding()).expect("default binding parses");
         }
+    }
+
+    #[test]
+    fn editor_defaults_parse_for_egui() {
+        for a in EditorAction::ALL {
+            assert!(egui_shortcut(a.default_binding()).is_some(), "{a:?}");
+        }
+        let (m, k) = egui_shortcut("control+KeyZ").unwrap();
+        assert!(m.ctrl && k == eframe::egui::Key::Z);
     }
 
     #[test]

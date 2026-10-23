@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, vec2};
 
-use crate::hotkeys::{self, Action};
+use crate::hotkeys::{self, Action, EditorAction};
 use crate::settings::Settings;
 
 const WARN_BG: Color32 = Color32::from_rgb(58, 42, 16);
@@ -18,16 +18,39 @@ pub enum Tab {
     General,
 }
 
+/// A shortcut slot: a global hotkey or a key inside the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bind {
+    Global(Action),
+    Editor(EditorAction),
+}
+
+impl Bind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Bind::Global(a) => a.label(),
+            Bind::Editor(a) => a.label(),
+        }
+    }
+
+    pub fn default_binding(self) -> &'static str {
+        match self {
+            Bind::Global(a) => a.default_binding(),
+            Bind::Editor(a) => a.default_binding(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SettingsState {
     pub tab: Tab,
-    pub listening: Option<Action>,
+    pub listening: Option<Bind>,
 }
 
 pub enum UiAction {
-    Listen(Action),
+    Listen(Bind),
     StopListening,
-    SetBinding(Action, String),
+    SetBinding(Bind, String),
     ResetAll,
     OpenSettingsFolder,
     SettingsChanged,
@@ -39,7 +62,7 @@ pub enum UiAction {
 /// `actions`, and the app applies them on its next frame and refreshes the rest.
 pub struct Shared {
     pub settings: Settings,
-    pub errors: HashMap<Action, String>,
+    pub errors: HashMap<Bind, String>,
     pub snipping_tool: Option<bool>,
     pub state: SettingsState,
     pub actions: Vec<UiAction>,
@@ -70,7 +93,7 @@ pub fn show(ctx: &egui::Context, shared: &std::sync::Arc<std::sync::Mutex<Shared
 
 pub struct View<'a> {
     pub settings: &'a mut Settings,
-    pub errors: &'a HashMap<Action, String>,
+    pub errors: &'a HashMap<Bind, String>,
     pub snipping_tool: Option<bool>,
 }
 
@@ -107,6 +130,8 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     }
     ui.add_space(8.0);
     let mut changed = false;
+    changed |= ui.checkbox(&mut s.open_editor, "Open each capture in the editor").changed();
+    ui.label(RichText::new("When off, captures are saved and copied straight away using the two options below.").color(MUTED).size(12.0));
     changed |= ui.checkbox(&mut s.save_to_file, "Save every capture as a PNG file").changed();
     changed |= ui.checkbox(&mut s.copy_to_clipboard, "Copy every capture to the clipboard").changed();
     changed |= ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting").changed();
@@ -135,7 +160,7 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
 
     let prtsc_failed = Action::ALL
         .iter()
-        .any(|a| view.errors.contains_key(a) && view.settings.binding(*a).to_ascii_lowercase().contains("printscreen"));
+        .any(|a| view.errors.contains_key(&Bind::Global(*a)) && view.settings.binding(*a).to_ascii_lowercase().contains("printscreen"));
     if view.snipping_tool == Some(true) || prtsc_failed {
         egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -155,16 +180,26 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
         for &action in Action::ALL {
             if action.group() != current_group {
                 current_group = action.group();
-                ui.add_space(6.0);
-                ui.label(RichText::new(current_group.to_uppercase()).size(11.0).color(MUTED));
-                ui.add_space(4.0);
+                group_title(ui, current_group);
             }
-            row(ui, state, &view, action, out);
+            row(ui, state, &view, Bind::Global(action), view.settings.binding(action), out);
+        }
+        group_title(ui, "Editor");
+        ui.label(RichText::new("These work inside the editor window only.").color(MUTED).size(12.0));
+        ui.add_space(4.0);
+        for &action in EditorAction::ALL {
+            row(ui, state, &view, Bind::Editor(action), view.settings.editor_binding(action), out);
         }
     });
 }
 
-fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Action, out: &mut Vec<UiAction>) {
+fn group_title(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(title.to_uppercase()).size(11.0).color(MUTED));
+    ui.add_space(4.0);
+}
+
+fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bind, binding: &str, out: &mut Vec<UiAction>) {
     let listening = state.listening == Some(action);
     let error = view.errors.get(&action);
     let fill = if listening {
@@ -183,7 +218,6 @@ fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Ac
                 if ui.add_sized([56.0, 32.0], egui::Button::new("Reset")).on_hover_text("Reset to default").clicked() {
                     out.push(UiAction::SetBinding(action, action.default_binding().to_string()));
                 }
-                let binding = view.settings.binding(action);
                 let text = if listening {
                     "Press new keys…".to_string()
                 } else if binding.is_empty() {
