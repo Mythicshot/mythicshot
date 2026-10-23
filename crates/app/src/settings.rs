@@ -38,6 +38,8 @@ pub struct Settings {
     pub hotkeys: BTreeMap<Action, String>,
     /// Editor action → shortcut, same syntax as `hotkeys`.
     pub editor_keys: BTreeMap<EditorAction, String>,
+    /// What the editor remembers between captures.
+    pub editor: EditorPrefs,
 
     // Phase 1–2 options, read once to fill `destinations`, never written.
     #[serde(skip_serializing)]
@@ -46,6 +48,46 @@ pub struct Settings {
     save_to_file: Option<bool>,
     #[serde(skip_serializing)]
     copy_to_clipboard: Option<bool>,
+}
+
+/// A drawing style as saved in the settings file.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedStyle {
+    pub stroke: [u8; 4],
+    pub fill: Option<[u8; 4]>,
+    pub width: f32,
+    pub font_size: f32,
+    pub shadow: bool,
+    /// For the obfuscate tool: blur instead of pixelate.
+    pub blur: bool,
+}
+
+impl Default for SavedStyle {
+    fn default() -> Self {
+        Self { stroke: [229, 72, 77, 255], fill: None, width: 3.0, font_size: 20.0, shadow: true, blur: false }
+    }
+}
+
+/// The editor's remembered choices: a style per tool (like Greenshot), the
+/// last tool used, and the GIF editor's export settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorPrefs {
+    pub tool: String,
+    /// Tool name → its style, for example `text` → white 32 pt.
+    pub styles: BTreeMap<String, SavedStyle>,
+    pub export_format: String,
+    pub export_scale: u32,
+    pub export_quality: u8,
+    pub export_loop: bool,
+    pub export_fps: u32,
+}
+
+impl Default for EditorPrefs {
+    fn default() -> Self {
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30 }
+    }
 }
 
 impl Default for Settings {
@@ -68,6 +110,7 @@ impl Default for Settings {
             last_region: None,
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
+            editor: EditorPrefs::default(),
             open_editor: None,
             save_to_file: None,
             copy_to_clipboard: None,

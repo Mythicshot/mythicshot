@@ -76,6 +76,8 @@ struct App {
     rec_events: Vec<mythicshot_editor::overlays::InputEvent>,
     /// Read by the input hook thread: where to send events while recording.
     tap: Arc<std::sync::Mutex<Option<input::Tap>>>,
+    /// When to save editor preferences that changed.
+    prefs_save_at: Option<Instant>,
     encoding: Vec<recorder_ui::EncodeJob>,
     /// The root window is kept out of screen capture once its handle is known.
     root_hidden_from_capture: bool,
@@ -166,6 +168,7 @@ impl App {
             session: None,
             rec_events: Vec::new(),
             tap: Arc::new(std::sync::Mutex::new(None)),
+            prefs_save_at: None,
             encoding: Vec::new(),
             root_hidden_from_capture: false,
             refocus_at: None,
@@ -525,14 +528,14 @@ impl App {
     }
 
     fn open_editor(&mut self, img: image::RgbaImage, title: String) {
-        let editor = editor_ui::Editor::new(img, title.clone(), self.settings.editor_keys.clone(), self.settings.dest_context(&title));
+        let editor = editor_ui::Editor::new(img, title.clone(), self.settings.editor_keys.clone(), self.settings.dest_context(&title), self.settings.editor.clone());
         self.editors.push((editor_ui::EditorWindow::new(editor), true));
     }
 
     /// Open a recording in the editor's video mode (the GIF editor).
     fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, title: String) {
         let s = &self.settings;
-        match editor_ui::Editor::new_video(rec.clone(), events, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.gif_quality, s.record_fps) {
+        match editor_ui::Editor::new_video(rec.clone(), events, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.editor.clone()) {
             Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
             Err(e) => {
                 rec.delete_files();
@@ -554,9 +557,44 @@ impl App {
     }
 
     fn show_editors(&mut self, ctx: &egui::Context) {
+        self.collect_editor_prefs();
         self.editors.retain(|(w, _)| !w.is_closed());
         for (w, first) in &mut self.editors {
             w.show(ctx, self.icon.clone(), std::mem::take(first));
+        }
+    }
+
+    /// Pick up styles, tool and export choices changed in any editor, share
+    /// them with the other open editors, and save them shortly after the last
+    /// change (a slider drag changes them every frame).
+    fn collect_editor_prefs(&mut self) {
+        let mut changed: Option<settings::EditorPrefs> = None;
+        for (w, _) in &self.editors {
+            if let Ok(mut e) = w.editor.lock() {
+                if std::mem::take(&mut e.prefs_changed) {
+                    changed = Some(e.prefs.clone());
+                }
+                if let Some(o) = e.overlay_default.take() {
+                    self.settings.overlays = o;
+                    self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+                }
+            }
+        }
+        if let Some(prefs) = changed {
+            for (w, _) in &self.editors {
+                if let Ok(mut e) = w.editor.lock() {
+                    // Other editors keep their current tool; they get the styles and export choices.
+                    let tool = std::mem::take(&mut e.prefs.tool);
+                    e.prefs = prefs.clone();
+                    e.prefs.tool = tool;
+                }
+            }
+            self.settings.editor = prefs;
+            self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+        }
+        if self.prefs_save_at.is_some_and(|t| Instant::now() >= t) {
+            self.prefs_save_at = None;
+            self.settings.save();
         }
     }
 

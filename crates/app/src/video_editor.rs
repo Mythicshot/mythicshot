@@ -111,6 +111,8 @@ pub struct VideoState {
     pub exported: bool,
     pub close_after_export: bool,
     drag: Option<TimelineDrag>,
+    /// Overlay style last reported to the app, to notice changes.
+    last_overlays: OverlayStyle,
 }
 
 impl Drop for VideoState {
@@ -141,13 +143,22 @@ impl Editor {
         keys: std::collections::BTreeMap<crate::hotkeys::EditorAction, String>,
         dest: Context,
         overlays: OverlayStyle,
-        quality: u8,
-        fps: u32,
+        prefs: crate::settings::EditorPrefs,
     ) -> Result<Editor, String> {
         let mut reader = FrameReader::new(rec.clone())?;
         let first = reader.get(0)?;
-        let mut editor = Editor::new(first, title, keys, dest);
-        let edit = Edit::new(&rec, overlays);
+        let format = match prefs.export_format.as_str() {
+            "apng" => Format::Apng,
+            "mp4" => Format::Mp4,
+            "webm" => Format::Webm,
+            _ => Format::Gif,
+        };
+        let ffmpeg = ffmpeg_available();
+        let format = if format.needs_ffmpeg() && !ffmpeg { Format::Gif } else { format };
+        let (quality, loop_forever, fps, scale) = (prefs.export_quality, prefs.export_loop, prefs.export_fps, prefs.export_scale);
+        let mut editor = Editor::new(first, title, keys, dest, prefs);
+        let mut edit = Edit::new(&rec, overlays);
+        edit.scale = scale;
         editor.video = Some(VideoState {
             rec,
             reader,
@@ -156,11 +167,12 @@ impl Editor {
             current: 0,
             loaded: Some(0),
             playing: None,
-            format: Format::Gif,
+            format,
             quality,
-            loop_forever: true,
+            loop_forever,
             fps,
-            ffmpeg: ffmpeg_available(),
+            ffmpeg,
+            last_overlays: overlays,
             job: None,
             exported: false,
             close_after_export: false,
@@ -235,6 +247,12 @@ impl Editor {
                     self.start_export(None);
                 }
             }
+        }
+        let Some(v) = self.video.as_mut() else { return };
+        // Overlay style changes become the default for the next recording.
+        if v.edit.overlays != v.last_overlays {
+            v.last_overlays = v.edit.overlays;
+            self.overlay_default = Some(v.edit.overlays);
         }
         let Some(v) = self.video.as_mut() else { return };
         if let Some((since, from)) = v.playing {
@@ -377,6 +395,23 @@ impl Editor {
                 ui.close();
             }
         });
+        self.remember_export();
+    }
+
+    /// Save the export panel's choices for the next recording.
+    fn remember_export(&mut self) {
+        let Some(v) = self.video.as_ref() else { return };
+        let format = v.format.extension().replace("png", "apng");
+        let p = &mut self.prefs;
+        let changed = p.export_format != format || p.export_scale != v.edit.scale || p.export_quality != v.quality || p.export_loop != v.loop_forever || p.export_fps != v.fps;
+        if changed {
+            p.export_format = format;
+            p.export_scale = v.edit.scale;
+            p.export_quality = v.quality;
+            p.export_loop = v.loop_forever;
+            p.export_fps = v.fps;
+            self.prefs_changed = true;
+        }
     }
 
     /// Controls and the timeline strip, above the status bar.

@@ -42,6 +42,44 @@ pub enum Tool {
 }
 
 impl Tool {
+    /// The name used in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tool::Select => "select",
+            Tool::Rectangle => "rectangle",
+            Tool::Ellipse => "ellipse",
+            Tool::Line => "line",
+            Tool::Arrow => "arrow",
+            Tool::Freehand => "freehand",
+            Tool::Text => "text",
+            Tool::Bubble => "bubble",
+            Tool::Step => "step",
+            Tool::Highlight => "highlight",
+            Tool::Obfuscate => "obfuscate",
+            Tool::Crop => "crop",
+        }
+    }
+
+    fn from_key(k: &str) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|t| t.key() == k)
+    }
+
+    /// The tool that draws a shape, so editing an item updates that tool's style.
+    fn for_shape(s: &Shape) -> Tool {
+        match s {
+            Shape::Rect(_) => Tool::Rectangle,
+            Shape::Ellipse(_) => Tool::Ellipse,
+            Shape::Line(..) => Tool::Line,
+            Shape::Arrow(..) => Tool::Arrow,
+            Shape::Freehand(_) => Tool::Freehand,
+            Shape::Text { .. } => Tool::Text,
+            Shape::Bubble { .. } => Tool::Bubble,
+            Shape::Step { .. } => Tool::Step,
+            Shape::Highlight(_) => Tool::Highlight,
+            Shape::Obfuscate { .. } => Tool::Obfuscate,
+        }
+    }
+
     const ALL: [Tool; 12] = [
         Tool::Select,
         Tool::Rectangle,
@@ -140,11 +178,17 @@ pub struct Editor {
     last_canvas: CanvasGeom,
     /// Set when the editor holds a recording instead of a still image.
     pub(crate) video: Option<crate::video_editor::VideoState>,
+    /// Remembered styles and choices; the app saves them when `prefs_changed`.
+    pub prefs: crate::settings::EditorPrefs,
+    pub prefs_changed: bool,
+    /// A new default overlay style chosen in the GIF editor, for the app to save.
+    pub overlay_default: Option<mythicshot_editor::overlays::OverlayStyle>,
 }
 
 impl Editor {
-    pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context) -> Self {
-        Self {
+    pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context, prefs: crate::settings::EditorPrefs) -> Self {
+        let tool = Tool::from_key(&prefs.tool).filter(|t| *t != Tool::Crop).unwrap_or(Tool::Rectangle);
+        let mut editor = Self {
             doc: Document::new(img),
             title,
             tool: Tool::Rectangle,
@@ -167,6 +211,36 @@ impl Editor {
             prop_checkpoint: None,
             last_canvas: CanvasGeom { min: pos2(0.0, 0.0), zoom: 1.0 },
             video: None,
+            prefs,
+            prefs_changed: false,
+            overlay_default: None,
+        };
+        editor.tool = tool;
+        editor.load_tool_style(tool);
+        editor
+    }
+
+    /// Show the remembered style of `tool` in the properties row.
+    fn load_tool_style(&mut self, tool: Tool) {
+        if let Some(s) = self.prefs.styles.get(tool.key()) {
+            self.style = Style { stroke: Rgba(s.stroke), fill: s.fill.map(Rgba), width: s.width, font_size: s.font_size, shadow: s.shadow };
+            self.obfuscate = if s.blur { ObfuscateMode::Blur } else { ObfuscateMode::Pixelate };
+        } else if tool != Tool::Select {
+            self.style = Style::default();
+            self.obfuscate = ObfuscateMode::Pixelate;
+        }
+    }
+
+    /// Remember the current properties as `tool`'s style.
+    fn remember_style(&mut self, tool: Tool) {
+        if matches!(tool, Tool::Select | Tool::Crop) {
+            return;
+        }
+        let st = self.style;
+        let saved = crate::settings::SavedStyle { stroke: st.stroke.0, fill: st.fill.map(|f| f.0), width: st.width, font_size: st.font_size, shadow: st.shadow, blur: self.obfuscate == ObfuscateMode::Blur };
+        if self.prefs.styles.get(tool.key()) != Some(&saved) {
+            self.prefs.styles.insert(tool.key().to_string(), saved);
+            self.prefs_changed = true;
         }
     }
 
@@ -309,6 +383,11 @@ impl Editor {
         self.crop = None;
         if tool != Tool::Select {
             self.selected = None;
+            self.load_tool_style(tool);
+        }
+        if tool != Tool::Crop && self.prefs.tool != tool.key() {
+            self.prefs.tool = tool.key().to_string();
+            self.prefs_changed = true;
         }
     }
 
@@ -501,6 +580,12 @@ impl Editor {
                 });
         }
 
+        // Remember the change as the style of whatever tool it applies to: the
+        // selected item's tool, or the current tool for the next item drawn.
+        if self.style != before || self.obfuscate != before_mode {
+            let owner = self.selected.and_then(|id| self.doc.item(id)).map(|it| Tool::for_shape(&it.shape)).unwrap_or(self.tool);
+            self.remember_style(owner);
+        }
         if let Some(id) = self.selected {
             if self.style != before || self.obfuscate != before_mode {
                 let recent = self.prop_checkpoint.is_some_and(|(pid, at)| pid == id && at.elapsed() < Duration::from_millis(700));
@@ -1144,5 +1229,62 @@ impl EditorWindow {
         if first_frame {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{EditorPrefs, Settings};
+
+    fn editor(prefs: EditorPrefs) -> Editor {
+        let s = Settings::default();
+        Editor::new(RgbaImage::new(64, 48), "t".into(), BTreeMap::new(), s.dest_context("t"), prefs)
+    }
+
+    #[test]
+    fn tool_styles_carry_over_to_the_next_capture() {
+        let mut first = editor(EditorPrefs::default());
+        first.set_tool(Tool::Text);
+        first.style.stroke = Rgba([255, 255, 255, 255]);
+        first.style.font_size = 32.0;
+        first.style.fill = Some(Rgba([0, 0, 0, 200]));
+        first.remember_style(Tool::Text);
+        assert!(first.prefs_changed);
+
+        // The next capture opens with the same tool and its remembered style.
+        let mut next = editor(first.prefs.clone());
+        assert_eq!(next.tool, Tool::Text);
+        assert_eq!(next.style.font_size, 32.0);
+        assert_eq!(next.style.stroke, Rgba([255, 255, 255, 255]));
+        assert_eq!(next.style.fill, Some(Rgba([0, 0, 0, 200])));
+        // Other tools keep their own defaults.
+        next.set_tool(Tool::Rectangle);
+        assert_eq!(next.style, Style::default());
+        next.set_tool(Tool::Text);
+        assert_eq!(next.style.font_size, 32.0);
+    }
+
+    #[test]
+    fn editing_a_selected_item_updates_its_tool_style() {
+        let mut e = editor(EditorPrefs::default());
+        e.set_tool(Tool::Rectangle);
+        let id = e.doc.add(Shape::Arrow(pt(1.0, 1.0), pt(20.0, 20.0)), e.style);
+        e.selected = Some(id);
+        e.style.width = 9.0;
+        let owner = Tool::for_shape(&e.doc.item(id).unwrap().shape);
+        e.remember_style(owner);
+        assert_eq!(e.prefs.styles.get("arrow").map(|s| s.width), Some(9.0));
+        assert!(e.prefs.styles.get("rectangle").is_none());
+    }
+
+    #[test]
+    fn prefs_round_trip_through_the_settings_file() {
+        let mut s = Settings::default();
+        s.editor.tool = "highlight".into();
+        s.editor.export_format = "apng".into();
+        s.editor.styles.insert("text".into(), crate::settings::SavedStyle { font_size: 40.0, ..Default::default() });
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.editor, s.editor);
     }
 }
