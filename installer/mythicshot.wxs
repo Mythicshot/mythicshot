@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Mythicshot installer (WiX v5). Per-user: installs to
+  %LocalAppData%\Programs\Mythicshot without an admin prompt, adds a Start
+  menu shortcut and an entry in Settings › Apps for uninstalling.
+  Build: wix build installer\mythicshot.wxs -arch x64 -d Version=0.1.0 -d Exe=<path to mythicshot.exe> -o dist\Mythicshot-0.1.0-x64.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Mythicshot"
+           Manufacturer="Mythicshot"
+           Version="$(Version)"
+           UpgradeCode="41EFFDDF-DEBA-4B83-A653-893B2EF06D69"
+           Scope="perUser"
+           Compressed="yes">
+    <SummaryInformation Description="Mythicshot - screenshots and GIF recordings" />
+
+    <!-- Installing a newer version replaces the old one. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="MythicshotIcon" SourceFile="..\assets\mythicshot.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MythicshotIcon" />
+    <Property Id="ARPHELPLINK" Value="https://www.gnu.org/licenses/agpl-3.0.html" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Mythicshot" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!-- Per-user components use a registry value as their key path, as Windows Installer expects. -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="D6C760D4-E8E1-4502-BB2E-65853E41E6F4">
+        <File Id="MythicshotExe" Source="$(Exe)" Name="mythicshot.exe" />
+        <File Id="LicenseFile" Source="..\LICENSE" Name="LICENSE.txt" />
+        <File Id="ReadmeFile" Source="..\README.md" Name="README.md" />
+        <RegistryValue Root="HKCU" Key="Software\Mythicshot" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+      </Component>
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="7F64D9FB-8823-4244-B7E2-F8CC91A8E17D">
+        <Shortcut Id="MythicshotShortcut"
+                  Name="Mythicshot"
+                  Description="Screenshots and GIF recordings"
+                  Target="[INSTALLFOLDER]mythicshot.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="MythicshotIcon" />
+        <RegistryValue Root="HKCU" Key="Software\Mythicshot" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Mythicshot">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+  </Package>
+</Wix>

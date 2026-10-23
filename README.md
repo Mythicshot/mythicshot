@@ -26,6 +26,18 @@ The program is `target/release/mythicshot.exe` (or `mythicshot` on macOS and Lin
 
 On Linux, install the development packages listed in `.github/workflows/ci.yml` first.
 
+### Windows installer
+
+The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. It needs [WiX 5](https://www.nuget.org/packages/wix) as a .NET tool (`dotnet tool install --global wix --version 5.0.2`):
+
+```sh
+cargo build --release -p mythicshot
+cd installer
+wix build mythicshot.wxs -arch x64 -d Version=0.1.0 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.0-x64.msi
+```
+
+The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
+
 ## Layout
 
 | Crate | Job |

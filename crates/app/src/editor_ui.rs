@@ -217,6 +217,11 @@ impl Editor {
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
+        // Test hook: open with the close prompt showing, to check its layout.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("MYTHICSHOT_TEST_CONFIRM_CLOSE").is_some() {
+            editor.confirm_close = true;
+        }
         editor
     }
 
@@ -969,25 +974,36 @@ impl Editor {
 
     fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
         let is_video = self.video.is_some();
-        let modal = egui::Modal::new(egui::Id::unique("confirm-close")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            if is_video {
-                ui.heading("Export this recording?");
-                ui.label("Closing without exporting deletes the recording.");
+        // Roomy and centred: the title, the message, then three wide buttons
+        // with space between them, Save (or Export) as the main one.
+        const BUTTON: egui::Vec2 = egui::vec2(132.0, 36.0);
+        const GAP: f32 = 14.0;
+        let modal = egui::Modal::new(egui::Id::unique("confirm-close")).frame(egui::Frame::popup(&ctx.global_style()).inner_margin(24.0)).show(ctx, |ui| {
+            ui.set_width(3.0 * BUTTON.x + 2.0 * GAP + 24.0);
+            let (title, text) = if is_video {
+                ("Export this recording?", "Closing without exporting deletes the recording.")
             } else {
-                ui.heading("Save this capture?");
-                ui.label("It has changes that are not saved yet.");
-            }
-            ui.add_space(10.0);
+                ("Save this capture?", "It has changes that are not saved yet.")
+            };
+            ui.vertical_centered(|ui| {
+                ui.heading(title);
+                ui.add_space(8.0);
+                ui.label(text);
+            });
+            ui.add_space(22.0);
             let mut choice = None;
             ui.horizontal(|ui| {
-                if ui.button(if is_video { "Export and close" } else { "Save" }).clicked() {
+                ui.spacing_mut().item_spacing.x = GAP;
+                let row = 3.0 * BUTTON.x + 2.0 * GAP;
+                ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
+                let primary = egui::Button::new(egui::RichText::new(if is_video { "Export and close" } else { "Save" }).strong()).fill(Color32::from_rgb(47, 111, 235)).min_size(BUTTON);
+                if ui.add(primary).clicked() {
                     choice = Some(0);
                 }
-                if ui.button(if is_video { "Discard" } else { "Don't save" }).clicked() {
+                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON)).clicked() {
                     choice = Some(1);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(egui::Button::new("Cancel").min_size(BUTTON)).clicked() {
                     choice = Some(2);
                 }
             });

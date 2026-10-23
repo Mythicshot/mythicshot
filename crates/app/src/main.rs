@@ -879,7 +879,9 @@ fn install_crash_log() {
 
 fn main() -> eframe::Result {
     install_crash_log();
-    if !platform::single_instance() {
+    // Debug builds can run beside an installed copy for tests.
+    let second_allowed = cfg!(debug_assertions) && std::env::var_os("MYTHICSHOT_TEST_SECOND_COPY").is_some();
+    if !second_allowed && !platform::single_instance() {
         eprintln!("Mythicshot is already running");
         return Ok(());
     }
