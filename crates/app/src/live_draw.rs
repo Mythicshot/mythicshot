@@ -224,7 +224,7 @@ fn draw_window(ui: &mut egui::Ui, s: &mut State, size: (u32, u32)) {
     let painter = ui.painter().clone();
     if !s.hidden_from_capture {
         // Not out of the recording yet: show nothing.
-        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
         return;
     }
     painter.rect_filled(full, 0.0, TINT);
@@ -323,13 +323,13 @@ fn draw_window(ui: &mut egui::Ui, s: &mut State, size: (u32, u32)) {
 
 /// The toolbar at the top of the draw window. Returns whether the pointer is on it.
 fn toolbar(ui: &mut egui::Ui, s: &mut State, full: egui::Rect) -> bool {
-    let size = vec2(420.0, 40.0);
-    let rect = egui::Rect::from_min_size(egui::pos2(full.center().x - size.x / 2.0, full.min.y + 10.0), size);
-    let over = ui.ctx().pointer_hover_pos().is_some_and(|p| rect.contains(p));
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+    // Wraps onto more rows when the recorded area is narrow.
+    let width = 420.0f32.min(full.width() - 8.0).max(60.0);
+    let max = egui::Rect::from_min_size(egui::pos2(full.center().x - width / 2.0, full.min.y + 6.0), vec2(width, full.height() - 12.0));
+    let shown = ui.scope_builder(egui::UiBuilder::new().max_rect(max), |ui| {
         egui::Frame::new().fill(BAR_BG).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 for (tool, icon, tip) in [(Tool::Pen, Icon::Freehand, "Pen (P)"), (Tool::Arrow, Icon::Arrow, "Arrow (A)"), (Tool::Rect, Icon::Rect, "Rectangle (R)"), (Tool::Ellipse, Icon::Ellipse, "Ellipse (E)")] {
                     if icons::button(ui, icon, 28.0, s.tool == tool, tip).clicked() {
                         s.tool = tool;
@@ -359,7 +359,7 @@ fn toolbar(ui: &mut egui::Ui, s: &mut State, full: egui::Rect) -> bool {
             });
         });
     });
-    over
+    ui.ctx().pointer_hover_pos().is_some_and(|p| shown.response.rect.contains(p))
 }
 
 #[cfg(test)]
