@@ -2761,6 +2761,7 @@ dependencies = [
  "global-hotkey",
  "image",
  "mythicshot-capture",
+ "mythicshot-destinations",
  "mythicshot-editor",
  "rdev",
  "rfd",
@@ -2776,6 +2777,18 @@ version = "0.0.0"
 dependencies = [
  "image",
  "xcap",
+]
+
+[[package]]
+name = "mythicshot-destinations"
+version = "0.0.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "image",
+ "rfd",
+ "serde",
+ "windows",
 ]
 
 [[package]]

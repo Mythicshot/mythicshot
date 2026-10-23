@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, vec2};
 
+use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_pattern};
+
 use crate::hotkeys::{self, Action, EditorAction};
 use crate::settings::Settings;
 
@@ -14,8 +16,9 @@ const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
-    Hotkeys,
     General,
+    Output,
+    Hotkeys,
 }
 
 /// A shortcut slot: a global hotkey or a key inside the editor.
@@ -54,6 +57,7 @@ pub enum UiAction {
     ResetAll,
     OpenSettingsFolder,
     SettingsChanged,
+    SetAutostart(bool),
 }
 
 /// State shared between the app and the settings window. The window is a
@@ -64,6 +68,7 @@ pub struct Shared {
     pub settings: Settings,
     pub errors: HashMap<Bind, String>,
     pub snipping_tool: Option<bool>,
+    pub autostart: bool,
     pub state: SettingsState,
     pub actions: Vec<UiAction>,
     pub close_requested: bool,
@@ -85,7 +90,7 @@ pub fn show(ctx: &egui::Context, shared: &std::sync::Arc<std::sync::Mutex<Shared
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             s.close_requested = true;
         }
-        let view = View { settings: &mut s.settings, errors: &s.errors, snipping_tool: s.snipping_tool };
+        let view = View { settings: &mut s.settings, errors: &s.errors, snipping_tool: s.snipping_tool, autostart: s.autostart };
         let out = self::ui(ui, &mut s.state, view);
         s.actions.extend(out);
     });
@@ -95,6 +100,7 @@ pub struct View<'a> {
     pub settings: &'a mut Settings,
     pub errors: &'a HashMap<Bind, String>,
     pub snipping_tool: Option<bool>,
+    pub autostart: bool,
 }
 
 pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<UiAction> {
@@ -103,7 +109,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
         ui.add_space(8.0);
         ui.label(RichText::new("Mythicshot settings").strong().size(15.0));
         ui.add_space(10.0);
-        for (tab, name) in [(Tab::General, "General"), (Tab::Hotkeys, "Hotkeys")] {
+        for (tab, name) in [(Tab::General, "General"), (Tab::Output, "Output"), (Tab::Hotkeys, "Hotkeys")] {
             let selected = state.tab == tab;
             if ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(selected, name)).clicked() {
                 state.tab = tab;
@@ -113,6 +119,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     });
     egui::CentralPanel::default().show(ui, |ui| match state.tab {
         Tab::General => general(ui, view, &mut out),
+        Tab::Output => output_tab(ui, view, &mut out),
         Tab::Hotkeys => hotkeys_tab(ui, state, view, &mut out),
     });
     out
@@ -122,25 +129,78 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     let s = view.settings;
     ui.heading("General");
     ui.add_space(12.0);
-    ui.label("Save captures to");
-    let mut dir = s.output_dir.display().to_string();
-    if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(f32::INFINITY)).changed() {
-        s.output_dir = dir.into();
-        out.push(UiAction::SettingsChanged);
+    let mut autostart = view.autostart;
+    if ui.checkbox(&mut autostart, "Start Mythicshot when I sign in").changed() {
+        out.push(UiAction::SetAutostart(autostart));
     }
-    ui.add_space(8.0);
-    let mut changed = false;
-    changed |= ui.checkbox(&mut s.open_editor, "Open each capture in the editor").changed();
-    ui.label(RichText::new("When off, captures are saved and copied straight away using the two options below.").color(MUTED).size(12.0));
-    changed |= ui.checkbox(&mut s.save_to_file, "Save every capture as a PNG file").changed();
-    changed |= ui.checkbox(&mut s.copy_to_clipboard, "Copy every capture to the clipboard").changed();
-    changed |= ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting").changed();
-    if changed {
+    if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
         out.push(UiAction::SettingsChanged);
     }
     ui.add_space(16.0);
     if ui.button("Open settings folder").clicked() {
         out.push(UiAction::OpenSettingsFolder);
+    }
+}
+
+fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
+    let s = view.settings;
+    let mut changed = false;
+    ui.heading("Output");
+    ui.add_space(10.0);
+
+    ui.label(RichText::new("AFTER CAPTURE").size(11.0).color(MUTED));
+    ui.label(RichText::new("Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.").color(MUTED).size(12.0));
+    ui.add_space(4.0);
+    for d in DestId::ALL {
+        let mut on = s.has_destination(*d);
+        if ui.checkbox(&mut on, d.label()).on_hover_text(d.help()).changed() {
+            s.toggle_destination(*d);
+            changed = true;
+        }
+    }
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("SAVING").size(11.0).color(MUTED));
+    ui.add_space(4.0);
+    ui.label("Captures folder");
+    ui.horizontal(|ui| {
+        let mut dir = s.output_dir.display().to_string();
+        if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(ui.available_width() - 90.0)).changed() {
+            s.output_dir = dir.into();
+            changed = true;
+        }
+        if ui.button("Browse…").clicked() {
+            if let Some(p) = rfd::FileDialog::new().set_directory(&s.output_dir).pick_folder() {
+                s.output_dir = p;
+                changed = true;
+            }
+        }
+    });
+    ui.add_space(8.0);
+    ui.label("File name pattern");
+    ui.horizontal(|ui| {
+        if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(ui.available_width() - 90.0).font(egui::TextStyle::Monospace)).changed() {
+            changed = true;
+        }
+        if ui.button("Default").clicked() {
+            s.filename_pattern = DEFAULT_PATTERN.to_string();
+            changed = true;
+        }
+    });
+    let example = expand_pattern(&s.filename_pattern, "Window title", chrono::Local::now());
+    ui.label(RichText::new(format!("Example: {example}.{}", s.image_format.extension())).color(MUTED).size(12.0));
+    ui.label(RichText::new("Tokens: ${YYYY} ${MM} ${DD} ${hh} ${mm} ${ss} ${title} ${user}. Use / for subfolders.").color(MUTED).size(12.0));
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("Format");
+        changed |= ui.radio_value(&mut s.image_format, ImageFormat::Png, "PNG").changed();
+        changed |= ui.radio_value(&mut s.image_format, ImageFormat::Jpeg, "JPEG").changed();
+        if s.image_format == ImageFormat::Jpeg {
+            changed |= ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100).text("quality")).changed();
+        }
+    });
+    if changed {
+        out.push(UiAction::SettingsChanged);
     }
 }
 

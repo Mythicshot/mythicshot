@@ -12,12 +12,18 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, ColorImage, CursorIcon, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2};
 use mythicshot_editor::{Bounds, Document, Item, ObfuscateMode, Pixmap, Pt, Rgba, RgbaImage, Shape, Style, effects, pt, render_items_onto, to_pixmap};
 
+use mythicshot_destinations::{self as dest, Context, DestId, Sent};
+
 use crate::hotkeys::{self, EditorAction};
-use crate::output;
+use crate::icons::{self, Icon};
 
 const ACCENT: Color32 = Color32::from_rgb(91, 141, 239);
 const CANVAS_BG: Color32 = Color32::from_rgb(16, 18, 22);
 const HANDLE: f32 = 8.0;
+const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
+/// Toolbar icon button size and tool rail width.
+const ICON: f32 = 28.0;
+const RAIL: f32 = 44.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -51,20 +57,20 @@ impl Tool {
         Tool::Crop,
     ];
 
-    fn label(self) -> &'static str {
+    fn icon(self) -> Icon {
         match self {
-            Tool::Select => "Select",
-            Tool::Rectangle => "Rectangle",
-            Tool::Ellipse => "Ellipse",
-            Tool::Line => "Line",
-            Tool::Arrow => "Arrow",
-            Tool::Freehand => "Freehand",
-            Tool::Text => "Text",
-            Tool::Bubble => "Speech bubble",
-            Tool::Step => "Step label",
-            Tool::Highlight => "Highlight",
-            Tool::Obfuscate => "Obfuscate",
-            Tool::Crop => "Crop",
+            Tool::Select => Icon::Select,
+            Tool::Rectangle => Icon::Rect,
+            Tool::Ellipse => Icon::Ellipse,
+            Tool::Line => Icon::Line,
+            Tool::Arrow => Icon::Arrow,
+            Tool::Freehand => Icon::Freehand,
+            Tool::Text => Icon::Text,
+            Tool::Bubble => Icon::Bubble,
+            Tool::Step => Icon::Step,
+            Tool::Highlight => Icon::Highlight,
+            Tool::Obfuscate => Icon::Obfuscate,
+            Tool::Crop => Icon::Crop,
         }
     }
 
@@ -121,9 +127,11 @@ pub struct Editor {
     /// Base plus every item except the one being dragged, built when a drag starts.
     drag_cache: Option<Pixmap>,
     pub keys: BTreeMap<EditorAction, String>,
-    pub output_dir: PathBuf,
+    /// Output folder, pattern and format from settings; `title` is this capture's.
+    dest: Context,
     saved: Option<PathBuf>,
-    status: Option<(String, Instant)>,
+    /// Last action and the time it happened, shown in the status bar.
+    status: Option<(String, String)>,
     pub closed: bool,
     confirm_close: bool,
     /// When the property panel last checkpointed, so one slider drag is one undo step.
@@ -132,7 +140,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, output_dir: PathBuf) -> Self {
+    pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context) -> Self {
         Self {
             doc: Document::new(img),
             title,
@@ -148,7 +156,7 @@ impl Editor {
             shown_version: None,
             drag_cache: None,
             keys,
-            output_dir,
+            dest,
             saved: None,
             status: None,
             closed: false,
@@ -162,8 +170,14 @@ impl Editor {
         &self.title
     }
 
+    /// New output settings from the app; keeps this capture's own title.
+    pub fn set_output(&mut self, mut ctx: Context) {
+        ctx.title = std::mem::take(&mut self.dest.title);
+        self.dest = ctx;
+    }
+
     fn notify(&mut self, msg: impl Into<String>) {
-        self.status = Some((msg.into(), Instant::now()));
+        self.status = Some((msg.into(), chrono::Local::now().format("%H:%M:%S").to_string()));
     }
 
     fn select(&mut self, id: Option<u64>) {
@@ -188,17 +202,12 @@ impl Editor {
         }
         self.shortcuts(&ctx);
         self.toolbar(ui);
+        self.status_bar(ui);
         self.tool_rail(ui);
-        self.properties(ui);
         self.canvas(ui);
         self.text_editor(&ctx);
         if self.confirm_close {
             self.confirm_close_dialog(&ctx);
-        }
-        if let Some((_, at)) = &self.status {
-            if at.elapsed() > Duration::from_secs(5) {
-                self.status = None;
-            }
         }
     }
 
@@ -251,7 +260,7 @@ impl Editor {
                 }
             }
             EditorAction::Copy => self.copy(),
-            EditorAction::Save => self.save(None),
+            EditorAction::Save => self.save(),
             _ => {}
         }
     }
@@ -271,42 +280,34 @@ impl Editor {
     }
 
     fn copy(&mut self) {
-        match output::copy_to_clipboard(&self.doc.flatten()) {
-            Ok(()) => self.notify("Copied to clipboard"),
+        self.send(DestId::Clipboard);
+    }
+
+    /// Send the flattened image to a destination and report the result here.
+    fn send(&mut self, d: DestId) {
+        match dest::send(d, &self.doc.flatten(), &self.dest) {
+            Ok(Sent::Saved(p)) => self.saved_to(p),
+            Ok(Sent::Cancelled) => {}
+            Ok(sent) => self.notify(sent.describe()),
             Err(e) => self.notify(e),
         }
     }
 
-    /// Save to `path`, or to the last saved path, or to a new file in the captures folder.
-    fn save(&mut self, path: Option<PathBuf>) {
-        let path = match path.or_else(|| self.saved.clone()) {
-            Some(p) => p,
-            None => match output::capture_path(&self.output_dir) {
-                Ok(p) => p,
-                Err(e) => return self.notify(e),
+    fn saved_to(&mut self, path: PathBuf) {
+        self.doc.mark_saved();
+        self.notify(format!("Saved {}", path.display()));
+        self.title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.saved = Some(path);
+    }
+
+    /// Save over the last saved file, or to a new file named by the pattern.
+    fn save(&mut self) {
+        match self.saved.clone() {
+            Some(p) => match dest::save(&self.doc.flatten(), &p, self.dest.format, self.dest.jpeg_quality) {
+                Ok(()) => self.saved_to(p),
+                Err(e) => self.notify(e),
             },
-        };
-        match output::save_image(&self.doc.flatten(), &path) {
-            Ok(()) => {
-                self.doc.mark_saved();
-                self.notify(format!("Saved {}", path.display()));
-                self.title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.saved = Some(path);
-            }
-            Err(e) => self.notify(e),
-        }
-    }
-
-    fn save_as(&mut self) {
-        let name = self.saved.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.title.clone());
-        let picked = rfd::FileDialog::new()
-            .set_directory(&self.output_dir)
-            .set_file_name(&name)
-            .add_filter("PNG image", &["png"])
-            .add_filter("JPEG image", &["jpg", "jpeg"])
-            .save_file();
-        if let Some(p) = picked {
-            self.save(Some(p));
+            None => self.send(DestId::File),
         }
     }
 
@@ -324,83 +325,150 @@ impl Editor {
 
     // ---- panels -------------------------------------------------------------
 
+    /// Two rows like Greenshot's editor: actions on top, then the properties of
+    /// the selected item (or of the next one drawn).
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("editor-toolbar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.add_space(4.0);
-                let dirty = if self.doc.dirty { " •" } else { "" };
-                ui.label(egui::RichText::new(format!("{}{dirty}", self.title)).strong());
-                ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).monospace().weak());
+        egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if icons::button(ui, Icon::Save, ICON, false, &self.key_hint(EditorAction::Save)).clicked() {
+                    self.save();
+                }
+                if icons::button(ui, Icon::SaveAs, ICON, false, "Save as…").clicked() {
+                    self.send(DestId::FileAs);
+                }
+                if icons::button(ui, Icon::Copy, ICON, false, &self.key_hint(EditorAction::Copy)).clicked() {
+                    self.copy();
+                }
+                let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
+                egui::Popup::menu(&send).show(|ui| {
+                    for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
+                        if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
+                            self.send(d);
+                            ui.close();
+                        }
+                    }
+                });
+                if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
+                    crate::platform::open_folder(&self.dest.output_dir);
+                }
                 ui.separator();
-                if ui.add_enabled(self.doc.can_undo(), egui::Button::new("Undo")).on_hover_text(self.key_hint(EditorAction::Undo)).clicked() {
+                let (can_undo, can_redo) = (self.doc.can_undo(), self.doc.can_redo());
+                if ui.add_enabled_ui(can_undo, |ui| icons::button(ui, Icon::Undo, ICON, false, &self.key_hint(EditorAction::Undo))).inner.clicked() {
                     self.run(EditorAction::Undo);
                 }
-                if ui.add_enabled(self.doc.can_redo(), egui::Button::new("Redo")).on_hover_text(self.key_hint(EditorAction::Redo)).clicked() {
+                if ui.add_enabled_ui(can_redo, |ui| icons::button(ui, Icon::Redo, ICON, false, &self.key_hint(EditorAction::Redo))).inner.clicked() {
                     self.run(EditorAction::Redo);
                 }
                 ui.separator();
-                ui.menu_button("Effects", |ui| {
-                    if ui.button("Drop shadow").clicked() {
-                        self.effect(effects::drop_shadow);
-                    }
-                    if ui.button("Torn edge").clicked() {
-                        self.effect(effects::torn_edge);
-                    }
-                    if ui.button("Border (current colour and width)").clicked() {
-                        let (w, c) = (self.style.width.round().max(1.0) as u32, self.style.stroke.0);
-                        self.effect(move |img| effects::border(img, w, c));
-                    }
-                    ui.separator();
-                    if ui.button("Greyscale").clicked() {
-                        self.effect(effects::greyscale);
-                    }
-                    if ui.button("Invert").clicked() {
-                        self.effect(effects::invert);
-                    }
-                    ui.separator();
-                    ui.menu_button("Resize", |ui| {
-                        for p in [25, 50, 75, 125, 150, 200] {
-                            if ui.button(format!("{p}%")).clicked() {
-                                self.effect(move |img| effects::resize(img, p));
-                            }
-                        }
-                    });
-                    if ui.button("Rotate right").clicked() {
-                        self.effect(effects::rotate_cw);
-                    }
-                    if ui.button("Rotate left").clicked() {
-                        self.effect(effects::rotate_ccw);
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Effects flatten annotations into the image").weak().size(11.0));
-                });
+                let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
+                egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
                 ui.separator();
-                if ui.button("Fit").clicked() {
-                    self.zoom = None;
-                }
-                if ui.button("100%").clicked() {
-                    self.zoom = Some(1.0);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new("Save").strong()).fill(Color32::from_rgb(47, 111, 235))).on_hover_text(self.key_hint(EditorAction::Save)).clicked() {
-                        self.save(None);
-                    }
-                    if ui.button("Save as…").clicked() {
-                        self.save_as();
-                    }
-                    if ui.button("Copy").on_hover_text(self.key_hint(EditorAction::Copy)).clicked() {
-                        self.copy();
-                    }
-                    if ui.button("Open folder").clicked() {
-                        crate::platform::open_folder(&self.output_dir);
-                    }
-                    if let Some((msg, _)) = &self.status {
-                        ui.label(egui::RichText::new(msg).color(Color32::from_rgb(163, 170, 184)));
-                    }
-                });
+                self.properties_row(ui);
             });
         });
+    }
+
+    fn effects_menu(&mut self, ui: &mut egui::Ui) {
+        let mut pick: Option<Box<dyn FnOnce(&RgbaImage) -> RgbaImage>> = None;
+        if ui.button("Drop shadow").clicked() {
+            pick = Some(Box::new(effects::drop_shadow));
+        }
+        if ui.button("Torn edge").clicked() {
+            pick = Some(Box::new(effects::torn_edge));
+        }
+        if ui.button("Border (current colour and width)").clicked() {
+            let (w, c) = (self.style.width.round().max(1.0) as u32, self.style.stroke.0);
+            pick = Some(Box::new(move |img: &RgbaImage| effects::border(img, w, c)));
+        }
+        ui.separator();
+        if ui.button("Greyscale").clicked() {
+            pick = Some(Box::new(effects::greyscale));
+        }
+        if ui.button("Invert").clicked() {
+            pick = Some(Box::new(effects::invert));
+        }
+        ui.separator();
+        ui.menu_button("Resize", |ui| {
+            for p in [25, 50, 75, 125, 150, 200] {
+                if ui.button(format!("{p}%")).clicked() {
+                    pick = Some(Box::new(move |img: &RgbaImage| effects::resize(img, p)));
+                }
+            }
+        });
+        if ui.button("Rotate right").clicked() {
+            pick = Some(Box::new(effects::rotate_cw));
+        }
+        if ui.button("Rotate left").clicked() {
+            pick = Some(Box::new(effects::rotate_ccw));
+        }
+        if let Some(f) = pick {
+            self.effect(f);
+            ui.close();
+        }
+    }
+
+    /// Colour, fill, width, text size, shadow and, for a selection, its actions.
+    fn properties_row(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let before = self.style;
+        let before_mode = self.obfuscate;
+
+        let mut c = to_color32(self.style.stroke);
+        if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).on_hover_text("Line and text colour").changed() {
+            self.style.stroke = from_color32(c);
+        }
+        let mut fill_on = self.style.fill.is_some();
+        if ui.toggle_value(&mut fill_on, "Fill").on_hover_text("Fill rectangles, ellipses, text boxes and bubbles").changed() {
+            self.style.fill = fill_on.then_some(Rgba([255, 255, 255, 255]));
+        }
+        if let Some(f) = self.style.fill {
+            let mut c = to_color32(f);
+            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).on_hover_text("Fill colour").changed() {
+                self.style.fill = Some(from_color32(c));
+            }
+        }
+        ui.add(egui::DragValue::new(&mut self.style.width).range(1.0..=20.0).speed(0.1).suffix(" px")).on_hover_text("Line width (drag or type)");
+        ui.add(egui::DragValue::new(&mut self.style.font_size).range(10.0..=96.0).speed(0.3).suffix(" pt")).on_hover_text("Text and step label size");
+        if icons::button(ui, Icon::Shadow, ICON, self.style.shadow, "Shadow").clicked() {
+            self.style.shadow = !self.style.shadow;
+        }
+        if self.tool == Tool::Obfuscate || self.selected_is_obfuscate() {
+            egui::ComboBox::from_id_salt("obfuscate-mode")
+                .width(80.0)
+                .selected_text(if self.obfuscate == ObfuscateMode::Pixelate { "Pixelate" } else { "Blur" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Pixelate, "Pixelate");
+                    ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Blur, "Blur");
+                });
+        }
+
+        if let Some(id) = self.selected {
+            if self.style != before || self.obfuscate != before_mode {
+                let recent = self.prop_checkpoint.is_some_and(|(pid, at)| pid == id && at.elapsed() < Duration::from_millis(700));
+                if !recent {
+                    self.doc.checkpoint();
+                }
+                self.prop_checkpoint = Some((id, Instant::now()));
+                let (style, mode) = (self.style, self.obfuscate);
+                self.doc.update(id, |it| {
+                    it.style = style;
+                    if let Shape::Obfuscate { mode: m, .. } = &mut it.shape {
+                        *m = mode;
+                    }
+                });
+            }
+            ui.separator();
+            if self.doc.item(id).and_then(|it| it.shape.text()).is_some() && icons::button(ui, Icon::EditText, ICON, false, "Edit text").clicked() {
+                self.edit_text(id);
+            }
+            if icons::button(ui, Icon::Front, ICON, false, "Bring to front").clicked() {
+                self.doc.bring_to_front(id);
+            }
+            if icons::button(ui, Icon::Delete, ICON, false, &self.key_hint(EditorAction::Delete)).clicked() {
+                self.run(EditorAction::Delete);
+            }
+        }
     }
 
     fn key_hint(&self, action: EditorAction) -> String {
@@ -408,89 +476,62 @@ impl Editor {
         if b.is_empty() { action.label().to_string() } else { format!("{}  ({})", action.label(), hotkeys::display(b)) }
     }
 
+    /// A narrow column of tool icons, grouped like Greenshot's.
     fn tool_rail(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("editor-tools").resizable(false).exact_size(150.0).show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("ANNOTATE").size(11.0).weak());
-            ui.add_space(4.0);
+        egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             for tool in Tool::ALL {
-                let selected = self.tool == tool;
-                let hint = self.key_hint(tool.action());
-                if ui.add_sized([ui.available_width(), 30.0], egui::Button::selectable(selected, tool.label())).on_hover_text(hint).clicked() {
+                if matches!(tool, Tool::Rectangle | Tool::Text | Tool::Highlight | Tool::Crop) {
+                    ui.add_space(3.0);
+                    ui.separator();
+                    ui.add_space(3.0);
+                }
+                let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
+                if icons::button(ui, tool.icon(), RAIL - 8.0, self.tool == tool, &tip).clicked() {
                     self.set_tool(tool);
                 }
             }
         });
     }
 
-    fn properties(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::right("editor-props").resizable(false).exact_size(240.0).show(ui, |ui| {
-            ui.spacing_mut().slider_width = 110.0;
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(if self.selected.is_some() { "SELECTED ITEM" } else { "NEW ITEMS" }).size(11.0).weak());
-            ui.add_space(6.0);
-            let before = self.style;
-            let before_mode = self.obfuscate;
-
+    /// Size, last action with its time, and zoom, like Greenshot's status bar.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let mut c = to_color32(self.style.stroke);
-                if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
-                    self.style.stroke = from_color32(c);
-                }
-                ui.label("Colour");
-            });
-            ui.horizontal(|ui| {
-                let mut on = self.style.fill.is_some();
-                if ui.checkbox(&mut on, "Fill").changed() {
-                    self.style.fill = on.then_some(Rgba([255, 255, 255, 255]));
-                }
-                if let Some(f) = self.style.fill {
-                    let mut c = to_color32(f);
-                    if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).changed() {
-                        self.style.fill = Some(from_color32(c));
-                    }
-                }
-            });
-            ui.add(egui::Slider::new(&mut self.style.width, 1.0..=20.0).text("Line width"));
-            ui.add(egui::Slider::new(&mut self.style.font_size, 10.0..=96.0).text("Text size"));
-            ui.checkbox(&mut self.style.shadow, "Shadow");
-            if self.tool == Tool::Obfuscate || self.selected_is_obfuscate() {
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.obfuscate, ObfuscateMode::Pixelate, "Pixelate");
-                    ui.radio_value(&mut self.obfuscate, ObfuscateMode::Blur, "Blur");
-                });
-            }
-
-            if let Some(id) = self.selected {
-                if self.style != before || self.obfuscate != before_mode {
-                    let recent = self.prop_checkpoint.is_some_and(|(pid, at)| pid == id && at.elapsed() < Duration::from_millis(700));
-                    if !recent {
-                        self.doc.checkpoint();
-                    }
-                    self.prop_checkpoint = Some((id, Instant::now()));
-                    let (style, mode) = (self.style, self.obfuscate);
-                    self.doc.update(id, |it| {
-                        it.style = style;
-                        if let Shape::Obfuscate { mode: m, .. } = &mut it.shape {
-                            *m = mode;
+                let muted = Color32::from_rgb(163, 170, 184);
+                ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).monospace().color(muted));
+                ui.separator();
+                let dirty = match (&self.saved, self.doc.dirty) {
+                    (None, _) => "Not saved yet",
+                    (Some(_), true) => "Unsaved changes",
+                    (Some(_), false) => "Saved",
+                };
+                match &self.status {
+                    Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
+                    None => ui.label(egui::RichText::new(dirty).color(muted)),
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let z = self.zoom.unwrap_or(self.last_canvas.zoom);
+                    let label = if self.zoom.is_none() { format!("Fit {:.0}%", z * 100.0) } else { format!("{:.0}%", z * 100.0) };
+                    egui::ComboBox::from_id_salt("zoom").width(84.0).selected_text(label).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.zoom.is_none(), "Fit to window").clicked() {
+                            self.zoom = None;
+                        }
+                        for p in [25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0] {
+                            if ui.selectable_label(self.zoom == Some(p / 100.0), format!("{p:.0}%")).clicked() {
+                                self.zoom = Some(p / 100.0);
+                            }
                         }
                     });
-                }
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Bring to front").clicked() {
-                        self.doc.bring_to_front(id);
+                    if icons::button(ui, Icon::Actual, 22.0, self.zoom == Some(1.0), "Actual size (100%)").clicked() {
+                        self.zoom = Some(1.0);
                     }
-                    if ui.button("Delete").on_hover_text(self.key_hint(EditorAction::Delete)).clicked() {
-                        self.run(EditorAction::Delete);
+                    if icons::button(ui, Icon::Fit, 22.0, self.zoom.is_none(), "Fit to window (Ctrl + mouse wheel zooms)").clicked() {
+                        self.zoom = None;
                     }
                 });
-                if self.doc.item(id).and_then(|it| it.shape.text()).is_some() && ui.button("Edit text").clicked() {
-                    self.edit_text(id);
-                }
-            }
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new(tool_hint(self.tool)).weak().size(12.0));
+            });
         });
     }
 
@@ -805,7 +846,7 @@ impl Editor {
         });
         match modal.inner {
             Some(0) => {
-                self.save(None);
+                self.save();
                 if !self.doc.dirty {
                     self.closed = true;
                 }

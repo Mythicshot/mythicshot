@@ -80,6 +80,72 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
     None
 }
 
+#[cfg(windows)]
+const RUN_KEY: windows::core::PCWSTR = windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+
+/// Whether Mythicshot starts when the user signs in (the per-user Run key).
+#[cfg(windows)]
+pub fn autostart_enabled() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    use windows::core::w;
+    let mut size = 0u32;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Mythicshot"), RRF_RT_REG_SZ, None, None, Some(&mut size)).is_ok() }
+}
+
+#[cfg(windows)]
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+    use windows::core::w;
+    unsafe {
+        if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let value: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain(std::iter::once(0)).collect();
+            RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Mythicshot"), REG_SZ.0, Some(value.as_ptr() as *const _), (value.len() * 2) as u32)
+                .ok()
+                .map_err(|e| format!("could not turn on start with Windows: {e}"))
+        } else {
+            let r = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Mythicshot"));
+            if r.is_ok() || r.0 == 2 { Ok(()) } else { Err(format!("could not turn off start with Windows: {}", r.0)) }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn set_autostart(_on: bool) -> Result<(), String> {
+    Err("Start at login is not available on this system yet".into())
+}
+
+/// Open a file with its default app.
+pub fn open_path(path: &Path) {
+    #[cfg(windows)]
+    let result = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(path).spawn();
+    if let Err(e) = result {
+        eprintln!("could not open {}: {e}", path.display());
+    }
+}
+
+/// Show a file selected in the file manager.
+pub fn reveal(path: &Path) {
+    #[cfg(windows)]
+    let result = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
+    if let Err(e) = result {
+        eprintln!("could not show {}: {e}", path.display());
+    }
+}
+
 pub fn open_folder(path: &Path) {
     let _ = std::fs::create_dir_all(path);
     #[cfg(windows)]

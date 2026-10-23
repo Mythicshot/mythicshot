@@ -1,0 +1,17 @@
+[package]
+name = "mythicshot-destinations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Where a finished capture goes: file, clipboard, printer, email"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+rfd = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Mapi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

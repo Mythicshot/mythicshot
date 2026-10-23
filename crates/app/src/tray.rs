@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use mythicshot_destinations::DestId;
+
 use crate::hotkeys::{self, Action};
 use crate::settings::Settings;
 
@@ -19,8 +21,7 @@ pub enum Command {
     Display(usize),
     FromClipboard,
     OpenFile,
-    ToggleClipboard,
-    ToggleEditor,
+    ToggleDestination(DestId),
     ToggleMagnifier,
     Preferences,
     OpenFolder,
@@ -43,9 +44,8 @@ pub struct Tray {
     _icon: TrayIcon,
     commands: HashMap<MenuId, Command>,
     labelled: Vec<(Action, MenuItem)>,
-    clipboard: CheckMenuItem,
+    destinations: Vec<(DestId, CheckMenuItem)>,
     magnifier: CheckMenuItem,
-    editor: CheckMenuItem,
 }
 
 fn label(text: &str, binding: &str) -> String {
@@ -75,21 +75,27 @@ impl Tray {
         let folder = item("Open captures folder", Command::OpenFolder, true);
         let exit = item("Exit", Command::Exit, true);
 
-        let clipboard = CheckMenuItem::new("Copy to clipboard", true, settings.copy_to_clipboard, None);
         let magnifier = CheckMenuItem::new("Show magnifier", true, settings.magnifier, None);
-        let editor = CheckMenuItem::new("Open captures in the editor", true, settings.open_editor, None);
-        commands.insert(editor.id().clone(), Command::ToggleEditor);
-        commands.insert(clipboard.id().clone(), Command::ToggleClipboard);
         commands.insert(magnifier.id().clone(), Command::ToggleMagnifier);
+        let destinations: Vec<(DestId, CheckMenuItem)> = DestId::ALL
+            .iter()
+            .map(|d| {
+                let it = CheckMenuItem::new(d.label(), true, settings.has_destination(*d), None);
+                commands.insert(it.id().clone(), Command::ToggleDestination(*d));
+                (*d, it)
+            })
+            .collect();
 
         let full = Submenu::new("Capture full screen", true);
         full.append(&all_screens).map_err(|e| e.to_string())?;
         for d in &display_items {
             full.append(d).map_err(|e| e.to_string())?;
         }
-        let quick = Submenu::new("Quick preferences", true);
-        quick.append(&editor).map_err(|e| e.to_string())?;
-        quick.append(&clipboard).map_err(|e| e.to_string())?;
+        let quick = Submenu::new("After capture", true);
+        for (_, it) in &destinations {
+            quick.append(it).map_err(|e| e.to_string())?;
+        }
+        quick.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
         quick.append(&magnifier).map_err(|e| e.to_string())?;
 
         let menu = Menu::new();
@@ -120,7 +126,7 @@ impl Tray {
             .build()
             .map_err(|e| e.to_string())?;
 
-        Ok(Self { _icon: icon, commands, labelled, clipboard, magnifier, editor })
+        Ok(Self { _icon: icon, commands, labelled, destinations, magnifier })
     }
 
     pub fn command(&self, id: &MenuId) -> Option<Command> {
@@ -137,9 +143,10 @@ impl Tray {
             };
             item.set_text(label(text, settings.binding(*action)));
         }
-        self.clipboard.set_checked(settings.copy_to_clipboard);
+        for (d, it) in &self.destinations {
+            it.set_checked(settings.has_destination(*d));
+        }
         self.magnifier.set_checked(settings.magnifier);
-        self.editor.set_checked(settings.open_editor);
     }
 }
 
