@@ -13,6 +13,7 @@ mod hook;
 mod icons;
 mod input;
 mod overlay;
+mod password;
 mod platform;
 mod popups;
 mod recorder_ui;
@@ -342,7 +343,7 @@ impl App {
                 self.settings_changed();
                 if let Ok(mut t) = self.tap.lock() {
                     if let Some(t) = t.as_mut() {
-                        t.keys = self.settings.record_keys;
+                        t.set_keys(self.settings.record_keys);
                     }
                 }
             }
@@ -425,7 +426,7 @@ impl App {
             let mut started = false;
             if let Ok(mut t) = self.tap.lock() {
                 if t.is_none() {
-                    *t = Some(input::Tap { clock, origin, keys: self.settings.record_keys });
+                    *t = Some(input::Tap::new(clock, origin, self.settings.record_keys));
                     started = true;
                 }
             }
@@ -678,7 +679,7 @@ impl App {
                     let _ = tx.send(AppEvent::Key(ev));
                     ctx.request_repaint();
                 }
-                if let Some(ev) = tap.lock().ok().and_then(|t| t.as_ref().and_then(|t| t.convert(&ev, pointer))) {
+                if let Some(ev) = tap.lock().ok().and_then(|mut t| t.as_mut().and_then(|t| t.convert(&ev, pointer))) {
                     let _ = tx.send(AppEvent::Input(ev));
                 }
             });

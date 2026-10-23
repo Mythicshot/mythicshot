@@ -3,30 +3,63 @@
 //! The hook thread calls [`Tap::convert`] for every key and button event and
 //! stamps it with the recording clock right there, so events line up with
 //! frames even when the UI thread is busy. Clicks are always logged (just the
-//! button and where it was); keys only when the user turned "Record keys" on.
+//! button and where it was); keys only when the user turned "Record keys" on,
+//! and never while a password field has focus (see [`crate::password`]).
 
 use mythicshot_editor::overlays::{InputEvent, InputKind, MouseButton};
 use mythicshot_recording::ClockHandle;
 use rdev::{Button, EventType, Key};
 
+use crate::password::PasswordWatch;
+
 pub struct Tap {
     pub clock: ClockHandle,
     /// Top-left of the recorded area in desktop pixels.
     pub origin: (i32, i32),
-    pub keys: bool,
+    /// Running while keys are logged.
+    password: Option<PasswordWatch>,
+    /// Keys whose press was logged; only their releases are logged, so a
+    /// release never gives away a key pressed in a password field.
+    down: Vec<Key>,
 }
 
 impl Tap {
+    pub fn new(clock: ClockHandle, origin: (i32, i32), keys: bool) -> Self {
+        let mut tap = Self { clock, origin, password: None, down: Vec::new() };
+        tap.set_keys(keys);
+        tap
+    }
+
+    pub fn set_keys(&mut self, on: bool) {
+        if on != self.password.is_some() {
+            self.password = on.then(PasswordWatch::start);
+            self.down.clear();
+        }
+    }
+
     /// An overlay event for `ev`, or `None` if it should not be logged.
     /// `pointer` is the last mouse position the hook saw.
-    pub fn convert(&self, ev: &EventType, pointer: (f64, f64)) -> Option<InputEvent> {
+    pub fn convert(&mut self, ev: &EventType, pointer: (f64, f64)) -> Option<InputEvent> {
         if self.clock.paused() {
             return None;
         }
         let (x, y) = (pointer.0 as i32 - self.origin.0, pointer.1 as i32 - self.origin.1);
         let kind = match ev {
-            EventType::KeyPress(k) if self.keys => InputKind::KeyDown(key_label(*k)?),
-            EventType::KeyRelease(k) if self.keys => InputKind::KeyUp(key_label(*k)?),
+            EventType::KeyPress(k) => {
+                if self.password.as_ref().is_none_or(PasswordWatch::blocked) {
+                    return None;
+                }
+                let label = key_label(*k)?;
+                if !self.down.contains(k) {
+                    self.down.push(*k);
+                }
+                InputKind::KeyDown(label)
+            }
+            EventType::KeyRelease(k) => {
+                let i = self.down.iter().position(|d| d == k)?;
+                self.down.swap_remove(i);
+                InputKind::KeyUp(key_label(*k)?)
+            }
             EventType::ButtonPress(b) => InputKind::MouseDown(button(*b)?, x, y),
             EventType::ButtonRelease(b) => InputKind::MouseUp(button(*b)?, x, y),
             _ => return None,
