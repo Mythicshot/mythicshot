@@ -16,11 +16,12 @@ use mythicshot_recording::export::{self, Format, Job};
 use mythicshot_recording::{Recorder, Recording, Target};
 
 use crate::icons::{self, Icon};
+use crate::live_draw::LiveDraw;
 use crate::platform::{self, WindowId};
 use crate::video::{self, Edit};
 
 pub const FRAME_TITLE: &str = "Mythicshot recording frame";
-pub const BAR_SIZE: [f32; 2] = [620.0, 46.0];
+pub const BAR_SIZE: [f32; 2] = [680.0, 46.0];
 const BORDER: f32 = 4.0;
 const RED: Color32 = Color32::from_rgb(229, 72, 77);
 const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
@@ -39,6 +40,8 @@ pub enum BarAction {
     PauseToggle,
     /// Turn key logging on or off for the key overlay.
     ToggleKeys,
+    /// Turn live draw on or off.
+    ToggleDraw,
     Stop,
     Restart,
     Discard,
@@ -63,6 +66,7 @@ pub struct Session {
     frame_hidden_from_capture: bool,
     /// The app that had focus when recording began; it gets focus back.
     pub previous_foreground: Option<WindowId>,
+    pub draw: LiveDraw,
 }
 
 impl Session {
@@ -94,6 +98,7 @@ impl Session {
             frame: Arc::new(Mutex::new(FrameState::default())),
             frame_hidden_from_capture: false,
             previous_foreground: platform::foreground_window(),
+            draw: LiveDraw::default(),
         };
         if countdown_secs == 0 {
             s.go_live()?;
@@ -155,6 +160,7 @@ impl Session {
         if let Phase::Live(rec) = std::mem::replace(&mut self.phase, Phase::Countdown { until: Instant::now() }) {
             rec.discard();
         }
+        self.draw.reset();
         self.go_live()
     }
 
@@ -258,6 +264,10 @@ impl Session {
                 let keys = egui::Button::selectable(keys_on, "Keys").min_size(vec2(44.0, 28.0));
                 if ui.add(keys).on_hover_text("Log key presses for the key overlay. Off by default: anything typed is logged, passwords too.").clicked() {
                     action = Some(BarAction::ToggleKeys);
+                }
+                let draw = egui::Button::selectable(self.draw.is_on(), "Draw").min_size(vec2(48.0, 28.0));
+                if ui.add_enabled(live, draw).on_hover_text("Draw on the screen while recording. The drawing goes into the GIF; the toolbar does not.").clicked() {
+                    action = Some(BarAction::ToggleDraw);
                 }
                 ui.separator();
                 let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;

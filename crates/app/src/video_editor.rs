@@ -139,6 +139,7 @@ impl Editor {
     pub fn new_video(
         rec: Arc<Recording>,
         events: Vec<InputEvent>,
+        items: Vec<mythicshot_editor::Item>,
         title: String,
         keys: std::collections::BTreeMap<crate::hotkeys::EditorAction, String>,
         dest: Context,
@@ -157,6 +158,9 @@ impl Editor {
         let format = if format.needs_ffmpeg() && !ffmpeg { Format::Gif } else { format };
         let (quality, loop_forever, fps, scale) = (prefs.export_quality, prefs.export_loop, prefs.export_fps, prefs.export_scale);
         let mut editor = Editor::new(first, title, keys, dest, prefs);
+        for it in items {
+            editor.doc.add_initial(it);
+        }
         let mut edit = Edit::new(&rec, overlays);
         edit.scale = scale;
         editor.video = Some(VideoState {

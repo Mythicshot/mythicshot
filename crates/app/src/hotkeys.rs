@@ -20,6 +20,7 @@ pub enum Action {
     RecordWindow,
     RecordFullScreen,
     PauseRecording,
+    LiveDraw,
 }
 
 impl Action {
@@ -33,6 +34,7 @@ impl Action {
         Action::RecordWindow,
         Action::RecordFullScreen,
         Action::PauseRecording,
+        Action::LiveDraw,
     ];
 
     pub fn label(self) -> &'static str {
@@ -46,12 +48,13 @@ impl Action {
             Action::RecordWindow => "Record window",
             Action::RecordFullScreen => "Record full screen",
             Action::PauseRecording => "Pause or resume recording",
+            Action::LiveDraw => "Draw on screen while recording",
         }
     }
 
     pub fn group(self) -> &'static str {
         match self {
-            Action::RecordRegion | Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen | Action::PauseRecording => "Recording",
+            Action::RecordRegion | Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen | Action::PauseRecording | Action::LiveDraw => "Recording",
             _ => "Screenshot",
         }
     }
@@ -65,6 +68,7 @@ impl Action {
             Action::RecordRegion => "shift+PrintScreen",
             Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen => "",
             Action::PauseRecording => "Pause",
+            Action::LiveDraw => "control+shift+KeyD",
         }
     }
 }

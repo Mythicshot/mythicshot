@@ -16,6 +16,8 @@ pub struct Tap {
     pub clock: ClockHandle,
     /// Top-left of the recorded area in desktop pixels.
     pub origin: (i32, i32),
+    /// Live draw is on: its clicks and keys are not part of the overlay.
+    pub drawing: bool,
     /// Running while keys are logged.
     password: Option<PasswordWatch>,
     /// Keys whose press was logged; only their releases are logged, so a
@@ -25,7 +27,7 @@ pub struct Tap {
 
 impl Tap {
     pub fn new(clock: ClockHandle, origin: (i32, i32), keys: bool) -> Self {
-        let mut tap = Self { clock, origin, password: None, down: Vec::new() };
+        let mut tap = Self { clock, origin, drawing: false, password: None, down: Vec::new() };
         tap.set_keys(keys);
         tap
     }
@@ -40,7 +42,7 @@ impl Tap {
     /// An overlay event for `ev`, or `None` if it should not be logged.
     /// `pointer` is the last mouse position the hook saw.
     pub fn convert(&mut self, ev: &EventType, pointer: (f64, f64)) -> Option<InputEvent> {
-        if self.clock.paused() {
+        if self.clock.paused() || self.drawing {
             return None;
         }
         let (x, y) = (pointer.0 as i32 - self.origin.0, pointer.1 as i32 - self.origin.1);

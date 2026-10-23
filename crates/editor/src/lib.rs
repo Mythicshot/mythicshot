@@ -339,6 +339,17 @@ impl Document {
         id
     }
 
+    /// Add an item to the starting document, such as a stroke drawn while
+    /// recording: no undo step, and not an unsaved change.
+    pub fn add_initial(&mut self, mut item: Item) -> u64 {
+        item.id = self.next_id;
+        self.next_id += 1;
+        let id = item.id;
+        self.items.push(item);
+        self.version += 1;
+        id
+    }
+
     /// Change an item without a checkpoint (the caller made one at drag start).
     pub fn update(&mut self, id: u64, f: impl FnOnce(&mut Item)) {
         if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {

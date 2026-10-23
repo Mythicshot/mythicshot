@@ -12,6 +12,7 @@ mod hotkeys;
 mod hook;
 mod icons;
 mod input;
+mod live_draw;
 mod overlay;
 mod password;
 mod platform;
@@ -190,6 +191,7 @@ impl App {
                         // While recording, the record keys stop it and the pause key pauses.
                         match action {
                             Action::PauseRecording => self.recording_action(ctx, recorder_ui::BarAction::PauseToggle),
+                            Action::LiveDraw => self.recording_action(ctx, recorder_ui::BarAction::ToggleDraw),
                             Action::RecordRegion | Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen => {
                                 self.recording_action(ctx, recorder_ui::BarAction::Stop)
                             }
@@ -242,6 +244,7 @@ impl App {
                 }
             }
             Command::PauseRecording => self.recording_action(ctx, recorder_ui::BarAction::PauseToggle),
+            Command::LiveDraw => self.recording_action(ctx, recorder_ui::BarAction::ToggleDraw),
             Command::Display(i) => self.capture_now(ctx, move |d| d.monitors.get(i).map(|m| (m.rect, format!("Display {}", i + 1)))),
             Command::FromClipboard => match dest::image_from_clipboard() {
                 Ok(img) => self.captured(ctx, img, "Clipboard image".into()),
@@ -352,6 +355,21 @@ impl App {
                     s.toggle_pause();
                 }
             }
+            BarAction::ToggleDraw => {
+                let Some(s) = self.session.as_mut() else { return };
+                let Some(clock) = s.clock() else { return };
+                let on = !s.draw.is_on();
+                s.draw.set_on(on, Some(clock));
+                if let Ok(mut t) = self.tap.lock() {
+                    if let Some(t) = t.as_mut() {
+                        t.drawing = on;
+                    }
+                }
+                if !on {
+                    // Give focus back to the app being recorded.
+                    self.refocus_at = Some(Instant::now() + Duration::from_millis(150));
+                }
+            }
             BarAction::Restart => {
                 if let Some(Err(e)) = self.session.as_mut().map(|s| s.restart()) {
                     self.end_session(ctx);
@@ -365,8 +383,9 @@ impl App {
                 self.end_session(ctx);
             }
             BarAction::Stop => {
-                let Some(s) = self.session.take() else { return };
+                let Some(mut s) = self.session.take() else { return };
                 let title = s.title.clone();
+                let draw = std::mem::take(&mut s.draw);
                 self.end_session(ctx);
                 match s.stop() {
                     None => {}
@@ -377,7 +396,8 @@ impl App {
                     }
                     Some(Ok(rec)) => {
                         let events = std::mem::take(&mut self.rec_events);
-                        self.recording_done(rec, events, title);
+                        let items = draw.into_items(&rec);
+                        self.recording_done(rec, events, items, title);
                     }
                 }
             }
@@ -396,12 +416,12 @@ impl App {
 
     /// A finished recording: open it in the GIF editor if the editor is a
     /// destination, otherwise export a GIF straight away.
-    fn recording_done(&mut self, rec: mythicshot_recording::Recording, events: Vec<mythicshot_editor::overlays::InputEvent>, title: String) {
+    fn recording_done(&mut self, rec: mythicshot_recording::Recording, events: Vec<mythicshot_editor::overlays::InputEvent>, items: Vec<mythicshot_editor::Item>, title: String) {
         let keys = events.iter().filter(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_))).count();
         eprintln!("recording: {} frames, {} input events ({keys} key presses)", rec.frames.len(), events.len());
         let rec = Arc::new(rec);
         if self.settings.has_destination(DestId::Editor) || self.settings.has_destination(DestId::Picker) {
-            self.open_video_editor(rec, events, title);
+            self.open_video_editor(rec, events, items, title);
             return;
         }
         match dest::new_path_with_extension(&self.settings.dest_context(&title), "gif") {
@@ -409,7 +429,7 @@ impl App {
                 self.toast.post("Encoding GIF…".into(), None);
                 let edit = video::Edit::new(&rec, self.settings.overlays);
                 let spec = recorder_ui::ExportSpec { format: mythicshot_recording::export::Format::Gif, quality: self.settings.gif_quality, loop_forever: true, video_fps: self.settings.record_fps };
-                self.encoding.push(recorder_ui::EncodeJob::start(rec, Vec::new(), events, edit, spec, path, true));
+                self.encoding.push(recorder_ui::EncodeJob::start(rec, items, events, edit, spec, path, true));
             }
             Err(e) => {
                 rec.delete_files();
@@ -441,6 +461,11 @@ impl App {
                 return;
             }
             s.show_frame(ctx);
+            let rect = s.rect;
+            s.draw.show(ctx, rect);
+        }
+        if self.session.as_ref().is_some_and(|s| s.draw.take_done()) {
+            self.recording_action(ctx, recorder_ui::BarAction::ToggleDraw);
         }
         if self.refocus_at.is_some_and(|t| Instant::now() >= t) {
             self.refocus_at = None;
@@ -534,9 +559,9 @@ impl App {
     }
 
     /// Open a recording in the editor's video mode (the GIF editor).
-    fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, title: String) {
+    fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, items: Vec<mythicshot_editor::Item>, title: String) {
         let s = &self.settings;
-        match editor_ui::Editor::new_video(rec.clone(), events, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.editor.clone()) {
+        match editor_ui::Editor::new_video(rec.clone(), events, items, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.editor.clone()) {
             Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
             Err(e) => {
                 rec.delete_files();

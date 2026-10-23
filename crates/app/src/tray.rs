@@ -21,6 +21,8 @@ pub enum Command {
     RecordWindow,
     RecordFullScreen,
     PauseRecording,
+    /// Only does something while recording.
+    LiveDraw,
     /// Index into `xcap::Monitor::all()` order at the time the menu was built.
     Display(usize),
     FromClipboard,
@@ -44,6 +46,7 @@ impl Command {
             Action::RecordWindow => Command::RecordWindow,
             Action::RecordFullScreen => Command::RecordFullScreen,
             Action::PauseRecording => Command::PauseRecording,
+            Action::LiveDraw => Command::LiveDraw,
         }
     }
 }
