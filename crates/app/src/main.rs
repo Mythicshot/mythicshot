@@ -13,6 +13,7 @@ mod icons;
 mod overlay;
 mod platform;
 mod popups;
+mod recorder_ui;
 mod settings;
 mod settings_ui;
 mod tray;
@@ -63,6 +64,13 @@ struct App {
     snipping_tool: Option<bool>,
     pickers: Vec<popups::PickerWindow>,
     toast: popups::Toast,
+    /// The recording in progress, and GIFs being encoded.
+    session: Option<recorder_ui::Session>,
+    encoding: Vec<recorder_ui::EncodeJob>,
+    /// The root window is kept out of screen capture once its handle is known.
+    root_hidden_from_capture: bool,
+    /// When to give focus back to the app being recorded.
+    refocus_at: Option<Instant>,
     hidden_at_start: bool,
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     started: Instant,
@@ -145,6 +153,10 @@ impl App {
             snipping_tool: platform::snipping_tool_owns_prtsc(),
             pickers: Vec::new(),
             toast: popups::Toast::new(),
+            session: None,
+            encoding: Vec::new(),
+            root_hidden_from_capture: false,
+            refocus_at: None,
             hidden_at_start: false,
             started: Instant::now(),
         }
@@ -157,9 +169,19 @@ impl App {
                     if self.listening.load(Ordering::Relaxed) || self.overlay.is_some() {
                         continue;
                     }
-                    if let Some(action) = self.hotkeys.action_for(id) {
-                        self.run(ctx, Command::from_action(action));
+                    let Some(action) = self.hotkeys.action_for(id) else { continue };
+                    if self.session.is_some() {
+                        // While recording, the record keys stop it and the pause key pauses.
+                        match action {
+                            Action::PauseRecording => self.recording_action(ctx, recorder_ui::BarAction::PauseToggle),
+                            Action::RecordRegion | Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen => {
+                                self.recording_action(ctx, recorder_ui::BarAction::Stop)
+                            }
+                            _ => {}
+                        }
+                        continue;
                     }
+                    self.run(ctx, Command::from_action(action));
                 }
                 AppEvent::Menu(id) => {
                     if let Some(cmd) = self.tray.command(&id) {
@@ -181,7 +203,24 @@ impl App {
             },
             Command::Window => self.capture_now(ctx, |d| d.focused_window().map(|w| (w.rect, w.title.clone()))),
             Command::FullScreen => self.capture_now(ctx, |d| Some((d.bounds, "Full screen".into()))),
-            Command::Record => self.notify("GIF recording arrives in Phase 4".into()),
+            Command::Record => self.start_overlay_mode(ctx, true),
+            Command::RecordLastRegion => match self.settings.last_region {
+                Some([x, y, w, h]) => self.start_recording(ctx, PxRect::new(x, y, w as u32, h as u32), "Region".into()),
+                None => self.start_overlay_mode(ctx, true),
+            },
+            Command::RecordWindow => match grab_desktop().ok().and_then(|d| d.focused_window().map(|w| (w.rect, w.title.clone()))) {
+                Some((rect, title)) => self.start_recording(ctx, rect, title),
+                None => self.notify("No window to record".into()),
+            },
+            Command::RecordFullScreen => {
+                let (cx, cy) = platform::cursor_pos().unwrap_or((0, 0));
+                let monitors = mythicshot_capture::list_monitors();
+                match monitors.iter().find(|m| m.rect.contains(cx, cy)).or_else(|| monitors.iter().find(|m| m.primary)) {
+                    Some(m) => self.start_recording(ctx, m.rect, "Full screen".into()),
+                    None => self.notify("No screen to record".into()),
+                }
+            }
+            Command::PauseRecording => self.recording_action(ctx, recorder_ui::BarAction::PauseToggle),
             Command::Display(i) => self.capture_now(ctx, move |d| d.monitors.get(i).map(|m| (m.rect, format!("Display {}", i + 1)))),
             Command::FromClipboard => match dest::image_from_clipboard() {
                 Ok(img) => self.captured(ctx, img, "Clipboard image".into()),
@@ -206,6 +245,13 @@ impl App {
     }
 
     fn start_overlay(&mut self, ctx: &egui::Context) {
+        self.start_overlay_mode(ctx, false);
+    }
+
+    fn start_overlay_mode(&mut self, ctx: &egui::Context, record: bool) {
+        if self.session.is_some() {
+            return;
+        }
         let desktop = match grab_desktop() {
             Ok(d) => d,
             Err(e) => return self.notify(format!("Capture failed: {e}")),
@@ -216,7 +262,7 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(b.w as f32 / ppp, b.h as f32 / ppp)));
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
-        self.overlay = Some(Overlay::new(desktop, self.settings.magnifier));
+        self.overlay = Some(Overlay::new(desktop, self.settings.magnifier, record));
     }
 
     /// Freeze the desktop and take a rectangle (and a title for it) without showing the overlay.
@@ -236,12 +282,122 @@ impl App {
         let Some(ov) = self.overlay.take() else { return };
         self.settings.magnifier = ov.magnifier;
         if let Outcome::Capture(rect) = outcome {
-            if let Some(img) = ov.desktop.crop(rect) {
-                self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
-                self.settings.save();
-                // A window picked in the overlay keeps its title for the file name.
-                let title = ov.desktop.windows.iter().find(|w| w.rect == rect).map(|w| w.title.clone()).unwrap_or_else(|| "Region".into());
+            self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
+            self.settings.save();
+            // A window picked in the overlay keeps its title for the file name.
+            let title = ov.desktop.windows.iter().find(|w| w.rect == rect).map(|w| w.title.clone()).unwrap_or_else(|| "Region".into());
+            if ov.record {
+                self.start_recording(ctx, rect, title);
+            } else if let Some(img) = ov.desktop.crop(rect) {
                 self.captured(ctx, img, title);
+            }
+        }
+    }
+
+    /// Show the red frame and control bar, count down, then record `rect`.
+    fn start_recording(&mut self, ctx: &egui::Context, rect: PxRect, title: String) {
+        if self.session.is_some() {
+            return;
+        }
+        match recorder_ui::Session::new(rect, title, self.settings.countdown_secs, self.settings.record_fps) {
+            Ok(s) => {
+                let ppp = ctx.pixels_per_point();
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(s.bar_position(ppp)));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(recorder_ui::BAR_SIZE[0], recorder_ui::BAR_SIZE[1])));
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                self.refocus_at = Some(Instant::now() + Duration::from_millis(150));
+                self.session = Some(s);
+            }
+            Err(e) => self.notify(e),
+        }
+    }
+
+    /// A control-bar button or recording hotkey.
+    fn recording_action(&mut self, ctx: &egui::Context, action: recorder_ui::BarAction) {
+        use recorder_ui::BarAction;
+        match action {
+            BarAction::PauseToggle => {
+                if let Some(s) = self.session.as_mut() {
+                    s.toggle_pause();
+                }
+            }
+            BarAction::Restart => {
+                if let Some(Err(e)) = self.session.as_mut().map(|s| s.restart()) {
+                    self.end_session(ctx);
+                    self.notify(e);
+                }
+            }
+            BarAction::Discard => {
+                if let Some(s) = self.session.take() {
+                    s.discard();
+                }
+                self.end_session(ctx);
+            }
+            BarAction::Stop => {
+                let Some(s) = self.session.take() else { return };
+                let title = s.title.clone();
+                self.end_session(ctx);
+                match s.stop() {
+                    None => {}
+                    Some(Err(e)) => self.notify(e),
+                    Some(Ok(rec)) if rec.frames.is_empty() => {
+                        rec.delete();
+                        self.notify("Nothing was recorded".into());
+                    }
+                    Some(Ok(rec)) => match dest::new_path_with_extension(&self.settings.dest_context(&title), "gif") {
+                        Ok(path) => {
+                            self.toast.post("Encoding GIF…".into(), None);
+                            self.encoding.push(recorder_ui::EncodeJob::start(rec, path, self.settings.gif_quality, self.settings.record_cursor));
+                        }
+                        Err(e) => {
+                            rec.delete();
+                            self.notify(e);
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    /// Hide the control bar; the frame window goes when it is no longer shown.
+    fn end_session(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.refocus_at = None;
+    }
+
+    /// Each frame while recording: countdown, frame window, errors, focus.
+    fn tick_recording(&mut self, ctx: &egui::Context) {
+        if let Some(s) = self.session.as_mut() {
+            if let Err(e) = s.tick() {
+                self.recording_action(ctx, recorder_ui::BarAction::Stop);
+                self.notify(e);
+                return;
+            }
+            s.show_frame(ctx);
+        }
+        if self.refocus_at.is_some_and(|t| Instant::now() >= t) {
+            self.refocus_at = None;
+            if let Some(h) = self.session.as_ref().and_then(|s| s.previous_foreground) {
+                platform::set_foreground(h);
+            }
+        }
+        // GIFs being encoded: progress in the toast, then the result.
+        let mut finished = Vec::new();
+        for (i, job) in self.encoding.iter().enumerate() {
+            match job.take_result() {
+                Some(r) => finished.push((i, r)),
+                None => self.toast.post(format!("Encoding GIF… {:.0}%", job.progress() * 100.0), None),
+            }
+        }
+        for (i, r) in finished.into_iter().rev() {
+            self.encoding.remove(i);
+            match r {
+                Ok((path, size)) => {
+                    let msg = format!("Saved GIF ({:.1} MB) {}", size as f64 / 1_048_576.0, path.display());
+                    eprintln!("{msg}");
+                    self.toast.post(msg, Some(path));
+                }
+                Err(e) => self.notify(format!("GIF export failed: {e}")),
             }
         }
     }
@@ -465,6 +621,10 @@ impl App {
                     self.settings.image_format = edited.image_format;
                     self.settings.jpeg_quality = edited.jpeg_quality;
                     self.settings.magnifier = edited.magnifier;
+                    self.settings.record_fps = edited.record_fps;
+                    self.settings.countdown_secs = edited.countdown_secs;
+                    self.settings.record_cursor = edited.record_cursor;
+                    self.settings.gif_quality = edited.gif_quality;
                     self.settings_changed();
                 }
                 UiAction::SetAutostart(on) => {
@@ -497,11 +657,16 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 1.0]
+        // Transparent, so the recording frame window can be see-through. Every
+        // other window paints its own background.
+        [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.root_hidden_from_capture {
+            self.root_hidden_from_capture = root_window(frame).is_some_and(platform::exclude_from_capture);
+        }
         if !self.hidden_at_start {
             // eframe shows the root window after its first frame even when it was
             // built invisible; hide it until a capture starts.
@@ -535,7 +700,10 @@ impl eframe::App for App {
                 Outcome::Continue => {}
                 outcome => self.finish_overlay(&ctx, outcome),
             }
+        } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui)) {
+            self.recording_action(&ctx, action);
         }
+        self.tick_recording(&ctx);
         self.show_editors(&ctx);
         self.show_pickers(&ctx);
         self.toast.show(&ctx);
@@ -545,6 +713,21 @@ impl eframe::App for App {
         // Keep the event loop ticking slowly while hidden so queued events are never stranded.
         ctx.request_repaint_after(Duration::from_millis(250));
     }
+}
+
+/// The root window's native handle.
+#[cfg(windows)]
+fn root_window(frame: &eframe::Frame) -> Option<platform::WindowId> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn root_window(_frame: &eframe::Frame) -> Option<platform::WindowId> {
+    None
 }
 
 /// Write panics to `crash.log` next to the settings file; release builds have
@@ -577,6 +760,9 @@ fn main() -> eframe::Result {
             .with_decorations(false)
             .with_taskbar(false)
             .with_always_on_top()
+            // eframe's OpenGL backend picks one pixel format for every window from
+            // the root; it must have alpha for the recording frame to be see-through.
+            .with_transparent(true)
             .with_resizable(false)
             .with_position([-32000.0, -32000.0])
             .with_inner_size([1.0, 1.0]),

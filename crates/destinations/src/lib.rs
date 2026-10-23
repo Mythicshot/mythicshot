@@ -170,8 +170,13 @@ pub fn send(dest: DestId, img: &RgbaImage, ctx: &Context) -> Result<Sent, String
 /// A new, unused path in the captures folder from the file name pattern.
 /// The pattern may contain `/` or `\` to make subfolders.
 pub fn new_path(ctx: &Context) -> Result<PathBuf, String> {
+    new_path_with_extension(ctx, ctx.format.extension())
+}
+
+/// Like [`new_path`] but with a given extension, for GIFs and other non-image formats.
+pub fn new_path_with_extension(ctx: &Context, ext: &str) -> Result<PathBuf, String> {
     let rel = expand_pattern(&ctx.pattern, &ctx.title, chrono::Local::now());
-    let path = ctx.output_dir.join(format!("{rel}.{}", ctx.format.extension()));
+    let path = ctx.output_dir.join(format!("{rel}.{ext}"));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     }

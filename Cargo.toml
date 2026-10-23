@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/capture", "crates/destinations", "crates/editor", "spikes/phase0"]
+members = ["crates/app", "crates/capture", "crates/destinations", "crates/editor", "crates/recording", "spikes/phase0"]
 
 [profile.release]
 lto = "thin"
@@ -12,3 +12,7 @@ version = "0.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
+
+# Dependencies (gifski, zstd, image) run far too slowly unoptimised; our own code stays debuggable.
+[profile.dev.package."*"]
+opt-level = 2

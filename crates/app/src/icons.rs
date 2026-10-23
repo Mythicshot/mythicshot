@@ -36,6 +36,10 @@ pub enum Icon {
     Front,
     EditText,
     Shadow,
+    Pause,
+    Play,
+    Stop,
+    Restart,
 }
 
 const FG: Color32 = Color32::from_rgb(214, 218, 226);
@@ -207,6 +211,24 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::Front => {
             p.rect_stroke(rect(0.0, 0.0, 0.62, 0.62), 1.0, thin, StrokeKind::Middle);
             p.rect_filled(rect(0.38, 0.38, 1.0, 1.0), 1.0, c);
+        }
+        Icon::Pause => {
+            p.rect_filled(rect(0.15, 0.05, 0.4, 0.95), 1.0, c);
+            p.rect_filled(rect(0.6, 0.05, 0.85, 0.95), 1.0, c);
+        }
+        Icon::Play => {
+            p.add(poly(&[(0.15, 0.05), (0.92, 0.5), (0.15, 0.95)]));
+        }
+        Icon::Stop => {
+            p.rect_filled(rect(0.1, 0.1, 0.9, 0.9), 2.0, c);
+        }
+        Icon::Restart => {
+            let pts: Vec<Pos2> = (0..=20).map(|i| {
+                let a = std::f32::consts::PI * (0.35 + 1.5 * i as f32 / 20.0);
+                at(0.5 + 0.42 * a.cos(), 0.5 + 0.42 * a.sin())
+            }).collect();
+            p.add(Shape::line(pts, s));
+            p.add(poly(&[(0.95, 0.05), (0.95, 0.42), (0.6, 0.3)]));
         }
         Icon::Shadow => {
             p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, Color32::from_black_alpha(200));

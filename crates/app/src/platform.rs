@@ -80,6 +80,67 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
     None
 }
 
+/// A native window handle as a plain number, so it can cross threads.
+pub type WindowId = isize;
+
+/// Keep a window out of every screen capture, ours and other apps' (OBS
+/// included), so the recording controls never appear in a recording.
+#[cfg(windows)]
+pub fn exclude_from_capture(hwnd: WindowId) -> bool {
+    use windows::Win32::Foundation::HWND;
+    // Debug builds can leave our windows visible to capture, to screenshot them in tests.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("MYTHICSHOT_TEST_SHOW_IN_CAPTURE").is_some() {
+        return true;
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+    unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
+}
+
+/// Find one of our windows by its exact title.
+#[cfg(windows)]
+pub fn find_window(title: &str) -> Option<WindowId> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())).ok().map(|h| h.0 as WindowId) }
+}
+
+#[cfg(windows)]
+pub fn foreground_window() -> Option<WindowId> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let h = unsafe { GetForegroundWindow() };
+    (!h.0.is_null()).then_some(h.0 as WindowId)
+}
+
+/// Give focus back to the app that had it before one of our windows appeared.
+#[cfg(windows)]
+pub fn set_foreground(hwnd: WindowId) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    unsafe {
+        let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+    }
+}
+
+#[cfg(not(windows))]
+pub fn exclude_from_capture(_hwnd: WindowId) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn find_window(_title: &str) -> Option<WindowId> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn foreground_window() -> Option<WindowId> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn set_foreground(_hwnd: WindowId) {}
+
 #[cfg(windows)]
 const RUN_KEY: windows::core::PCWSTR = windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 

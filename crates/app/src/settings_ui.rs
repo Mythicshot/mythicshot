@@ -199,6 +199,32 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
             changed |= ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100).text("quality")).changed();
         }
     });
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("RECORDING").size(11.0).color(MUTED));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Frame rate");
+        egui::ComboBox::from_id_salt("record-fps").width(90.0).selected_text(format!("{} fps", s.record_fps)).show_ui(ui, |ui| {
+            for fps in [10, 15, 24, 30] {
+                changed |= ui.selectable_value(&mut s.record_fps, fps, format!("{fps} fps")).changed();
+            }
+        });
+        ui.add_space(12.0);
+        ui.label("Countdown");
+        egui::ComboBox::from_id_salt("countdown").width(90.0).selected_text(if s.countdown_secs == 0 { "None".to_string() } else { format!("{} s", s.countdown_secs) }).show_ui(ui, |ui| {
+            for secs in [0, 3, 5, 10] {
+                let label = if secs == 0 { "None".to_string() } else { format!("{secs} s") };
+                changed |= ui.selectable_value(&mut s.countdown_secs, secs, label).changed();
+            }
+        });
+    });
+    changed |= ui.checkbox(&mut s.record_cursor, "Show the mouse pointer in GIFs").changed();
+    ui.horizontal(|ui| {
+        ui.label("GIF quality");
+        changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
+    });
+    ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(MUTED).size(12.0));
     if changed {
         out.push(UiAction::SettingsChanged);
     }

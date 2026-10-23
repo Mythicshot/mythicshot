@@ -21,6 +21,12 @@ pub struct Settings {
     pub image_format: ImageFormat,
     pub jpeg_quality: u8,
     pub magnifier: bool,
+    /// Recording: frames per second, countdown before it starts, and whether
+    /// the mouse pointer is drawn into the GIF.
+    pub record_fps: u32,
+    pub countdown_secs: u32,
+    pub record_cursor: bool,
+    pub gif_quality: u8,
     /// Last captured region in desktop pixels: x, y, width, height.
     pub last_region: Option<[i32; 4]>,
     /// Action → shortcut in `global-hotkey` syntax, for example `shift+PrintScreen`.
@@ -50,6 +56,10 @@ impl Default for Settings {
             image_format: ImageFormat::Png,
             jpeg_quality: 90,
             magnifier: true,
+            record_fps: 15,
+            countdown_secs: 3,
+            record_cursor: true,
+            gif_quality: 90,
             last_region: None,
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),

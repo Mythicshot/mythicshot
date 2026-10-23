@@ -16,10 +16,24 @@ pub enum Action {
     CaptureWindow,
     CaptureFullScreen,
     RecordRegion,
+    RecordLastRegion,
+    RecordWindow,
+    RecordFullScreen,
+    PauseRecording,
 }
 
 impl Action {
-    pub const ALL: &'static [Action] = &[Action::CaptureRegion, Action::CaptureLastRegion, Action::CaptureWindow, Action::CaptureFullScreen, Action::RecordRegion];
+    pub const ALL: &'static [Action] = &[
+        Action::CaptureRegion,
+        Action::CaptureLastRegion,
+        Action::CaptureWindow,
+        Action::CaptureFullScreen,
+        Action::RecordRegion,
+        Action::RecordLastRegion,
+        Action::RecordWindow,
+        Action::RecordFullScreen,
+        Action::PauseRecording,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -27,13 +41,17 @@ impl Action {
             Action::CaptureLastRegion => "Capture last region",
             Action::CaptureWindow => "Capture window",
             Action::CaptureFullScreen => "Capture full screen",
-            Action::RecordRegion => "Record region",
+            Action::RecordRegion => "Record region (press again to stop)",
+            Action::RecordLastRegion => "Record last region",
+            Action::RecordWindow => "Record window",
+            Action::RecordFullScreen => "Record full screen",
+            Action::PauseRecording => "Pause or resume recording",
         }
     }
 
     pub fn group(self) -> &'static str {
         match self {
-            Action::RecordRegion => "Recording",
+            Action::RecordRegion | Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen | Action::PauseRecording => "Recording",
             _ => "Screenshot",
         }
     }
@@ -45,6 +63,8 @@ impl Action {
             Action::CaptureWindow => "alt+PrintScreen",
             Action::CaptureFullScreen => "control+PrintScreen",
             Action::RecordRegion => "shift+PrintScreen",
+            Action::RecordLastRegion | Action::RecordWindow | Action::RecordFullScreen => "",
+            Action::PauseRecording => "Pause",
         }
     }
 }

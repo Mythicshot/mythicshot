@@ -1,5 +1,7 @@
 //! The region selector (screen 2 of the mockup): the frozen desktop, dimmed,
-//! with a selection, a magnifier and a hint bar.
+//! with a selection, a magnifier and a hint bar. In record mode the selection
+//! is red and the result starts a recording instead of a screenshot; Tab
+//! switches between the two.
 
 use eframe::egui::{self, Align2, Color32, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
 use mythicshot_capture::{Desktop, PxRect};
@@ -8,6 +10,7 @@ use crate::platform;
 
 const DIM: Color32 = Color32::from_black_alpha(130);
 const ACCENT: Color32 = Color32::from_rgb(91, 141, 239);
+const RECORD: Color32 = Color32::from_rgb(229, 72, 77);
 const PANEL: Color32 = Color32::from_rgba_premultiplied(17, 20, 26, 235);
 const TEXT: Color32 = Color32::from_rgb(230, 232, 236);
 const MAGNIFIER: f32 = 128.0;
@@ -25,11 +28,13 @@ pub struct Overlay {
     window_mode: bool,
     drag_from: Option<(i32, i32)>,
     pub magnifier: bool,
+    /// Selecting an area to record rather than to screenshot.
+    pub record: bool,
 }
 
 impl Overlay {
-    pub fn new(desktop: Desktop, magnifier: bool) -> Self {
-        Self { desktop, texture: None, window_mode: false, drag_from: None, magnifier }
+    pub fn new(desktop: Desktop, magnifier: bool, record: bool) -> Self {
+        Self { desktop, texture: None, window_mode: false, drag_from: None, magnifier, record }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Outcome {
@@ -52,7 +57,7 @@ impl Overlay {
         let response = ui.interact(full, ui.scope_id().with("overlay"), Sense::click_and_drag());
         ctx.set_cursor_icon(CursorIcon::Crosshair);
 
-        let (esc, space, z, enter, arrows) = ctx.input(|i| {
+        let (esc, space, z, enter, tab, arrows) = ctx.input(|i| {
             let step = if i.modifiers.shift { 10 } else { 1 };
             let mut a = (0, 0);
             if i.key_pressed(Key::ArrowLeft) {
@@ -67,7 +72,7 @@ impl Overlay {
             if i.key_pressed(Key::ArrowDown) {
                 a.1 += step;
             }
-            (i.key_pressed(Key::Escape), i.key_pressed(Key::Space), i.key_pressed(Key::Z), i.key_pressed(Key::Enter), a)
+            (i.key_pressed(Key::Escape), i.key_pressed(Key::Space), i.key_pressed(Key::Z), i.key_pressed(Key::Enter), i.key_pressed(Key::Tab), a)
         });
         if esc {
             return Outcome::Cancel;
@@ -79,6 +84,10 @@ impl Overlay {
         if z {
             self.magnifier = !self.magnifier;
         }
+        if tab {
+            self.record = !self.record;
+        }
+        let accent = if self.record { RECORD } else { ACCENT };
         if arrows != (0, 0) {
             platform::nudge_cursor(arrows.0, arrows.1);
         }
@@ -124,7 +133,7 @@ impl Overlay {
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.max.y), full.max), 0.0, DIM);
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.min.y), pos2(h.min.x, h.max.y)), 0.0, DIM);
                 painter.rect_filled(Rect::from_min_max(pos2(h.max.x, h.min.y), pos2(full.max.x, h.max.y)), 0.0, DIM);
-                painter.rect_stroke(h, 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+                painter.rect_stroke(h, 0.0, Stroke::new(if self.record { 3.0 } else { 2.0 }, accent), StrokeKind::Outside);
             }
             None => {
                 painter.rect_filled(full, 0.0, DIM);
@@ -150,13 +159,18 @@ impl Overlay {
         }
 
         let screen = cursor.and_then(|(x, y)| self.desktop.monitor_at(x, y)).map(|m| to_pt(m.rect)).unwrap_or(full);
-        let mode = if self.window_mode { "Window" } else { "Region" };
+        let mode = match (self.record, self.window_mode) {
+            (false, false) => "Screenshot · Region",
+            (false, true) => "Screenshot · Window",
+            (true, false) => "Record GIF · Region",
+            (true, true) => "Record GIF · Window",
+        };
         label(painter, screen.center_top() + vec2(0.0, 18.0), Align2::CENTER_TOP, mode);
         label(
             painter,
             screen.center_bottom() - vec2(0.0, 18.0),
             Align2::CENTER_BOTTOM,
-            "Drag  select    Click  window    Space  region / window    Arrows  nudge 1 px (Shift: 10)    Z  magnifier    Esc  cancel",
+            "Drag  select    Click  window    Space  region / window    Tab  screenshot / record    Arrows  nudge 1 px (Shift: 10)    Z  magnifier    Esc  cancel",
         );
 
         ctx.request_repaint();

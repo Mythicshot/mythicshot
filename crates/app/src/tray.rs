@@ -17,6 +17,10 @@ pub enum Command {
     Window,
     FullScreen,
     Record,
+    RecordLastRegion,
+    RecordWindow,
+    RecordFullScreen,
+    PauseRecording,
     /// Index into `xcap::Monitor::all()` order at the time the menu was built.
     Display(usize),
     FromClipboard,
@@ -36,6 +40,10 @@ impl Command {
             Action::CaptureWindow => Command::Window,
             Action::CaptureFullScreen => Command::FullScreen,
             Action::RecordRegion => Command::Record,
+            Action::RecordLastRegion => Command::RecordLastRegion,
+            Action::RecordWindow => Command::RecordWindow,
+            Action::RecordFullScreen => Command::RecordFullScreen,
+            Action::PauseRecording => Command::PauseRecording,
         }
     }
 }
@@ -70,7 +78,14 @@ impl Tray {
         let display_items: Vec<MenuItem> = displays.iter().enumerate().map(|(i, name)| item(name, Command::Display(i), true)).collect();
         let from_clipboard = item("Capture from clipboard", Command::FromClipboard, true);
         let open_file = item("Open image from file…", Command::OpenFile, true);
-        let record = item(&label("Record GIF (Phase 4)", settings.binding(Action::RecordRegion)), Command::Record, true);
+        let record = Submenu::new("Record GIF", true);
+        let rec_region = item(&label("Region", settings.binding(Action::RecordRegion)), Command::Record, true);
+        let rec_last = item(&label("Last region", settings.binding(Action::RecordLastRegion)), Command::RecordLastRegion, true);
+        let rec_window = item(&label("Window", settings.binding(Action::RecordWindow)), Command::RecordWindow, true);
+        let rec_full = item(&label("Full screen", settings.binding(Action::RecordFullScreen)), Command::RecordFullScreen, true);
+        for it in [&rec_region, &rec_last, &rec_window, &rec_full] {
+            record.append(it).map_err(|e| e.to_string())?;
+        }
         let prefs = item("Preferences…", Command::Preferences, true);
         let folder = item("Open captures folder", Command::OpenFolder, true);
         let exit = item("Exit", Command::Exit, true);
@@ -116,7 +131,10 @@ impl Tray {
         labelled.push((Action::CaptureLastRegion, last));
         labelled.push((Action::CaptureWindow, window));
         labelled.push((Action::CaptureFullScreen, all_screens));
-        labelled.push((Action::RecordRegion, record));
+        labelled.push((Action::RecordRegion, rec_region));
+        labelled.push((Action::RecordLastRegion, rec_last));
+        labelled.push((Action::RecordWindow, rec_window));
+        labelled.push((Action::RecordFullScreen, rec_full));
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -138,7 +156,10 @@ impl Tray {
         for (action, item) in &self.labelled {
             let text = match action {
                 Action::CaptureFullScreen => "All screens",
-                Action::RecordRegion => "Record GIF (Phase 4)",
+                Action::RecordRegion => "Region",
+                Action::RecordLastRegion => "Last region",
+                Action::RecordWindow => "Window",
+                Action::RecordFullScreen => "Full screen",
                 a => a.label(),
             };
             item.set_text(label(text, settings.binding(*action)));
