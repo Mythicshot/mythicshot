@@ -6,7 +6,7 @@
   (ui.wxs) can also start Mythicshot at sign-in and run it when setup ends.
   Build, from installer\:
   wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=<path to mythicshot.exe> -o ..\dist\Mythicshot-0.1.0-x64.msi
-  Silent install without start at sign-in: msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0
+  Silent install without start at sign-in or taking Print Screen: msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Mythicshot"
@@ -29,6 +29,20 @@
     <!-- Wizard options, both on by default. A cleared checkbox deletes its property. -->
     <Property Id="AUTOSTART" Value="1" Secure="yes" />
     <Property Id="LAUNCHAPP" Value="1" Secure="yes" />
+    <Property Id="TAKEPRTSC" Value="1" Secure="yes" />
+
+    <!--
+      Print Screen: Windows 11 gives the key to Snipping Tool by default. Install
+      turns that off (if ticked); a real uninstall, not an upgrade, asks whether
+      to turn it back on. Both steps are mythicshot.exe itself, so the logic is
+      in platform.rs. The question is skipped for silent uninstalls.
+    -->
+    <CustomAction Id="TakePrintScreen" FileRef="MythicshotExe" ExeCommand="--installer prtsc-off" Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="AskPrintScreen" FileRef="MythicshotExe" ExeCommand="--installer prtsc-ask" Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="TakePrintScreen" After="InstallFiles" Condition="TAKEPRTSC = 1 AND NOT REMOVE" />
+      <Custom Action="AskPrintScreen" After="InstallInitialize" Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 2" />
+    </InstallExecuteSequence>
 
     <UIRef Id="MythicshotUI" />
     <WixVariable Id="WixUIBannerBmp" Value="images/banner.bmp" />

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The setup wizard: Welcome, Options (start at sign-in, run when done), Ready,
+  The setup wizard: Welcome, Options (start at sign-in, Print Screen key, run when done), Ready,
   progress, and a Finished page that confirms the install. Built on the
   standard WixUI dialogs; only the Options page is our own.
 -->
@@ -46,11 +46,13 @@
         <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
         <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
         <Control Id="Title" Type="Text" X="15" Y="6" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Options" />
-        <Control Id="Description" Type="Text" X="25" Y="23" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose how Mythicshot starts." />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose how Mythicshot starts and which keys it uses." />
 
         <Control Id="AutostartCheck" Type="CheckBox" X="20" Y="60" Width="330" Height="17" Property="AUTOSTART" CheckBoxValue="1" Text="&amp;Start Mythicshot when I sign in to Windows" />
         <Control Id="AutostartHint" Type="Text" X="36" Y="78" Width="314" Height="26" NoPrefix="yes" Text="Mythicshot waits in the notification area, so PrtSc works straight away. You can change this later in Settings › General." />
-        <Control Id="LaunchCheck" Type="CheckBox" X="20" Y="112" Width="330" Height="17" Property="LAUNCHAPP" CheckBoxValue="1" Text="&amp;Run Mythicshot when setup finishes" />
+        <Control Id="PrtScCheck" Type="CheckBox" X="20" Y="112" Width="330" Height="17" Property="TAKEPRTSC" CheckBoxValue="1" Text="Use the &amp;Print Screen key for Mythicshot instead of Snipping Tool" />
+        <Control Id="PrtScHint" Type="Text" X="36" Y="130" Width="314" Height="26" NoPrefix="yes" Text="Turns off Windows' own Print Screen shortcut. Uninstalling Mythicshot asks whether to turn it back on." />
+        <Control Id="LaunchCheck" Type="CheckBox" X="20" Y="164" Width="330" Height="17" Property="LAUNCHAPP" CheckBoxValue="1" Text="&amp;Run Mythicshot when setup finishes" />
 
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back">

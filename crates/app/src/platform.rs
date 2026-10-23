@@ -50,6 +50,57 @@ pub fn snipping_tool_owns_prtsc() -> Option<bool> {
     Some(false)
 }
 
+/// Turn Windows' "Use the Print screen key to open screen capture" on or off,
+/// and tell running apps the keyboard settings changed.
+#[cfg(windows)]
+pub fn set_snipping_tool_prtsc(on: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_DWORD, RegSetKeyValueW};
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+    use windows::core::w;
+    let value: u32 = on.into();
+    unsafe {
+        RegSetKeyValueW(HKEY_CURRENT_USER, w!("Control Panel\\Keyboard"), w!("PrintScreenKeyForSnippingEnabled"), REG_DWORD.0, Some(&value as *const u32 as *const _), 4)
+            .ok()
+            .map_err(|e| e.to_string())?;
+        let area = w!("Keyboard");
+        let _ = SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(area.as_ptr() as isize), SMTO_ABORTIFHUNG, 2000, None);
+    }
+    Ok(())
+}
+
+/// Steps the Windows installer runs with `mythicshot.exe --installer <step>`:
+/// `prtsc-off` gives the Print Screen key to Mythicshot during install;
+/// `prtsc-ask` asks, while uninstalling, whether to give it back to Snipping Tool.
+#[cfg(windows)]
+pub fn installer_step(step: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MessageBoxW};
+    use windows::core::{HSTRING, w};
+    match step {
+        "prtsc-off" => {
+            if snipping_tool_owns_prtsc() != Some(false) {
+                let _ = set_snipping_tool_prtsc(false);
+            }
+        }
+        "prtsc-ask" => {
+            // Only worth asking if the key is not already Snipping Tool's.
+            if snipping_tool_owns_prtsc() == Some(false) {
+                let text = HSTRING::from(
+                    "Mythicshot is being removed.\n\nTurn Snipping Tool's Print Screen shortcut back on?\n\nYou can change this later in Settings › Accessibility › Keyboard.",
+                );
+                let answer = unsafe { MessageBoxW(None, &text, w!("Mythicshot Setup"), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) };
+                if answer == IDYES {
+                    let _ = set_snipping_tool_prtsc(true);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(windows))]
+pub fn installer_step(_step: &str) {}
+
 /// Move the mouse pointer by a few pixels (arrow keys in the region selector).
 #[cfg(windows)]
 pub fn nudge_cursor(dx: i32, dy: i32) {

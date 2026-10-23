@@ -905,6 +905,12 @@ fn install_crash_log() {
 
 fn main() -> eframe::Result {
     install_crash_log();
+    // Steps the installer runs; these never start the app.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--installer") {
+        platform::installer_step(args.get(i + 1).map(String::as_str).unwrap_or(""));
+        return Ok(());
+    }
     // Debug builds can run beside an installed copy for tests.
     let second_allowed = cfg!(debug_assertions) && std::env::var_os("MYTHICSHOT_TEST_SECOND_COPY").is_some();
     if !second_allowed && !platform::single_instance() {
