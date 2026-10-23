@@ -9,6 +9,7 @@ description = "Annotation document, undo, effects and the tiny-skia renderer use
 [dependencies]
 tiny-skia = "0.12"
 ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
 epaint_default_fonts = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 

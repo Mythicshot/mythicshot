@@ -9,6 +9,7 @@ description = "Screen recording to compressed frames on disk, and GIF export"
 [dependencies]
 pinray = "0.2"
 zstd = "0.13"
+png = "0.18"
 gifski = { version = "1.34", default-features = false }
 imgref = "1"
 rgb = "0.8"

@@ -219,7 +219,26 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
             }
         });
     });
-    changed |= ui.checkbox(&mut s.record_cursor, "Show the mouse pointer in GIFs").changed();
+    changed |= ui.checkbox(&mut s.record_keys, "Record key presses for the key overlay").on_hover_text("Off by default: the log could include anything you type, passwords too. It stays in memory and is deleted with the recording.").changed();
+    ui.horizontal(|ui| {
+        use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
+        ui.label("Show keys as");
+        egui::ComboBox::from_id_salt("overlay-keys").width(130.0).selected_text(key_style_label(s.overlays.keys)).show_ui(ui, |ui| {
+            for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
+                changed |= ui.selectable_value(&mut s.overlays.keys, k, key_style_label(k)).changed();
+            }
+        });
+        ui.label("clicks as");
+        egui::ComboBox::from_id_salt("overlay-clicks").width(130.0).selected_text(click_style_label(s.overlays.clicks)).show_ui(ui, |ui| {
+            for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
+                changed |= ui.selectable_value(&mut s.overlays.clicks, c, click_style_label(c)).changed();
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(&mut s.overlays.pointer, "Show the mouse pointer").changed();
+        changed |= ui.checkbox(&mut s.overlays.halo, "Highlight it").changed();
+    });
     ui.horizontal(|ui| {
         ui.label("GIF quality");
         changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
@@ -227,6 +246,25 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(MUTED).size(12.0));
     if changed {
         out.push(UiAction::SettingsChanged);
+    }
+}
+
+pub fn key_style_label(k: mythicshot_editor::overlays::KeyStyle) -> &'static str {
+    use mythicshot_editor::overlays::KeyStyle;
+    match k {
+        KeyStyle::Off => "Off",
+        KeyStyle::Chips => "Key chips",
+        KeyStyle::Keyboard => "On-screen keyboard",
+    }
+}
+
+pub fn click_style_label(c: mythicshot_editor::overlays::ClickStyle) -> &'static str {
+    use mythicshot_editor::overlays::ClickStyle;
+    match c {
+        ClickStyle::Off => "Off",
+        ClickStyle::Ripple => "Ripple",
+        ClickStyle::Mouse => "On-screen mouse",
+        ClickStyle::Both => "Ripple and mouse",
     }
 }
 

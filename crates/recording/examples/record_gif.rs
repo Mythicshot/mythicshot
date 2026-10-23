@@ -44,9 +44,20 @@ fn main() {
     println!("working set: after 1s {:.1} MB, at end {:.1} MB, peak {:.1} MB", mb(first), mb(last), mb(peak));
 
     let t = Instant::now();
-    let size = export::encode_gif(&recording, std::path::Path::new(&out), 90, true, |_| true).expect("encode gif");
+    let recording = std::sync::Arc::new(recording);
+    let job = export::Job {
+        frames: export::all_frames(&recording),
+        end_ms: recording.end_ms,
+        width: recording.width,
+        height: recording.height,
+        format: export::Format::Gif,
+        quality: 90,
+        loop_forever: true,
+        video_fps: fps,
+    };
+    let size = export::export(recording.clone(), &job, std::path::Path::new(&out), |_, img| img, |_| true).expect("encode gif");
     println!("gif {:.2} MB in {:.1}s -> {out}", size as f64 / 1_048_576.0, t.elapsed().as_secs_f64());
-    recording.delete();
+    recording.delete_files();
 }
 
 fn xcap_primary() -> (String, (i32, i32), (u32, u32)) {

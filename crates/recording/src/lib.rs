@@ -7,9 +7,11 @@
 //! `KEYFRAME_EVERY`th frame is stored whole so any frame can be decoded
 //! without reading from the start. Each frame keeps the active recording time (pauses
 //! excluded) and where the mouse pointer was, because the Windows capture path
-//! leaves the pointer out; [`export::encode_gif`] draws it back in.
+//! leaves the pointer out; the overlay renderer draws it back in at export.
 
 mod cursor;
+
+pub use cursor::position as pointer_position;
 pub mod export;
 
 use std::fs::File;
@@ -104,12 +106,79 @@ impl Recording {
         Ok(())
     }
 
+    /// A recording with frame times but no pixels, for tests of timing code.
+    #[doc(hidden)]
+    pub fn timing_only(width: u32, height: u32, times: &[u64], end_ms: u64) -> Recording {
+        let frames = times.iter().map(|t| FrameMeta { offset: 0, len: 0, key: true, t_ms: *t, cursor: None }).collect();
+        Recording { dir: PathBuf::new(), width, height, frames, end_ms }
+    }
+
     pub fn duration_ms(&self) -> u64 {
         self.end_ms
     }
 
     pub fn delete(self) {
+        self.delete_files();
+    }
+
+    /// Remove the temp files; for a recording shared through an `Arc`.
+    pub fn delete_files(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Reads frames from a shared recording, keeping the last one decoded so
+/// stepping forward costs one small delta instead of a walk from the keyframe.
+pub struct FrameReader {
+    rec: Arc<Recording>,
+    file: File,
+    px: Vec<u8>,
+    idx: Option<usize>,
+}
+
+impl FrameReader {
+    pub fn new(rec: Arc<Recording>) -> Result<Self, String> {
+        let file = File::open(rec.dir.join(FRAMES_FILE)).map_err(|e| e.to_string())?;
+        Ok(Self { rec, file, px: Vec::new(), idx: None })
+    }
+
+    pub fn recording(&self) -> &Recording {
+        &self.rec
+    }
+
+    pub fn get(&mut self, i: usize) -> Result<RgbaImage, String> {
+        if i >= self.rec.frames.len() {
+            return Err("no such frame".into());
+        }
+        let start = match self.idx {
+            Some(cur) if cur == i => return self.rec.to_image(self.px.clone()),
+            // Moving forward within the same keyframe group: apply the deltas in between.
+            Some(cur) if cur < i && !(cur + 1..=i).any(|k| self.rec.frames[k].key) => cur + 1,
+            _ => {
+                let key = (0..=i).rev().find(|k| self.rec.frames[*k].key).ok_or("no keyframe")?;
+                self.px = self.rec.read_raw(&mut self.file, &self.rec.frames[key])?;
+                key + 1
+            }
+        };
+        for k in start..=i {
+            let delta = self.rec.read_raw(&mut self.file, &self.rec.frames[k])?;
+            xor_into(&mut self.px, &delta);
+        }
+        self.idx = Some(i);
+        self.rec.to_image(self.px.clone())
+    }
+}
+
+#[derive(Clone)]
+pub struct ClockHandle(Arc<Shared>);
+
+impl ClockHandle {
+    pub fn active_ms(&self) -> u64 {
+        self.0.active().as_millis() as u64
+    }
+
+    pub fn paused(&self) -> bool {
+        self.0.paused()
     }
 }
 
@@ -121,13 +190,50 @@ pub struct Stats {
     pub compressed_bytes: u64,
 }
 
+/// Active recording time: wall time since the capture started, minus pauses.
+/// Shared so key and click events from other threads get the same clock as
+/// the frames.
+struct Clock {
+    started: Instant,
+    paused_total: Duration,
+    paused_since: Option<Instant>,
+}
+
+impl Clock {
+    fn active(&self) -> Duration {
+        let now = Instant::now();
+        let paused_now = self.paused_since.map(|p| now - p).unwrap_or_default();
+        (now - self.started).saturating_sub(self.paused_total + paused_now)
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        match (paused, self.paused_since) {
+            (true, None) => self.paused_since = Some(Instant::now()),
+            (false, Some(p)) => {
+                self.paused_total += p.elapsed();
+                self.paused_since = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Shared {
     stop: AtomicBool,
-    paused: AtomicBool,
+    clock: Mutex<Clock>,
     frames: AtomicU64,
     bytes: AtomicU64,
-    active_ms: AtomicU64,
     error: Mutex<Option<String>>,
+}
+
+impl Shared {
+    fn active(&self) -> Duration {
+        self.clock.lock().map(|c| c.active()).unwrap_or_default()
+    }
+
+    fn paused(&self) -> bool {
+        self.clock.lock().map(|c| c.paused_since.is_some()).unwrap_or(false)
+    }
 }
 
 pub struct Recorder {
@@ -142,10 +248,9 @@ impl Recorder {
         std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
+            clock: Mutex::new(Clock { started: Instant::now(), paused_total: Duration::ZERO, paused_since: None }),
             frames: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
-            active_ms: AtomicU64::new(0),
             error: Mutex::new(None),
         });
         // The session is created on the capture thread; report whether it started.
@@ -166,17 +271,30 @@ impl Recorder {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.shared.paused.store(paused, Ordering::Relaxed);
+        if let Ok(mut c) = self.shared.clock.lock() {
+            c.set_paused(paused);
+        }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.shared.paused.load(Ordering::Relaxed)
+        self.shared.paused()
+    }
+
+    /// The recording clock right now, in ms; frames and input events share it.
+    pub fn active_ms(&self) -> u64 {
+        self.shared.active().as_millis() as u64
+    }
+
+    /// A handle to the recording clock that other threads can keep, so input
+    /// events are stamped on the same clock as frames.
+    pub fn clock(&self) -> ClockHandle {
+        ClockHandle(self.shared.clone())
     }
 
     pub fn stats(&self) -> Stats {
         Stats {
             frames: self.shared.frames.load(Ordering::Relaxed),
-            active_ms: self.shared.active_ms.load(Ordering::Relaxed),
+            active_ms: self.active_ms(),
             compressed_bytes: self.shared.bytes.load(Ordering::Relaxed),
         }
     }
@@ -230,6 +348,9 @@ fn capture_loop(target: Target, fps: u32, dir: PathBuf, sh: Arc<Shared>, ready: 
         .build();
     let mut session = match session.and_then(|mut s| s.start().map(|_| s)) {
         Ok(s) => {
+            if let Ok(mut c) = sh.clock.lock() {
+                c.started = Instant::now();
+            }
             let _ = ready.send(Ok(()));
             s
         }
@@ -245,29 +366,9 @@ fn capture_loop(target: Target, fps: u32, dir: PathBuf, sh: Arc<Shared>, ready: 
     let mut writer = FrameWriter::create(&dir, w, h)?;
     let mut packed = vec![0u8; row * h as usize];
 
-    // Active time: wall time minus time spent paused.
-    let started = Instant::now();
-    let mut paused_total = Duration::ZERO;
-    let mut paused_since: Option<Instant> = None;
-    let active = |paused_total: Duration, paused_since: Option<Instant>| {
-        let now = Instant::now();
-        let paused_now = paused_since.map(|p| now - p).unwrap_or_default();
-        (now - started).saturating_sub(paused_total + paused_now)
-    };
-
     let mut failure = None;
     while !sh.stop.load(Ordering::Relaxed) {
-        let paused = sh.paused.load(Ordering::Relaxed);
-        match (paused, paused_since) {
-            (true, None) => paused_since = Some(Instant::now()),
-            (false, Some(p)) => {
-                paused_total += p.elapsed();
-                paused_since = None;
-            }
-            _ => {}
-        }
-        sh.active_ms.store(active(paused_total, paused_since).as_millis() as u64, Ordering::Relaxed);
-
+        let paused = sh.paused();
         match session.next_event(Some(Duration::from_millis(100))) {
             Ok(CaptureEvent::Video(frame)) => {
                 if paused || frame.width != w || frame.height != h {
@@ -281,7 +382,7 @@ fn capture_loop(target: Target, fps: u32, dir: PathBuf, sh: Arc<Shared>, ready: 
                 let cursor = cursor::position()
                     .map(|(x, y)| (x - target.origin.0 - target.x as i32, y - target.origin.1 - target.y as i32))
                     .filter(|(x, y)| *x >= -32 && *y >= -32 && *x < w as i32 && *y < h as i32);
-                if let Err(e) = writer.push(&packed, active(paused_total, paused_since).as_millis() as u64, cursor) {
+                if let Err(e) = writer.push(&packed, sh.active().as_millis() as u64, cursor) {
                     failure = Some(e);
                     break;
                 }
@@ -297,7 +398,7 @@ fn capture_loop(target: Target, fps: u32, dir: PathBuf, sh: Arc<Shared>, ready: 
             }
         }
     }
-    let end_ms = active(paused_total, paused_since).as_millis() as u64;
+    let end_ms = sh.active().as_millis() as u64;
     let _ = session.stop();
     let rec = writer.finish(dir.clone(), end_ms)?;
     if let Some(f) = failure {

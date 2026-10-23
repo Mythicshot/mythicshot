@@ -10,6 +10,7 @@
 //! snapshot costs only the item list unless the base itself changed.
 
 pub mod effects;
+pub mod overlays;
 mod render;
 mod text;
 
@@ -406,6 +407,13 @@ impl Document {
 
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+    }
+
+    /// Show a different picture under the items (the next frame of a
+    /// recording). Not an edit: no undo step, not marked unsaved.
+    pub fn replace_base(&mut self, base: RgbaImage) {
+        self.base = Arc::new(base);
+        self.version += 1;
     }
 }
 

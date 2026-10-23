@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use mythicshot_destinations::{Context, DEFAULT_PATTERN, DestId, ImageFormat};
+use mythicshot_editor::overlays::{KeyStyle, OverlayStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkeys::{Action, EditorAction};
@@ -21,12 +22,15 @@ pub struct Settings {
     pub image_format: ImageFormat,
     pub jpeg_quality: u8,
     pub magnifier: bool,
-    /// Recording: frames per second, countdown before it starts, and whether
-    /// the mouse pointer is drawn into the GIF.
+    /// Recording: frames per second and the countdown before it starts.
     pub record_fps: u32,
     pub countdown_secs: u32,
-    pub record_cursor: bool,
     pub gif_quality: u8,
+    /// Log key presses while recording, for the key overlay. Off by default:
+    /// the log could include anything typed, passwords too.
+    pub record_keys: bool,
+    /// Overlays new recordings start with; the GIF editor can change them.
+    pub overlays: OverlayStyle,
     /// Last captured region in desktop pixels: x, y, width, height.
     pub last_region: Option<[i32; 4]>,
     /// Action → shortcut in `global-hotkey` syntax, for example `shift+PrintScreen`.
@@ -58,8 +62,9 @@ impl Default for Settings {
             magnifier: true,
             record_fps: 15,
             countdown_secs: 3,
-            record_cursor: true,
             gif_quality: 90,
+            record_keys: false,
+            overlays: OverlayStyle { keys: KeyStyle::Chips, ..OverlayStyle::default() },
             last_region: None,
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),

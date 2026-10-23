@@ -111,24 +111,25 @@ struct TextEdit {
 }
 
 pub struct Editor {
-    doc: Document,
+    pub(crate) doc: Document,
     title: String,
     tool: Tool,
     style: Style,
     obfuscate: ObfuscateMode,
-    selected: Option<u64>,
+    pub(crate) selected: Option<u64>,
     drag: Option<Drag>,
     text: Option<TextEdit>,
     crop: Option<Bounds>,
     /// `None` fits the image to the window.
     zoom: Option<f32>,
     texture: Option<TextureHandle>,
-    shown_version: Option<u64>,
+    /// What the canvas texture shows: document version, frame, overlay style.
+    shown: Option<(u64, usize, Option<mythicshot_editor::overlays::OverlayStyle>)>,
     /// Base plus every item except the one being dragged, built when a drag starts.
     drag_cache: Option<Pixmap>,
     pub keys: BTreeMap<EditorAction, String>,
     /// Output folder, pattern and format from settings; `title` is this capture's.
-    dest: Context,
+    pub(crate) dest: Context,
     saved: Option<PathBuf>,
     /// Last action and the time it happened, shown in the status bar.
     status: Option<(String, String)>,
@@ -137,6 +138,8 @@ pub struct Editor {
     /// When the property panel last checkpointed, so one slider drag is one undo step.
     prop_checkpoint: Option<(u64, Instant)>,
     last_canvas: CanvasGeom,
+    /// Set when the editor holds a recording instead of a still image.
+    pub(crate) video: Option<crate::video_editor::VideoState>,
 }
 
 impl Editor {
@@ -153,7 +156,7 @@ impl Editor {
             crop: None,
             zoom: None,
             texture: None,
-            shown_version: None,
+            shown: None,
             drag_cache: None,
             keys,
             dest,
@@ -163,6 +166,7 @@ impl Editor {
             confirm_close: false,
             prop_checkpoint: None,
             last_canvas: CanvasGeom { min: pos2(0.0, 0.0), zoom: 1.0 },
+            video: None,
         }
     }
 
@@ -176,11 +180,38 @@ impl Editor {
         self.dest = ctx;
     }
 
-    fn notify(&mut self, msg: impl Into<String>) {
+    pub(crate) fn notify(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), chrono::Local::now().format("%H:%M:%S").to_string()));
     }
 
-    fn select(&mut self, id: Option<u64>) {
+    pub(crate) fn text_editing(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// Items on the canvas now: all of them for an image, those whose frame
+    /// range includes the current frame for a recording.
+    fn display_items(&self) -> Vec<Item> {
+        match &self.video {
+            Some(v) => crate::video::visible(self.doc.items(), v.current),
+            None => self.doc.items().to_vec(),
+        }
+    }
+
+    /// Topmost item under `p` among those on the canvas now.
+    fn hit(&self, p: Pt, tol: f32) -> Option<u64> {
+        self.display_items().iter().rev().find(|i| i.hit(p, tol)).map(|i| i.id)
+    }
+
+    /// Add an item; on a recording it shows from the current frame for a while.
+    pub(crate) fn add_item(&mut self, shape: Shape) -> u64 {
+        let id = self.doc.add(shape, self.style);
+        if let Some(r) = self.default_range() {
+            self.doc.update(id, |it| it.frames = Some(r));
+        }
+        id
+    }
+
+    pub(crate) fn select(&mut self, id: Option<u64>) {
         self.selected = id;
         if let Some(it) = id.and_then(|i| self.doc.item(i)) {
             self.style = it.style;
@@ -193,16 +224,20 @@ impl Editor {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.doc.dirty {
+            let unexported = self.video.as_ref().is_some_and(|v| !v.exported);
+            if self.doc.dirty || unexported {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_close = true;
             } else {
                 self.closed = true;
             }
         }
+        self.video_keys(&ctx);
         self.shortcuts(&ctx);
+        self.video_tick(&ctx);
         self.toolbar(ui);
         self.status_bar(ui);
+        self.timeline(ui);
         self.tool_rail(ui);
         self.canvas(ui);
         self.text_editor(&ctx);
@@ -249,16 +284,20 @@ impl Editor {
             EditorAction::Undo => {
                 self.doc.undo();
                 self.fix_selection();
+                self.reload_frame();
             }
             EditorAction::Redo => {
                 self.doc.redo();
                 self.fix_selection();
+                self.reload_frame();
             }
             EditorAction::Delete => {
                 if let Some(id) = self.selected.take() {
                     self.doc.remove(id);
                 }
             }
+            EditorAction::Copy if self.video.is_some() => self.copy_frame(),
+            EditorAction::Save if self.video.is_some() => self.start_export(None),
             EditorAction::Copy => self.copy(),
             EditorAction::Save => self.save(),
             _ => {}
@@ -313,8 +352,14 @@ impl Editor {
 
     fn apply_crop(&mut self) {
         if let Some(b) = self.crop.take() {
-            self.doc.crop(b);
-            self.fix_selection();
+            match self.video.as_mut() {
+                // A recording keeps every frame whole; the crop applies at export.
+                Some(v) => v.edit.crop = Some(b.norm()),
+                None => {
+                    self.doc.crop(b);
+                    self.fix_selection();
+                }
+            }
         }
     }
 
@@ -331,26 +376,37 @@ impl Editor {
         egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if icons::button(ui, Icon::Save, ICON, false, &self.key_hint(EditorAction::Save)).clicked() {
+                if self.video.is_some() {
+                    let exp = icons::button(ui, Icon::Export, ICON, false, "Export (GIF, APNG, MP4, WebM)");
+                    egui::Popup::menu(&exp).show(|ui| self.export_menu(ui));
+                    if icons::button(ui, Icon::Copy, ICON, false, "Copy this frame").clicked() {
+                        self.copy_frame();
+                    }
+                    if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
+                        crate::platform::open_folder(&self.dest.output_dir);
+                    }
+                } else if icons::button(ui, Icon::Save, ICON, false, &self.key_hint(EditorAction::Save)).clicked() {
                     self.save();
                 }
-                if icons::button(ui, Icon::SaveAs, ICON, false, "Save as…").clicked() {
-                    self.send(DestId::FileAs);
-                }
-                if icons::button(ui, Icon::Copy, ICON, false, &self.key_hint(EditorAction::Copy)).clicked() {
-                    self.copy();
-                }
-                let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
-                egui::Popup::menu(&send).show(|ui| {
-                    for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
-                        if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
-                            self.send(d);
-                            ui.close();
-                        }
+                if self.video.is_none() {
+                    if icons::button(ui, Icon::SaveAs, ICON, false, "Save as…").clicked() {
+                        self.send(DestId::FileAs);
                     }
-                });
-                if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
-                    crate::platform::open_folder(&self.dest.output_dir);
+                    if icons::button(ui, Icon::Copy, ICON, false, &self.key_hint(EditorAction::Copy)).clicked() {
+                        self.copy();
+                    }
+                    let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
+                    egui::Popup::menu(&send).show(|ui| {
+                        for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
+                            if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
+                                self.send(d);
+                                ui.close();
+                            }
+                        }
+                    });
+                    if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
+                        crate::platform::open_folder(&self.dest.output_dir);
+                    }
                 }
                 ui.separator();
                 let (can_undo, can_redo) = (self.doc.can_undo(), self.doc.can_redo());
@@ -361,9 +417,11 @@ impl Editor {
                     self.run(EditorAction::Redo);
                 }
                 ui.separator();
-                let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
-                egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
-                ui.separator();
+                if self.video.is_none() {
+                    let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
+                    egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
+                    ui.separator();
+                }
                 self.properties_row(ui);
             });
         });
@@ -581,7 +639,7 @@ impl Editor {
         match self.tool {
             Tool::Select => match (p, self.selected) {
                 (Some(p), Some(id)) if self.handle_at(id, p, z).is_some() => CursorIcon::Grab,
-                (Some(p), _) if self.doc.hit(p, 6.0 / z).is_some() => CursorIcon::Move,
+                (Some(p), _) if self.hit(p, 6.0 / z).is_some() => CursorIcon::Move,
                 _ => CursorIcon::Default,
             },
             Tool::Text => CursorIcon::Text,
@@ -605,7 +663,7 @@ impl Editor {
             self.finish_drag();
         }
         if resp.double_clicked() {
-            if let Some(id) = resp.interact_pointer_pos().map(to_img).and_then(|p| self.doc.hit(p, tol)) {
+            if let Some(id) = resp.interact_pointer_pos().map(to_img).and_then(|p| self.hit(p, tol)) {
                 if self.doc.item(id).and_then(|it| it.shape.text()).is_some() {
                     self.select(Some(id));
                     self.edit_text(id);
@@ -616,17 +674,17 @@ impl Editor {
         if resp.clicked() {
             let Some(p) = resp.interact_pointer_pos().map(to_img) else { return };
             match self.tool {
-                Tool::Text => match self.doc.hit(p, tol).filter(|id| matches!(self.doc.item(*id).map(|i| &i.shape), Some(Shape::Text { .. }))) {
+                Tool::Text => match self.hit(p, tol).filter(|id| matches!(self.doc.item(*id).map(|i| &i.shape), Some(Shape::Text { .. }))) {
                     Some(id) => self.edit_text(id),
                     None => self.text = Some(TextEdit { item: None, at: p, buffer: String::new(), focused: false }),
                 },
                 Tool::Step => {
                     let n = self.doc.next_step_number();
-                    let id = self.doc.add(Shape::Step { center: p, number: n }, self.style);
+                    let id = self.add_item(Shape::Step { center: p, number: n });
                     self.selected = Some(id);
                 }
                 _ => {
-                    let hit = self.doc.hit(p, tol);
+                    let hit = self.hit(p, tol);
                     if self.tool == Tool::Select || hit.is_some() {
                         if hit.is_some() && self.tool != Tool::Select {
                             self.tool = Tool::Select;
@@ -651,7 +709,7 @@ impl Editor {
                         HandleKind::Tail => Drag::Tail { id },
                     });
                     self.build_cache(Some(id));
-                } else if let Some(id) = self.doc.hit(p, tol) {
+                } else if let Some(id) = self.hit(p, tol) {
                     self.select(Some(id));
                     self.doc.checkpoint();
                     self.drag = Some(Drag::Move { id, last: p });
@@ -722,7 +780,7 @@ impl Editor {
             Some(Drag::Create { start, now }) => {
                 if let Some(shape) = self.shape_from_drag(start, now) {
                     let is_bubble = matches!(shape, Shape::Bubble { .. });
-                    let id = self.doc.add(shape, self.style);
+                    let id = self.add_item(shape);
                     self.selected = Some(id);
                     if is_bubble {
                         self.edit_text(id);
@@ -730,7 +788,7 @@ impl Editor {
                 }
             }
             Some(Drag::Freehand(ps)) if ps.len() > 1 => {
-                let id = self.doc.add(Shape::Freehand(ps), self.style);
+                let id = self.add_item(Shape::Freehand(ps));
                 self.selected = Some(id);
             }
             Some(Drag::Crop { start, now }) => {
@@ -781,7 +839,7 @@ impl Editor {
                 }
             }
             None if !t.buffer.trim().is_empty() => {
-                let id = self.doc.add(Shape::Text { at: t.at, text: t.buffer }, self.style);
+                let id = self.add_item(Shape::Text { at: t.at, text: t.buffer });
                 self.selected = Some(id);
             }
             None => {}
@@ -825,17 +883,23 @@ impl Editor {
     }
 
     fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
+        let is_video = self.video.is_some();
         let modal = egui::Modal::new(egui::Id::unique("confirm-close")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.heading("Save this capture?");
-            ui.label("It has changes that are not saved yet.");
+            if is_video {
+                ui.heading("Export this recording?");
+                ui.label("Closing without exporting deletes the recording.");
+            } else {
+                ui.heading("Save this capture?");
+                ui.label("It has changes that are not saved yet.");
+            }
             ui.add_space(10.0);
             let mut choice = None;
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button(if is_video { "Export and close" } else { "Save" }).clicked() {
                     choice = Some(0);
                 }
-                if ui.button("Don't save").clicked() {
+                if ui.button(if is_video { "Discard" } else { "Don't save" }).clicked() {
                     choice = Some(1);
                 }
                 if ui.button("Cancel").clicked() {
@@ -845,6 +909,13 @@ impl Editor {
             choice
         });
         match modal.inner {
+            Some(0) if is_video => {
+                if let Some(v) = self.video.as_mut() {
+                    v.close_after_export = true;
+                }
+                self.start_export(None);
+                self.confirm_close = false;
+            }
             Some(0) => {
                 self.save();
                 if !self.doc.dirty {
@@ -866,9 +937,17 @@ impl Editor {
 
     fn build_cache(&mut self, exclude: Option<u64>) {
         let mut pm = to_pixmap(self.doc.base());
-        let items: Vec<Item> = self.doc.items().iter().filter(|i| Some(i.id) != exclude).cloned().collect();
+        let items: Vec<Item> = self.display_items().into_iter().filter(|i| Some(i.id) != exclude).collect();
         render_items_onto(&mut pm, &items);
         self.drag_cache = Some(pm);
+    }
+
+    /// Key and click overlays on a recording frame, the same way export draws them.
+    fn draw_video_overlays(&self, pm: &mut Pixmap) {
+        if let Some(v) = &self.video {
+            let meta = &v.rec.frames[v.current];
+            mythicshot_editor::overlays::draw_overlays(pm, meta.t_ms, meta.cursor, &v.events, &v.edit.overlays);
+        }
     }
 
     fn refresh_texture(&mut self, ctx: &egui::Context) {
@@ -884,16 +963,19 @@ impl Editor {
                 if let Some(it) = extra {
                     render_items_onto(&mut pm, std::slice::from_ref(&it));
                 }
-                self.shown_version = None;
+                self.draw_video_overlays(&mut pm);
+                self.shown = None;
                 pm
             }
             _ => {
-                if self.shown_version == Some(self.doc.version) && self.texture.is_some() {
+                let key = (self.doc.version, self.video.as_ref().map(|v| v.current).unwrap_or(0), self.video.as_ref().map(|v| v.edit.overlays));
+                if self.shown == Some(key) && self.texture.is_some() {
                     return;
                 }
                 let mut pm = to_pixmap(self.doc.base());
-                render_items_onto(&mut pm, self.doc.items());
-                self.shown_version = Some(self.doc.version);
+                render_items_onto(&mut pm, &self.display_items());
+                self.draw_video_overlays(&mut pm);
+                self.shown = Some(key);
                 pm
             }
         };
@@ -914,7 +996,7 @@ impl Editor {
         // Crop preview: dim everything outside.
         let crop = match &self.drag {
             Some(Drag::Crop { start, now }) => Some(Bounds::new(*start, *now).norm()),
-            _ => self.crop,
+            _ => self.crop.or_else(|| self.video.as_ref().and_then(|v| v.edit.crop)),
         };
         if let Some(b) = crop {
             let r = scr_rect(b);

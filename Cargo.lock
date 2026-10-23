@@ -2800,6 +2800,7 @@ dependencies = [
  "ab_glyph",
  "epaint_default_fonts",
  "image",
+ "serde",
  "tiny-skia 0.12.0",
 ]
 
@@ -2811,6 +2812,7 @@ dependencies = [
  "image",
  "imgref",
  "pinray",
+ "png",
  "rgb",
  "windows",
  "xcap",

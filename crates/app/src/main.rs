@@ -9,7 +9,9 @@
 
 mod editor_ui;
 mod hotkeys;
+mod hook;
 mod icons;
+mod input;
 mod overlay;
 mod platform;
 mod popups;
@@ -17,6 +19,8 @@ mod recorder_ui;
 mod settings;
 mod settings_ui;
 mod tray;
+mod video;
+mod video_editor;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,6 +46,8 @@ enum AppEvent {
     Menu(tray_icon::menu::MenuId),
     TrayClick,
     Key(rdev::EventType),
+    /// A key or click logged for the recording in progress.
+    Input(mythicshot_editor::overlays::InputEvent),
 }
 
 struct App {
@@ -66,6 +72,10 @@ struct App {
     toast: popups::Toast,
     /// The recording in progress, and GIFs being encoded.
     session: Option<recorder_ui::Session>,
+    /// Key and click events for the recording in progress.
+    rec_events: Vec<mythicshot_editor::overlays::InputEvent>,
+    /// Read by the input hook thread: where to send events while recording.
+    tap: Arc<std::sync::Mutex<Option<input::Tap>>>,
     encoding: Vec<recorder_ui::EncodeJob>,
     /// The root window is kept out of screen capture once its handle is known.
     root_hidden_from_capture: bool,
@@ -154,6 +164,8 @@ impl App {
             pickers: Vec::new(),
             toast: popups::Toast::new(),
             session: None,
+            rec_events: Vec::new(),
+            tap: Arc::new(std::sync::Mutex::new(None)),
             encoding: Vec::new(),
             root_hidden_from_capture: false,
             refocus_at: None,
@@ -190,6 +202,11 @@ impl App {
                 }
                 AppEvent::TrayClick => self.run(ctx, Command::Region),
                 AppEvent::Key(ev) => self.record_key(&ev),
+                AppEvent::Input(ev) => {
+                    if self.session.is_some() {
+                        self.rec_events.push(ev);
+                    }
+                }
             }
         }
     }
@@ -301,6 +318,7 @@ impl App {
         }
         match recorder_ui::Session::new(rect, title, self.settings.countdown_secs, self.settings.record_fps) {
             Ok(s) => {
+                self.rec_events.clear();
                 let ppp = ctx.pixels_per_point();
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(s.bar_position(ppp)));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(recorder_ui::BAR_SIZE[0], recorder_ui::BAR_SIZE[1])));
@@ -316,6 +334,15 @@ impl App {
     fn recording_action(&mut self, ctx: &egui::Context, action: recorder_ui::BarAction) {
         use recorder_ui::BarAction;
         match action {
+            BarAction::ToggleKeys => {
+                self.settings.record_keys = !self.settings.record_keys;
+                self.settings_changed();
+                if let Ok(mut t) = self.tap.lock() {
+                    if let Some(t) = t.as_mut() {
+                        t.keys = self.settings.record_keys;
+                    }
+                }
+            }
             BarAction::PauseToggle => {
                 if let Some(s) = self.session.as_mut() {
                     s.toggle_pause();
@@ -344,29 +371,65 @@ impl App {
                         rec.delete();
                         self.notify("Nothing was recorded".into());
                     }
-                    Some(Ok(rec)) => match dest::new_path_with_extension(&self.settings.dest_context(&title), "gif") {
-                        Ok(path) => {
-                            self.toast.post("Encoding GIF…".into(), None);
-                            self.encoding.push(recorder_ui::EncodeJob::start(rec, path, self.settings.gif_quality, self.settings.record_cursor));
-                        }
-                        Err(e) => {
-                            rec.delete();
-                            self.notify(e);
-                        }
-                    },
+                    Some(Ok(rec)) => {
+                        let events = std::mem::take(&mut self.rec_events);
+                        self.recording_done(rec, events, title);
+                    }
                 }
             }
         }
     }
 
-    /// Hide the control bar; the frame window goes when it is no longer shown.
+    /// Hide the control bar and stop logging input; the frame window goes when
+    /// it is no longer shown.
     fn end_session(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.refocus_at = None;
+        if let Ok(mut t) = self.tap.lock() {
+            *t = None;
+        }
+    }
+
+    /// A finished recording: open it in the GIF editor if the editor is a
+    /// destination, otherwise export a GIF straight away.
+    fn recording_done(&mut self, rec: mythicshot_recording::Recording, events: Vec<mythicshot_editor::overlays::InputEvent>, title: String) {
+        let keys = events.iter().filter(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_))).count();
+        eprintln!("recording: {} frames, {} input events ({keys} key presses)", rec.frames.len(), events.len());
+        let rec = Arc::new(rec);
+        if self.settings.has_destination(DestId::Editor) || self.settings.has_destination(DestId::Picker) {
+            self.open_video_editor(rec, events, title);
+            return;
+        }
+        match dest::new_path_with_extension(&self.settings.dest_context(&title), "gif") {
+            Ok(path) => {
+                self.toast.post("Encoding GIF…".into(), None);
+                let edit = video::Edit::new(&rec, self.settings.overlays);
+                let spec = recorder_ui::ExportSpec { format: mythicshot_recording::export::Format::Gif, quality: self.settings.gif_quality, loop_forever: true, video_fps: self.settings.record_fps };
+                self.encoding.push(recorder_ui::EncodeJob::start(rec, Vec::new(), events, edit, spec, path, true));
+            }
+            Err(e) => {
+                rec.delete_files();
+                self.notify(e);
+            }
+        }
     }
 
     /// Each frame while recording: countdown, frame window, errors, focus.
     fn tick_recording(&mut self, ctx: &egui::Context) {
+        // Once recording is live, point the input hook at it.
+        if let Some(clock) = self.session.as_ref().and_then(|s| s.clock()) {
+            let origin = self.session.as_ref().map(|s| (s.rect.x, s.rect.y)).unwrap_or_default();
+            let mut started = false;
+            if let Ok(mut t) = self.tap.lock() {
+                if t.is_none() {
+                    *t = Some(input::Tap { clock, origin, keys: self.settings.record_keys });
+                    started = true;
+                }
+            }
+            if started {
+                self.ensure_input_hook(ctx);
+            }
+        }
         if let Some(s) = self.session.as_mut() {
             if let Err(e) = s.tick() {
                 self.recording_action(ctx, recorder_ui::BarAction::Stop);
@@ -466,6 +529,18 @@ impl App {
         self.editors.push((editor_ui::EditorWindow::new(editor), true));
     }
 
+    /// Open a recording in the editor's video mode (the GIF editor).
+    fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, title: String) {
+        let s = &self.settings;
+        match editor_ui::Editor::new_video(rec.clone(), events, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.gif_quality, s.record_fps) {
+            Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Err(e) => {
+                rec.delete_files();
+                self.notify(format!("Could not open the recording: {e}"));
+            }
+        }
+    }
+
     fn open_file(&mut self) {
         let picked = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir).pick_file();
         let Some(path) = picked else { return };
@@ -540,22 +615,39 @@ impl App {
         self.settings_state.listening = action;
         self.recorder = ShortcutRecorder::default();
         self.listening.store(action.is_some(), Ordering::Relaxed);
-        if action.is_some() && !self.key_hook_started {
-            self.key_hook_started = true;
-            let (tx, flag, ctx) = (self.tx.clone(), self.listening.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                // The hook only forwards events while the settings page is listening.
-                let result = rdev::listen(move |e| {
-                    if flag.load(Ordering::Relaxed) {
-                        let _ = tx.send(AppEvent::Key(e.event_type));
-                        ctx.request_repaint();
-                    }
-                });
-                if let Err(e) = result {
-                    eprintln!("keyboard hook unavailable: {e:?}");
+        if action.is_some() {
+            self.ensure_input_hook(ctx);
+        }
+    }
+
+    /// Start the one input hook this process may have (rdev allows one). It
+    /// forwards keys only while the settings page records a shortcut, and keys
+    /// and clicks only while a recording is running.
+    fn ensure_input_hook(&mut self, ctx: &egui::Context) {
+        if self.key_hook_started {
+            return;
+        }
+        self.key_hook_started = true;
+        let (tx, flag, tap, ctx) = (self.tx.clone(), self.listening.clone(), self.tap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut pointer = (0.0, 0.0);
+            let result = hook::listen(move |ev: rdev::EventType| {
+                if let rdev::EventType::MouseMove { x, y } = ev {
+                    pointer = (x, y);
+                    return;
+                }
+                if flag.load(Ordering::Relaxed) {
+                    let _ = tx.send(AppEvent::Key(ev));
+                    ctx.request_repaint();
+                }
+                if let Some(ev) = tap.lock().ok().and_then(|t| t.as_ref().and_then(|t| t.convert(&ev, pointer))) {
+                    let _ = tx.send(AppEvent::Input(ev));
                 }
             });
-        }
+            if let Err(e) = result {
+                eprintln!("input hook unavailable: {e}");
+            }
+        });
     }
 
     fn record_key(&mut self, ev: &rdev::EventType) {
@@ -623,7 +715,8 @@ impl App {
                     self.settings.magnifier = edited.magnifier;
                     self.settings.record_fps = edited.record_fps;
                     self.settings.countdown_secs = edited.countdown_secs;
-                    self.settings.record_cursor = edited.record_cursor;
+                    self.settings.record_keys = edited.record_keys;
+                    self.settings.overlays = edited.overlays;
                     self.settings.gif_quality = edited.gif_quality;
                     self.settings_changed();
                 }
@@ -700,7 +793,7 @@ impl eframe::App for App {
                 Outcome::Continue => {}
                 outcome => self.finish_overlay(&ctx, outcome),
             }
-        } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui)) {
+        } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui, self.settings.record_keys)) {
             self.recording_action(&ctx, action);
         }
         self.tick_recording(&ctx);

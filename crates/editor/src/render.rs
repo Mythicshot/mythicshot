@@ -166,7 +166,7 @@ fn arrow(pm: &mut Pixmap, a: Pt, b: Pt, width: f32, line: &Paint, t: Transform) 
     }
 }
 
-fn rounded_rect(r: Rect, radius: f32) -> Option<Path> {
+pub(crate) fn rounded_rect(r: Rect, radius: f32) -> Option<Path> {
     let rad = radius.min(r.width() / 2.0).min(r.height() / 2.0);
     let (l, tp, rt, bt) = (r.left(), r.top(), r.right(), r.bottom());
     let k = 0.4477; // control-point inset for a quarter circle

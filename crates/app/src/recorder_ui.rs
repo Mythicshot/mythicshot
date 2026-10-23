@@ -10,13 +10,17 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, StrokeKind, vec2};
 use mythicshot_capture::PxRect;
-use mythicshot_recording::{Recorder, Recording, Target, export};
+use mythicshot_editor::Item;
+use mythicshot_editor::overlays::InputEvent;
+use mythicshot_recording::export::{self, Format, Job};
+use mythicshot_recording::{Recorder, Recording, Target};
 
 use crate::icons::{self, Icon};
 use crate::platform::{self, WindowId};
+use crate::video::{self, Edit};
 
 pub const FRAME_TITLE: &str = "Mythicshot recording frame";
-pub const BAR_SIZE: [f32; 2] = [560.0, 46.0];
+pub const BAR_SIZE: [f32; 2] = [620.0, 46.0];
 const BORDER: f32 = 4.0;
 const RED: Color32 = Color32::from_rgb(229, 72, 77);
 const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
@@ -33,6 +37,8 @@ enum Phase {
 
 pub enum BarAction {
     PauseToggle,
+    /// Turn key logging on or off for the key overlay.
+    ToggleKeys,
     Stop,
     Restart,
     Discard,
@@ -114,6 +120,14 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// The recording clock, once recording has started.
+    pub fn clock(&self) -> Option<mythicshot_recording::ClockHandle> {
+        match &self.phase {
+            Phase::Live(rec) => Some(rec.clock()),
+            Phase::Countdown { .. } => None,
+        }
     }
 
     pub fn toggle_pause(&mut self) {
@@ -204,7 +218,8 @@ impl Session {
     }
 
     /// The control bar's contents (drawn in the root window).
-    pub fn bar_ui(&self, ui: &mut egui::Ui) -> Option<BarAction> {
+    /// `keys_on` is whether key presses are being logged right now.
+    pub fn bar_ui(&self, ui: &mut egui::Ui, keys_on: bool) -> Option<BarAction> {
         let mut action = None;
         let frame = egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, Color32::from_rgb(52, 59, 72)));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -240,6 +255,11 @@ impl Session {
                     action = Some(BarAction::Discard);
                 }
                 ui.separator();
+                let keys = egui::Button::selectable(keys_on, "Keys").min_size(vec2(44.0, 28.0));
+                if ui.add(keys).on_hover_text("Log key presses for the key overlay. Off by default: anything typed is logged, passwords too.").clicked() {
+                    action = Some(BarAction::ToggleKeys);
+                }
+                ui.separator();
                 let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;
                 ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(MUTED));
             });
@@ -249,23 +269,45 @@ impl Session {
     }
 }
 
-/// A GIF being encoded on a background thread.
+/// What to export, in what format.
+pub struct ExportSpec {
+    pub format: Format,
+    pub quality: u8,
+    pub loop_forever: bool,
+    pub video_fps: u32,
+}
+
+/// An export running on a background thread.
 pub struct EncodeJob {
     progress: Arc<AtomicU32>,
     result: Arc<Mutex<Option<Result<(PathBuf, u64), String>>>>,
 }
 
 impl EncodeJob {
-    pub fn start(rec: Recording, path: PathBuf, quality: u8, draw_cursor: bool) -> EncodeJob {
+    /// Export `rec` with `edit` applied, drawing `items` and the overlays for
+    /// `events`. With `delete_after`, the recording's temp files go when done.
+    pub fn start(rec: Arc<Recording>, items: Vec<Item>, events: Vec<InputEvent>, edit: Edit, spec: ExportSpec, path: PathBuf, delete_after: bool) -> EncodeJob {
         let progress = Arc::new(AtomicU32::new(0));
         let result = Arc::new(Mutex::new(None));
         let (p, r, out) = (progress.clone(), result.clone(), path);
         std::thread::spawn(move || {
-            let res = export::encode_gif(&rec, &out, quality, draw_cursor, |f| {
-                p.store((f * 1000.0) as u32, Ordering::Relaxed);
-                true
-            });
-            rec.delete();
+            let (frames, end_ms) = video::plan(&rec, &edit);
+            let (width, height) = video::output_size(&rec, &edit);
+            let job = Job { frames, end_ms, width, height, format: spec.format, quality: spec.quality, loop_forever: spec.loop_forever, video_fps: spec.video_fps };
+            let source = rec.clone();
+            let res = export::export(
+                rec.clone(),
+                &job,
+                &out,
+                |src, img| video::decorate(&source, src, img, &items, &events, &edit, true),
+                |f| {
+                    p.store((f * 1000.0) as u32, Ordering::Relaxed);
+                    true
+                },
+            );
+            if delete_after {
+                rec.delete_files();
+            }
             if let Ok(mut slot) = r.lock() {
                 *slot = Some(res.map(|size| (out, size)));
             }

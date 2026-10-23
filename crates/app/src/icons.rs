@@ -40,6 +40,9 @@ pub enum Icon {
     Play,
     Stop,
     Restart,
+    StepBack,
+    StepForward,
+    Export,
 }
 
 const FG: Color32 = Color32::from_rgb(214, 218, 226);
@@ -229,6 +232,19 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             }).collect();
             p.add(Shape::line(pts, s));
             p.add(poly(&[(0.95, 0.05), (0.95, 0.42), (0.6, 0.3)]));
+        }
+        Icon::StepBack => {
+            p.rect_filled(rect(0.08, 0.1, 0.24, 0.9), 1.0, c);
+            p.add(poly(&[(0.92, 0.1), (0.92, 0.9), (0.3, 0.5)]));
+        }
+        Icon::StepForward => {
+            p.rect_filled(rect(0.76, 0.1, 0.92, 0.9), 1.0, c);
+            p.add(poly(&[(0.08, 0.1), (0.08, 0.9), (0.7, 0.5)]));
+        }
+        Icon::Export => {
+            p.add(line(&[(0.05, 0.55), (0.05, 0.95), (0.95, 0.95), (0.95, 0.55)]));
+            p.add(line(&[(0.5, 0.7), (0.5, 0.05)]));
+            p.add(line(&[(0.25, 0.3), (0.5, 0.05), (0.75, 0.3)]));
         }
         Icon::Shadow => {
             p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, Color32::from_black_alpha(200));

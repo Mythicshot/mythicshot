@@ -63,3 +63,38 @@ fn effects_on_annotated_image() {
     d.apply(effects::drop_shadow);
     check("torn_edge_shadow", &d.flatten());
 }
+
+fn overlay_events() -> Vec<mythicshot_editor::overlays::InputEvent> {
+    use mythicshot_editor::overlays::{InputEvent, InputKind, MouseButton};
+    let k = |t: u64, name: &str, down: bool| InputEvent { t_ms: t, kind: if down { InputKind::KeyDown(name.into()) } else { InputKind::KeyUp(name.into()) } };
+    vec![
+        k(100, "Ctrl", true),
+        k(120, "Shift", true),
+        k(200, "S", true),
+        k(260, "S", false),
+        k(400, "S", true),
+        k(1000, "S", false),
+        InputEvent { t_ms: 700, kind: InputKind::MouseDown(MouseButton::Left, 320, 160) },
+        InputEvent { t_ms: 950, kind: InputKind::MouseUp(MouseButton::Left, 320, 160) },
+        k(1100, "Shift", false),
+        k(1120, "Ctrl", false),
+    ]
+}
+
+fn with_overlays(style: mythicshot_editor::overlays::OverlayStyle) -> RgbaImage {
+    let mut pm = mythicshot_editor::to_pixmap(&checker(640, 400));
+    mythicshot_editor::overlays::draw_overlays(&mut pm, 850, Some((326, 168)), &overlay_events(), &style);
+    mythicshot_editor::to_rgba_image(&pm)
+}
+
+#[test]
+fn overlays_chips_ripple_mouse() {
+    use mythicshot_editor::overlays::{ClickStyle, KeyStyle, OverlayStyle};
+    check("overlays_chips", &with_overlays(OverlayStyle { keys: KeyStyle::Chips, clicks: ClickStyle::Both, halo: true, pointer: true }));
+}
+
+#[test]
+fn overlays_keyboard() {
+    use mythicshot_editor::overlays::{ClickStyle, KeyStyle, OverlayStyle};
+    check("overlays_keyboard", &with_overlays(OverlayStyle { keys: KeyStyle::Keyboard, clicks: ClickStyle::Ripple, halo: false, pointer: true }));
+}
