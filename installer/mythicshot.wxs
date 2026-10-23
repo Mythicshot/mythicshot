@@ -2,8 +2,11 @@
 <!--
   Mythicshot installer (WiX v5). Per-user: installs to
   %LocalAppData%\Programs\Mythicshot without an admin prompt, adds a Start
-  menu shortcut and an entry in Settings › Apps for uninstalling.
-  Build: wix build installer\mythicshot.wxs -arch x64 -d Version=0.1.0 -d Exe=<path to mythicshot.exe> -o dist\Mythicshot-0.1.0-x64.msi
+  menu shortcut and an entry in Settings › Apps for uninstalling. The wizard
+  (ui.wxs) can also start Mythicshot at sign-in and run it when setup ends.
+  Build, from installer\:
+  wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=<path to mythicshot.exe> -o ..\dist\Mythicshot-0.1.0-x64.msi
+  Silent install without start at sign-in: msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Mythicshot"
@@ -14,14 +17,24 @@
            Compressed="yes">
     <SummaryInformation Description="Mythicshot - screenshots and GIF recordings" />
 
-    <!-- Installing a newer version replaces the old one. -->
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
+    <!-- Installing this or a newer version replaces the old one. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="MythicshotIcon" SourceFile="..\assets\mythicshot.ico" />
     <Property Id="ARPPRODUCTICON" Value="MythicshotIcon" />
     <Property Id="ARPHELPLINK" Value="https://www.gnu.org/licenses/agpl-3.0.html" />
     <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- Wizard options, both on by default. A cleared checkbox deletes its property. -->
+    <Property Id="AUTOSTART" Value="1" Secure="yes" />
+    <Property Id="LAUNCHAPP" Value="1" Secure="yes" />
+
+    <UIRef Id="MythicshotUI" />
+    <WixVariable Id="WixUIBannerBmp" Value="images/banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="images/dialog.bmp" />
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="Mythicshot is installed. Find it in the Start menu; while it runs it sits in the notification area. Press PrtSc to take a screenshot." Before="CostFinalize" Sequence="ui" Condition="NOT Installed" />
+    <CustomAction Id="LaunchApplication" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]mythicshot.exe&quot;" Return="asyncNoWait" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsDir" Name="Programs">
@@ -48,6 +61,11 @@
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="MythicshotIcon" />
         <RegistryValue Root="HKCU" Key="Software\Mythicshot" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <!-- The same Run entry the app's "Start Mythicshot when I sign in" setting writes, so either can turn it off. -->
+      <Component Id="Autostart" Guid="C7F2AE15-D64E-43CF-B660-586F0DFB8F72" Condition="AUTOSTART = 1">
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Mythicshot" Type="string" Value="&quot;[INSTALLFOLDER]mythicshot.exe&quot;" />
+        <RegistryValue Root="HKCU" Key="Software\Mythicshot" Name="AutostartAtInstall" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

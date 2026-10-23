@@ -28,15 +28,17 @@ On Linux, install the development packages listed in `.github/workflows/ci.yml` 
 
 ### Windows installer
 
-The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. It needs WiX 5 as a .NET tool (`dotnet tool install --global wix --version 5.0.2`):
+The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. The wizard has two options, both on by default: start Mythicshot when you sign in (the same setting as Settings › General) and run it when setup finishes. For a silent install without start at sign-in: `msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0`.
+
+It needs WiX 5 as a .NET tool and its UI extension (`dotnet tool install --global wix --version 5.0.2`, then `wix extension add -g WixToolset.UI.wixext/5.0.2`):
 
 ```sh
 cargo build --release -p mythicshot
 cd installer
-wix build mythicshot.wxs -arch x64 -d Version=0.1.0 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.0-x64.msi
+wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.0-x64.msi
 ```
 
-The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
+The wizard's banner images come from `installer/make_images.py`. The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
 
 ## Layout
 
