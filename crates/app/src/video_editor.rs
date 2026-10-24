@@ -91,6 +91,13 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
         Shape::Highlight(_) => "Highlight".into(),
         Shape::Obfuscate { .. } => "Obfuscate".into(),
         Shape::Image { image, .. } => format!("Image {}×{}", image.width(), image.height()),
+        Shape::Circle(_) => "Circle".into(),
+        Shape::Group(_) => "Group".into(),
+        Shape::Cone(..) => "Cone".into(),
+        Shape::Donut(_) => "Donut".into(),
+        Shape::Slice(..) => "Pizza slice".into(),
+        Shape::Cross(_) => "Cross".into(),
+        Shape::Asterisk(_) => "Asterisk".into(),
     }
 }
 

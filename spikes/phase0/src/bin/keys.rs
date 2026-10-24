@@ -3,7 +3,7 @@
 //! `keys F13 wait:800 Space Enter` presses F13, waits 800 ms, then Space and Enter.
 //! `click:983,380` moves the mouse there and left-clicks; `rclick:` right-clicks;
 //! `drag:x1,y1,x2,y2` drags with the left button.
-//! Supported keys: F13–F16, Space, Enter, Escape, and `ctrl+<letter>` such as `ctrl+c`.
+//! Supported keys: F13–F16, Space, Enter, Escape, `key:<letter>` and `ctrl+<letter>` such as `ctrl+c`.
 
 use std::thread;
 use std::time::Duration;
@@ -56,6 +56,29 @@ fn main() {
                 simulate(&ev).expect("key");
                 thread::sleep(Duration::from_millis(40));
             }
+            thread::sleep(Duration::from_millis(120));
+            continue;
+        }
+        if let Some(letter) = arg.strip_prefix("key:") {
+            let key = match letter {
+                "a" => Key::KeyA,
+                "c" => Key::KeyC,
+                "d" => Key::KeyD,
+                "e" => Key::KeyE,
+                "f" => Key::KeyF,
+                "g" => Key::KeyG,
+                "l" => Key::KeyL,
+                "o" => Key::KeyO,
+                "r" => Key::KeyR,
+                "u" => Key::KeyU,
+                "v" => Key::KeyV,
+                "w" => Key::KeyW,
+                "z" => Key::KeyZ,
+                other => panic!("unsupported key {other}"),
+            };
+            simulate(&EventType::KeyPress(key)).expect("press");
+            thread::sleep(Duration::from_millis(30));
+            simulate(&EventType::KeyRelease(key)).expect("release");
             thread::sleep(Duration::from_millis(120));
             continue;
         }

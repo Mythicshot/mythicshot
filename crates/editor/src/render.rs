@@ -5,7 +5,7 @@ use image::RgbaImage;
 use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Rect, Stroke, Transform};
 
 use crate::text::{draw_lines, line_height_px, wrap_text};
-use crate::{Bounds, Item, ObfuscateMode, Pt, Rgba, Shape, Style, measure_text, step_radius};
+use crate::{Bounds, Item, ObfuscateMode, Pt, Rgba, Shape, Style, cone_points, measure_text, slice_points, step_radius};
 
 const SHADOW_OFFSET: f32 = 3.0;
 const SHADOW_BLUR: usize = 3;
@@ -139,8 +139,101 @@ fn draw_shape(pm: &mut Pixmap, shape: &Shape, st: &Style, mono: Option<Rgba>, t:
                 }
             }
         }
+        Shape::Circle(b) => {
+            let (c, r) = circle_in(b);
+            if let Some(path) = PathBuilder::from_circle(c.x, c.y, r) {
+                fill_and_stroke(pm, &path, st, mono, &s, t);
+            }
+        }
+        Shape::Donut(b) => {
+            let (c, r) = circle_in(b);
+            let mut pb = PathBuilder::new();
+            pb.push_circle(c.x, c.y, r);
+            pb.push_circle(c.x, c.y, r * DONUT_HOLE);
+            if let Some(path) = pb.finish() {
+                if let Some(f) = st.fill {
+                    pm.fill_path(&path, &paint(col(f)), FillRule::EvenOdd, t, None);
+                }
+                pm.stroke_path(&path, &line, &s, t, None);
+            }
+        }
+        Shape::Group(b) => {
+            if let Some(r) = rect_of(b) {
+                let path = PathBuilder::from_rect(r);
+                if let Some(f) = st.fill {
+                    pm.fill_path(&path, &paint(col(f)), FillRule::Winding, t, None);
+                }
+                let dash = st.width.max(1.0) * 3.0;
+                let dashed = Stroke { dash: tiny_skia::StrokeDash::new(vec![dash, dash * 0.7], 0.0), line_cap: LineCap::Butt, ..s.clone() };
+                pm.stroke_path(&path, &line, &dashed, t, None);
+            }
+        }
+        Shape::Cross(b) => {
+            let n = b.norm();
+            let (w, h) = (n.width(), n.height());
+            // An X with arms of even width, as one outline.
+            const D: f32 = 0.1;
+            let unit = [(0.0, D), (D, 0.0), (0.5, 0.5 - D), (1.0 - D, 0.0), (1.0, D), (0.5 + D, 0.5), (1.0, 1.0 - D), (1.0 - D, 1.0), (0.5, 0.5 + D), (D, 1.0), (0.0, 1.0 - D), (0.5 - D, 0.5)];
+            let ps: Vec<Pt> = unit.iter().map(|(x, y)| Pt { x: n.x0 + x * w, y: n.y0 + y * h }).collect();
+            if let Some(path) = polygon(&ps) {
+                fill_and_stroke(pm, &path, st, mono, &s, t);
+            }
+        }
+        Shape::Asterisk(b) => {
+            let n = b.norm();
+            let (cx, cy) = ((n.x0 + n.x1) / 2.0, (n.y0 + n.y1) / 2.0);
+            let (hw, hh) = (n.width() / 2.0, n.height() / 2.0);
+            let bar = Stroke { width: (n.width().min(n.height()) * 0.11).max(st.width), line_cap: LineCap::Butt, ..Default::default() };
+            let mut pb = PathBuilder::new();
+            for (dx, dy) in [(hw, 0.0), (0.0, hh), (hw * 0.78, hh * 0.78), (hw * 0.78, -hh * 0.78)] {
+                pb.move_to(cx - dx, cy - dy);
+                pb.line_to(cx + dx, cy + dy);
+            }
+            if let Some(path) = pb.finish() {
+                pm.stroke_path(&path, &line, &bar, t, None);
+            }
+        }
+        Shape::Cone(a, b) => {
+            if let Some(path) = polygon(&cone_points(*a, *b)) {
+                fill_and_stroke(pm, &path, st, mono, &s, t);
+            }
+        }
+        Shape::Slice(a, b) => {
+            if let Some(path) = polygon(&slice_points(*a, *b)) {
+                fill_and_stroke(pm, &path, st, mono, &s, t);
+            }
+        }
         Shape::Highlight(_) | Shape::Obfuscate { .. } => {}
     }
+}
+
+/// How big a donut's hole is, as part of its radius.
+const DONUT_HOLE: f32 = 0.5;
+
+/// The biggest circle centred in `b`.
+fn circle_in(b: &Bounds) -> (Pt, f32) {
+    let n = b.norm();
+    (Pt { x: (n.x0 + n.x1) / 2.0, y: (n.y0 + n.y1) / 2.0 }, (n.width().min(n.height()) / 2.0).max(0.5))
+}
+
+fn polygon(ps: &[Pt]) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    let first = ps.first()?;
+    pb.move_to(first.x, first.y);
+    for p in &ps[1..] {
+        pb.line_to(p.x, p.y);
+    }
+    pb.close();
+    pb.finish()
+}
+
+/// The fill colour if the style has one, then the outline.
+fn fill_and_stroke(pm: &mut Pixmap, path: &Path, st: &Style, mono: Option<Rgba>, s: &Stroke, t: Transform) {
+    let col = |c: Rgba| mono.unwrap_or(c);
+    if let Some(f) = st.fill {
+        pm.fill_path(path, &paint(col(f)), FillRule::Winding, t, None);
+    }
+    pm.stroke_path(path, &paint(col(st.stroke)), s, t, None);
 }
 
 fn polyline(ps: &[Pt]) -> Option<Path> {

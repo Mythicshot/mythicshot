@@ -136,6 +136,54 @@ pub enum Shape {
     Obfuscate { rect: Bounds, mode: ObfuscateMode },
     /// A picture stretched to fill `rect`.
     Image { rect: Bounds, image: ImageData },
+    /// Mockup shapes. The circle and donut are round, centred in their box.
+    Circle(Bounds),
+    /// A dashed outline around an area.
+    Group(Bounds),
+    Donut(Bounds),
+    Cross(Bounds),
+    Asterisk(Bounds),
+    /// A triangle from its point to the middle of its wide end.
+    Cone(Pt, Pt),
+    /// A cone whose wide end is an arc, like a slice of pizza.
+    Slice(Pt, Pt),
+}
+
+/// How wide cones and slices open, in degrees.
+pub const CONE_SPREAD_DEG: f32 = 45.0;
+
+/// A cone's corners: the point, then the two ends of its wide side.
+pub fn cone_points(apex: Pt, tip: Pt) -> [Pt; 3] {
+    let (dx, dy) = (tip.x - apex.x, tip.y - apex.y);
+    let half = (CONE_SPREAD_DEG / 2.0).to_radians().tan();
+    let (px, py) = (-dy * half, dx * half);
+    [apex, pt(tip.x + px, tip.y + py), pt(tip.x - px, tip.y - py)]
+}
+
+/// A slice's outline: the point, then points along its arc.
+pub fn slice_points(apex: Pt, tip: Pt) -> Vec<Pt> {
+    let (dx, dy) = (tip.x - apex.x, tip.y - apex.y);
+    let r = (dx * dx + dy * dy).sqrt();
+    let mid = dy.atan2(dx);
+    let half = (CONE_SPREAD_DEG / 2.0).to_radians();
+    const STEPS: usize = 24;
+    let mut v = vec![apex];
+    for i in 0..=STEPS {
+        let a = mid - half + 2.0 * half * i as f32 / STEPS as f32;
+        v.push(pt(apex.x + r * a.cos(), apex.y + r * a.sin()));
+    }
+    v
+}
+
+fn points_bounds(ps: &[Pt]) -> Bounds {
+    let mut b = Bounds { x0: f32::MAX, y0: f32::MAX, x1: f32::MIN, y1: f32::MIN };
+    for p in ps {
+        b.x0 = b.x0.min(p.x);
+        b.y0 = b.y0.min(p.y);
+        b.x1 = b.x1.max(p.x);
+        b.y1 = b.y1.max(p.y);
+    }
+    b
 }
 
 impl Shape {
@@ -146,7 +194,8 @@ impl Shape {
         };
         match self {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => *b = b.translate(dx, dy),
-            Shape::Line(a, b) | Shape::Arrow(a, b) => {
+            Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => *b = b.translate(dx, dy),
+            Shape::Line(a, b) | Shape::Arrow(a, b) | Shape::Cone(a, b) | Shape::Slice(a, b) => {
                 mv(a);
                 mv(b);
             }
@@ -164,6 +213,7 @@ impl Shape {
     pub fn rect(&self) -> Option<Bounds> {
         match self {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => Some(*b),
+            Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => Some(*b),
             _ => None,
         }
     }
@@ -171,6 +221,7 @@ impl Shape {
     pub fn set_rect(&mut self, nb: Bounds) {
         match self {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => *b = nb,
+            Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => *b = nb,
             _ => {}
         }
     }
@@ -220,7 +271,10 @@ impl Item {
         let pad = self.style.width / 2.0;
         match &self.shape {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => b.norm(),
+            Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => b.norm(),
             Shape::Line(a, b) | Shape::Arrow(a, b) => Bounds::new(*a, *b).norm(),
+            Shape::Cone(a, b) => points_bounds(&cone_points(*a, *b)),
+            Shape::Slice(a, b) => points_bounds(&slice_points(*a, *b)),
             Shape::Freehand(ps) => {
                 let mut b = Bounds { x0: f32::MAX, y0: f32::MAX, x1: f32::MIN, y1: f32::MIN };
                 for p in ps {
@@ -495,6 +549,40 @@ mod tests {
         assert!(matches!(d.items()[0].shape, Shape::Step { center: Pt { x: 30.0, y: 30.0 }, .. }));
         d.undo();
         assert_eq!((d.width(), d.height()), (100, 80));
+    }
+
+    #[test]
+    fn mockup_shapes_draw_and_move() {
+        let b = Bounds { x0: 10.0, y0: 10.0, x1: 90.0, y1: 70.0 };
+        let fill = Some(Rgba([229, 72, 77, 110]));
+        let shapes = [
+            Shape::Circle(b),
+            Shape::Group(b),
+            Shape::Donut(b),
+            Shape::Cross(b),
+            Shape::Asterisk(b),
+            Shape::Cone(pt(10.0, 40.0), pt(90.0, 40.0)),
+            Shape::Slice(pt(10.0, 40.0), pt(90.0, 40.0)),
+        ];
+        for shape in shapes {
+            let it = Item { id: 1, shape: shape.clone(), style: Style { stroke: Rgba::WHITE, fill, shadow: false, ..Style::default() }, frames: None };
+            let mut pm = Pixmap::new(100, 80).unwrap();
+            render_items_onto(&mut pm, std::slice::from_ref(&it));
+            let painted = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
+            assert!(painted > 200, "{shape:?} painted {painted} pixels");
+            // Moving shifts the area it covers by the same amount.
+            let mut moved = it.clone();
+            moved.shape.translate(5.0, 3.0);
+            let (a, m) = (it.bounds(), moved.bounds());
+            assert!((m.x0 - a.x0 - 5.0).abs() < 0.01 && (m.y0 - a.y0 - 3.0).abs() < 0.01, "{shape:?}");
+        }
+        // A cone 80 long opens 45°: its wide end is 2 × 80 × tan 22.5° ≈ 66.3 across.
+        let [_, l, r] = cone_points(pt(0.0, 0.0), pt(80.0, 0.0));
+        assert!(((l.y - r.y).abs() - 66.27).abs() < 0.05);
+        // The donut has a hole: its middle stays clear.
+        let mut pm = Pixmap::new(100, 80).unwrap();
+        render_items_onto(&mut pm, &[Item { id: 1, shape: Shape::Donut(b), style: Style { fill, ..Style::default() }, frames: None }]);
+        assert_eq!(pm.pixel(50, 40).unwrap().alpha(), 0);
     }
 
     #[test]

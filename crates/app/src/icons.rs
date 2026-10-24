@@ -12,6 +12,13 @@ pub enum Icon {
     Line,
     Arrow,
     Freehand,
+    Circle,
+    Group,
+    Cone,
+    Donut,
+    Slice,
+    Cross,
+    Asterisk,
     Text,
     Bubble,
     Step,
@@ -92,6 +99,43 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         }
         Icon::Rect => {
             p.rect_stroke(rect(0.05, 0.18, 0.95, 0.82), 1.5, s, StrokeKind::Middle);
+        }
+        Icon::Circle => {
+            p.circle_stroke(r.center(), r.width() * 0.42, s);
+        }
+        Icon::Donut => {
+            p.circle_stroke(r.center(), r.width() * 0.44, s);
+            p.circle_stroke(r.center(), r.width() * 0.2, thin);
+        }
+        Icon::Group => {
+            let pts = vec![at(0.06, 0.12), at(0.94, 0.12), at(0.94, 0.88), at(0.06, 0.88), at(0.06, 0.12)];
+            p.extend(Shape::dashed_line(&pts, thin, r.width() * 0.14, r.width() * 0.09));
+            p.circle_filled(at(0.36, 0.42), r.width() * 0.09, c);
+            p.circle_filled(at(0.64, 0.42), r.width() * 0.09, c);
+            p.add(line(&[(0.24, 0.72), (0.36, 0.6), (0.48, 0.72)]));
+            p.add(line(&[(0.52, 0.72), (0.64, 0.6), (0.76, 0.72)]));
+        }
+        Icon::Cone => {
+            p.add(Shape::closed_line(vec![at(0.08, 0.5), at(0.92, 0.12), at(0.92, 0.88)], s));
+        }
+        Icon::Slice => {
+            let apex = at(0.12, 0.88);
+            let mut pts = vec![apex];
+            for i in 0..=8 {
+                let a = (-80.0f32 + 70.0 * i as f32 / 8.0).to_radians();
+                pts.push(pos2(apex.x + r.width() * 0.86 * a.cos(), apex.y + r.height() * 0.86 * a.sin()));
+            }
+            p.add(Shape::closed_line(pts, s));
+        }
+        Icon::Cross => {
+            let d = 0.13;
+            let u = [(0.0, d), (d, 0.0), (0.5, 0.5 - d), (1.0 - d, 0.0), (1.0, d), (0.5 + d, 0.5), (1.0, 1.0 - d), (1.0 - d, 1.0), (0.5, 0.5 + d), (d, 1.0), (0.0, 1.0 - d), (0.5 - d, 0.5)];
+            p.add(Shape::closed_line(u.iter().map(|(x, y)| at(0.08 + x * 0.84, 0.08 + y * 0.84)).collect(), thin));
+        }
+        Icon::Asterisk => {
+            for (x0, y0, x1, y1) in [(0.08, 0.5, 0.92, 0.5), (0.5, 0.08, 0.5, 0.92), (0.2, 0.2, 0.8, 0.8), (0.2, 0.8, 0.8, 0.2)] {
+                p.add(line(&[(x0, y0), (x1, y1)]));
+            }
         }
         Icon::Ellipse => {
             p.add(Shape::ellipse_stroke(r.center(), vec2(r.width() * 0.46, r.height() * 0.34), s));

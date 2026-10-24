@@ -23,7 +23,16 @@ const HANDLE: f32 = 8.0;
 const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
 /// Toolbar icon button size and tool rail width.
 const ICON: f32 = 28.0;
-const RAIL: f32 = 44.0;
+const RAIL: f32 = 84.0;
+/// A tool button on the rail.
+const TOOL_BUTTON: f32 = 36.0;
+/// The rail's sections, like a mockup palette; `None` has no heading.
+const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
+    (None, &[Tool::Select]),
+    (Some("DRAW"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
+    (Some("SHAPES"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
+    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Crop]),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -33,6 +42,13 @@ pub enum Tool {
     Line,
     Arrow,
     Freehand,
+    Circle,
+    Group,
+    Cone,
+    Donut,
+    Slice,
+    Cross,
+    Asterisk,
     Text,
     Bubble,
     Step,
@@ -51,6 +67,13 @@ impl Tool {
             Tool::Line => "line",
             Tool::Arrow => "arrow",
             Tool::Freehand => "freehand",
+            Tool::Circle => "circle",
+            Tool::Group => "group",
+            Tool::Cone => "cone",
+            Tool::Donut => "donut",
+            Tool::Slice => "slice",
+            Tool::Cross => "cross",
+            Tool::Asterisk => "asterisk",
             Tool::Text => "text",
             Tool::Bubble => "bubble",
             Tool::Step => "step",
@@ -72,6 +95,13 @@ impl Tool {
             Shape::Line(..) => Tool::Line,
             Shape::Arrow(..) => Tool::Arrow,
             Shape::Freehand(_) => Tool::Freehand,
+            Shape::Circle(_) => Tool::Circle,
+            Shape::Group(_) => Tool::Group,
+            Shape::Cone(..) => Tool::Cone,
+            Shape::Donut(_) => Tool::Donut,
+            Shape::Slice(..) => Tool::Slice,
+            Shape::Cross(_) => Tool::Cross,
+            Shape::Asterisk(_) => Tool::Asterisk,
             Shape::Text { .. } => Tool::Text,
             Shape::Bubble { .. } => Tool::Bubble,
             Shape::Step { .. } => Tool::Step,
@@ -82,13 +112,20 @@ impl Tool {
         }
     }
 
-    const ALL: [Tool; 12] = [
+    const ALL: [Tool; 19] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
         Tool::Line,
         Tool::Arrow,
         Tool::Freehand,
+        Tool::Circle,
+        Tool::Group,
+        Tool::Cone,
+        Tool::Donut,
+        Tool::Slice,
+        Tool::Cross,
+        Tool::Asterisk,
         Tool::Text,
         Tool::Bubble,
         Tool::Step,
@@ -105,6 +142,13 @@ impl Tool {
             Tool::Line => Icon::Line,
             Tool::Arrow => Icon::Arrow,
             Tool::Freehand => Icon::Freehand,
+            Tool::Circle => Icon::Circle,
+            Tool::Group => Icon::Group,
+            Tool::Cone => Icon::Cone,
+            Tool::Donut => Icon::Donut,
+            Tool::Slice => Icon::Slice,
+            Tool::Cross => Icon::Cross,
+            Tool::Asterisk => Icon::Asterisk,
             Tool::Text => Icon::Text,
             Tool::Bubble => Icon::Bubble,
             Tool::Step => Icon::Step,
@@ -122,6 +166,13 @@ impl Tool {
             Tool::Line => EditorAction::Line,
             Tool::Arrow => EditorAction::Arrow,
             Tool::Freehand => EditorAction::Freehand,
+            Tool::Circle => EditorAction::Circle,
+            Tool::Group => EditorAction::Group,
+            Tool::Cone => EditorAction::Cone,
+            Tool::Donut => EditorAction::Donut,
+            Tool::Slice => EditorAction::Slice,
+            Tool::Cross => EditorAction::Cross,
+            Tool::Asterisk => EditorAction::Asterisk,
             Tool::Text => EditorAction::Text,
             Tool::Bubble => EditorAction::Bubble,
             Tool::Step => EditorAction::Step,
@@ -318,7 +369,7 @@ impl Editor {
             self.style = Style { stroke: Rgba(s.stroke), fill: s.fill.map(Rgba), width: s.width, font_size: s.font_size, shadow: s.shadow };
             self.obfuscate = if s.blur { ObfuscateMode::Blur } else { ObfuscateMode::Pixelate };
         } else if tool != Tool::Select {
-            self.style = Style::default();
+            self.style = default_style(tool);
             self.obfuscate = ObfuscateMode::Pixelate;
         }
     }
@@ -891,19 +942,39 @@ impl Editor {
     /// A narrow column of tool icons, grouped like Greenshot's.
     fn tool_rail(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for tool in Tool::ALL {
-                if matches!(tool, Tool::Rectangle | Tool::Text | Tool::Highlight | Tool::Crop) {
-                    ui.add_space(3.0);
-                    ui.separator();
-                    ui.add_space(3.0);
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                for (title, tools) in RAIL_GROUPS {
+                    if let Some(title) = title {
+                        ui.add_space(4.0);
+                        ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(10.0).strong().color(ACCENT)));
+                    }
+                    for row in tools.chunks(2) {
+                        ui.horizontal(|ui| {
+                            for &tool in row {
+                                self.rail_button(ui, tool);
+                            }
+                        });
+                    }
                 }
-                let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
-                if icons::button(ui, tool.icon(), RAIL - 8.0, self.tool == tool, &tip).clicked() {
-                    self.set_tool(tool);
-                }
-            }
+            });
         });
+    }
+
+    /// A tool button with its key in the corner, like a palette.
+    fn rail_button(&mut self, ui: &mut egui::Ui, tool: Tool) {
+        let binding = self.keys.get(&tool.action()).map(String::as_str).unwrap_or("");
+        let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
+        let resp = icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip);
+        let key = hotkeys::display(binding);
+        if !key.is_empty() && key.chars().count() <= 2 {
+            let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
+            let color = if self.tool == tool { Color32::WHITE } else { Color32::from_rgb(140, 148, 164) };
+            ui.painter().text(corner, egui::Align2::RIGHT_BOTTOM, key, FontId::proportional(9.0), color);
+        }
+        if resp.clicked() {
+            self.set_tool(tool);
+        }
     }
 
     /// Size, last action with its time, and zoom, like Greenshot's status bar.
@@ -1122,10 +1193,10 @@ impl Editor {
                     if let Some(b) = it.shape.rect() {
                         let mut nb = resize_bounds(b.norm(), h, p);
                         // Pictures keep their shape from a corner unless Shift is held.
-                        if let Shape::Image { image, .. } = &it.shape {
-                            if !free {
-                                nb = keep_aspect(nb, h, image.width() as f32 / image.height().max(1) as f32);
-                            }
+                        match &it.shape {
+                            Shape::Image { image, .. } if !free => nb = keep_aspect(nb, h, image.width() as f32 / image.height().max(1) as f32),
+                            Shape::Circle(_) | Shape::Donut(_) => nb = keep_square(nb, h),
+                            _ => {}
                         }
                         it.shape.set_rect(nb);
                     }
@@ -1134,7 +1205,7 @@ impl Editor {
             Some(Drag::Endpoint { id, end }) => {
                 let (id, end) = (*id, *end);
                 self.doc.update(id, |it| {
-                    if let Shape::Line(a, b) | Shape::Arrow(a, b) = &mut it.shape {
+                    if let Shape::Line(a, b) | Shape::Arrow(a, b) | Shape::Cone(a, b) | Shape::Slice(a, b) = &mut it.shape {
                         *(if end == 0 { a } else { b }) = p;
                     }
                 });
@@ -1189,6 +1260,13 @@ impl Editor {
             Tool::Ellipse => Shape::Ellipse(r),
             Tool::Line => Shape::Line(a, b),
             Tool::Arrow => Shape::Arrow(a, b),
+            Tool::Circle => Shape::Circle(square_from(a, b)),
+            Tool::Donut => Shape::Donut(square_from(a, b)),
+            Tool::Group => Shape::Group(r),
+            Tool::Cross => Shape::Cross(r),
+            Tool::Asterisk => Shape::Asterisk(r),
+            Tool::Cone => Shape::Cone(a, b),
+            Tool::Slice => Shape::Slice(a, b),
             Tool::Highlight => Shape::Highlight(r),
             Tool::Obfuscate => Shape::Obfuscate { rect: r, mode: self.obfuscate },
             Tool::Bubble => Shape::Bubble { rect: r, tail: pt(r.x0 + r.width() * 0.25, r.y1 + (r.height() * 0.5).max(30.0)), text: String::new() },
@@ -1440,7 +1518,7 @@ enum HandleKind {
 /// Handle positions: eight around a box, two on a line, plus a bubble's tail.
 fn handles(it: &Item) -> Vec<(Pt, HandleKind)> {
     match &it.shape {
-        Shape::Line(a, b) | Shape::Arrow(a, b) => vec![(*a, HandleKind::End(0)), (*b, HandleKind::End(1))],
+        Shape::Line(a, b) | Shape::Arrow(a, b) | Shape::Cone(a, b) | Shape::Slice(a, b) => vec![(*a, HandleKind::End(0)), (*b, HandleKind::End(1))],
         shape => {
             let Some(b) = shape.rect().map(|b| b.norm()) else { return Vec::new() };
             let (mx, my) = ((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0);
@@ -1474,6 +1552,24 @@ fn resize_bounds(mut b: Bounds, handle: usize, p: Pt) -> Bounds {
     b
 }
 
+/// A square from `a` towards `b`, as big as the longer side of the drag.
+fn square_from(a: Pt, b: Pt) -> Bounds {
+    let side = (b.x - a.x).abs().max((b.y - a.y).abs());
+    Bounds::new(a, pt(a.x + side.copysign(b.x - a.x), a.y + side.copysign(b.y - a.y))).norm()
+}
+
+/// Keep `b` square after `handle` moved: corners keep the shape, and a side
+/// handle sets both sides.
+fn keep_square(b: Bounds, handle: usize) -> Bounds {
+    let mut out = keep_aspect(b, handle, 1.0);
+    match handle {
+        1 | 5 => out.x1 = out.x0 + (out.y1 - out.y0).abs(),
+        3 | 7 => out.y1 = out.y0 + (out.x1 - out.x0).abs(),
+        _ => {}
+    }
+    out
+}
+
 /// For a corner handle, grow the smaller side so `b` has the width/height
 /// ratio `aspect`, keeping the opposite corner where it is.
 fn keep_aspect(b: Bounds, handle: usize, aspect: f32) -> Bounds {
@@ -1498,6 +1594,18 @@ fn keep_aspect(b: Bounds, handle: usize, aspect: f32) -> Bounds {
     out
 }
 
+/// What a tool draws with before the user picks colours: the mockup shapes
+/// get a white outline over a see-through fill, the asterisk is solid white.
+fn default_style(tool: Tool) -> Style {
+    match tool {
+        Tool::Circle | Tool::Group | Tool::Cone | Tool::Donut | Tool::Slice | Tool::Cross => {
+            Style { stroke: Rgba::WHITE, fill: Some(Rgba([229, 72, 77, 110])), shadow: false, ..Style::default() }
+        }
+        Tool::Asterisk => Style { stroke: Rgba::WHITE, shadow: false, ..Style::default() },
+        _ => Style::default(),
+    }
+}
+
 fn tool_hint(tool: Tool) -> &'static str {
     match tool {
         Tool::Select => "Click an item to select it. Drag to move, drag a handle to resize, double-click text to edit.",
@@ -1508,6 +1616,13 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Obfuscate => "Drag over anything private to pixelate or blur it.",
         Tool::Highlight => "Drag over text to highlight it.",
         Tool::Freehand => "Draw with the mouse held down.",
+        Tool::Circle => "Drag out a circle. It stays round.",
+        Tool::Group => "Drag around an area to mark it as a group.",
+        Tool::Cone => "Drag from the point of the cone to its wide end.",
+        Tool::Donut => "Drag out a ring. It stays round.",
+        Tool::Slice => "Drag from the point of the slice to the middle of its curved edge.",
+        Tool::Cross => "Drag over something to cross it out.",
+        Tool::Asterisk => "Drag out an asterisk.",
         _ => "Drag on the image to draw.",
     }
 }

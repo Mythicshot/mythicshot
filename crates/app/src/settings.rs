@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::hotkeys::{Action, EditorAction};
 
+/// Bumped when default editor keys change in a way old files need moving.
+const EDITOR_KEYS_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -40,6 +43,10 @@ pub struct Settings {
     pub editor_keys: BTreeMap<EditorAction, String>,
     /// What the editor remembers between captures.
     pub editor: EditorPrefs,
+    /// Which default editor keys this file has seen; see [`Settings::upgrade`].
+    /// Files from before it existed read as 0, not as today's defaults.
+    #[serde(default)]
+    pub editor_keys_version: u32,
 
     // Phase 1–2 options, read once to fill `destinations`, never written.
     #[serde(skip_serializing)]
@@ -111,6 +118,7 @@ impl Default for Settings {
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor: EditorPrefs::default(),
+            editor_keys_version: EDITOR_KEYS_VERSION,
             open_editor: None,
             save_to_file: None,
             copy_to_clipboard: None,
@@ -133,7 +141,12 @@ impl Settings {
 
     pub fn load() -> Self {
         let parsed: Option<Settings> = std::fs::read_to_string(Self::path()).ok().and_then(|text| toml::from_str(&text).ok());
-        let mut s = parsed.unwrap_or_default();
+        parsed.unwrap_or_default().upgrade()
+    }
+
+    /// Bring a file written by an older version up to date.
+    fn upgrade(self) -> Self {
+        let mut s = self;
         // Before recording existed, Shift+PrtSc was the default for last region.
         // Files from then get it moved to Record region, the new default.
         if !s.hotkeys.contains_key(&Action::RecordRegion) && s.binding(Action::CaptureLastRegion).eq_ignore_ascii_case("shift+PrintScreen") {
@@ -145,6 +158,16 @@ impl Settings {
         for a in Action::ALL {
             s.hotkeys.entry(*a).or_insert_with(|| a.default_binding().to_string());
         }
+        // Version 1 gave F to the asterisk and C to the cone: the pen moved to W
+        // and crop to K. Keys still on the old default move; rebound ones stay.
+        if s.editor_keys_version < 1 {
+            for (a, old) in [(EditorAction::Freehand, "KeyF"), (EditorAction::Crop, "KeyC")] {
+                if s.editor_keys.get(&a).is_some_and(|b| b == old) {
+                    s.editor_keys.insert(a, a.default_binding().to_string());
+                }
+            }
+        }
+        s.editor_keys_version = EDITOR_KEYS_VERSION;
         for a in EditorAction::ALL {
             s.editor_keys.entry(*a).or_insert_with(|| a.default_binding().to_string());
         }
@@ -224,6 +247,32 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pen_and_crop_move_off_f_and_c_unless_rebound() {
+        // An older file: pen and crop on their old defaults, select rebound.
+        let old: Settings = toml::from_str("[editor_keys]
+freehand = \"KeyF\"
+crop = \"KeyC\"
+select = \"KeyQ\"
+").unwrap();
+        assert_eq!(old.editor_keys_version, 0);
+        let s = old.upgrade();
+        assert_eq!(s.editor_binding(EditorAction::Freehand), "KeyW");
+        assert_eq!(s.editor_binding(EditorAction::Crop), "KeyK");
+        assert_eq!(s.editor_binding(EditorAction::Select), "KeyQ");
+        assert_eq!(s.editor_binding(EditorAction::Asterisk), "KeyF");
+        assert_eq!(s.editor_binding(EditorAction::Cone), "KeyC");
+        // Someone who moved crop to X keeps it, and a second load changes nothing.
+        let mine: Settings = toml::from_str("[editor_keys]
+freehand = \"KeyP\"
+crop = \"KeyX\"
+").unwrap();
+        let s = mine.upgrade();
+        assert_eq!((s.editor_binding(EditorAction::Freehand), s.editor_binding(EditorAction::Crop)), ("KeyP", "KeyX"));
+        let again: Settings = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(again.editor_keys_version, EDITOR_KEYS_VERSION);
+    }
 
     #[test]
     fn old_files_migrate_to_destinations() {
