@@ -94,6 +94,9 @@ pub enum EditorAction {
     Redo,
     Delete,
     Copy,
+    Cut,
+    Paste,
+    Duplicate,
     Save,
 }
 
@@ -115,6 +118,9 @@ impl EditorAction {
         EditorAction::Redo,
         EditorAction::Delete,
         EditorAction::Copy,
+        EditorAction::Cut,
+        EditorAction::Paste,
+        EditorAction::Duplicate,
         EditorAction::Save,
     ];
 
@@ -135,7 +141,10 @@ impl EditorAction {
             EditorAction::Undo => "Undo",
             EditorAction::Redo => "Redo",
             EditorAction::Delete => "Delete selected",
-            EditorAction::Copy => "Copy image",
+            EditorAction::Copy => "Copy the selected annotation, or the image",
+            EditorAction::Cut => "Cut the selected annotation",
+            EditorAction::Paste => "Paste an annotation",
+            EditorAction::Duplicate => "Duplicate the selected annotation",
             EditorAction::Save => "Save",
         }
     }
@@ -158,6 +167,9 @@ impl EditorAction {
             EditorAction::Redo => "control+KeyY",
             EditorAction::Delete => "Delete",
             EditorAction::Copy => "control+KeyC",
+            EditorAction::Cut => "control+KeyX",
+            EditorAction::Paste => "control+KeyV",
+            EditorAction::Duplicate => "control+KeyD",
             EditorAction::Save => "control+KeyS",
         }
     }

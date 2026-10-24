@@ -148,6 +148,17 @@ struct TextEdit {
     focused: bool,
 }
 
+/// An annotation copied with Ctrl+C. `pastes` moves each paste a bit further.
+struct CopiedItem {
+    shape: Shape,
+    style: Style,
+    pastes: u32,
+}
+
+static ITEM_CLIPBOARD: std::sync::Mutex<Option<CopiedItem>> = std::sync::Mutex::new(None);
+/// How far each paste lands from the last, in image pixels.
+const PASTE_OFFSET: f32 = 16.0;
+
 pub struct Editor {
     pub(crate) doc: Document,
     title: String,
@@ -375,6 +386,20 @@ impl Editor {
                     self.doc.remove(id);
                 }
             }
+            EditorAction::Copy if self.selected.is_some() => self.copy_item(),
+            EditorAction::Cut => {
+                if self.selected.is_some() {
+                    self.copy_item();
+                    self.run(EditorAction::Delete);
+                }
+            }
+            EditorAction::Paste => self.paste_item(),
+            EditorAction::Duplicate => {
+                if self.selected.is_some() {
+                    self.copy_item();
+                    self.paste_item();
+                }
+            }
             EditorAction::Copy if self.video.is_some() => self.copy_frame(),
             EditorAction::Save if self.video.is_some() => self.start_export(None),
             EditorAction::Copy => self.copy(),
@@ -404,6 +429,37 @@ impl Editor {
 
     fn copy(&mut self) {
         self.send(DestId::Clipboard);
+    }
+
+    /// Copy the selected annotation to Mythicshot's own clipboard, shared by
+    /// every editor window.
+    fn copy_item(&mut self) {
+        let Some(it) = self.selected.and_then(|id| self.doc.item(id)) else { return };
+        if let Ok(mut c) = ITEM_CLIPBOARD.lock() {
+            *c = Some(CopiedItem { shape: it.shape.clone(), style: it.style, pastes: 0 });
+        }
+        self.notify("Copied the annotation");
+    }
+
+    /// Paste the copied annotation, a little further down and right each time,
+    /// and select it so it can be dragged into place.
+    fn paste_item(&mut self) {
+        let Some((mut shape, style, n)) = ITEM_CLIPBOARD.lock().ok().and_then(|mut c| {
+            c.as_mut().map(|c| {
+                c.pastes += 1;
+                (c.shape.clone(), c.style, c.pastes)
+            })
+        }) else {
+            return;
+        };
+        let step = PASTE_OFFSET * n as f32;
+        shape.translate(step, step);
+        let previous = self.style;
+        self.style = style;
+        let id = self.add_item(shape);
+        self.style = previous;
+        self.set_tool(Tool::Select);
+        self.select(Some(id));
     }
 
     /// Send the flattened image to a destination and report the result here.
@@ -1256,6 +1312,35 @@ mod tests {
     fn editor(prefs: EditorPrefs) -> Editor {
         let s = Settings::default();
         Editor::new(RgbaImage::new(64, 48), "t".into(), BTreeMap::new(), s.dest_context("t"), prefs)
+    }
+
+    #[test]
+    fn copy_paste_duplicate_and_cut_annotations() {
+        let mut ed = editor(EditorPrefs::default());
+        let rect = |x: f32| Shape::Rect(Bounds::new(mythicshot_editor::pt(x, 10.0), mythicshot_editor::pt(x + 20.0, 30.0)));
+        ed.style.stroke = Rgba::YELLOW;
+        let id = ed.add_item(rect(5.0));
+        ed.style.stroke = Rgba::RED;
+        ed.select(Some(id));
+        ed.run(EditorAction::Copy);
+        ed.run(EditorAction::Paste);
+        ed.run(EditorAction::Paste);
+        let items = ed.doc.items();
+        assert_eq!(items.len(), 3);
+        // Each paste keeps the copy's colour and lands a step further.
+        assert!(items.iter().all(|it| it.style.stroke == Rgba::YELLOW));
+        assert_eq!(items[1].shape, { let mut s = rect(5.0); s.translate(16.0, 16.0); s });
+        assert_eq!(items[2].shape, { let mut s = rect(5.0); s.translate(32.0, 32.0); s });
+        // The paste is selected, so Ctrl+D duplicates it.
+        assert_eq!(ed.selected, Some(items[2].id));
+        ed.run(EditorAction::Duplicate);
+        assert_eq!(ed.doc.items().len(), 4);
+        ed.run(EditorAction::Cut);
+        assert_eq!(ed.doc.items().len(), 3);
+        assert_eq!(ed.selected, None);
+        // Undo brings back the cut one.
+        ed.run(EditorAction::Undo);
+        assert_eq!(ed.doc.items().len(), 4);
     }
 
     #[test]
