@@ -90,6 +90,7 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
         Shape::Step { number, .. } => format!("Step {number}"),
         Shape::Highlight(_) => "Highlight".into(),
         Shape::Obfuscate { .. } => "Obfuscate".into(),
+        Shape::Image { image, .. } => format!("Image {}×{}", image.width(), image.height()),
     }
 }
 

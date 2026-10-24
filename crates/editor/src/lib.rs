@@ -88,6 +88,38 @@ pub enum ObfuscateMode {
     Blur,
 }
 
+/// A picture placed on top of the base image, such as a pasted screenshot.
+/// Shared, so copies and undo snapshots don't duplicate the pixels; two are
+/// equal only if they share them.
+#[derive(Clone)]
+pub struct ImageData(pub Arc<Pixmap>);
+
+impl ImageData {
+    pub fn from_rgba(img: &RgbaImage) -> Self {
+        Self(Arc::new(to_pixmap(img)))
+    }
+
+    pub fn width(&self) -> u32 {
+        self.0.width()
+    }
+
+    pub fn height(&self) -> u32 {
+        self.0.height()
+    }
+}
+
+impl PartialEq for ImageData {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ImageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageData({}x{})", self.width(), self.height())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Rect(Bounds),
@@ -102,6 +134,8 @@ pub enum Shape {
     Step { center: Pt, number: u32 },
     Highlight(Bounds),
     Obfuscate { rect: Bounds, mode: ObfuscateMode },
+    /// A picture stretched to fill `rect`.
+    Image { rect: Bounds, image: ImageData },
 }
 
 impl Shape {
@@ -111,7 +145,7 @@ impl Shape {
             p.y += dy;
         };
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } => *b = b.translate(dx, dy),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => *b = b.translate(dx, dy),
             Shape::Line(a, b) | Shape::Arrow(a, b) => {
                 mv(a);
                 mv(b);
@@ -129,14 +163,14 @@ impl Shape {
     /// The rectangle a shape is resized through, if it has one.
     pub fn rect(&self) -> Option<Bounds> {
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } => Some(*b),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => Some(*b),
             _ => None,
         }
     }
 
     pub fn set_rect(&mut self, nb: Bounds) {
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } => *b = nb,
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => *b = nb,
             _ => {}
         }
     }
@@ -185,7 +219,7 @@ impl Item {
     pub fn bounds(&self) -> Bounds {
         let pad = self.style.width / 2.0;
         match &self.shape {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } => b.norm(),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => b.norm(),
             Shape::Line(a, b) | Shape::Arrow(a, b) => Bounds::new(*a, *b).norm(),
             Shape::Freehand(ps) => {
                 let mut b = Bounds { x0: f32::MAX, y0: f32::MAX, x1: f32::MIN, y1: f32::MIN };

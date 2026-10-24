@@ -126,6 +126,19 @@ fn draw_shape(pm: &mut Pixmap, shape: &Shape, st: &Style, mono: Option<Rgba>, t:
             let lh = line_height_px(size);
             draw_lines(pm, &[label], center.x - w / 2.0 + t.tx, center.y - lh / 2.0 + t.ty, size, col(Rgba::WHITE));
         }
+        Shape::Image { rect, image } => {
+            let Some(r) = rect_of(rect) else { return };
+            match mono {
+                // The shadow is the picture's outline.
+                Some(c) => pm.fill_rect(r, &paint(c), t, None),
+                None => {
+                    let (sx, sy) = (r.width() / image.width() as f32, r.height() / image.height() as f32);
+                    let place = t.pre_translate(r.left(), r.top()).pre_scale(sx, sy);
+                    let p = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+                    pm.draw_pixmap(0, 0, image.0.as_ref().as_ref(), &p, place, None);
+                }
+            }
+        }
         Shape::Highlight(_) | Shape::Obfuscate { .. } => {}
     }
 }

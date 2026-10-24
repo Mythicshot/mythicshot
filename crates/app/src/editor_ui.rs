@@ -77,6 +77,8 @@ impl Tool {
             Shape::Step { .. } => Tool::Step,
             Shape::Highlight(_) => Tool::Highlight,
             Shape::Obfuscate { .. } => Tool::Obfuscate,
+            // Pasted pictures have no tool, so no style to remember.
+            Shape::Image { .. } => Tool::Select,
         }
     }
 
@@ -148,11 +150,17 @@ struct TextEdit {
     focused: bool,
 }
 
+/// What a paste brought from the system clipboard.
+enum Pasted {
+    Text(String),
+    Image(RgbaImage),
+}
+
 /// A clipboard shortcut as egui reports it: the letter it stands for and, for a
-/// paste, the text on the system clipboard (empty for an image).
+/// paste, what was on the system clipboard.
 struct ClipboardKey {
     key: Key,
-    pasted: Option<String>,
+    pasted: Option<Pasted>,
 }
 
 /// egui turns Ctrl+C, Ctrl+X and Ctrl+V into Copy, Cut and Paste events and
@@ -166,8 +174,8 @@ fn take_clipboard_keys(ctx: &egui::Context) -> Vec<ClipboardKey> {
             let key = match e {
                 egui::Event::Copy => ClipboardKey { key: Key::C, pasted: None },
                 egui::Event::Cut => ClipboardKey { key: Key::X, pasted: None },
-                egui::Event::Paste(text) => ClipboardKey { key: Key::V, pasted: Some(text.clone()) },
-                egui::Event::PasteImage(_) => ClipboardKey { key: Key::V, pasted: Some(String::new()) },
+                egui::Event::Paste(text) => ClipboardKey { key: Key::V, pasted: Some(Pasted::Text(text.clone())) },
+                egui::Event::PasteImage(img) => ClipboardKey { key: Key::V, pasted: Some(Pasted::Image(color_image_to_rgba(img))) },
                 _ => return true,
             };
             keys.push(key);
@@ -175,6 +183,24 @@ fn take_clipboard_keys(ctx: &egui::Context) -> Vec<ClipboardKey> {
         });
         keys
     })
+}
+
+fn color_image_to_rgba(img: &egui::ColorImage) -> RgbaImage {
+    let [w, h] = img.size;
+    let bytes = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+    RgbaImage::from_raw(w as u32, h as u32, bytes).unwrap_or_default()
+}
+
+/// What is on the system clipboard right now, for the right-click Paste here.
+fn read_clipboard() -> Option<Pasted> {
+    let mut c = arboard::Clipboard::new().ok()?;
+    if let Ok(t) = c.get_text().map(|t| t.replace("\r\n", "\n")) {
+        if !t.trim().is_empty() {
+            return Some(Pasted::Text(t));
+        }
+    }
+    let img = c.get_image().ok()?;
+    RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()).map(Pasted::Image)
 }
 
 /// An annotation copied with Ctrl+C. `marker` is the text put on the system
@@ -220,6 +246,10 @@ pub struct Editor {
     confirm_close: bool,
     /// Where the canvas was right-clicked, for the menu's Paste here.
     menu_at: Option<Pt>,
+    /// Where the pointer is over the picture, for Ctrl+V of text or images.
+    hover: Option<Pt>,
+    /// Shift is held: resize pictures freely.
+    shift: bool,
     /// When the property panel last checkpointed, so one slider drag is one undo step.
     prop_checkpoint: Option<(u64, Instant)>,
     last_canvas: CanvasGeom,
@@ -256,6 +286,8 @@ impl Editor {
             closed: false,
             confirm_close: false,
             menu_at: None,
+            hover: None,
+            shift: false,
             prop_checkpoint: None,
             last_canvas: CanvasGeom { min: pos2(0.0, 0.0), zoom: 1.0 },
             video: None,
@@ -366,6 +398,7 @@ impl Editor {
                 self.closed = true;
             }
         }
+        self.shift = ctx.input(|i| i.modifiers.shift);
         self.video_keys(&ctx);
         self.shortcuts(&ctx);
         self.video_tick(&ctx);
@@ -401,11 +434,13 @@ impl Editor {
             .filter_map(|(a, b)| hotkeys::egui_shortcut(b).map(|(m, k)| (*a, m, k)))
             .collect();
         bound.sort_by_key(|(_, m, _)| std::cmp::Reverse(m.ctrl as u8 + m.alt as u8 + m.shift as u8 + m.mac_cmd as u8));
-        let clipboard_keys = take_clipboard_keys(ctx);
+        let mut clipboard_keys = take_clipboard_keys(ctx);
         for (action, m, k) in bound {
-            let event = clipboard_keys.iter().find(|c| c.key == k && m.ctrl && !m.alt && !m.shift);
-            if let Some(ClipboardKey { pasted: Some(text), .. }) = event.filter(|_| action == EditorAction::Paste) {
-                self.paste_item(Some(text));
+            let event = clipboard_keys.iter().position(|c| c.key == k && m.ctrl && !m.alt && !m.shift);
+            if let Some(i) = event.filter(|_| action == EditorAction::Paste) {
+                if let Some(pasted) = clipboard_keys.swap_remove(i).pasted {
+                    self.paste(pasted, self.hover);
+                }
                 break;
             }
             if event.is_some() || ctx.input_mut(|i| i.consume_key(m, k)) {
@@ -511,7 +546,7 @@ impl Editor {
     fn context_menu(&mut self, ui: &mut egui::Ui) {
         let hint = |ed: &Self, a: EditorAction| hotkeys::display(ed.keys.get(&a).map(String::as_str).unwrap_or(""));
         let item = |ui: &mut egui::Ui, label: &str, shortcut: String| ui.add(egui::Button::new(label).shortcut_text(shortcut)).clicked();
-        let can_paste = ITEM_CLIPBOARD.lock().is_ok_and(|c| c.is_some());
+        let can_paste = ITEM_CLIPBOARD.lock().is_ok_and(|c| c.is_some()) || read_clipboard().is_some();
         if let Some(id) = self.selected {
             if item(ui, "Copy", hint(self, EditorAction::Copy)) {
                 self.copy_item();
@@ -558,11 +593,61 @@ impl Editor {
     /// Paste the copied annotation with its top-left corner where the canvas
     /// was right-clicked.
     fn paste_here(&mut self) {
-        let Some(at) = self.menu_at else { return self.paste_item(None) };
+        match read_clipboard() {
+            Some(pasted) => self.paste(pasted, self.menu_at),
+            // The clipboard can't be read: fall back to Mythicshot's own copy.
+            None => self.paste_annotation_at(self.menu_at),
+        }
+    }
+
+    /// Paste what came from the system clipboard, at `at` (image pixels) if
+    /// given: Mythicshot's own annotation (its marker), text as a text
+    /// annotation, or a picture as an image element.
+    fn paste(&mut self, pasted: Pasted, at: Option<Pt>) {
+        match pasted {
+            Pasted::Text(t) if ITEM_CLIPBOARD.lock().is_ok_and(|c| c.as_ref().is_some_and(|c| c.marker == t)) => {
+                if at.is_some() && at == self.menu_at { self.paste_annotation_at(at) } else { self.paste_item(Some(&t)) }
+            }
+            Pasted::Text(t) if !t.trim().is_empty() => self.paste_text(t.trim_end().to_string(), at),
+            Pasted::Text(_) => {}
+            Pasted::Image(img) => self.paste_image(&img, at),
+        }
+    }
+
+    /// Mythicshot's copied annotation with its top-left corner at `at`.
+    fn paste_annotation_at(&mut self, at: Option<Pt>) {
+        let Some(at) = at else { return self.paste_item(None) };
         let Some((mut shape, style)) = ITEM_CLIPBOARD.lock().ok().and_then(|c| c.as_ref().map(|c| (c.shape.clone(), c.style))) else { return };
         let b = Item { id: 0, shape: shape.clone(), style, frames: None }.bounds().norm();
         shape.translate(at.x - b.x0, at.y - b.y0);
         self.add_copy(shape, style, 0);
+    }
+
+    /// Text from another app becomes a text annotation in the text tool's
+    /// style, starting at `at`, or centred on the picture.
+    fn paste_text(&mut self, text: String, at: Option<Pt>) {
+        let (current, obfuscate) = (self.style, self.obfuscate);
+        self.load_tool_style(Tool::Text);
+        let style = self.style;
+        (self.style, self.obfuscate) = (current, obfuscate);
+        let (w, h) = mythicshot_editor::measure_text(&text, style.font_size);
+        let at = at.unwrap_or(pt((self.doc.width() as f32 - w) / 2.0, (self.doc.height() as f32 - h) / 2.0));
+        self.add_copy(Shape::Text { at, text }, style, 0);
+    }
+
+    /// A picture from the clipboard becomes an image element, shrunk to fit
+    /// inside the picture if it is bigger, starting at `at` or centred.
+    fn paste_image(&mut self, img: &RgbaImage, at: Option<Pt>) {
+        if img.width() == 0 || img.height() == 0 {
+            return;
+        }
+        let (dw, dh) = (self.doc.width() as f32, self.doc.height() as f32);
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        let scale = (dw * 0.9 / iw).min(dh * 0.9 / ih).min(1.0);
+        let (w, h) = (iw * scale, ih * scale);
+        let at = at.unwrap_or(pt((dw - w) / 2.0, (dh - h) / 2.0));
+        let shape = Shape::Image { rect: Bounds::new(at, pt(at.x + w, at.y + h)), image: mythicshot_editor::ImageData::from_rgba(img) };
+        self.add_copy(shape, Style::default(), 0);
     }
 
     /// Ctrl+D: a copy of the selection just beside it, without the clipboard.
@@ -895,6 +980,7 @@ impl Editor {
                 }
                 ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), StrokeKind::Outside);
 
+                self.hover = resp.hover_pos().map(to_img).filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= w && p.y <= h);
                 self.handle_pointer(&resp, z, &to_img);
                 // Right-click selects what is under the pointer, then shows the menu.
                 if resp.secondary_clicked() {
@@ -931,7 +1017,11 @@ impl Editor {
     fn handle_pointer(&mut self, resp: &egui::Response, z: f32, to_img: &dyn Fn(egui::Pos2) -> Pt) {
         let tol = 6.0 / z;
         if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos().map(to_img) {
+            // Where the button went down, not where the pointer is once it has
+            // moved far enough to count as a drag, so quick drags still catch
+            // a small handle.
+            let origin = resp.ctx.input(|i| i.pointer.press_origin());
+            if let Some(p) = origin.or(resp.interact_pointer_pos()).map(to_img) {
                 self.start_drag(p, z, tol);
             }
         }
@@ -1027,10 +1117,17 @@ impl Editor {
                 self.doc.update(id, |it| it.shape.translate(dx, dy));
             }
             Some(Drag::Resize { id, handle }) => {
-                let (id, h) = (*id, *handle);
+                let (id, h, free) = (*id, *handle, self.shift);
                 self.doc.update(id, |it| {
                     if let Some(b) = it.shape.rect() {
-                        it.shape.set_rect(resize_bounds(b.norm(), h, p));
+                        let mut nb = resize_bounds(b.norm(), h, p);
+                        // Pictures keep their shape from a corner unless Shift is held.
+                        if let Shape::Image { image, .. } = &it.shape {
+                            if !free {
+                                nb = keep_aspect(nb, h, image.width() as f32 / image.height().max(1) as f32);
+                            }
+                        }
+                        it.shape.set_rect(nb);
                     }
                 });
             }
@@ -1377,6 +1474,30 @@ fn resize_bounds(mut b: Bounds, handle: usize, p: Pt) -> Bounds {
     b
 }
 
+/// For a corner handle, grow the smaller side so `b` has the width/height
+/// ratio `aspect`, keeping the opposite corner where it is.
+fn keep_aspect(b: Bounds, handle: usize, aspect: f32) -> Bounds {
+    if ![0, 2, 4, 6].contains(&handle) || aspect <= 0.0 {
+        return b;
+    }
+    let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+    let h2 = h.abs().max(w.abs() / aspect);
+    let (w, h) = ((h2 * aspect).copysign(w), h2.copysign(h));
+    let mut out = b;
+    // The dragged corner moves; the opposite one stays.
+    if [0, 6].contains(&handle) {
+        out.x0 = b.x1 - w;
+    } else {
+        out.x1 = b.x0 + w;
+    }
+    if [0, 2].contains(&handle) {
+        out.y0 = b.y1 - h;
+    } else {
+        out.y1 = b.y0 + h;
+    }
+    out
+}
+
 fn tool_hint(tool: Tool) -> &'static str {
     match tool {
         Tool::Select => "Click an item to select it. Drag to move, drag a handle to resize, double-click text to edit.",
@@ -1484,10 +1605,6 @@ mod tests {
         assert_eq!(items[1].shape, { let mut s = rect(5.0); s.translate(16.0, 16.0); s });
         assert_eq!(items[2].shape, { let mut s = rect(5.0); s.translate(32.0, 32.0); s });
 
-        // Something else was copied since: Ctrl+V leaves the picture alone.
-        press(&mut ed, &ctx, vec![egui::Event::Paste("some text".into())]);
-        assert_eq!(ed.doc.items().len(), 3);
-
         // The paste is selected, so Ctrl+D (an ordinary key press) duplicates it.
         assert_eq!(ed.selected, Some(ed.doc.items()[2].id));
         press(&mut ed, &ctx, vec![ctrl(Key::D)]);
@@ -1498,6 +1615,51 @@ mod tests {
         // Ctrl+Z brings back the cut one.
         press(&mut ed, &ctx, vec![ctrl(Key::Z)]);
         assert_eq!(ed.doc.items().len(), 4);
+
+        // Text copied in another app becomes a text annotation, selected.
+        press(&mut ed, &ctx, vec![egui::Event::Paste("Hello\r\nworld\n".into())]);
+        let last = ed.doc.items().last().unwrap();
+        assert!(matches!(&last.shape, Shape::Text { text, .. } if text == "Hello\r\nworld"));
+        assert_eq!(ed.selected, Some(last.id));
+    }
+
+    #[test]
+    fn picture_corners_keep_the_shape() {
+        let b = |x0, y0, x1, y1| Bounds { x0, y0, x1, y1 };
+        // A 3:2 picture dragged from bottom-right to 400 wide, 200 tall: height grows to 266.67.
+        let r = keep_aspect(b(0.0, 0.0, 400.0, 200.0), 4, 1.5);
+        assert_eq!((r.x0, r.y0, r.x1), (0.0, 0.0, 400.0));
+        assert!((r.y1 - 266.67).abs() < 0.01);
+        // From top-left the bottom-right corner stays put.
+        let r = keep_aspect(b(-50.0, 100.0, 300.0, 300.0), 0, 1.5);
+        assert_eq!((r.x1, r.y1), (300.0, 300.0));
+        assert!(((r.x1 - r.x0) / (r.y1 - r.y0) - 1.5).abs() < 0.001);
+        // Edge handles stretch freely.
+        assert_eq!(keep_aspect(b(0.0, 0.0, 400.0, 200.0), 3, 1.5).y1, 200.0);
+    }
+
+    #[test]
+    fn pasted_pictures_become_image_elements_that_fit() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        let ctx = egui::Context::default();
+        // A small picture keeps its size and lands in the middle of the 64×48 capture.
+        let small = egui::ColorImage::new([20, 10], vec![egui::Color32::GREEN; 200]);
+        press(&mut ed, &ctx, vec![egui::Event::PasteImage(Arc::new(small))]);
+        let it = ed.doc.items().last().unwrap().clone();
+        let Shape::Image { rect, image } = &it.shape else { panic!("not an image: {:?}", it.shape) };
+        assert_eq!((image.width(), image.height()), (20, 10));
+        assert_eq!((rect.x0, rect.y0, rect.x1, rect.y1), (22.0, 19.0, 42.0, 29.0));
+        assert_eq!(ed.selected, Some(it.id));
+        // A bigger one is shrunk to fit inside, keeping its shape.
+        let big = egui::ColorImage::new([640, 480], vec![egui::Color32::BLUE; 640 * 480]);
+        press(&mut ed, &ctx, vec![egui::Event::PasteImage(Arc::new(big))]);
+        let b = ed.doc.items().last().unwrap().bounds();
+        assert!(b.width() <= 64.0 * 0.9 + 0.01 && b.height() <= 48.0 * 0.9 + 0.01, "{b:?}");
+        assert!((b.width() / b.height() - 640.0 / 480.0).abs() < 0.01);
+        // It is drawn: the middle of the capture is now blue.
+        let flat = ed.doc.flatten();
+        assert_eq!(flat.get_pixel(32, 24).0, [0, 0, 255, 255]);
     }
 
     #[test]
