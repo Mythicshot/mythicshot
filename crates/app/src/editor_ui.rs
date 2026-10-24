@@ -148,14 +148,48 @@ struct TextEdit {
     focused: bool,
 }
 
-/// An annotation copied with Ctrl+C. `pastes` moves each paste a bit further.
+/// A clipboard shortcut as egui reports it: the letter it stands for and, for a
+/// paste, the text on the system clipboard (empty for an image).
+struct ClipboardKey {
+    key: Key,
+    pasted: Option<String>,
+}
+
+/// egui turns Ctrl+C, Ctrl+X and Ctrl+V into Copy, Cut and Paste events and
+/// never reports them as key presses; a Ctrl+V with nothing on the clipboard
+/// sends nothing at all. Take those events so the shortcuts can match them
+/// like any other key.
+fn take_clipboard_keys(ctx: &egui::Context) -> Vec<ClipboardKey> {
+    ctx.input_mut(|i| {
+        let mut keys = Vec::new();
+        i.events.retain(|e| {
+            let key = match e {
+                egui::Event::Copy => ClipboardKey { key: Key::C, pasted: None },
+                egui::Event::Cut => ClipboardKey { key: Key::X, pasted: None },
+                egui::Event::Paste(text) => ClipboardKey { key: Key::V, pasted: Some(text.clone()) },
+                egui::Event::PasteImage(_) => ClipboardKey { key: Key::V, pasted: Some(String::new()) },
+                _ => return true,
+            };
+            keys.push(key);
+            false
+        });
+        keys
+    })
+}
+
+/// An annotation copied with Ctrl+C. `marker` is the text put on the system
+/// clipboard with it: Ctrl+V needs something there to fire at all, and if the
+/// clipboard no longer holds the marker, something else was copied since.
+/// `pastes` moves each paste a bit further.
 struct CopiedItem {
     shape: Shape,
     style: Style,
+    marker: String,
     pastes: u32,
 }
 
 static ITEM_CLIPBOARD: std::sync::Mutex<Option<CopiedItem>> = std::sync::Mutex::new(None);
+static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How far each paste lands from the last, in image pixels.
 const PASTE_OFFSET: f32 = 16.0;
 
@@ -357,8 +391,14 @@ impl Editor {
             .filter_map(|(a, b)| hotkeys::egui_shortcut(b).map(|(m, k)| (*a, m, k)))
             .collect();
         bound.sort_by_key(|(_, m, _)| std::cmp::Reverse(m.ctrl as u8 + m.alt as u8 + m.shift as u8 + m.mac_cmd as u8));
+        let clipboard_keys = take_clipboard_keys(ctx);
         for (action, m, k) in bound {
-            if ctx.input_mut(|i| i.consume_key(m, k)) {
+            let event = clipboard_keys.iter().find(|c| c.key == k && m.ctrl && !m.alt && !m.shift);
+            if let Some(ClipboardKey { pasted: Some(text), .. }) = event.filter(|_| action == EditorAction::Paste) {
+                self.paste_item(Some(text));
+                break;
+            }
+            if event.is_some() || ctx.input_mut(|i| i.consume_key(m, k)) {
                 self.run(action);
                 break;
             }
@@ -393,13 +433,8 @@ impl Editor {
                     self.run(EditorAction::Delete);
                 }
             }
-            EditorAction::Paste => self.paste_item(),
-            EditorAction::Duplicate => {
-                if self.selected.is_some() {
-                    self.copy_item();
-                    self.paste_item();
-                }
-            }
+            EditorAction::Paste => self.paste_item(None),
+            EditorAction::Duplicate => self.duplicate(),
             EditorAction::Copy if self.video.is_some() => self.copy_frame(),
             EditorAction::Save if self.video.is_some() => self.start_export(None),
             EditorAction::Copy => self.copy(),
@@ -432,26 +467,45 @@ impl Editor {
     }
 
     /// Copy the selected annotation to Mythicshot's own clipboard, shared by
-    /// every editor window.
+    /// every editor window, with a marker on the system clipboard.
     fn copy_item(&mut self) {
         let Some(it) = self.selected.and_then(|id| self.doc.item(id)) else { return };
+        let n = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let marker = format!("Mythicshot annotation {n}");
+        // Tests leave the real clipboard alone.
+        if !cfg!(test) {
+            let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(marker.clone()));
+        }
         if let Ok(mut c) = ITEM_CLIPBOARD.lock() {
-            *c = Some(CopiedItem { shape: it.shape.clone(), style: it.style, pastes: 0 });
+            *c = Some(CopiedItem { shape: it.shape.clone(), style: it.style, marker, pastes: 0 });
         }
         self.notify("Copied the annotation");
     }
 
-    /// Paste the copied annotation, a little further down and right each time,
-    /// and select it so it can be dragged into place.
-    fn paste_item(&mut self) {
-        let Some((mut shape, style, n)) = ITEM_CLIPBOARD.lock().ok().and_then(|mut c| {
-            c.as_mut().map(|c| {
-                c.pastes += 1;
-                (c.shape.clone(), c.style, c.pastes)
-            })
+    /// Paste the copied annotation, a little further down and right each time.
+    /// `clipboard` is the system clipboard's text when Ctrl+V came from egui's
+    /// paste event; nothing is pasted if it is not this copy's marker.
+    fn paste_item(&mut self, clipboard: Option<&str>) {
+        let Some((shape, style, n)) = ITEM_CLIPBOARD.lock().ok().and_then(|mut c| {
+            let c = c.as_mut().filter(|c| clipboard.is_none_or(|t| t == c.marker))?;
+            c.pastes += 1;
+            Some((c.shape.clone(), c.style, c.pastes))
         }) else {
             return;
         };
+        self.add_copy(shape, style, n);
+    }
+
+    /// Ctrl+D: a copy of the selection just beside it, without the clipboard.
+    fn duplicate(&mut self) {
+        let Some(it) = self.selected.and_then(|id| self.doc.item(id)) else { return };
+        let (shape, style) = (it.shape.clone(), it.style);
+        self.add_copy(shape, style, 1);
+    }
+
+    /// Add `shape` moved `n` steps down and right, and select it so it can be
+    /// dragged into place.
+    fn add_copy(&mut self, mut shape: Shape, style: Style, n: u32) {
         let step = PASTE_OFFSET * n as f32;
         shape.translate(step, step);
         let previous = self.style;
@@ -1314,32 +1368,54 @@ mod tests {
         Editor::new(RgbaImage::new(64, 48), "t".into(), BTreeMap::new(), s.dest_context("t"), prefs)
     }
 
+    /// Feed `events` to the editor's shortcuts the way a window would.
+    fn press(ed: &mut Editor, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput { events, ..Default::default() };
+        ctx.run_ui(input, |ui| ed.shortcuts(ui.ctx())).textures_delta.clear();
+    }
+
+    fn ctrl(key: Key) -> egui::Event {
+        // On Windows egui reports Ctrl as both ctrl and command.
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::CTRL | Modifiers::COMMAND }
+    }
+
+    /// Ctrl+C, X and V arrive as egui's Copy, Cut and Paste events, never as
+    /// key presses, so the test sends exactly that.
     #[test]
     fn copy_paste_duplicate_and_cut_annotations() {
         let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        let ctx = egui::Context::default();
         let rect = |x: f32| Shape::Rect(Bounds::new(mythicshot_editor::pt(x, 10.0), mythicshot_editor::pt(x + 20.0, 30.0)));
         ed.style.stroke = Rgba::YELLOW;
         let id = ed.add_item(rect(5.0));
         ed.style.stroke = Rgba::RED;
         ed.select(Some(id));
-        ed.run(EditorAction::Copy);
-        ed.run(EditorAction::Paste);
-        ed.run(EditorAction::Paste);
+
+        press(&mut ed, &ctx, vec![egui::Event::Copy]);
+        let marker = ITEM_CLIPBOARD.lock().unwrap().as_ref().unwrap().marker.clone();
+        press(&mut ed, &ctx, vec![egui::Event::Paste(marker.clone())]);
+        press(&mut ed, &ctx, vec![egui::Event::Paste(marker.clone())]);
         let items = ed.doc.items();
         assert_eq!(items.len(), 3);
         // Each paste keeps the copy's colour and lands a step further.
         assert!(items.iter().all(|it| it.style.stroke == Rgba::YELLOW));
         assert_eq!(items[1].shape, { let mut s = rect(5.0); s.translate(16.0, 16.0); s });
         assert_eq!(items[2].shape, { let mut s = rect(5.0); s.translate(32.0, 32.0); s });
-        // The paste is selected, so Ctrl+D duplicates it.
-        assert_eq!(ed.selected, Some(items[2].id));
-        ed.run(EditorAction::Duplicate);
+
+        // Something else was copied since: Ctrl+V leaves the picture alone.
+        press(&mut ed, &ctx, vec![egui::Event::Paste("some text".into())]);
+        assert_eq!(ed.doc.items().len(), 3);
+
+        // The paste is selected, so Ctrl+D (an ordinary key press) duplicates it.
+        assert_eq!(ed.selected, Some(ed.doc.items()[2].id));
+        press(&mut ed, &ctx, vec![ctrl(Key::D)]);
         assert_eq!(ed.doc.items().len(), 4);
-        ed.run(EditorAction::Cut);
+        press(&mut ed, &ctx, vec![egui::Event::Cut]);
         assert_eq!(ed.doc.items().len(), 3);
         assert_eq!(ed.selected, None);
-        // Undo brings back the cut one.
-        ed.run(EditorAction::Undo);
+        // Ctrl+Z brings back the cut one.
+        press(&mut ed, &ctx, vec![ctrl(Key::Z)]);
         assert_eq!(ed.doc.items().len(), 4);
     }
 
