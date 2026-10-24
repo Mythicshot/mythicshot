@@ -1,8 +1,8 @@
 //! Test helper: send a sequence of keys, for driving Mythicshot in tests.
 //!
 //! `keys F13 wait:800 Space Enter` presses F13, waits 800 ms, then Space and Enter.
-//! `click:983,380` moves the mouse there and left-clicks.
-//! Supported keys: F13–F16, Space, Enter, Escape.
+//! `click:983,380` moves the mouse there and left-clicks; `rclick:` right-clicks.
+//! Supported keys: F13–F16, Space, Enter, Escape, and `ctrl+<letter>` such as `ctrl+c`.
 
 use std::thread;
 use std::time::Duration;
@@ -15,15 +15,32 @@ fn main() {
             thread::sleep(Duration::from_millis(ms.parse().expect("wait:<ms>")));
             continue;
         }
-        if let Some(xy) = arg.strip_prefix("click:") {
+        let click = arg.strip_prefix("click:").map(|xy| (xy, rdev::Button::Left)).or_else(|| arg.strip_prefix("rclick:").map(|xy| (xy, rdev::Button::Right)));
+        if let Some((xy, button)) = click {
             let (x, y) = xy.split_once(',').expect("click:<x>,<y>");
             let (x, y): (f64, f64) = (x.parse().expect("x"), y.parse().expect("y"));
             simulate(&EventType::MouseMove { x, y }).expect("move");
             thread::sleep(Duration::from_millis(80));
-            simulate(&EventType::ButtonPress(rdev::Button::Left)).expect("press");
+            simulate(&EventType::ButtonPress(button)).expect("press");
             thread::sleep(Duration::from_millis(40));
-            simulate(&EventType::ButtonRelease(rdev::Button::Left)).expect("release");
+            simulate(&EventType::ButtonRelease(button)).expect("release");
             thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        if let Some(letter) = arg.strip_prefix("ctrl+") {
+            let key = match letter {
+                "c" => Key::KeyC,
+                "v" => Key::KeyV,
+                "x" => Key::KeyX,
+                "d" => Key::KeyD,
+                "z" => Key::KeyZ,
+                other => panic!("unsupported ctrl key {other}"),
+            };
+            for ev in [EventType::KeyPress(Key::ControlLeft), EventType::KeyPress(key), EventType::KeyRelease(key), EventType::KeyRelease(Key::ControlLeft)] {
+                simulate(&ev).expect("key");
+                thread::sleep(Duration::from_millis(40));
+            }
+            thread::sleep(Duration::from_millis(120));
             continue;
         }
         let key = match arg.as_str() {

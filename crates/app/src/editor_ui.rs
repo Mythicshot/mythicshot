@@ -218,6 +218,8 @@ pub struct Editor {
     status: Option<(String, String)>,
     pub closed: bool,
     confirm_close: bool,
+    /// Where the canvas was right-clicked, for the menu's Paste here.
+    menu_at: Option<Pt>,
     /// When the property panel last checkpointed, so one slider drag is one undo step.
     prop_checkpoint: Option<(u64, Instant)>,
     last_canvas: CanvasGeom,
@@ -253,6 +255,7 @@ impl Editor {
             status: None,
             closed: false,
             confirm_close: false,
+            menu_at: None,
             prop_checkpoint: None,
             last_canvas: CanvasGeom { min: pos2(0.0, 0.0), zoom: 1.0 },
             video: None,
@@ -264,6 +267,13 @@ impl Editor {
         editor.load_tool_style(tool);
         // Test hook: open with the close prompt showing, to check its layout.
         #[cfg(debug_assertions)]
+        // Test hook: start with a rectangle selected.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("MYTHICSHOT_TEST_SELECT_RECT").is_some() {
+            let id = editor.add_item(Shape::Rect(Bounds::new(mythicshot_editor::pt(40.0, 40.0), mythicshot_editor::pt(200.0, 140.0))));
+            editor.tool = Tool::Select;
+            editor.selected = Some(id);
+        }
         if std::env::var_os("MYTHICSHOT_TEST_CONFIRM_CLOSE").is_some() {
             editor.confirm_close = true;
         }
@@ -494,6 +504,65 @@ impl Editor {
             return;
         };
         self.add_copy(shape, style, n);
+    }
+
+    /// The canvas right-click menu: what can be done to the annotation under
+    /// the pointer, or to the picture when there is none.
+    fn context_menu(&mut self, ui: &mut egui::Ui) {
+        let hint = |ed: &Self, a: EditorAction| hotkeys::display(ed.keys.get(&a).map(String::as_str).unwrap_or(""));
+        let item = |ui: &mut egui::Ui, label: &str, shortcut: String| ui.add(egui::Button::new(label).shortcut_text(shortcut)).clicked();
+        let can_paste = ITEM_CLIPBOARD.lock().is_ok_and(|c| c.is_some());
+        if let Some(id) = self.selected {
+            if item(ui, "Copy", hint(self, EditorAction::Copy)) {
+                self.copy_item();
+                ui.close();
+            }
+            if item(ui, "Cut", hint(self, EditorAction::Cut)) {
+                self.run(EditorAction::Cut);
+                ui.close();
+            }
+            if item(ui, "Duplicate", hint(self, EditorAction::Duplicate)) {
+                self.duplicate();
+                ui.close();
+            }
+            if ui.add_enabled(can_paste, egui::Button::new("Paste here")).clicked() {
+                self.paste_here();
+                ui.close();
+            }
+            ui.separator();
+            if self.doc.item(id).and_then(|it| it.shape.text()).is_some() && ui.button("Edit text").clicked() {
+                self.edit_text(id);
+                ui.close();
+            }
+            if ui.button("Bring to front").clicked() {
+                self.doc.bring_to_front(id);
+                ui.close();
+            }
+            if item(ui, "Delete", hint(self, EditorAction::Delete)) {
+                self.run(EditorAction::Delete);
+                ui.close();
+            }
+        } else {
+            if ui.add_enabled(can_paste, egui::Button::new("Paste here").shortcut_text(hint(self, EditorAction::Paste))).clicked() {
+                self.paste_here();
+                ui.close();
+            }
+            let copy_label = if self.video.is_some() { "Copy frame" } else { "Copy image" };
+            if item(ui, copy_label, hint(self, EditorAction::Copy)) {
+                self.run(EditorAction::Copy);
+                ui.close();
+            }
+        }
+    }
+
+    /// Paste the copied annotation with its top-left corner where the canvas
+    /// was right-clicked.
+    fn paste_here(&mut self) {
+        let Some(at) = self.menu_at else { return self.paste_item(None) };
+        let Some((mut shape, style)) = ITEM_CLIPBOARD.lock().ok().and_then(|c| c.as_ref().map(|c| (c.shape.clone(), c.style))) else { return };
+        let b = Item { id: 0, shape: shape.clone(), style, frames: None }.bounds().norm();
+        shape.translate(at.x - b.x0, at.y - b.y0);
+        self.add_copy(shape, style, 0);
     }
 
     /// Ctrl+D: a copy of the selection just beside it, without the clipboard.
@@ -827,6 +896,18 @@ impl Editor {
                 ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), StrokeKind::Outside);
 
                 self.handle_pointer(&resp, z, &to_img);
+                // Right-click selects what is under the pointer, then shows the menu.
+                if resp.secondary_clicked() {
+                    if let Some(p) = resp.interact_pointer_pos().map(to_img) {
+                        let hit = self.hit(p, 6.0 / z);
+                        if hit.is_some() {
+                            self.set_tool(Tool::Select);
+                        }
+                        self.select(hit);
+                        self.menu_at = Some(p);
+                    }
+                }
+                resp.context_menu(|ui| self.context_menu(ui));
                 self.draw_chrome(ui, img_rect, z, &to_scr);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(self.cursor(resp.hover_pos().map(to_img), z));

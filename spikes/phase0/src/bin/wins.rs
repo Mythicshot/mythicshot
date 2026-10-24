@@ -10,6 +10,12 @@ fn main() {
         if !app.to_lowercase().contains(&filter) {
             continue;
         }
+        // WINS_TITLE narrows it to windows whose title contains that text.
+        if let Ok(t) = std::env::var("WINS_TITLE") {
+            if !w.title().unwrap_or_default().contains(&t) {
+                continue;
+            }
+        }
         println!(
             "pid={} app={app} title={:?} pos=({},{}) size={}x{} minimized={}",
             w.pid().unwrap_or_default(),

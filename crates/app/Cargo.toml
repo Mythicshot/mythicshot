@@ -13,7 +13,7 @@ mythicshot-destinations = { path = "../destinations" }
 mythicshot-recording = { path = "../recording" }
 raw-window-handle = "0.6"
 rfd = "0.17"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "clipboard", "wayland", "x11"] }
 tray-icon = "0.26"
 global-hotkey = "0.9"
 rdev = "0.5"
