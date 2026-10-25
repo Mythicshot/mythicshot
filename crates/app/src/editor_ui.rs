@@ -723,9 +723,20 @@ impl Editor {
 
     /// Send the flattened image to a destination and report the result here.
     fn send(&mut self, d: DestId) {
-        match dest::send(d, &self.doc.flatten(), &self.dest) {
+        let result = dest::send(d, &self.doc.flatten(), &self.dest);
+        self.sent(result);
+    }
+
+    fn sent(&mut self, result: Result<Sent, String>) {
+        match result {
             Ok(Sent::Saved(p)) => self.saved_to(p),
             Ok(Sent::Cancelled) => {}
+            Ok(Sent::Copied) => {
+                // On the clipboard counts as kept: closing won't ask to save,
+                // unless the picture changes again.
+                self.doc.mark_saved();
+                self.notify(Sent::Copied.describe());
+            }
             Ok(sent) => self.notify(sent.describe()),
             Err(e) => self.notify(e),
         }
@@ -1751,6 +1762,37 @@ mod tests {
         assert!(((r.x1 - r.x0) / (r.y1 - r.y0) - 1.5).abs() < 0.001);
         // Edge handles stretch freely.
         assert_eq!(keep_aspect(b(0.0, 0.0, 400.0, 200.0), 3, 1.5).y1, 200.0);
+    }
+
+    /// Ask the editor's window to close, the way the title bar's X does.
+    fn request_close(ed: &mut Editor, ctx: &egui::Context) {
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
+        ctx.run_ui(input, |ui| ed.ui(ui)).textures_delta.clear();
+    }
+
+    #[test]
+    fn copying_the_picture_means_closing_does_not_ask_to_save() {
+        let ctx = egui::Context::default();
+        let rect = Shape::Rect(Bounds::new(mythicshot_editor::pt(5.0, 5.0), mythicshot_editor::pt(20.0, 20.0)));
+        // Edited and neither saved nor copied: closing asks.
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(rect.clone());
+        request_close(&mut ed, &ctx);
+        assert!(ed.confirm_close && !ed.closed);
+        // Copied to the clipboard: closing just closes.
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(rect.clone());
+        ed.sent(Ok(Sent::Copied));
+        request_close(&mut ed, &ctx);
+        assert!(ed.closed && !ed.confirm_close);
+        // Changed again after copying: it asks again.
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(rect.clone());
+        ed.sent(Ok(Sent::Copied));
+        ed.add_item(rect);
+        request_close(&mut ed, &ctx);
+        assert!(ed.confirm_close && !ed.closed);
     }
 
     #[test]
