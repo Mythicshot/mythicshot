@@ -279,28 +279,79 @@ pub struct Hotkeys {
     /// Why an action's shortcut could not be registered.
     pub errors: HashMap<Action, String>,
     /// Print Screen shortcuts go to the input hook instead of being
-    /// registered (Windows only): modifiers → action.
+    /// registered (Windows only).
     pub take_print_screen: bool,
-    taken: HashMap<Action, u8>,
+    /// Shortcuts the input hook takes: modifiers and virtual-key code, and
+    /// the binding, per action.
+    taken: HashMap<Action, ((u8, u32), String)>,
+    /// A recording is running, so recording shortcuts are live.
+    recording: bool,
 }
 
-/// The modifiers of a Print Screen shortcut as [`crate::hook::mods`] bits,
-/// or `None` if `binding` is not on the Print Screen key.
-pub fn print_screen_mods(binding: &str) -> Option<u8> {
+const VK_SNAPSHOT: u32 = 0x2C;
+
+impl Action {
+    /// Only used while recording. On Windows the input hook takes these keys
+    /// during a recording, so no other app can hold them, and leaves them to
+    /// other apps the rest of the time.
+    pub fn while_recording(self) -> bool {
+        matches!(self, Action::PauseRecording | Action::LiveDraw)
+    }
+}
+
+/// A shortcut as [`crate::hook::mods`] bits and a Windows virtual-key code,
+/// or `None` for keys the hook doesn't know.
+pub fn binding_vk(binding: &str) -> Option<(u8, u32)> {
     use crate::hook::mods;
     let mut m = 0;
-    let mut key = false;
+    let mut vk = None;
     for part in binding.split('+') {
         match part.to_ascii_lowercase().as_str() {
             "control" | "ctrl" => m |= mods::CTRL,
             "shift" => m |= mods::SHIFT,
             "alt" | "option" => m |= mods::ALT,
             "meta" | "super" | "cmd" | "command" => m |= mods::WIN,
-            "printscreen" => key = true,
-            _ => return None,
+            _ => vk = Some(key_vk(part)?),
         }
     }
-    key.then_some(m)
+    vk.map(|vk| (m, vk))
+}
+
+fn key_vk(name: &str) -> Option<u32> {
+    let n = name.trim();
+    let one = |s: &str| s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric();
+    if let Some(c) = n.strip_prefix("Key").filter(|c| one(c)) {
+        return Some(c.to_ascii_uppercase().as_bytes()[0] as u32);
+    }
+    if let Some(c) = n.strip_prefix("Digit").filter(|c| one(c)) {
+        return Some(c.as_bytes()[0] as u32);
+    }
+    if let Some(f) = n.strip_prefix('F').and_then(|f| f.parse::<u32>().ok()).filter(|f| (1..=24).contains(f)) {
+        return Some(0x6F + f);
+    }
+    Some(match n.to_ascii_lowercase().as_str() {
+        "printscreen" => VK_SNAPSHOT,
+        "pause" => 0x13,
+        "scrolllock" => 0x91,
+        "insert" => 0x2D,
+        "delete" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "arrowleft" => 0x25,
+        "arrowup" => 0x26,
+        "arrowright" => 0x27,
+        "arrowdown" => 0x28,
+        "space" => 0x20,
+        _ => return None,
+    })
+}
+
+/// The modifiers of a Print Screen shortcut, or `None` if `binding` is not on
+/// the Print Screen key.
+pub fn print_screen_mods(binding: &str) -> Option<u8> {
+    binding_vk(binding).filter(|(_, vk)| *vk == VK_SNAPSHOT).map(|(m, _)| m)
 }
 
 impl Hotkeys {
@@ -312,12 +363,53 @@ impl Hotkeys {
                 None
             }
         };
-        Self { manager, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: false, taken: HashMap::new() }
+        Self { manager, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: false, taken: HashMap::new(), recording: false }
     }
 
-    /// The Print Screen shortcuts the input hook should take.
-    pub fn taken(&self) -> Vec<(u8, Action)> {
-        self.taken.iter().map(|(a, m)| (*m, *a)).collect()
+    /// The shortcuts the input hook should take now: Print Screen ones always,
+    /// recording ones only while a recording is running.
+    pub fn taken(&self) -> Vec<crate::hook::TakenKey> {
+        self.taken.iter().filter(|(a, _)| self.recording || !a.while_recording()).map(|(a, ((m, vk), _))| (*m, *vk, *a)).collect()
+    }
+
+    /// A recording started or ended: recording shortcuts go live or are given
+    /// back to other apps.
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on;
+        let recording_keys: Vec<(Action, String)> = self.taken.iter().filter(|(a, _)| a.while_recording()).map(|(a, (_, b))| (*a, b.clone())).collect();
+        for (action, binding) in recording_keys {
+            if on {
+                self.register_quietly(action, &binding);
+            } else {
+                self.unregister(action);
+            }
+        }
+    }
+
+    fn unregister(&mut self, action: Action) {
+        if let Some(old) = self.active.remove(&action) {
+            if let Some(m) = &self.manager {
+                let _ = m.unregister(old);
+            }
+            self.by_id.remove(&old.id());
+        }
+    }
+
+    /// Ask Windows for a shortcut the hook also takes, without reporting a
+    /// failure. The hook doesn't see keys while one of Mythicshot's own
+    /// windows has focus, and a registered shortcut does; when another app
+    /// holds it, the hook still covers every other window.
+    fn register_quietly(&mut self, action: Action, binding: &str) {
+        let (Ok(hotkey), Some(m)) = (HotKey::from_str(binding), &self.manager) else { return };
+        if !self.by_id.contains_key(&hotkey.id()) && m.register(hotkey).is_ok() {
+            self.active.insert(action, hotkey);
+            self.by_id.insert(hotkey.id(), action);
+        }
+    }
+
+    /// Whether the input hook handles `action`'s shortcut.
+    pub fn is_taken(&self, action: Action) -> bool {
+        self.taken.contains_key(&action)
     }
 
     pub fn action_for(&self, id: u32) -> Option<Action> {
@@ -328,23 +420,21 @@ impl Hotkeys {
     /// binding just removes the old one. On failure the action is left with no
     /// shortcut and the reason is kept in `errors`.
     pub fn apply(&mut self, action: Action, binding: &str) {
-        if let Some(old) = self.active.remove(&action) {
-            if let Some(m) = &self.manager {
-                let _ = m.unregister(old);
-            }
-            self.by_id.remove(&old.id());
-        }
+        self.unregister(action);
         self.errors.remove(&action);
         self.taken.remove(&action);
         if binding.is_empty() {
             return;
         }
-        if self.take_print_screen && cfg!(windows) {
-            if let Some(m) = print_screen_mods(binding) {
-                if let Some((other, _)) = self.taken.iter().find(|(_, tm)| **tm == m) {
+        if cfg!(windows) {
+            if let Some(key) = binding_vk(binding).filter(|(_, vk)| action.while_recording() || (self.take_print_screen && *vk == VK_SNAPSHOT)) {
+                if let Some((other, _)) = self.taken.iter().find(|(_, (k, _))| *k == key) {
                     self.errors.insert(action, format!("Already used by \"{}\"", other.label()));
-                } else {
-                    self.taken.insert(action, m);
+                    return;
+                }
+                self.taken.insert(action, (key, binding.to_string()));
+                if !action.while_recording() || self.recording {
+                    self.register_quietly(action, binding);
                 }
                 return;
             }
@@ -524,7 +614,7 @@ mod tests {
         assert_eq!(print_screen_mods("alt+PrintScreen"), Some(mods::ALT));
         assert_eq!(print_screen_mods("control+shift+PrintScreen"), Some(mods::CTRL | mods::SHIFT));
         assert_eq!(print_screen_mods("control+KeyS"), None);
-        let mut h = Hotkeys { manager: None, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: true, taken: HashMap::new() };
+        let mut h = Hotkeys { manager: None, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: true, taken: HashMap::new(), recording: false };
         h.apply(Action::CaptureRegion, "PrintScreen");
         h.apply(Action::CaptureWindow, "alt+PrintScreen");
         h.apply(Action::CaptureFullScreen, "PrintScreen");
@@ -534,12 +624,25 @@ mod tests {
             assert!(!h.errors.contains_key(&Action::CaptureRegion) && !h.errors.contains_key(&Action::CaptureWindow));
             assert!(h.errors[&Action::CaptureFullScreen].contains("Capture region"));
             let mut t = h.taken();
-            t.sort_by_key(|(m, _)| *m);
-            assert_eq!(t, vec![(0, Action::CaptureRegion), (mods::ALT, Action::CaptureWindow)]);
+            t.sort_by_key(|(m, _, _)| *m);
+            assert_eq!(t, vec![(0, 0x2C, Action::CaptureRegion), (mods::ALT, 0x2C, Action::CaptureWindow)]);
+            // Recording keys go to the hook too, but only while recording.
+            h.apply(Action::LiveDraw, "control+shift+KeyD");
+            h.apply(Action::PauseRecording, "Pause");
+            assert!(h.errors.get(&Action::LiveDraw).is_none() && h.errors.get(&Action::PauseRecording).is_none());
+            assert!(h.taken().iter().all(|(_, _, a)| !a.while_recording()));
+            h.set_recording(true);
+            let rec = h.taken();
+            assert!(rec.contains(&(mods::CTRL | mods::SHIFT, 0x44, Action::LiveDraw)) && rec.contains(&(0, 0x13, Action::PauseRecording)));
         }
         // Moving an action off Print Screen frees its slot.
         h.apply(Action::CaptureRegion, "");
-        assert!(h.taken().iter().all(|(_, a)| *a != Action::CaptureRegion));
+        assert!(h.taken().iter().all(|(_, _, a)| *a != Action::CaptureRegion));
+        // Keys the hook knows.
+        assert_eq!(binding_vk("control+shift+KeyD"), Some((mods::CTRL | mods::SHIFT, 0x44)));
+        assert_eq!(binding_vk("F13"), Some((0, 0x7C)));
+        assert_eq!(binding_vk("alt+Digit5"), Some((mods::ALT, 0x35)));
+        assert_eq!(binding_vk("control+Quote"), None);
     }
 
     #[test]

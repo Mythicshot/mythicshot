@@ -50,6 +50,23 @@ pub fn snipping_tool_owns_prtsc() -> Option<bool> {
     Some(false)
 }
 
+/// Stop receiving raw keyboard input, which the window library asks Windows
+/// for at start-up. While a process gets raw keyboard input, Windows stops
+/// calling its low-level keyboard hook whenever one of its own windows has
+/// focus, so Print Screen and the recording shortcuts would go dead while a
+/// Mythicshot window is in front. egui doesn't use raw keyboard input.
+#[cfg(windows)]
+pub fn stop_raw_keyboard_input() {
+    use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
+    let keyboard = [RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_REMOVE, hwndTarget: Default::default() }];
+    if let Err(e) = unsafe { RegisterRawInputDevices(&keyboard, std::mem::size_of::<RAWINPUTDEVICE>() as u32) } {
+        eprintln!("could not stop raw keyboard input: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+pub fn stop_raw_keyboard_input() {}
+
 /// Turn Windows' "Use the Print screen key to open screen capture" on or off,
 /// and tell running apps the keyboard settings changed.
 #[cfg(windows)]

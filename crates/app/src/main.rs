@@ -90,8 +90,12 @@ struct App {
     hidden_at_start: bool,
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     started: Instant,
-    /// For work started outside a frame, such as re-registering shortcuts.
-    ctx: egui::Context,
+    /// Wakes the UI from the input hook's thread. The hook must answer
+    /// Windows quickly or Windows quietly removes it, and asking egui for a
+    /// repaint can wait on the UI thread, so a relay thread does that instead.
+    wake: mpsc::Sender<()>,
+    /// Draw was pressed during the countdown.
+    draw_when_live: bool,
 }
 
 impl App {
@@ -130,7 +134,7 @@ impl App {
             match (hotkeys.errors.get(a), settings.binding(*a)) {
                 (Some(e), b) => eprintln!("hotkey {} [{b}]: {e}", a.label()),
                 (None, "") => eprintln!("hotkey {}: no shortcut", a.label()),
-                (None, b) if hotkeys.taken().iter().any(|(_, t)| t == a) => eprintln!("hotkey {} [{b}]: taken by the input hook", a.label()),
+                (None, b) if hotkeys.is_taken(*a) => eprintln!("hotkey {} [{b}]: taken by the input hook", a.label()),
                 (None, b) => eprintln!("hotkey {} [{b}]: registered", a.label()),
             }
         }
@@ -182,9 +186,20 @@ impl App {
             refocus_at: None,
             hidden_at_start: false,
             started: Instant::now(),
-            ctx: ctx.clone(),
+            draw_when_live: false,
+            wake: {
+                let (wake, woken) = mpsc::channel::<()>();
+                let relay = ctx.clone();
+                std::thread::spawn(move || {
+                    while woken.recv().is_ok() {
+                        relay.request_repaint();
+                    }
+                });
+                wake
+            },
         };
-        app.publish_print_screen(&ctx);
+        platform::stop_raw_keyboard_input();
+        app.publish_taken_keys();
         app
     }
 
@@ -348,6 +363,9 @@ impl App {
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                 self.refocus_at = Some(Instant::now() + Duration::from_millis(150));
                 self.session = Some(s);
+                self.draw_when_live = false;
+                self.hotkeys.set_recording(true);
+                self.publish_taken_keys();
             }
             Err(e) => self.notify(e),
         }
@@ -373,7 +391,11 @@ impl App {
             }
             BarAction::ToggleDraw => {
                 let Some(s) = self.session.as_mut() else { return };
-                let Some(clock) = s.clock() else { return };
+                let Some(clock) = s.clock() else {
+                    // Still counting down: start drawing when recording starts.
+                    self.draw_when_live = !self.draw_when_live;
+                    return;
+                };
                 let on = !s.draw.is_on();
                 s.draw.set_on(on, Some(clock));
                 if let Ok(mut t) = self.tap.lock() {
@@ -428,6 +450,9 @@ impl App {
         if let Ok(mut t) = self.tap.lock() {
             *t = None;
         }
+        // The recording keys go back to other apps.
+        self.hotkeys.set_recording(false);
+        self.publish_taken_keys();
     }
 
     /// A finished recording: open it in the GIF editor if the editor is a
@@ -467,7 +492,10 @@ impl App {
                 }
             }
             if started {
-                self.ensure_input_hook(ctx);
+                self.ensure_input_hook();
+                if std::mem::take(&mut self.draw_when_live) {
+                    self.recording_action(ctx, recorder_ui::BarAction::ToggleDraw);
+                }
             }
         }
         if let Some(s) = self.session.as_mut() {
@@ -657,33 +685,33 @@ impl App {
     }
 
     /// Register every global shortcut again, after the Print Screen choice changed.
-    fn apply_hotkeys(&mut self, ctx: &egui::Context) {
+    fn apply_hotkeys(&mut self) {
         self.hotkeys.take_print_screen = self.settings.take_print_screen;
         for a in Action::ALL {
             let b = self.settings.binding(*a).to_string();
             self.hotkeys.apply(*a, &b);
         }
-        self.publish_print_screen(ctx);
+        self.publish_taken_keys();
     }
 
-    /// Tell the input hook which Print Screen shortcuts to take, starting it
-    /// if any are.
-    fn publish_print_screen(&mut self, ctx: &egui::Context) {
+    /// Tell the input hook which shortcuts to take now (recording ones only
+    /// while a recording is on), starting it if any are.
+    fn publish_taken_keys(&mut self) {
         let taken = self.hotkeys.taken();
         if taken.is_empty() && !self.key_hook_started {
             return;
         }
-        let (tx, repaint, listening) = (self.tx.clone(), ctx.clone(), self.listening.clone());
-        hook::set_print_screen(taken, move |a| {
+        let (tx, wake, listening) = (self.tx.clone(), self.wake.clone(), self.listening.clone());
+        hook::set_taken_keys(taken, move |a| {
             // Recording a new shortcut: let the key through to the recorder.
             if listening.load(Ordering::Relaxed) {
                 return false;
             }
             let _ = tx.send(AppEvent::Taken(a));
-            repaint.request_repaint();
+            let _ = wake.send(());
             true
         });
-        self.ensure_input_hook(ctx);
+        self.ensure_input_hook();
     }
 
     fn set_binding(&mut self, bind: Bind, binding: String) {
@@ -691,9 +719,8 @@ impl App {
             Bind::Global(action) => {
                 self.settings.hotkeys.insert(action, binding.clone());
                 self.hotkeys.apply(action, &binding);
-                if hotkeys::print_screen_mods(&binding).is_some() || self.key_hook_started {
-                    let ctx = self.ctx.clone();
-                    self.publish_print_screen(&ctx);
+                if hotkeys::print_screen_mods(&binding).is_some() || action.while_recording() || self.key_hook_started {
+                    self.publish_taken_keys();
                 }
             }
             Bind::Editor(action) => {
@@ -725,24 +752,24 @@ impl App {
         errors
     }
 
-    fn listen(&mut self, ctx: &egui::Context, action: Option<Bind>) {
+    fn listen(&mut self, action: Option<Bind>) {
         self.settings_state.listening = action;
         self.recorder = ShortcutRecorder::default();
         self.listening.store(action.is_some(), Ordering::Relaxed);
         if action.is_some() {
-            self.ensure_input_hook(ctx);
+            self.ensure_input_hook();
         }
     }
 
     /// Start the one input hook this process may have (rdev allows one). It
     /// forwards keys only while the settings page records a shortcut, and keys
     /// and clicks only while a recording is running.
-    fn ensure_input_hook(&mut self, ctx: &egui::Context) {
+    fn ensure_input_hook(&mut self) {
         if self.key_hook_started {
             return;
         }
         self.key_hook_started = true;
-        let (tx, flag, tap, ctx) = (self.tx.clone(), self.listening.clone(), self.tap.clone(), ctx.clone());
+        let (tx, flag, tap, wake) = (self.tx.clone(), self.listening.clone(), self.tap.clone(), self.wake.clone());
         std::thread::spawn(move || {
             let mut pointer = (0.0, 0.0);
             let result = hook::listen(move |ev: rdev::EventType| {
@@ -752,9 +779,10 @@ impl App {
                 }
                 if flag.load(Ordering::Relaxed) {
                     let _ = tx.send(AppEvent::Key(ev));
-                    ctx.request_repaint();
+                    let _ = wake.send(());
                 }
-                if let Some(ev) = tap.lock().ok().and_then(|mut t| t.as_mut().and_then(|t| t.convert(&ev, pointer))) {
+                // try_lock: the hook must never wait (see `wake`).
+                if let Some(ev) = tap.try_lock().ok().and_then(|mut t| t.as_mut().and_then(|t| t.convert(&ev, pointer))) {
                     let _ = tx.send(AppEvent::Input(ev));
                 }
             });
@@ -799,7 +827,7 @@ impl App {
         self.settings_state.tab = tab;
         for a in actions {
             match a {
-                UiAction::Listen(action) => self.listen(ctx, Some(action)),
+                UiAction::Listen(action) => self.listen(Some(action)),
                 UiAction::StopListening => self.stop_listening(),
                 UiAction::SetBinding(action, b) => {
                     self.stop_listening();
@@ -836,7 +864,7 @@ impl App {
                 }
                 UiAction::SetTakePrintScreen(on) => {
                     self.settings.take_print_screen = on;
-                    self.apply_hotkeys(ctx);
+                    self.apply_hotkeys();
                     self.settings_changed();
                 }
                 UiAction::SetAutostart(on) => {

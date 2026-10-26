@@ -7,27 +7,31 @@
 //! need key codes, so this hook never touches another thread. Other systems use
 //! rdev. Either way the callback gets rdev event types.
 //!
-//! On Windows the hook also takes Print Screen shortcuts before any other app
-//! sees them (see [`set_print_screen`]): Windows hands a registered shortcut to
+//! On Windows the hook also takes some shortcuts before any other app sees
+//! them (see [`set_taken_keys`]): Windows hands a registered shortcut to
 //! whichever app asked first, and at sign-in OneDrive, Snipping Tool or a
-//! graphics driver's tool often beat Mythicshot to it.
+//! graphics driver's tool often beat Mythicshot to Print Screen.
 
 use rdev::EventType;
 
 use crate::hotkeys::Action;
 
-/// Print Screen shortcuts the hook takes: modifiers (see [`MODS`]) → action.
-/// `on_press` runs on the hook thread and must return quickly; it returns
-/// false to let the key through (while a new shortcut is being recorded).
+/// A shortcut the hook takes: modifier bits (see [`mods`]), a Windows
+/// virtual-key code, and the action it runs.
+pub type TakenKey = (u8, u32, Action);
+
+/// The shortcuts the hook takes from now on. `on_press` runs on the hook
+/// thread and must return quickly; it returns false to let the key through
+/// (while a new shortcut is being recorded).
 #[cfg(windows)]
-pub fn set_print_screen(claims: Vec<(u8, Action)>, on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {
-    win::set_print_screen(claims, Box::new(on_press));
+pub fn set_taken_keys(keys: Vec<TakenKey>, on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {
+    win::set_taken_keys(keys, Box::new(on_press));
 }
 
 #[cfg(not(windows))]
-pub fn set_print_screen(_claims: Vec<(u8, Action)>, _on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {}
+pub fn set_taken_keys(_keys: Vec<TakenKey>, _on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {}
 
-/// Modifier bits for [`set_print_screen`].
+/// Modifier bits for [`TakenKey`].
 pub mod mods {
     pub const CTRL: u8 = 1;
     pub const SHIFT: u8 = 2;
@@ -48,7 +52,7 @@ pub fn listen(mut callback: impl FnMut(EventType) + Send + 'static) -> Result<()
 
 #[cfg(windows)]
 mod win {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock, RwLock};
 
     use rdev::{Button, EventType, Key};
@@ -66,18 +70,17 @@ mod win {
     type Callback = Box<dyn FnMut(EventType) + Send>;
     static CALLBACK: OnceLock<Mutex<Callback>> = OnceLock::new();
 
-    struct PrintScreen {
-        claims: Vec<(u8, Action)>,
+    struct Taken {
+        keys: Vec<super::TakenKey>,
         on_press: Box<dyn Fn(Action) -> bool + Send + Sync>,
     }
-    static PRINT_SCREEN: RwLock<Option<PrintScreen>> = RwLock::new(None);
-    /// A Print Screen press was taken, so its release is taken too.
-    static TOOK_PRESS: AtomicBool = AtomicBool::new(false);
-    const VK_SNAPSHOT: u32 = 0x2C;
+    static TAKEN: RwLock<Option<Taken>> = RwLock::new(None);
+    /// The key whose press was taken, so its release is taken too (0: none).
+    static TOOK_VK: AtomicU32 = AtomicU32::new(0);
 
-    pub fn set_print_screen(claims: Vec<(u8, Action)>, on_press: Box<dyn Fn(Action) -> bool + Send + Sync>) {
-        if let Ok(mut p) = PRINT_SCREEN.write() {
-            *p = Some(PrintScreen { claims, on_press });
+    pub fn set_taken_keys(keys: Vec<super::TakenKey>, on_press: Box<dyn Fn(Action) -> bool + Send + Sync>) {
+        if let Ok(mut t) = TAKEN.write() {
+            *t = Some(Taken { keys, on_press });
         }
     }
 
@@ -99,21 +102,23 @@ mod win {
         m
     }
 
-    /// Take a Print Screen key event if it is one of Mythicshot's shortcuts.
-    fn take_print_screen(pressed: bool) -> bool {
+    /// Take a key event if it is one of the taken shortcuts.
+    fn take(vk: u32, pressed: bool) -> bool {
         if !pressed {
-            return TOOK_PRESS.swap(false, Ordering::Relaxed);
+            return TOOK_VK.compare_exchange(vk, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok();
         }
-        let Ok(guard) = PRINT_SCREEN.read() else { return false };
-        let Some(p) = guard.as_ref() else { return false };
+        let Ok(guard) = TAKEN.read() else { return false };
+        let Some(t) = guard.as_ref() else { return false };
+        if !t.keys.iter().any(|(_, k, _)| *k == vk) {
+            return false;
+        }
         let held = held_mods();
-        match p.claims.iter().find(|(m, _)| *m == held) {
-            Some((_, action)) if (p.on_press)(*action) => {
-                TOOK_PRESS.store(true, Ordering::Relaxed);
+        match t.keys.iter().find(|(m, k, _)| *k == vk && *m == held) {
+            Some((_, _, action)) if (t.on_press)(*action) => {
+                TOOK_VK.store(vk, Ordering::Relaxed);
                 true
             }
-            Some(_) => false,
-            None => false,
+            _ => false,
         }
     }
 
@@ -128,12 +133,10 @@ mod win {
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            if info.vkCode == VK_SNAPSHOT {
-                let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-                if take_print_screen(pressed) {
-                    // Swallowed: no other app, and not Windows, sees this key.
-                    return LRESULT(1);
-                }
+            let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if take(info.vkCode, pressed) {
+                // Swallowed: no other app, and not Windows, sees this key.
+                return LRESULT(1);
             }
             let key = vk_to_key(info.vkCode);
             match wparam.0 as u32 {

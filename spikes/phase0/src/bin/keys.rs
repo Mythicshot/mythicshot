@@ -31,6 +31,12 @@ fn main() {
             thread::sleep(Duration::from_millis(150));
             continue;
         }
+        if let Some(xy) = arg.strip_prefix("move:") {
+            let (x, y) = xy.split_once(',').expect("move:<x>,<y>");
+            simulate(&EventType::MouseMove { x: x.parse().expect("x"), y: y.parse().expect("y") }).expect("move");
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         let click = arg.strip_prefix("click:").map(|xy| (xy, rdev::Button::Left)).or_else(|| arg.strip_prefix("rclick:").map(|xy| (xy, rdev::Button::Right)));
         if let Some((xy, button)) = click {
             let (x, y) = xy.split_once(',').expect("click:<x>,<y>");
@@ -41,6 +47,21 @@ fn main() {
             thread::sleep(Duration::from_millis(40));
             simulate(&EventType::ButtonRelease(button)).expect("release");
             thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        if arg == "ctrl+shift+d" {
+            for ev in [
+                EventType::KeyPress(Key::ControlLeft),
+                EventType::KeyPress(Key::ShiftLeft),
+                EventType::KeyPress(Key::KeyD),
+                EventType::KeyRelease(Key::KeyD),
+                EventType::KeyRelease(Key::ShiftLeft),
+                EventType::KeyRelease(Key::ControlLeft),
+            ] {
+                simulate(&ev).expect("key");
+                thread::sleep(Duration::from_millis(40));
+            }
+            thread::sleep(Duration::from_millis(120));
             continue;
         }
         if let Some(letter) = arg.strip_prefix("ctrl+") {
