@@ -3,7 +3,7 @@
 //! `keys F13 wait:800 Space Enter` presses F13, waits 800 ms, then Space and Enter.
 //! `click:983,380` moves the mouse there and left-clicks; `rclick:` right-clicks;
 //! `drag:x1,y1,x2,y2` drags with the left button.
-//! Supported keys: F13–F16, Space, Enter, Escape, `key:<letter>` and `ctrl+<letter>` such as `ctrl+c`.
+//! Supported keys: F13–F16, Space, Enter, Escape, PrintScreen, `key:<letter>` and `ctrl+<letter>` such as `ctrl+c`.
 
 use std::thread;
 use std::time::Duration;
@@ -90,6 +90,7 @@ fn main() {
             "Space" => Key::Space,
             "Enter" => Key::Return,
             "Escape" => Key::Escape,
+            "PrintScreen" => Key::PrintScreen,
             other => panic!("unsupported key {other}"),
         };
         simulate(&EventType::KeyPress(key)).expect("press");

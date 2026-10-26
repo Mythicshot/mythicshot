@@ -25,6 +25,9 @@ pub struct Settings {
     pub image_format: ImageFormat,
     pub jpeg_quality: u8,
     pub magnifier: bool,
+    /// Take Print Screen shortcuts before other apps (OneDrive, Snipping Tool
+    /// and the like) on Windows, instead of asking Windows for them.
+    pub take_print_screen: bool,
     /// Recording: frames per second and the countdown before it starts.
     pub record_fps: u32,
     pub countdown_secs: u32,
@@ -109,6 +112,7 @@ impl Default for Settings {
             image_format: ImageFormat::Png,
             jpeg_quality: 90,
             magnifier: true,
+            take_print_screen: true,
             record_fps: 15,
             countdown_secs: 3,
             gif_quality: 90,

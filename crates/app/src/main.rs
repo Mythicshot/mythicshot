@@ -45,6 +45,8 @@ use tray::{Command, Tray};
 
 enum AppEvent {
     Hotkey(u32),
+    /// A Print Screen shortcut taken by the input hook.
+    Taken(Action),
     Menu(tray_icon::menu::MenuId),
     TrayClick,
     Key(rdev::EventType),
@@ -88,6 +90,8 @@ struct App {
     hidden_at_start: bool,
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     started: Instant,
+    /// For work started outside a frame, such as re-registering shortcuts.
+    ctx: egui::Context,
 }
 
 impl App {
@@ -120,11 +124,13 @@ impl App {
 
         let settings = Settings::load();
         let mut hotkeys = Hotkeys::new();
+        hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
             hotkeys.apply(*a, settings.binding(*a));
             match (hotkeys.errors.get(a), settings.binding(*a)) {
                 (Some(e), b) => eprintln!("hotkey {} [{b}]: {e}", a.label()),
                 (None, "") => eprintln!("hotkey {}: no shortcut", a.label()),
+                (None, b) if hotkeys.taken().iter().any(|(_, t)| t == a) => eprintln!("hotkey {} [{b}]: taken by the input hook", a.label()),
                 (None, b) => eprintln!("hotkey {} [{b}]: registered", a.label()),
             }
         }
@@ -148,7 +154,7 @@ impl App {
             focus: false,
         }));
 
-        Self {
+        let mut app = Self {
             settings,
             hotkeys,
             tray,
@@ -176,17 +182,27 @@ impl App {
             refocus_at: None,
             hidden_at_start: false,
             started: Instant::now(),
-        }
+            ctx: ctx.clone(),
+        };
+        app.publish_print_screen(&ctx);
+        app
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                AppEvent::Hotkey(id) => {
+                AppEvent::Hotkey(_) | AppEvent::Taken(_) => {
                     if self.listening.load(Ordering::Relaxed) || self.overlay.is_some() {
                         continue;
                     }
-                    let Some(action) = self.hotkeys.action_for(id) else { continue };
+                    let action = match ev {
+                        AppEvent::Taken(a) => a,
+                        AppEvent::Hotkey(id) => match self.hotkeys.action_for(id) {
+                            Some(a) => a,
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
                     if self.session.is_some() {
                         // While recording, the record keys stop it and the pause key pauses.
                         match action {
@@ -640,11 +656,45 @@ impl App {
         }
     }
 
+    /// Register every global shortcut again, after the Print Screen choice changed.
+    fn apply_hotkeys(&mut self, ctx: &egui::Context) {
+        self.hotkeys.take_print_screen = self.settings.take_print_screen;
+        for a in Action::ALL {
+            let b = self.settings.binding(*a).to_string();
+            self.hotkeys.apply(*a, &b);
+        }
+        self.publish_print_screen(ctx);
+    }
+
+    /// Tell the input hook which Print Screen shortcuts to take, starting it
+    /// if any are.
+    fn publish_print_screen(&mut self, ctx: &egui::Context) {
+        let taken = self.hotkeys.taken();
+        if taken.is_empty() && !self.key_hook_started {
+            return;
+        }
+        let (tx, repaint, listening) = (self.tx.clone(), ctx.clone(), self.listening.clone());
+        hook::set_print_screen(taken, move |a| {
+            // Recording a new shortcut: let the key through to the recorder.
+            if listening.load(Ordering::Relaxed) {
+                return false;
+            }
+            let _ = tx.send(AppEvent::Taken(a));
+            repaint.request_repaint();
+            true
+        });
+        self.ensure_input_hook(ctx);
+    }
+
     fn set_binding(&mut self, bind: Bind, binding: String) {
         match bind {
             Bind::Global(action) => {
                 self.settings.hotkeys.insert(action, binding.clone());
                 self.hotkeys.apply(action, &binding);
+                if hotkeys::print_screen_mods(&binding).is_some() || self.key_hook_started {
+                    let ctx = self.ctx.clone();
+                    self.publish_print_screen(&ctx);
+                }
             }
             Bind::Editor(action) => {
                 self.settings.editor_keys.insert(action, binding);
@@ -782,6 +832,11 @@ impl App {
                     self.settings.record_keys = edited.record_keys;
                     self.settings.overlays = edited.overlays;
                     self.settings.gif_quality = edited.gif_quality;
+                    self.settings_changed();
+                }
+                UiAction::SetTakePrintScreen(on) => {
+                    self.settings.take_print_screen = on;
+                    self.apply_hotkeys(ctx);
                     self.settings_changed();
                 }
                 UiAction::SetAutostart(on) => {

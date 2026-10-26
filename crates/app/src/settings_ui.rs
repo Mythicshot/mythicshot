@@ -58,6 +58,7 @@ pub enum UiAction {
     OpenSettingsFolder,
     SettingsChanged,
     SetAutostart(bool),
+    SetTakePrintScreen(bool),
 }
 
 /// State shared between the app and the settings window. The window is a
@@ -282,13 +283,26 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
     });
     ui.add_space(8.0);
 
+    if cfg!(windows) {
+        let mut take = view.settings.take_print_screen;
+        if ui
+            .checkbox(&mut take, "Take the Print Screen key from other apps")
+            .on_hover_text("On: Mythicshot gets Print Screen shortcuts first, even when OneDrive, Snipping Tool or another screenshot tool wants them. Off: Windows gives them to whichever app asks first.")
+            .changed()
+        {
+            view.settings.take_print_screen = take;
+            out.push(UiAction::SetTakePrintScreen(take));
+        }
+        ui.add_space(8.0);
+    }
     let prtsc_failed = Action::ALL
         .iter()
         .any(|a| view.errors.contains_key(&Bind::Global(*a)) && view.settings.binding(*a).to_ascii_lowercase().contains("printscreen"));
-    if view.snipping_tool == Some(true) || prtsc_failed {
+    let snipping = view.snipping_tool == Some(true) && !(cfg!(windows) && view.settings.take_print_screen);
+    if snipping || prtsc_failed {
         egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if view.snipping_tool == Some(true) {
+            if snipping {
                 ui.label(RichText::new("Windows is using the Print Screen key for Snipping Tool").color(WARN_TEXT).strong());
                 ui.label(RichText::new("Turn off Settings › Accessibility › Keyboard › \"Use the Print screen key to open screen capture\", then restart Mythicshot, or pick other keys below.").color(WARN_TEXT));
             } else {

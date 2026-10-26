@@ -6,8 +6,34 @@
 //! stalls, Windows times the hook out, and key presses stop arriving. We only
 //! need key codes, so this hook never touches another thread. Other systems use
 //! rdev. Either way the callback gets rdev event types.
+//!
+//! On Windows the hook also takes Print Screen shortcuts before any other app
+//! sees them (see [`set_print_screen`]): Windows hands a registered shortcut to
+//! whichever app asked first, and at sign-in OneDrive, Snipping Tool or a
+//! graphics driver's tool often beat Mythicshot to it.
 
 use rdev::EventType;
+
+use crate::hotkeys::Action;
+
+/// Print Screen shortcuts the hook takes: modifiers (see [`MODS`]) → action.
+/// `on_press` runs on the hook thread and must return quickly; it returns
+/// false to let the key through (while a new shortcut is being recorded).
+#[cfg(windows)]
+pub fn set_print_screen(claims: Vec<(u8, Action)>, on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {
+    win::set_print_screen(claims, Box::new(on_press));
+}
+
+#[cfg(not(windows))]
+pub fn set_print_screen(_claims: Vec<(u8, Action)>, _on_press: impl Fn(Action) -> bool + Send + Sync + 'static) {}
+
+/// Modifier bits for [`set_print_screen`].
+pub mod mods {
+    pub const CTRL: u8 = 1;
+    pub const SHIFT: u8 = 2;
+    pub const ALT: u8 = 4;
+    pub const WIN: u8 = 8;
+}
 
 /// Run the hook on the current thread until the process ends.
 #[cfg(windows)]
@@ -22,9 +48,14 @@ pub fn listen(mut callback: impl FnMut(EventType) + Send + 'static) -> Result<()
 
 #[cfg(windows)]
 mod win {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock, RwLock};
 
     use rdev::{Button, EventType, Key};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
+
+    use super::mods;
+    use crate::hotkeys::Action;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,6 +65,57 @@ mod win {
 
     type Callback = Box<dyn FnMut(EventType) + Send>;
     static CALLBACK: OnceLock<Mutex<Callback>> = OnceLock::new();
+
+    struct PrintScreen {
+        claims: Vec<(u8, Action)>,
+        on_press: Box<dyn Fn(Action) -> bool + Send + Sync>,
+    }
+    static PRINT_SCREEN: RwLock<Option<PrintScreen>> = RwLock::new(None);
+    /// A Print Screen press was taken, so its release is taken too.
+    static TOOK_PRESS: AtomicBool = AtomicBool::new(false);
+    const VK_SNAPSHOT: u32 = 0x2C;
+
+    pub fn set_print_screen(claims: Vec<(u8, Action)>, on_press: Box<dyn Fn(Action) -> bool + Send + Sync>) {
+        if let Ok(mut p) = PRINT_SCREEN.write() {
+            *p = Some(PrintScreen { claims, on_press });
+        }
+    }
+
+    fn held_mods() -> u8 {
+        let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+        let mut m = 0;
+        if down(VK_CONTROL.0) {
+            m |= mods::CTRL;
+        }
+        if down(VK_SHIFT.0) {
+            m |= mods::SHIFT;
+        }
+        if down(VK_MENU.0) {
+            m |= mods::ALT;
+        }
+        if down(VK_LWIN.0) || down(VK_RWIN.0) {
+            m |= mods::WIN;
+        }
+        m
+    }
+
+    /// Take a Print Screen key event if it is one of Mythicshot's shortcuts.
+    fn take_print_screen(pressed: bool) -> bool {
+        if !pressed {
+            return TOOK_PRESS.swap(false, Ordering::Relaxed);
+        }
+        let Ok(guard) = PRINT_SCREEN.read() else { return false };
+        let Some(p) = guard.as_ref() else { return false };
+        let held = held_mods();
+        match p.claims.iter().find(|(m, _)| *m == held) {
+            Some((_, action)) if (p.on_press)(*action) => {
+                TOOK_PRESS.store(true, Ordering::Relaxed);
+                true
+            }
+            Some(_) => false,
+            None => false,
+        }
+    }
 
     fn emit(ev: EventType) {
         if let Some(cb) = CALLBACK.get() {
@@ -46,6 +128,13 @@ mod win {
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if info.vkCode == VK_SNAPSHOT {
+                let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+                if take_print_screen(pressed) {
+                    // Swallowed: no other app, and not Windows, sees this key.
+                    return LRESULT(1);
+                }
+            }
             let key = vk_to_key(info.vkCode);
             match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => emit(EventType::KeyPress(key)),

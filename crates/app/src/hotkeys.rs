@@ -278,6 +278,29 @@ pub struct Hotkeys {
     by_id: HashMap<u32, Action>,
     /// Why an action's shortcut could not be registered.
     pub errors: HashMap<Action, String>,
+    /// Print Screen shortcuts go to the input hook instead of being
+    /// registered (Windows only): modifiers → action.
+    pub take_print_screen: bool,
+    taken: HashMap<Action, u8>,
+}
+
+/// The modifiers of a Print Screen shortcut as [`crate::hook::mods`] bits,
+/// or `None` if `binding` is not on the Print Screen key.
+pub fn print_screen_mods(binding: &str) -> Option<u8> {
+    use crate::hook::mods;
+    let mut m = 0;
+    let mut key = false;
+    for part in binding.split('+') {
+        match part.to_ascii_lowercase().as_str() {
+            "control" | "ctrl" => m |= mods::CTRL,
+            "shift" => m |= mods::SHIFT,
+            "alt" | "option" => m |= mods::ALT,
+            "meta" | "super" | "cmd" | "command" => m |= mods::WIN,
+            "printscreen" => key = true,
+            _ => return None,
+        }
+    }
+    key.then_some(m)
 }
 
 impl Hotkeys {
@@ -289,7 +312,12 @@ impl Hotkeys {
                 None
             }
         };
-        Self { manager, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new() }
+        Self { manager, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: false, taken: HashMap::new() }
+    }
+
+    /// The Print Screen shortcuts the input hook should take.
+    pub fn taken(&self) -> Vec<(u8, Action)> {
+        self.taken.iter().map(|(a, m)| (*m, *a)).collect()
     }
 
     pub fn action_for(&self, id: u32) -> Option<Action> {
@@ -307,8 +335,19 @@ impl Hotkeys {
             self.by_id.remove(&old.id());
         }
         self.errors.remove(&action);
+        self.taken.remove(&action);
         if binding.is_empty() {
             return;
+        }
+        if self.take_print_screen && cfg!(windows) {
+            if let Some(m) = print_screen_mods(binding) {
+                if let Some((other, _)) = self.taken.iter().find(|(_, tm)| **tm == m) {
+                    self.errors.insert(action, format!("Already used by \"{}\"", other.label()));
+                } else {
+                    self.taken.insert(action, m);
+                }
+                return;
+            }
         }
         let hotkey = match HotKey::from_str(binding) {
             Ok(h) => h,
@@ -477,6 +516,31 @@ fn code_name(key: rdev::Key) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_screen_shortcuts_go_to_the_hook() {
+        use crate::hook::mods;
+        assert_eq!(print_screen_mods("PrintScreen"), Some(0));
+        assert_eq!(print_screen_mods("alt+PrintScreen"), Some(mods::ALT));
+        assert_eq!(print_screen_mods("control+shift+PrintScreen"), Some(mods::CTRL | mods::SHIFT));
+        assert_eq!(print_screen_mods("control+KeyS"), None);
+        let mut h = Hotkeys { manager: None, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: true, taken: HashMap::new() };
+        h.apply(Action::CaptureRegion, "PrintScreen");
+        h.apply(Action::CaptureWindow, "alt+PrintScreen");
+        h.apply(Action::CaptureFullScreen, "PrintScreen");
+        if cfg!(windows) {
+            // Taken by the hook, so no "another app uses this" error; a clash
+            // between two of our own actions is still reported.
+            assert!(!h.errors.contains_key(&Action::CaptureRegion) && !h.errors.contains_key(&Action::CaptureWindow));
+            assert!(h.errors[&Action::CaptureFullScreen].contains("Capture region"));
+            let mut t = h.taken();
+            t.sort_by_key(|(m, _)| *m);
+            assert_eq!(t, vec![(0, Action::CaptureRegion), (mods::ALT, Action::CaptureWindow)]);
+        }
+        // Moving an action off Print Screen frees its slot.
+        h.apply(Action::CaptureRegion, "");
+        assert!(h.taken().iter().all(|(_, a)| *a != Action::CaptureRegion));
+    }
 
     #[test]
     fn display_names() {
