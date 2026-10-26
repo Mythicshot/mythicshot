@@ -38,6 +38,8 @@ cd installer
 wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.0-x64.msi
 ```
 
+Releases are built on GitHub: pushing a tag such as `v0.2.0` (matching the version in `Cargo.toml`) builds and tests the app, builds the MSI and publishes a release with it attached (`.github/workflows/release.yml`). For a tag that already exists, run the Release workflow by hand from the Actions tab and give it the tag.
+
 The wizard's banner images come from `installer/make_images.py`. The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
 
 ## Layout

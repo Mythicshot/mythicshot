@@ -1,0 +1,72 @@
+# Build the Windows installer and publish a GitHub release when a version tag
+# such as v0.2.0 is pushed. It can also be run by hand from the Actions tab
+# for a tag that already exists, to make a release that was missed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check the tag matches the version in Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match version $version in Cargo.toml" }
+          "VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p mythicshot
+
+      - name: Test
+        run: cargo test --workspace
+
+      # WiX 5, as on the development PC (v6 needs a separate licence accepted).
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Build the installer
+        shell: pwsh
+        working-directory: installer
+        run: |
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=$env:VERSION -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-$env:VERSION-x64.msi
+          wix msi validate ../dist/Mythicshot-$env:VERSION-x64.msi
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Mythicshot ${{ env.VERSION }}
+          generate_release_notes: true
+          body: |
+            Windows installer: download `Mythicshot-${{ env.VERSION }}-x64.msi` below. It installs for your user only, with no admin prompt.
+
+            The installer is not code-signed yet, so Windows SmartScreen warns the first time: choose **More info**, then **Run anyway**.
+          files: dist/Mythicshot-${{ env.VERSION }}-x64.msi
+          fail_on_unmatched_files: true
