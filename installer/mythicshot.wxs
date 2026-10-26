@@ -5,8 +5,8 @@
   menu shortcut and an entry in Settings › Apps for uninstalling. The wizard
   (ui.wxs) can also start Mythicshot at sign-in and run it when setup ends.
   Build, from installer\:
-  wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=<path to mythicshot.exe> -o ..\dist\Mythicshot-0.1.0-x64.msi
-  Silent install without start at sign-in or taking Print Screen: msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0
+  wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.1 -d Exe=<path to mythicshot.exe> -o ..\dist\Mythicshot-0.1.1-x64.msi
+  Silent install without start at sign-in or taking Print Screen: msiexec /i Mythicshot-0.1.1-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Mythicshot"

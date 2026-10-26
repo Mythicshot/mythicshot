@@ -117,6 +117,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
                 out.push(UiAction::StopListening);
             }
         }
+        // Which build this is, at the bottom of the sidebar.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(egui::Color32::from_rgb(140, 148, 164)));
+        });
     });
     egui::CentralPanel::default().show(ui, |ui| match state.tab {
         Tab::General => general(ui, view, &mut out),

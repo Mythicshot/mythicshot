@@ -2,7 +2,7 @@
 
 A light, fast screenshot tool in the spirit of [Greenshot](https://github.com/greenshot/greenshot), with GIF recording and key and click overlays. Written in Rust; the editor and the exported files are drawn by the same renderer, so what you see is what you save.
 
-Status: 0.1.0, built and tested on Windows 11. A CI workflow builds macOS and Linux too, but it has not run yet and neither has been tested by hand.
+Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Linux too, but it has not run yet and neither has been tested by hand.
 
 ## What it does
 
@@ -28,14 +28,14 @@ On Linux, install the development packages listed in `.github/workflows/ci.yml` 
 
 ### Windows installer
 
-The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. The wizard has three options, all on by default: start Mythicshot when you sign in (the same setting as Settings › General), use the Print Screen key for Mythicshot instead of Snipping Tool, and run it when setup finishes. Uninstalling asks whether to give Print Screen back to Snipping Tool. For a silent install without the first two: `msiexec /i Mythicshot-0.1.0-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0`.
+The MSI installs for the current user (no admin prompt) into `%LocalAppData%\Programs\Mythicshot`, with a Start menu shortcut and an uninstall entry. The wizard has three options, all on by default: start Mythicshot when you sign in (the same setting as Settings › General), use the Print Screen key for Mythicshot instead of Snipping Tool, and run it when setup finishes. Uninstalling asks whether to give Print Screen back to Snipping Tool. For a silent install without the first two: `msiexec /i Mythicshot-0.1.1-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0`.
 
 It needs WiX 5 as a .NET tool and its UI extension (`dotnet tool install --global wix --version 5.0.2`, then `wix extension add -g WixToolset.UI.wixext/5.0.2`):
 
 ```sh
 cargo build --release -p mythicshot
 cd installer
-wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.0 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.0-x64.msi
+wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.1 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.1-x64.msi
 ```
 
 Releases are built on GitHub: pushing a tag such as `v0.2.0` (matching the version in `Cargo.toml`) builds and tests the app, builds the MSI and publishes a release with it attached (`.github/workflows/release.yml`). For a tag that already exists, run the Release workflow by hand from the Actions tab and give it the tag.
