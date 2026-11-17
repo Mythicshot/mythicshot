@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tour preview</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: #16181d; color: #d8dbe2; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid #262a33; }
+  header h1 { flex: 1; margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { padding: 2px 8px; border: 1px solid #3a4152; border-radius: 999px; color: #9aa3b5; font-size: 12px; }
+  main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  #stage { position: relative; display: inline-block; line-height: 0; }
+  #shot { display: block; max-width: calc(100vw - 32px); max-height: calc(100vh - 130px); border-radius: 6px; box-shadow: 0 6px 30px rgba(0, 0, 0, .5); }
+  #ring { position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px; border: 3px solid #f2b84b; border-radius: 50%; background: rgba(242, 184, 75, .18); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
+  #ring[hidden] { display: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(242, 184, 75, .6); } 100% { box-shadow: 0 0 0 20px rgba(242, 184, 75, 0); } }
+  @media (prefers-reduced-motion: reduce) { #ring { animation: none; } }
+  #end { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(22, 24, 29, .72); border-radius: 6px; line-height: 1.4; font-size: 18px; }
+  #end.on { display: flex; }
+  a { color: #f2b84b; cursor: pointer; font-size: 14px; }
+  footer { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 10px 16px; border-top: 1px solid #262a33; }
+  button { padding: 6px 14px; border: 1px solid #3a4152; border-radius: 6px; background: #20242d; color: inherit; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+<header><h1 id="title"></h1><span class="tag">Local preview</span></header>
+<main>
+  <div id="stage">
+    <img id="shot" alt="">
+    <div id="ring" hidden></div>
+    <div id="end"><span>End of tour</span><a id="restart">Restart</a></div>
+  </div>
+</main>
+<footer>
+  <button id="prev">Back</button>
+  <span id="count"></span>
+  <button id="next">Next</button>
+</footer>
+<script>
+const TOUR = /*TOUR_JSON*/;
+(function () {
+  var steps = TOUR.steps, i = 0;
+  var $ = function (id) { return document.getElementById(id); };
+  document.title = TOUR.title + " (local preview)";
+  $("title").textContent = TOUR.title;
+  function show() {
+    var s = steps[i], last = i === steps.length - 1;
+    $("shot").src = s.image;
+    var ring = $("ring");
+    ring.hidden = !s.click;
+    if (s.click) { ring.style.left = s.click.x + "%"; ring.style.top = s.click.y + "%"; }
+    $("end").className = last && !s.click ? "on" : "";
+    $("count").textContent = "Step " + (i + 1) + " of " + steps.length;
+    $("prev").disabled = i === 0;
+    $("next").disabled = last;
+  }
+  function go(d) { var n = i + d; if (n >= 0 && n < steps.length) { i = n; show(); } }
+  $("ring").onclick = function () { go(1); };
+  $("next").onclick = function () { go(1); };
+  $("prev").onclick = function () { go(-1); };
+  $("restart").onclick = function () { i = 0; show(); };
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1);
+  });
+  show();
+})();
+</script>
+</body>
+</html>
