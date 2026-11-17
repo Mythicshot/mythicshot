@@ -17,9 +17,9 @@
   #shot { display: block; max-width: calc(100vw - 32px); max-height: calc(100vh - 130px); border-radius: 6px; box-shadow: 0 6px 30px rgba(0, 0, 0, .5); }
   #dim { position: absolute; inset: 0; z-index: 1; overflow: hidden; border-radius: 6px; pointer-events: none; opacity: 0; transition: opacity .4s ease-out; }
   #dim.on { opacity: 1; }
-  #dim[hidden], #layer[hidden] { display: none; }
+  #dim[hidden] { display: none; }
   #hole { position: absolute; border-radius: 3px; }
-  #layer { position: absolute; inset: 0; z-index: 2; container-type: size; pointer-events: none; line-height: 1.25; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #layer { position: absolute; inset: 0; z-index: 2; overflow: hidden; border-radius: 6px; container-type: size; pointer-events: none; line-height: 1.25; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   #layer svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .note { position: absolute; white-space: pre; }
   .bubble-text { position: absolute; display: flex; align-items: center; padding: .45em .6em; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -42,7 +42,7 @@
   <div id="stage">
     <img id="shot" alt="">
     <div id="dim" hidden><div id="hole"></div></div>
-    <div id="layer" hidden></div>
+    <div id="layer" aria-live="polite"></div>
     <button id="ring" type="button" aria-label="Next step" hidden></button>
     <div id="end"><span>End of tour</span><button id="restart" type="button">Restart</button></div>
   </div>
@@ -55,7 +55,7 @@
 <script>
 const TOUR = /*TOUR_JSON*/;
 (function () {
-  var steps = TOUR.steps, i = 0, done = false;
+  var steps = TOUR.steps, i = 0, done = false, drawn = -1;
   var $ = function (id) { return document.getElementById(id); };
   document.title = TOUR.title + " (local preview)";
   $("title").textContent = TOUR.title;
@@ -109,6 +109,7 @@ const TOUR = /*TOUR_JSON*/;
     var shapes = svgEl("svg", { viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", "aria-hidden": "true" });
     var texts = [];
     notes.forEach(function (n) {
+      if (!n || typeof n !== "object") return;
       var x = num(n.x), y = num(n.y), el = document.createElement("div");
       if (x === null || y === null || typeof n.text !== "string") return;
       el.style.left = x + "%"; el.style.top = y + "%";
@@ -133,13 +134,12 @@ const TOUR = /*TOUR_JSON*/;
       texts.push(el);
     });
     layer.replaceChildren.apply(layer, [shapes].concat(texts));
-    layer.hidden = texts.length === 0;
   }
   function show() {
     var s = steps[i], last = i === steps.length - 1;
     $("shot").src = s.image;
-    drawSpotlight(s);
-    drawNotes(s);
+    // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
+    if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
     var finished = done || (last && !s.click);
     var ring = $("ring");
     ring.hidden = !s.click || finished;

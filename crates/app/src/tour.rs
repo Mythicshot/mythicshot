@@ -580,6 +580,12 @@ mod tests {
     }
 
     #[test]
+    fn preview_notes_are_clipped_to_the_image_and_announced() {
+        assert!(PREVIEW_TEMPLATE.contains(r#"<div id="layer" aria-live="polite">"#));
+        assert!(PREVIEW_TEMPLATE.contains("#layer { position: absolute; inset: 0; z-index: 2; overflow: hidden;"));
+    }
+
+    #[test]
     fn note_text_cannot_break_out_of_the_preview_page() {
         let r = rec();
         let tmp = tempfile::tempdir().unwrap();
