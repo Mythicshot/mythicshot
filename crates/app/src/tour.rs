@@ -123,9 +123,10 @@ pub struct TourSummary {
 const PREVIEW_TEMPLATE: &str = include_str!("tour_preview.html");
 const JSON_PLACEHOLDER: &str = "/*TOUR_JSON*/";
 
-/// Write a tour bundle into `dir`, which must not exist or must be empty.
+/// Write a tour bundle into `dir`, which must not exist yet; its parent folder must.
 /// `frame(i)` returns source frame `i`. `progress` gets 0.0-1.0 and returns false to cancel.
-/// On any error after `dir` was created, `dir` is removed again.
+/// Only a folder this call created is ever removed: if anything fails after `create_dir`
+/// succeeded, `dir` is removed again. An existing `dir` is never touched.
 #[allow(clippy::too_many_arguments)]
 pub fn write_bundle(
     rec: &Recording,
@@ -138,19 +139,20 @@ pub fn write_bundle(
     progress: impl FnMut(f32) -> bool,
 ) -> Result<TourSummary, String> {
     let plan = plan_steps(rec, edit, events)?;
-    if dir.exists() {
-        let has_entries = std::fs::read_dir(dir).map_err(|e| format!("Could not read {}: {e}", dir.display()))?.next().is_some();
-        if has_entries {
-            return Err(format!("{} is not empty", dir.display()));
-        }
+    if dir.symlink_metadata().is_ok() {
+        return Err(format!("{} already exists", dir.display()));
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    // Not create_dir_all: a missing parent is an error, and a folder that appears
+    // between the check above and here makes this call fail instead of being reused.
+    std::fs::create_dir(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{} already exists", dir.display()) } else { format!("Could not create {}: {e}", dir.display()) }
+    })?;
     match write_into(rec, items, events, edit, title, dir, &plan, frame, progress) {
         Ok(summary) => Ok(summary),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(dir);
-            Err(e)
-        }
+        Err(e) => match std::fs::remove_dir_all(dir) {
+            Ok(()) => Err(e),
+            Err(_) => Err(format!("{e} (the partly written folder {} could not be removed)", dir.display())),
+        },
     }
 }
 
@@ -340,26 +342,53 @@ mod tests {
 
     #[test]
     fn step_images_have_crop_applied_and_no_overlays() {
-        let r = rec();
+        let mut r = rec();
+        // The frame used for the step (frame 1, 500 ms) has a pointer inside the crop.
+        r.frames[1].cursor = Some((75, 40));
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("t");
-        let mut e = edit(&r); // default style draws the pointer and click ripple
+        let mut e = Edit::new(&r, OverlayStyle { keys: KeyStyle::Chips, clicks: ClickStyle::Both, halo: true, pointer: true });
         e.crop = Some(Bounds { x0: 50.0, y0: 0.0, x1: 100.0, y1: 80.0 });
         e.scale = 50; // must be ignored
-        write_bundle(&r, &[], &[left(750, 75, 40)], &e, "t", &dir, flat, |_| true).unwrap();
+        // A right press and a key just before the frame time, so a ripple and a key chip would be visible on it.
+        let ev = [down(480, MouseButton::Right, 75, 40), InputEvent { t_ms: 490, kind: InputKind::KeyDown("K".into()) }, left(750, 75, 40)];
+        write_bundle(&r, &[], &ev, &e, "t", &dir, flat, |_| true).unwrap();
         let img = image::open(dir.join("step-001.png")).unwrap().to_rgba8();
         assert_eq!((img.width(), img.height()), (50, 80));
         assert!(img.pixels().all(|p| p.0 == [200, 200, 200, 255]), "an overlay was drawn on the step image");
     }
 
     #[test]
-    fn refuses_a_folder_that_already_has_files() {
+    fn refuses_a_folder_that_already_exists() {
         let r = rec();
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("keep.txt"), "x").unwrap();
-        let err = write_bundle(&r, &[], &[left(150, 50, 40)], &edit(&r), "t", tmp.path(), flat, |_| true).unwrap_err();
-        assert!(err.contains("not empty"), "{err}");
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        let ev = [left(150, 50, 40)];
+
+        let full = tmp.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("keep.txt"), "x").unwrap();
+        let err = write_bundle(&r, &[], &ev, &edit(&r), "t", &full, flat, |_| true).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_dir(&full).unwrap().count(), 1);
+        assert!(full.join("keep.txt").exists());
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let err = write_bundle(&r, &[], &ev, &edit(&r), "t", &empty, flat, |_| true).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(empty.is_dir());
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+
+        let parent = tmp.path().join("no-such-parent");
+        assert!(write_bundle(&r, &[], &ev, &edit(&r), "t", &parent.join("t"), flat, |_| true).is_err());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn preview_controls_are_keyboard_reachable_buttons() {
+        assert!(PREVIEW_TEMPLATE.contains(r#"<button id="ring""#) && PREVIEW_TEMPLATE.contains(r#"aria-label="Next step""#));
+        assert!(PREVIEW_TEMPLATE.contains(r#"<button id="restart""#));
+        assert!(PREVIEW_TEMPLATE.contains(":focus-visible"));
     }
 
     #[test]
