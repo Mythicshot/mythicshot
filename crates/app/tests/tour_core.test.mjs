@@ -15,6 +15,9 @@ const ctx = vm.createContext({});
 vm.runInContext(src, ctx);
 const TourCore = ctx.TourCore;
 
+// The fixture writes non-finite numbers as strings, since JSON has none.
+const n = (v) => (v === "NaN" ? NaN : v === "Infinity" ? Infinity : v === "-Infinity" ? -Infinity : v);
+
 const close = (a, b, what) => assert.ok(Math.abs(a - b) <= 0.01, `${what}: ${a} vs ${b}`);
 
 test("loads as a classic script with TourCore as its only global, and as a module", () => {
@@ -25,11 +28,10 @@ test("loads as a classic script with TourCore as its only global, and as a modul
 });
 
 test("place cases", () => {
-  const [w, h] = cases.image;
-  const [cw, ch] = cases.card;
   for (const c of cases.place) {
-    const avoid = c.avoid && { x0: c.avoid[0], y0: c.avoid[1], x1: c.avoid[2], y1: c.avoid[3] };
-    const p = TourCore.placeCard(w, h, cw, ch, avoid, c.placement);
+    const [x0, y0, x1, y1] = (c.avoid || []).map(n);
+    const avoid = c.avoid && { x0, y0, x1, y1 };
+    const p = TourCore.placeCard(c.image[0], c.image[1], c.card[0], c.card[1], avoid, c.placement);
     close(p.x, c.expect.x, `${c.name} x`);
     close(p.y, c.expect.y, `${c.name} y`);
     assert.equal(p.side, c.expect.side, c.name);
@@ -38,7 +40,7 @@ test("place cases", () => {
 
 test("zoom cases", () => {
   for (const c of cases.zoom) {
-    const z = TourCore.zoomOffset(c.view[0], c.view[1], c.focus[0], c.focus[1], c.k);
+    const z = TourCore.zoomOffset(n(c.view[0]), n(c.view[1]), n(c.focus[0]), n(c.focus[1]), n(c.k));
     close(z.tx, c.expect.tx, `${c.name} tx`);
     close(z.ty, c.expect.ty, `${c.name} ty`);
   }
@@ -50,6 +52,10 @@ test("bold cases", () => {
     const got = [...TourCore.parseBold(c.text)].map((p) => [p.text, p.bold]);
     assert.deepEqual(got, c.expect, c.name);
   }
+});
+
+test("bold of anything but a string is no pieces", () => {
+  for (const v of [null, undefined, 42, {}, ["**a**"]]) assert.equal(TourCore.parseBold(v).length, 0);
 });
 
 test("url cases", () => {

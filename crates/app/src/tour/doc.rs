@@ -233,9 +233,10 @@ pub(super) fn hex_colour(s: &str) -> Option<String> {
 }
 
 /// `https://` (the scheme in any case, written back lowercase), then an authority with no `@` that is
-/// a host of one or more non-empty labels of ASCII letters, digits and `-` separated by `.`, with an
-/// optional `:` and 1 to 5 digits; no whitespace, control (Cc) or format (Cf) character anywhere; at
-/// most 500 characters.
+/// a host of two or more non-empty labels of ASCII letters, digits and `-` separated by `.`, no label
+/// starting or ending with `-` and the last label holding at least one letter (so no bare names or IP
+/// addresses), with an optional `:` and a port of 1 to 5 digits from 1 to 65535; no whitespace, control
+/// (Cc) or format (Cf) character anywhere; at most 500 characters. `tour_core.js` gives the same answers.
 pub fn safe_url(s: &str) -> Option<String> {
     let s = s.trim();
     if s.chars().count() > LINK_MAX || s.chars().any(|c| c.is_whitespace() || c.is_control() || is_format(c)) {
@@ -251,8 +252,10 @@ pub fn safe_url(s: &str) -> Option<String> {
         Some((h, p)) => (h, Some(p)),
         None => (authority, None),
     };
-    let host_ok = !host.is_empty() && host.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
-    let port_ok = port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |l: &&str| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let host_ok = labels.len() >= 2 && labels.iter().all(label_ok) && labels.last().is_some_and(|l| l.bytes().any(|b| b.is_ascii_alphabetic()));
+    let port_ok = port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n)));
     (host_ok && port_ok).then(|| format!("https://{rest}"))
 }
 
