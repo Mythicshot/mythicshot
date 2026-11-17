@@ -304,14 +304,32 @@ fn link_warning(draft: &str) -> Option<&'static str> {
     (!draft.trim().is_empty() && safe_url(draft).is_none()).then_some(LINK_WARNING)
 }
 
+/// How one of a card's texts is typed and shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lines {
+    /// Typed on one line, shown wrapped (title, button).
+    Wrap,
+    /// Typed and shown as several lines (body).
+    Paragraph,
+    /// Typed on one line and shown on one line, cut with an ellipsis (the compact bar's text).
+    One,
+}
+
 /// Text pieces with `**bold**` marked, laid out at `width`. With `bold_only`, plain pieces are
 /// transparent, so drawing it a hair to the right over the full text makes the bold pieces heavier.
-fn text_job(pieces: &[(String, bool)], font: &FontId, color: Color32, width: f32, bold_only: bool) -> LayoutJob {
+/// With [`Lines::One`] line breaks become spaces and the text is cut to one row with an ellipsis.
+fn text_job(pieces: &[(String, bool)], font: &FontId, color: Color32, width: f32, bold_only: bool, lines: Lines) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
+    if lines == Lines::One {
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+    }
     for (text, bold) in pieces {
         let c = if bold_only && !bold { Color32::TRANSPARENT } else { color };
-        job.append(text, 0.0, TextFormat { font_id: font.clone(), color: c, ..Default::default() });
+        let text = if lines == Lines::One { text.replace('\n', " ") } else { text.clone() };
+        job.append(&text, 0.0, TextFormat { font_id: font.clone(), color: c, ..Default::default() });
     }
     job
 }
@@ -335,9 +353,9 @@ struct FieldCtx {
 /// One of the card's texts: drawn (with bold) until clicked, then typed in place, capped at `cap`.
 /// `all_bold` draws the whole text heavier (title, button); otherwise `**bold**` is honoured.
 #[allow(clippy::too_many_arguments)]
-fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut String, cap: usize, font: FontId, color: Color32, hint: (&str, Color32), width: f32, multiline: bool, all_bold: bool) {
+fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut String, cap: usize, font: FontId, color: Color32, hint: (&str, Color32), width: f32, lines: Lines, all_bold: bool) {
     if fc.editing == Some(which) {
-        let edit = if multiline { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
+        let edit = if lines == Lines::Paragraph { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
         let resp = ui.add(edit.id(field_id(fc.instance, fc.src, which)).frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
         if fc.focus {
             resp.request_focus();
@@ -351,12 +369,12 @@ fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut Str
         return;
     }
     let (pieces, c) = if text.trim().is_empty() { (vec![(hint.0.to_string(), false)], hint.1) } else if all_bold { (vec![(text.clone(), true)], color) } else { (parse_bold(text), color) };
-    let galley = ui.painter().layout_job(text_job(&pieces, &font, c, width, false));
-    let size = vec2(if multiline { width } else { galley.size().x.min(width) }, galley.size().y);
+    let galley = ui.painter().layout_job(text_job(&pieces, &font, c, width, false, lines));
+    let size = vec2(if lines == Lines::Paragraph { width } else { galley.size().x.min(width) }, galley.size().y);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     ui.painter().galley(rect.min, galley, c);
     if pieces.iter().any(|(_, b)| *b) {
-        let bold = ui.painter().layout_job(text_job(&pieces, &font, c, width, true));
+        let bold = ui.painter().layout_job(text_job(&pieces, &font, c, width, true, lines));
         ui.painter().galley(rect.min + vec2(0.55, 0.0), bold, c);
     }
     if resp.hovered() {
@@ -478,9 +496,10 @@ impl Editor {
         v.tour.card.editing.filter(|_| v.tour.card.selected).map(|f| field_id(v.tour.instance, src, f))
     }
 
-    /// A press anywhere but on the card ends typing on it there and then, so the card's text box
-    /// hands the keyboard back before the button is released: the press's own click (on a toolbar
-    /// button, "A spot I pick" or Export) then lands on a settled screen and one click is enough.
+    /// A press anywhere but on the card ends typing on it in the press's own frame, so the card's text
+    /// box hands the keyboard back before the button is released: the click (on a toolbar button,
+    /// "A spot I pick" or Export) then lands on a settled screen and one click is enough. Called after
+    /// the canvas, so a key typed in the same frame has already reached the card.
     /// `press` is where the pointer went down this frame, in screen points.
     pub(crate) fn end_card_typing_on_press(&mut self, ctx: &egui::Context, press: Option<Pos2>) {
         let Some(id) = self.card_typing_id() else { return };
@@ -677,19 +696,19 @@ impl Editor {
                 let counter = format!("{} of {count}", index + 1);
                 let next = |ui: &mut egui::Ui, fc: &mut FieldCtx, label: &mut String| {
                     egui::Frame::new().fill(next_fill).corner_radius(CornerRadius::same(if compact { 12 } else { 6 })).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
-                        card_field(ui, fc, Field::Next, label, NEXT_LABEL_MAX, FontId::proportional(13.0), next_ink, ("Next", next_ink), 90.0, false, true);
+                        card_field(ui, fc, Field::Next, label, NEXT_LABEL_MAX, FontId::proportional(13.0), next_ink, ("Next", next_ink), 90.0, Lines::Wrap, true);
                     });
                 };
                 if compact {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&counter).color(muted).size(12.0));
                         let body_w = (ui.available_width() - 110.0).max(60.0);
-                        card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), body_w, false, false);
+                        card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), body_w, Lines::One, false);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| next(ui, &mut fc, &mut card.next_label));
                     });
                 } else {
-                    card_field(ui, &mut fc, Field::Title, &mut card.title, CARD_TITLE_MAX, FontId::proportional(15.0), ink, ("Add a title", muted), inner, false, true);
-                    card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), inner, true, false);
+                    card_field(ui, &mut fc, Field::Title, &mut card.title, CARD_TITLE_MAX, FontId::proportional(15.0), ink, ("Add a title", muted), inner, Lines::Wrap, true);
+                    card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), inner, Lines::Paragraph, false);
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         // Back and the counter are filled in by the player, never typed.
@@ -1128,6 +1147,18 @@ mod tests {
         ui.picking = Some((3, Anchor::Point));
         cancel_pick(&mut doc, &mut ui);
         assert_eq!(anchor(&doc), Anchor::None);
+    }
+
+    #[test]
+    fn the_compact_bar_text_is_shown_on_one_line_with_an_ellipsis() {
+        let pieces = vec![("Open the\ninvoices".to_string(), false), (" page".to_string(), true)];
+        let one = text_job(&pieces, &FontId::proportional(13.0), Color32::WHITE, 120.0, false, Lines::One);
+        assert_eq!((one.wrap.max_rows, one.wrap.overflow_character, one.wrap.break_anywhere), (1, Some('…'), true));
+        assert!(!one.text.contains('\n'), "line breaks become spaces on one line");
+        for lines in [Lines::Wrap, Lines::Paragraph] {
+            let job = text_job(&pieces, &FontId::proportional(13.0), Color32::WHITE, 120.0, false, lines);
+            assert_eq!(job.wrap.max_rows, usize::MAX, "{lines:?} still wraps");
+        }
     }
 
     #[test]

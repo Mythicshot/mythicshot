@@ -28,7 +28,14 @@
     {"name": "aim 3: a spot right of the spotlight puts the card right of the spot", "image": [800, 500], "card": [260, 120], "avoid": [100, 150, 300, 350], "aim": [450, 250], "placement": "auto", "expect": {"x": 462, "y": 190, "side": "right"}},
     {"name": "aim 4: the asked side still comes first", "image": [800, 500], "card": [260, 120], "avoid": [300, 100, 500, 160], "aim": [320, 130], "placement": "left", "expect": {"x": 28, "y": 70, "side": "left"}},
     {"name": "aim 5: a spot whose side has no room falls back to the order, still centred on the spot", "image": [800, 500], "card": [260, 120], "avoid": [300, 200, 500, 300], "aim": [400, 120], "placement": "auto", "expect": {"x": 270, "y": 312, "side": "bottom"}},
-    {"name": "aim 6: a spot that is not finite is ignored", "image": [800, 500], "card": [260, 120], "avoid": [300, 100, 500, 160], "aim": ["NaN", 130], "placement": "auto", "expect": {"x": 270, "y": 172, "side": "bottom"}}
+    {"name": "aim 6: a spot that is not finite is ignored", "image": [800, 500], "card": [260, 120], "avoid": [300, 100, 500, 160], "aim": ["NaN", 130], "placement": "auto", "expect": {"x": 270, "y": 172, "side": "bottom"}},
+    {"name": "far 1: desktop, a spot far from the spotlight: beside the spotlight, pointing at the spot", "image": [800, 500], "card": [260, 120], "avoid": [50, 50, 150, 150], "aim": [750, 450], "placement": "auto", "expect": {"x": 162, "y": 372, "side": "right"}},
+    {"name": "far 2: phone, a spot far below the spotlight", "image": [390, 844], "card": [320, 180], "avoid": [40, 100, 200, 200], "aim": [300, 700], "placement": "auto", "expect": {"x": 62, "y": 212, "side": "bottom"}},
+    {"name": "far 3: desktop, a spot in the far top-left corner", "image": [800, 500], "card": [260, 120], "avoid": [600, 350, 750, 450], "aim": [60, 40], "placement": "auto", "expect": {"x": 328, "y": 8, "side": "left"}},
+    {"name": "far 4: phone, a spot far above the spotlight", "image": [390, 844], "card": [320, 180], "avoid": [100, 600, 300, 700], "aim": [50, 60], "placement": "auto", "expect": {"x": 8, "y": 408, "side": "top"}},
+    {"name": "far 5: desktop, the spotlight leaves no room, so the card keeps clear of the spot alone", "image": [800, 500], "card": [260, 120], "avoid": [10, 10, 790, 490], "aim": [400, 250], "placement": "auto", "expect": {"x": 270, "y": 284, "side": "bottom"}},
+    {"name": "far 6: phone, the spotlight leaves no room, so the card keeps clear of the spot alone", "image": [390, 844], "card": [320, 180], "avoid": [20, 20, 370, 820], "aim": [195, 100], "placement": "auto", "expect": {"x": 35, "y": 134, "side": "bottom"}},
+    {"name": "far 7: nothing fits even around the spot, so the card docks", "image": [320, 180], "card": [240, 100], "avoid": [10, 10, 310, 170], "aim": [160, 90], "placement": "auto", "expect": {"x": 0, "y": 180, "side": "docked"}}
   ],
   "zoom": [
     {"name": "zoom 1", "view": [800, 500], "focus": [400, 250], "k": 1.18, "expect": {"tx": -72, "ty": -45}},

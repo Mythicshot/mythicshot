@@ -155,10 +155,13 @@ pub(crate) fn click_point(v: &VideoState) -> Option<Pt> {
     Some(pt(cx as f32 + px / 100.0 * cw as f32, cy as f32 + py / 100.0 * ch as f32))
 }
 
-/// Seconds per pulse of the hotspot ring, close to the players' soft pulse.
-pub const PULSE_PERIOD: f64 = 1.6;
-/// How often a pulsing hotspot is redrawn: about 30 times a second, not every frame at full speed.
+/// Seconds per pulse of the hotspot ring. The preview page keeps the same number as `--pulse-period`
+/// in `tour_preview.html`; a test checks they agree.
+pub const PULSE_PERIOD: f64 = 1.9;
+/// How often a pulsing hotspot is redrawn while the window has focus: about 30 times a second.
 const PULSE_FRAME: Duration = Duration::from_millis(33);
+/// How often it is redrawn while the window is in the background or covered: a few times a second.
+const PULSE_FRAME_IDLE: Duration = Duration::from_millis(250);
 /// The hotspot ring's radius on screen, as the players draw it (30 px across).
 const HOTSPOT_R: f32 = 15.0;
 
@@ -172,6 +175,16 @@ pub fn pulse_ring(t: f64) -> (f32, f32) {
     }
     let eased = 1.0 - (1.0 - phase / 0.7).powi(3);
     (1.0 + 1.2 * eased, 0.55 * (1.0 - eased))
+}
+
+/// How soon to redraw a pulsing hotspot, from what the window system says about the window: never
+/// while minimised, quickly while focused, slowly while in the background or covered.
+fn pulse_frame(minimized: Option<bool>, focused: Option<bool>, occluded: Option<bool>) -> Option<Duration> {
+    match (minimized, focused, occluded) {
+        (Some(true), _, _) => None,
+        (_, _, Some(true)) | (_, Some(false), _) => Some(PULSE_FRAME_IDLE),
+        _ => Some(PULSE_FRAME),
+    }
 }
 
 /// The accent at `alpha` (0 to 1) of its strength.
@@ -301,8 +314,8 @@ impl Editor {
             if alpha > 0.0 {
                 painter.circle_stroke(at, (HOTSPOT_R + 1.0) * scale, Stroke::new(2.0, faded(accent, alpha)));
             }
-            if !ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
-                ctx.request_repaint_after(PULSE_FRAME);
+            if let Some(after) = ctx.input(|i| pulse_frame(i.viewport().minimized, i.viewport().focused, i.viewport().occluded)) {
+                ctx.request_repaint_after(after);
             }
         }
         painter.circle(at, HOTSPOT_R, faded(accent, 0.18), Stroke::new(2.0, accent));
@@ -625,7 +638,16 @@ mod tests {
             assert!(now.0 >= last.0 - 1e-5 && now.1 <= last.1 + 1e-5, "{i}: {last:?} then {now:?}");
             last = now;
         }
-        assert!((PULSE_PERIOD - 1.6).abs() < f64::EPSILON);
+        assert!((PULSE_PERIOD - 1.9).abs() < f64::EPSILON, "the preview page's period, which the owner liked");
+    }
+
+    #[test]
+    fn the_pulse_redraws_quickly_only_while_the_window_is_in_front() {
+        assert_eq!(pulse_frame(Some(false), Some(true), Some(false)), Some(PULSE_FRAME));
+        assert_eq!(pulse_frame(None, None, None), Some(PULSE_FRAME), "nothing known: as if in front");
+        assert_eq!(pulse_frame(Some(false), Some(false), None), Some(PULSE_FRAME_IDLE), "in the background");
+        assert_eq!(pulse_frame(Some(false), Some(true), Some(true)), Some(PULSE_FRAME_IDLE), "covered");
+        assert_eq!(pulse_frame(Some(true), Some(true), None), None, "minimised");
     }
 
     #[test]

@@ -484,13 +484,13 @@ impl Editor {
             }
         }
         self.shift = ctx.input(|i| i.modifiers.shift);
-        // A pick for the guide card's spot ends when the window loses the keyboard.
-        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
+        // A pick for the guide card's spot ends when the window loses the keyboard, but not while a
+        // button is held: the release would otherwise land as a click that unselects the card.
+        if ctx.input(|i| !i.pointer.any_down() && i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
             self.cancel_card_pick();
         }
-        // A press off the guide card ends typing on it before anything else sees the press.
+        // A press off the guide card ends typing on it; noted now, done once this frame's keys reached the card.
         let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
-        self.end_card_typing_on_press(&ctx, press);
         // While the "Publish tour" dialog is open it gets the keys, and the editor behind it is inert.
         let modal = self.publish_picker_open();
         if !modal {
@@ -506,6 +506,8 @@ impl Editor {
         self.timeline(ui);
         self.tool_rail(ui);
         self.canvas(ui);
+        // After the canvas, so a key typed in the same frame as the press still reaches the card first.
+        self.end_card_typing_on_press(&ctx, press);
         self.text_editor(&ctx);
         if self.confirm_close {
             self.confirm_close_dialog(&ctx);

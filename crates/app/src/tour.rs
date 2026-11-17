@@ -195,8 +195,9 @@ fn check_size(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-/// Each step's manifest entry with everything but its image: the name, size and bytes are filled in
-/// once the image is written.
+/// Each step's manifest entry with everything but its image. Until the image is written its size and
+/// bytes hold the largest values an image may have, so a size check on these entries is never smaller
+/// than the manifest that will be written.
 fn step_entries(rec: &Recording, edit: &Edit, items: &[Item], plan: &[StepPlan], doc: &TourDoc) -> Vec<ManifestStep> {
     plan.iter()
         .enumerate()
@@ -205,9 +206,9 @@ fn step_entries(rec: &Recording, edit: &Edit, items: &[Item], plan: &[StepPlan],
             let extras = doc.steps.get(&step.src);
             ManifestStep {
                 image: format!("step-{:03}.png", i + 1),
-                width: 1,
-                height: 1,
-                bytes: 1,
+                width: MAX_STEP_WIDTH,
+                height: MAX_STEP_HEIGHT,
+                bytes: MAX_STEP_BYTES as u64,
                 click: step.click.map(|(x, y)| Point { x, y }),
                 t_ms: step.t_ms,
                 spotlight: layer.spotlight,
@@ -278,7 +279,8 @@ pub fn write_bundle(
         c.logo = Some(format!("logo.{ext}"));
     }
     // Everything but the images is known now, so a tour the server would refuse writes nothing.
-    // The size check here counts every image at its smallest; the exact one runs before tour.json is written.
+    // The size check here counts every image at its largest, so a tour that is too big is refused before
+    // any image is encoded; the exact check before tour.json is written can then never fail on its own.
     let steps = step_entries(rec, edit, items, &plan, &doc);
     check_counts(&steps)?;
     let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
@@ -1117,15 +1119,24 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_over_the_servers_size_is_refused_and_writes_nothing() {
+    fn the_preview_pulses_as_often_as_the_tour_view() {
+        assert!(PREVIEW_TEMPLATE.contains(&format!("--pulse-period: {}s;", crate::tour_view::PULSE_PERIOD)));
+        assert!(PREVIEW_TEMPLATE.contains("animation: softpulse var(--pulse-period)"));
+    }
+
+    #[test]
+    fn a_manifest_over_the_servers_size_is_refused_before_any_image_is_read() {
         let (r, ev) = many(200);
         let long = "a".repeat(500);
         let items: Vec<Item> = (0..200u32).flat_map(|s| (0..5).map(move |i| (s, i))).map(|(s, i)| text(5.0 + i as f32, 20.0, &long, s)).collect();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("t");
-        let err = write_bundle(&r, &items, &ev, &edit(&r), "t", &dir, flat, |_| true).unwrap_err();
+        let mut read = 0;
+        let counting = |i: usize| { read += 1; flat(i) };
+        let err = write_bundle(&r, &items, &ev, &edit(&r), "t", &dir, counting, |_| true).unwrap_err();
         assert!(err.contains("256 KB"), "{err}");
         assert!(!dir.exists());
+        assert_eq!(read, 0, "refused before any step image was read or encoded");
     }
 
     #[test]

@@ -20,6 +20,8 @@ var TourCore = (function () {
   var LINK_MAX = 500;
   // A fit within this many pixels counts, so float32 and float64 callers agree on ties.
   var SLACK = 0.001;
+  // Half the box kept clear around an aimed spot when nothing else fits: the 44 px anchor box.
+  var AIM_HALF = 22;
 
   // Unicode White_Space, the set Rust's char::is_whitespace and str::trim use.
   function isSpace(c) {
@@ -80,49 +82,55 @@ var TourCore = (function () {
   // "docked" means under the image at full width, also when the box holds a value
   // that is not a finite number.
   //
-  // `aim` ({x, y} or omitted) is a spot the card points at while it keeps clear of `avoid`, such as
-  // a spot picked inside or beside a spotlight: the card is centred on the aim along the side it
-  // takes, keeps clear of the aim as well as the box, and when the aim lies outside the box the
-  // side facing it is tried right after the asked side. An aim that is not finite is ignored.
+  // `aim` ({x, y} or omitted) is a spot the card points at, such as a spot picked inside or beside
+  // a spotlight: the card is centred on the aim along the side it takes, and when the aim lies
+  // outside the box the side facing it is tried right after the asked side. The card first keeps
+  // clear of the box and the aim together; when no side fits that, of the box alone (still pointing
+  // at the aim); then of a box around the aim alone; only then is it docked. An aim that is not
+  // finite is ignored.
   function placeCard(imgW, imgH, cardW, cardH, avoid, placement, aim) {
     if (!avoid) {
       return { x: (imgW - cardW) / 2, y: imgH - cardH - BOTTOM_INSET, side: "none" };
     }
+    var docked = { x: 0, y: imgH, side: "docked" };
     if (!finite(avoid.x0) || !finite(avoid.y0) || !finite(avoid.x1) || !finite(avoid.y1)) {
-      return { x: 0, y: imgH, side: "docked" };
+      return docked;
     }
-    var x0 = Math.min(avoid.x0, avoid.x1), x1 = Math.max(avoid.x0, avoid.x1);
-    var y0 = Math.min(avoid.y0, avoid.y1), y1 = Math.max(avoid.y0, avoid.y1);
-    var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    var b = { x0: Math.min(avoid.x0, avoid.x1), y0: Math.min(avoid.y0, avoid.y1), x1: Math.max(avoid.x0, avoid.x1), y1: Math.max(avoid.y0, avoid.y1) };
     var order = ["bottom", "top", "right", "left"];
-    if (aim && finite(aim.x) && finite(aim.y)) {
+    var hasAim = !!aim && finite(aim.x) && finite(aim.y);
+    if (hasAim) {
       // The side of the box the aim lies beyond, if any: the one it is furthest past.
-      var past = [["bottom", aim.y - y1], ["top", y0 - aim.y], ["right", aim.x - x1], ["left", x0 - aim.x]], facing = null, most = 0;
+      var past = [["bottom", aim.y - b.y1], ["top", b.y0 - aim.y], ["right", aim.x - b.x1], ["left", b.x0 - aim.x]], facing = null, most = 0;
       for (var k = 0; k < past.length; k++) {
         if (past[k][1] > most) { most = past[k][1]; facing = past[k][0]; }
       }
       if (facing) order = [facing].concat(order.filter(function (s) { return s !== facing; }));
-      x0 = Math.min(x0, aim.x); x1 = Math.max(x1, aim.x);
-      y0 = Math.min(y0, aim.y); y1 = Math.max(y1, aim.y);
-      cx = aim.x; cy = aim.y;
     }
     if (order.indexOf(placement) >= 0) {
       order = [placement].concat(order.filter(function (s) { return s !== placement; }));
     }
-    for (var i = 0; i < order.length; i++) {
-      var side = order[i], x, y;
-      if (side === "bottom" || side === "top") {
-        x = clamp(cx - cardW / 2, MARGIN, imgW - cardW - MARGIN);
-        y = side === "bottom" ? y1 + GAP : y0 - GAP - cardH;
-      } else {
-        y = clamp(cy - cardH / 2, MARGIN, imgH - cardH - MARGIN);
-        x = side === "right" ? x1 + GAP : x0 - GAP - cardW;
+    // The first side of `order` on which the card keeps clear of `box`, centred on (cx, cy) along it.
+    function fit(box, cx, cy) {
+      for (var i = 0; i < order.length; i++) {
+        var side = order[i], x, y;
+        if (side === "bottom" || side === "top") {
+          x = clamp(cx - cardW / 2, MARGIN, imgW - cardW - MARGIN);
+          y = side === "bottom" ? box.y1 + GAP : box.y0 - GAP - cardH;
+        } else {
+          y = clamp(cy - cardH / 2, MARGIN, imgH - cardH - MARGIN);
+          x = side === "right" ? box.x1 + GAP : box.x0 - GAP - cardW;
+        }
+        if (x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cardW <= imgW - MARGIN + SLACK && y + cardH <= imgH - MARGIN + SLACK) {
+          return { x: x, y: y, side: side };
+        }
       }
-      if (x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cardW <= imgW - MARGIN + SLACK && y + cardH <= imgH - MARGIN + SLACK) {
-        return { x: x, y: y, side: side };
-      }
+      return null;
     }
-    return { x: 0, y: imgH, side: "docked" };
+    if (!hasAim) return fit(b, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2) || docked;
+    var both = { x0: Math.min(b.x0, aim.x), y0: Math.min(b.y0, aim.y), x1: Math.max(b.x1, aim.x), y1: Math.max(b.y1, aim.y) };
+    var around = { x0: aim.x - AIM_HALF, y0: aim.y - AIM_HALF, x1: aim.x + AIM_HALF, y1: aim.y + AIM_HALF };
+    return fit(both, aim.x, aim.y) || fit(b, aim.x, aim.y) || fit(around, aim.x, aim.y) || docked;
   }
 
   // The translation for a view zoomed by k around (focusX, focusY) that never

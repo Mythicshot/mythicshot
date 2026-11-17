@@ -6,7 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Tour preview</title>
 <style>
-  :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); }
+  :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse; the editor's Tour view uses the same as PULSE_PERIOD in tour_view.rs. */ --pulse-period: 1.9s; }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body { display: flex; flex-direction: column; background: #16181d; color: #d8dbe2; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -57,7 +57,7 @@
   .v3 #hole.glide { transition: left 550ms var(--ease), top 550ms var(--ease), width 550ms var(--ease), height 550ms var(--ease); }
   .v3 #ring { width: 30px; height: 30px; margin: -15px 0 0 -15px; border: 2px solid var(--accent); background: var(--accent-soft); animation: none; }
   .v3 #ring::before { content: ""; position: absolute; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: var(--accent); }
-  .v3 #ring.pulse::after { content: ""; position: absolute; inset: -2px; border: 2px solid var(--accent); border-radius: 50%; animation: softpulse 1.9s var(--ease) infinite; pointer-events: none; }
+  .v3 #ring.pulse::after { content: ""; position: absolute; inset: -2px; border: 2px solid var(--accent); border-radius: 50%; animation: softpulse var(--pulse-period) var(--ease) infinite; pointer-events: none; }
   .v3 #ring.ghost { opacity: 0; }
   @keyframes softpulse { 0% { transform: scale(1); opacity: .55; } 70%, 100% { transform: scale(2.2); opacity: 0; } }
   #bar { position: absolute; left: 0; right: 0; top: 0; z-index: 5; height: 3px; background: rgba(255, 255, 255, .1); line-height: 0; }
