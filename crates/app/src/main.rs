@@ -18,6 +18,7 @@ mod password;
 mod platform;
 mod popups;
 mod publish;
+mod publish_ui;
 mod recorder_ui;
 mod settings;
 mod settings_ui;
@@ -130,7 +131,8 @@ impl App {
             }
         }));
 
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        publish_ui::init(&mut settings);
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
@@ -679,6 +681,7 @@ impl App {
 
     fn settings_changed(&mut self) {
         self.settings.save();
+        publish_ui::set_server(&self.settings.publish_server);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
@@ -864,6 +867,7 @@ impl App {
                     self.settings.record_keys = edited.record_keys;
                     self.settings.overlays = edited.overlays;
                     self.settings.gif_quality = edited.gif_quality;
+                    self.settings.publish_server = edited.publish_server.clone();
                     self.settings_changed();
                 }
                 UiAction::SetTakePrintScreen(on) => {

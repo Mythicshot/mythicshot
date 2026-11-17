@@ -1,12 +1,14 @@
 //! The settings window (screen 5 of the mockup): General and Hotkeys tabs.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, vec2};
 
 use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_pattern};
 
 use crate::hotkeys::{self, Action, EditorAction};
+use crate::publish_ui::{self, TokenStatus};
 use crate::settings::Settings;
 
 const WARN_BG: Color32 = Color32::from_rgb(58, 42, 16);
@@ -48,6 +50,47 @@ impl Bind {
 pub struct SettingsState {
     pub tab: Tab,
     pub listening: Option<Bind>,
+    pub publishing: PublishingState,
+}
+
+/// The "Tour publishing" group's own state. The token field is only ever a masked
+/// input: it is emptied the moment Save is pressed, and a saved token is never read back.
+#[derive(Default)]
+pub struct PublishingState {
+    token_input: String,
+    /// The last Save, Forget or Test connection result: the text and whether it went well.
+    message: Arc<Mutex<Option<(String, bool)>>>,
+    /// A Save, Forget or Test connection is running on its background thread.
+    busy: Arc<Mutex<bool>>,
+}
+
+impl PublishingState {
+    fn is_busy(&self) -> bool {
+        self.busy.lock().map(|b| *b).unwrap_or(false)
+    }
+
+    /// Run `work` on a background thread and show what it returns.
+    fn run(&self, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        if let Ok(mut b) = self.busy.lock() {
+            *b = true;
+        }
+        if let Ok(mut m) = self.message.lock() {
+            *m = None;
+        }
+        let (busy, message) = (self.busy.clone(), self.message.clone());
+        std::thread::spawn(move || {
+            let result = work();
+            if let Ok(mut m) = message.lock() {
+                *m = Some(match result {
+                    Ok(text) => (text, true),
+                    Err(text) => (text, false),
+                });
+            }
+            if let Ok(mut b) = busy.lock() {
+                *b = false;
+            }
+        });
+    }
 }
 
 pub enum UiAction {
@@ -125,7 +168,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     });
     egui::CentralPanel::default().show(ui, |ui| match state.tab {
         Tab::General => general(ui, view, &mut out),
-        Tab::Output => output_tab(ui, view, &mut out),
+        Tab::Output => output_tab(ui, &mut state.publishing, view, &mut out),
         Tab::Hotkeys => hotkeys_tab(ui, state, view, &mut out),
     });
     out
@@ -148,7 +191,11 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     }
 }
 
-fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
+fn output_tab(ui: &mut egui::Ui, publishing: &mut PublishingState, view: View<'_>, out: &mut Vec<UiAction>) {
+    egui::ScrollArea::vertical().show(ui, |ui| output_page(ui, publishing, view, out));
+}
+
+fn output_page(ui: &mut egui::Ui, publishing: &mut PublishingState, view: View<'_>, out: &mut Vec<UiAction>) {
     let s = view.settings;
     let mut changed = false;
     ui.heading("Output");
@@ -250,9 +297,79 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
         changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
     });
     ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(MUTED).size(12.0));
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("TOUR PUBLISHING").size(11.0).color(MUTED));
+    ui.add_space(4.0);
+    changed |= tour_publishing(ui, publishing, &mut s.publish_server);
+    ui.add_space(8.0);
     if changed {
         out.push(UiAction::SettingsChanged);
     }
+}
+
+/// The "Tour publishing" group: the server, the API token (Save and Forget) and Test
+/// connection. Returns whether the server address changed.
+fn tour_publishing(ui: &mut egui::Ui, p: &mut PublishingState, server: &mut String) -> bool {
+    let busy = p.is_busy();
+    if busy {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    let token = publish_ui::token_status();
+    if token == TokenStatus::Checking {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    ui.label("Server");
+    let changed = ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(ui.available_width() - 90.0)).changed();
+    ui.add_space(8.0);
+    ui.label("API token");
+    ui.horizontal(|ui| {
+        let hint = if token == TokenStatus::Saved { "A token is saved; paste a new one to replace it" } else { "Paste the token from the server's setup page" };
+        ui.add(egui::TextEdit::singleline(&mut p.token_input).password(true).hint_text(hint).desired_width(ui.available_width() - 150.0));
+        if ui.add_enabled(!busy && !p.token_input.trim().is_empty(), egui::Button::new("Save")).clicked() {
+            // The field is emptied now; the token goes to the background thread and nowhere else.
+            let entered = std::mem::take(&mut p.token_input);
+            p.run(move || {
+                let saved = crate::publish::store_token(&entered);
+                drop(entered);
+                publish_ui::refresh_token_now();
+                saved.map(|()| "Token saved.".to_string())
+            });
+        }
+        if ui.add_enabled(!busy && token != TokenStatus::Missing, egui::Button::new("Forget")).clicked() {
+            p.run(|| {
+                let forgotten = crate::publish::forget_token();
+                publish_ui::refresh_token_now();
+                forgotten.map(|()| "Token removed from Windows Credential Manager.".to_string())
+            });
+        }
+    });
+    match &token {
+        TokenStatus::Checking => ui.label(RichText::new("Checking for a saved token…").color(MUTED).size(12.0)),
+        TokenStatus::Saved => ui.label(RichText::new("A token is saved.").color(MUTED).size(12.0)),
+        TokenStatus::Missing => ui.label(RichText::new("No token saved.").color(MUTED).size(12.0)),
+        TokenStatus::Unavailable(e) => ui.label(RichText::new(e).color(WARN_TEXT).size(12.0)),
+    };
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, egui::Button::new("Test connection")).clicked() {
+            let server = server.clone();
+            p.run(move || {
+                let server = crate::publish::check_server(&server)?;
+                let token = publish_ui::token_for_job()?;
+                let name = crate::publish::workspace_name(&server, &token)?;
+                Ok(format!("Connected to workspace \"{name}\""))
+            });
+        }
+        if busy {
+            ui.add(egui::Spinner::new());
+        } else if let Some((text, ok)) = p.message.lock().ok().and_then(|m| m.clone()) {
+            let color = if ok { Color32::from_rgb(125, 211, 140) } else { WARN_TEXT };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+        }
+    });
+    ui.label(RichText::new("The token is kept in Windows Credential Manager, not in the settings file.").color(MUTED).size(12.0));
+    changed
 }
 
 pub fn key_style_label(k: mythicshot_editor::overlays::KeyStyle) -> &'static str {
