@@ -147,6 +147,39 @@ fn tour_dir(parent: &Path, stem: &str) -> PathBuf {
     dir
 }
 
+/// The name a normal export would get, without its folders or extension.
+/// Unlike `dest::new_path_with_extension`, this never touches the disk.
+fn tour_stem(ctx: &Context, now: chrono::DateTime<chrono::Local>) -> String {
+    let rel = dest::expand_pattern(&ctx.pattern, &ctx.title, now);
+    let name = rel.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    // Only a real export extension is dropped: a dot in a window title is part of the name.
+    let name = match name.rsplit_once('.') {
+        Some((stem, ext)) if ["gif", "png", "apng", "mp4", "webm", "jpg", "jpeg"].contains(&ext.to_ascii_lowercase().as_str()) => stem.trim(),
+        _ => name,
+    };
+    if name.is_empty() { "recording".to_string() } else { name.to_string() }
+}
+
+/// What the editor does once an export has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterExport {
+    Nothing,
+    /// The user asked to export and close while a tour was running: the file export starts now.
+    StartFileExport,
+    Close,
+}
+
+/// "Export and close" is only ever satisfied by a file export. A tour that
+/// finishes, well or badly, hands over to the file export and never closes the editor.
+fn after_export(was_tour: bool, succeeded: bool, close_after_export: bool) -> AfterExport {
+    match (close_after_export, was_tour, succeeded) {
+        (false, _, _) => AfterExport::Nothing,
+        (true, true, _) => AfterExport::StartFileExport,
+        (true, false, true) => AfterExport::Close,
+        (true, false, false) => AfterExport::Nothing,
+    }
+}
+
 fn step_count(n: usize) -> String {
     if n == 1 { "1 step".to_string() } else { format!("{n} steps") }
 }
@@ -345,10 +378,10 @@ impl Editor {
         let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
         if let Some(r) = finished {
             v.job = None;
+            let next = after_export(is_tour, r.is_ok(), v.close_after_export);
             match r {
                 Ok(done) => {
                     v.exported = true;
-                    let close = v.close_after_export;
                     self.doc.mark_saved();
                     match done {
                         Exported::File(path, size) => {
@@ -363,9 +396,6 @@ impl Editor {
                             crate::platform::open_path(&tour.dir.join("index.html"));
                         }
                     }
-                    if close {
-                        self.closed = true;
-                    }
                 }
                 Err(e) if is_tour => {
                     eprintln!("Tour export failed: {e}");
@@ -375,6 +405,11 @@ impl Editor {
                     eprintln!("Export failed: {e}");
                     self.notify(format!("Export failed: {e}"));
                 }
+            }
+            match next {
+                AfterExport::Nothing => {}
+                AfterExport::StartFileExport => self.start_export(None),
+                AfterExport::Close => self.closed = true,
             }
         } else if let Some(p) = progress {
             let what = if is_tour { "Exporting tour…" } else { "Exporting…" };
@@ -422,11 +457,7 @@ impl Editor {
         if v.job.is_some() {
             return;
         }
-        let stem = match dest::new_path_with_extension(&self.dest, v.format.extension()) {
-            Ok(p) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "recording".into()),
-            Err(e) => return self.notify(e),
-        };
-        let dir = tour_dir(parent, &stem);
+        let dir = tour_dir(parent, &tour_stem(&self.dest, chrono::Local::now()));
         let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
         let job = EncodeJob::spawn(move |progress| {
             // The editor's reader stays on the UI thread; this one belongs to the export.
@@ -799,6 +830,42 @@ mod tests {
         assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0))), step(Some((2.0, 2.0))), step(None)]), "3 steps · one per click, plus the last frame");
         assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0))), step(Some((2.0, 2.0)))]), "2 steps · one per click");
         assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0)))]), "1 step · one per click");
+    }
+
+    #[test]
+    fn only_a_file_export_satisfies_close_after_export() {
+        use AfterExport::*;
+        // (finished job was a tour, it succeeded, close_after_export) -> what next
+        assert_eq!(after_export(false, true, true), Close);
+        assert_eq!(after_export(false, false, true), Nothing);
+        assert_eq!(after_export(false, true, false), Nothing);
+        assert_eq!(after_export(false, false, false), Nothing);
+        // A tour never closes the editor: the file export the user asked for starts instead.
+        assert_eq!(after_export(true, true, true), StartFileExport);
+        assert_eq!(after_export(true, false, true), StartFileExport);
+        assert_eq!(after_export(true, true, false), Nothing);
+        assert_eq!(after_export(true, false, false), Nothing);
+    }
+
+    #[test]
+    fn tour_stem_is_the_last_pattern_component_and_touches_no_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("captures");
+        std::fs::create_dir(&out).unwrap();
+        let now = chrono::Local::now();
+        let ctx = |pattern: &str| Context { output_dir: out.clone(), pattern: pattern.into(), format: dest::ImageFormat::Png, jpeg_quality: 85, title: "Demo".into() };
+        assert_eq!(tour_stem(&ctx("shots/${YYYY}/${title}"), now), "Demo");
+        assert_eq!(tour_stem(&ctx("shots\\${title}"), now), "Demo");
+        assert_eq!(tour_stem(&ctx("${title}"), now), "Demo");
+        assert_eq!(tour_stem(&ctx("${title}.gif"), now), "Demo");
+        // A dot that is not an export extension belongs to the name.
+        assert_eq!(tour_stem(&ctx("${title} v1.2"), now), "Demo v1.2");
+        assert_eq!(tour_stem(&ctx(""), now), "Mythicshot");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        // A missing output folder is no obstacle and is not created.
+        let missing = Context { output_dir: tmp.path().join("gone"), ..ctx("a/${title}") };
+        assert_eq!(tour_stem(&missing, now), "Demo");
+        assert!(!missing.output_dir.exists());
     }
 
     #[test]
