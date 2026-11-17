@@ -25,6 +25,7 @@ pub enum Icon {
     Highlight,
     Obfuscate,
     Spotlight,
+    Card,
     Crop,
     Undo,
     Redo,
@@ -193,6 +194,13 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.rect_filled(rect(0.0, y0, x0, y1), 0.0, dark);
             p.rect_filled(rect(x1, y0, 1.0, y1), 0.0, dark);
             p.rect_stroke(rect(x0, y0, x1, y1), 1.0, s, StrokeKind::Middle);
+        }
+        Icon::Card => {
+            // A guide card: a rounded panel with a title line, a body line and a button.
+            p.rect_stroke(rect(0.04, 0.14, 0.96, 0.86), 2.5, thin, StrokeKind::Middle);
+            p.add(line(&[(0.18, 0.34), (0.62, 0.34)]));
+            p.add(Shape::line_segment([at(0.18, 0.52), at(0.8, 0.52)], thin));
+            p.rect_filled(rect(0.56, 0.64, 0.84, 0.76), 1.5, c);
         }
         Icon::Crop => {
             p.add(line(&[(0.25, 0.0), (0.25, 0.75), (1.0, 0.75)]));

@@ -274,6 +274,8 @@ impl Editor {
         }
         let mut edit = Edit::new(&rec, overlays);
         edit.scale = scale;
+        // The last tour's theme and zoom; cover, buttons, end card and autoplay start empty.
+        crate::tour_cards::apply_saved_theme(&mut edit.tour_doc, &editor.prefs.tour_theme);
         editor.video = Some(VideoState {
             rec,
             reader,
