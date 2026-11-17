@@ -21,6 +21,7 @@ mod recorder_ui;
 mod settings;
 mod settings_ui;
 mod tray;
+mod tour;
 mod video;
 mod video_editor;
 
