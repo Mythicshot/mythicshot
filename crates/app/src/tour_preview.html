@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tour preview</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body { display: flex; flex-direction: column; background: #16181d; color: #d8dbe2; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -14,6 +14,7 @@
   .tag { padding: 2px 8px; border: 1px solid #3a4152; border-radius: 999px; color: #9aa3b5; font-size: 12px; }
   main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
   #stage { position: relative; display: inline-block; line-height: 0; }
+  #frame, #view { position: relative; }
   #shot { display: block; max-width: calc(100vw - 32px); max-height: calc(100vh - 130px); border-radius: 6px; box-shadow: 0 6px 30px rgba(0, 0, 0, .5); }
   #dim { position: absolute; inset: 0; z-index: 1; overflow: hidden; border-radius: 6px; pointer-events: none; opacity: 0; transition: opacity .4s ease-out; }
   #dim.on { opacity: 1; }
@@ -26,7 +27,6 @@
   #ring { position: absolute; z-index: 3; width: 36px; height: 36px; margin: -18px 0 0 -18px; padding: 0; border: 3px solid #f2b84b; border-radius: 50%; background: rgba(242, 184, 75, .18); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
   #ring[hidden] { display: none; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(242, 184, 75, .6); } 100% { box-shadow: 0 0 0 20px rgba(242, 184, 75, 0); } }
-  @media (prefers-reduced-motion: reduce) { #ring { animation: none; } #dim { transition: none; } }
   #end { display: none; position: absolute; inset: 0; z-index: 4; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(22, 24, 29, .72); border-radius: 6px; line-height: 1.4; font-size: 18px; }
   #end.on { display: flex; }
   #restart { color: #f2b84b; }
@@ -34,24 +34,116 @@
   footer { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 10px 16px; border-top: 1px solid #262a33; }
   button { padding: 6px 14px; border: 1px solid #3a4152; border-radius: 6px; background: #20242d; color: inherit; font: inherit; cursor: pointer; }
   button:disabled { opacity: .4; cursor: default; }
+  [hidden] { display: none !important; }
+  .sr { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* Version 3: the guided experience. Nothing below applies to an older manifest. */
+  body.v3 { background: var(--backdrop, #121419); }
+  .v3 header, .v3 footer { border-color: rgba(255, 255, 255, .06); }
+  .v3 main { overflow: auto; align-items: safe center; }
+  .v3 main { touch-action: pan-y; }
+  /* On a phone the image stays put at the top while a docked card comes and goes below it. */
+  @media (max-width: 640px) {
+    .v3 main { align-items: flex-start; }
+  }
+  .v3 #frame { overflow: hidden; border-radius: 14px; box-shadow: 0 14px 44px rgba(0, 0, 0, .38), 0 0 0 1px rgba(255, 255, 255, .05); isolation: isolate; }
+  .v3 #frame.anywhere { cursor: pointer; }
+  .v3 #shot { max-height: calc(100vh - 140px); border-radius: 0; box-shadow: none; }
+  .v3 #view { transform-origin: 0 0; transition: transform 550ms cubic-bezier(.22,.8,.26,1); will-change: transform; }
+  .v3 #dim, .v3 #layer { border-radius: 0; }
+  .v3 #dim { contain: strict; transition: opacity 400ms var(--ease); }
+  .v3 #hole.soft { border-radius: 10px; }
+  .v3 #hole.glide { transition: left 550ms var(--ease), top 550ms var(--ease), width 550ms var(--ease), height 550ms var(--ease); }
+  .v3 #ring { width: 30px; height: 30px; margin: -15px 0 0 -15px; border: 2px solid var(--accent); background: var(--accent-soft); animation: none; }
+  .v3 #ring::before { content: ""; position: absolute; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: var(--accent); }
+  .v3 #ring.pulse::after { content: ""; position: absolute; inset: -2px; border: 2px solid var(--accent); border-radius: 50%; animation: softpulse 1.9s var(--ease) infinite; pointer-events: none; }
+  .v3 #ring.ghost { opacity: 0; }
+  @keyframes softpulse { 0% { transform: scale(1); opacity: .55; } 70%, 100% { transform: scale(2.2); opacity: 0; } }
+  #bar { position: absolute; left: 0; right: 0; top: 0; z-index: 5; height: 3px; background: rgba(255, 255, 255, .1); line-height: 0; }
+  #bar-fill { height: 100%; background: var(--accent); transform: scaleX(0); transform-origin: 0 50%; transition: transform 550ms var(--ease); }
+  #scrim { position: absolute; inset: 0; z-index: 4; background: rgba(10, 12, 16, .6); opacity: 0; pointer-events: none; transition: opacity 400ms var(--ease); }
+  #scrim.on { opacity: 1; }
+  #cta { position: absolute; top: 12px; right: 12px; z-index: 6; max-width: calc(100% - 24px); padding: 7px 14px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 600; line-height: 1.2; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 4px 16px rgba(0, 0, 0, .28); transition: opacity 280ms var(--ease); }
+  #cta.left { right: auto; left: 12px; }
+  #cta:hover { filter: brightness(1.06); }
+  @media (max-width: 640px) { #cta { top: 9px; right: 9px; padding: 5px 11px; font-size: 12px; } #cta.left { left: 9px; } }
+
+  #card { position: absolute; left: 0; top: 0; z-index: 7; padding: 16px 18px 14px; border: 1px solid transparent; border-radius: 14px; font-size: 14px; line-height: 1.45; text-align: left; opacity: 0; transform: translateY(8px); transition: opacity 280ms var(--ease), transform 280ms var(--ease); }
+  #card.in { opacity: 1; transform: none; }
+  #card.now { transition: none; }
+  #card.dark { background: #1a1e26; border-color: rgba(255, 255, 255, .07); color: #eef1f6; box-shadow: 0 18px 44px rgba(0, 0, 0, .42), 0 2px 6px rgba(0, 0, 0, .28); }
+  #card.light { background: #fcfcfd; border-color: rgba(16, 22, 32, .08); color: #1b2029; box-shadow: 0 18px 44px rgba(8, 14, 24, .22), 0 2px 6px rgba(8, 14, 24, .1); }
+  #card.dark .c-body, #card.dark .p-body { color: #b6becb; }
+  #card.light .c-body, #card.light .p-body { color: #4a5262; }
+  #card.dark strong { color: #f4f6fa; }
+  #card.light strong { color: #12161d; }
+  #card button, #card a { border: 0; border-radius: 9px; font: inherit; line-height: 1.2; text-decoration: none; cursor: pointer; }
+  .c-title { margin: 0 0 4px; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+  .c-body { white-space: pre-line; overflow-wrap: anywhere; }
+  .c-body strong { font-weight: 650; }
+  .c-foot { display: flex; align-items: center; gap: 6px; margin-top: 14px; }
+  #card .c-back { padding: 5px 9px; background: transparent; color: inherit; opacity: .75; font-size: 15px; }
+  #card .c-back:hover { opacity: 1; }
+  #card .c-back:disabled { opacity: .3; cursor: default; }
+  .c-count { flex: 1; font-size: 12px; opacity: .62; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #card .c-next, #card .p-btn { padding: 8px 16px; background: var(--accent); color: var(--on-accent); font-weight: 600; }
+  #card .c-next:hover, #card .p-btn:hover { filter: brightness(1.07); }
+  #card .p-ghost { padding: 7px 15px; background: transparent; color: inherit; box-shadow: inset 0 0 0 1px currentColor; opacity: .85; }
+  #card .p-ghost:hover { opacity: 1; }
+  .notch { position: absolute; width: 12px; height: 12px; background: inherit; border: 0 solid; border-color: inherit; transform: rotate(45deg); pointer-events: none; }
+  .notch.up { top: -7px; border-width: 1px 0 0 1px; }
+  .notch.down { bottom: -7px; border-width: 0 1px 1px 0; }
+  .notch.toleft { left: -7px; border-width: 0 0 1px 1px; }
+  .notch.toright { right: -7px; border-width: 1px 1px 0 0; }
+  #card.compact { display: flex; align-items: center; gap: 10px; padding: 9px 10px 9px 6px; border-radius: 12px; background: rgba(22, 26, 33, .94); border-color: rgba(255, 255, 255, .08); color: #eef1f6; box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
+  #card.compact .c-body { flex: 1; min-width: 0; color: #c9d0db; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #card.compact .c-count { flex: none; }
+  #card.compact .c-next { flex: none; padding: 7px 14px; }
+  #card.panel { padding: 22px 24px 20px; text-align: center; }
+  .p-logo { display: block; max-width: 140px; max-height: 48px; margin: 0 auto 14px; }
+  .p-title { margin: 0 0 6px; font-size: 19px; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
+  .p-body { margin: 0; white-space: pre-line; overflow-wrap: anywhere; }
+  .p-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px; }
+  #card .p-actions > * { display: inline-block; }
+  #autoplay { min-width: 76px; }
+  .v3 #end { border-radius: 0; }
+  .v3 #restart { color: var(--accent); }
+
+  @media (prefers-reduced-motion: reduce) {
+    #ring { animation: none; }
+    #dim { transition: none; }
+    .v3 #view, .v3 #dim, .v3 #hole.glide, #card, #scrim, #bar-fill, #cta { transition: none !important; }
+    .v3 #ring.pulse::after { animation: none; display: none; }
+  }
 </style>
 </head>
 <body>
 <header><h1 id="title"></h1><span class="tag">Local preview</span></header>
 <main>
   <div id="stage">
-    <img id="shot" alt="">
-    <div id="dim" hidden><div id="hole"></div></div>
-    <div id="layer" aria-live="polite"></div>
-    <button id="ring" type="button" aria-label="Next step" hidden></button>
-    <div id="end"><span>End of tour</span><button id="restart" type="button">Restart</button></div>
+    <div id="frame">
+      <div id="view">
+        <img id="shot" alt="">
+        <div id="dim" hidden><div id="hole"></div></div>
+        <div id="layer" aria-live="polite"></div>
+        <button id="ring" type="button" aria-label="Next step" hidden></button>
+      </div>
+      <div id="bar" hidden><div id="bar-fill"></div></div>
+      <div id="scrim"></div>
+      <a id="cta" hidden></a>
+      <div id="end"><span>End of tour</span><button id="restart" type="button">Restart</button></div>
+    </div>
+    <div id="card" role="group" hidden></div>
   </div>
 </main>
 <footer>
   <button id="prev">Back</button>
   <span id="count"></span>
   <button id="next">Next</button>
+  <button id="autoplay" type="button" aria-label="Pause autoplay" hidden>Pause</button>
 </footer>
+<div id="status" class="sr" aria-live="polite"></div>
+<script>/*TOUR_CORE*/</script>
 <script>
 const TOUR = /*TOUR_JSON*/;
 (function () {
@@ -135,33 +227,483 @@ const TOUR = /*TOUR_JSON*/;
     });
     layer.replaceChildren.apply(layer, [shapes].concat(texts));
   }
-  function show() {
-    var s = steps[i], last = i === steps.length - 1;
-    $("shot").src = s.image;
-    // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
-    if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
-    var finished = done || (last && !s.click);
-    var ring = $("ring");
-    ring.hidden = !s.click || finished;
-    if (s.click) { ring.style.left = s.click.x + "%"; ring.style.top = s.click.y + "%"; }
-    $("end").className = finished ? "on" : "";
-    $("count").textContent = "Step " + (i + 1) + " of " + steps.length;
-    $("prev").disabled = i === 0;
-    $("next").disabled = finished;
+
+  var V3 = typeof TOUR.version === "number" && TOUR.version >= 3 && typeof TourCore === "object";
+  if (!V3) {
+    // Versions 1 and 2: the plain step-through, exactly as before.
+    var show = function () {
+      var s = steps[i], last = i === steps.length - 1;
+      $("shot").src = s.image;
+      // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
+      if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
+      var finished = done || (last && !s.click);
+      var ring = $("ring");
+      ring.hidden = !s.click || finished;
+      if (s.click) { ring.style.left = s.click.x + "%"; ring.style.top = s.click.y + "%"; }
+      $("end").className = finished ? "on" : "";
+      $("count").textContent = "Step " + (i + 1) + " of " + steps.length;
+      $("prev").disabled = i === 0;
+      $("next").disabled = finished;
+    };
+    var go = function (d) {
+      var n = i + d;
+      if (n >= steps.length) { done = true; show(); $("restart").focus(); }
+      else if (n >= 0) { i = n; done = false; show(); }
+    };
+    $("ring").onclick = function () { go(1); };
+    $("next").onclick = function () { go(1); };
+    $("prev").onclick = function () { go(-1); };
+    $("restart").onclick = function () { i = 0; done = false; show(); };
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1);
+    });
+    show();
+    return;
   }
-  function go(d) {
-    var n = i + d;
-    if (n >= steps.length) { done = true; show(); $("restart").focus(); }
-    else if (n >= 0) { i = n; done = false; show(); }
+
+  // ---- Version 3 ----
+  // Every setting is read through TourCore and falls back to its default when missing or wrong.
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  var prefersDark = window.matchMedia("(prefers-color-scheme: dark)");
+  function ms(n) { return reduced.matches ? 0 : n; }
+  function obj(v) { return v && typeof v === "object" && !Array.isArray(v) ? v : null; }
+  function bool(v, fallback) { return typeof v === "boolean" ? v : fallback; }
+  function pick(v, allowed, fallback) { return allowed.indexOf(v) >= 0 ? v : fallback; }
+  function line(v, max) { return TourCore.cleanText(v, max, false); }
+  function para(v, max) { return TourCore.cleanText(v, max, true); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text) e.textContent = text;
+    return e;
   }
-  $("ring").onclick = function () { go(1); };
+  function link(v) {
+    var l = obj(v), label = l ? line(l.label, 24) : "", url = l ? TourCore.safeUrl(l.url) : null;
+    return label && url ? { label: label, url: url } : null;
+  }
+  // A link that leaves the tour: only a checked https:// address, a new tab and no referrer.
+  function linkEl(l, cls) {
+    var a = el("a", cls, l.label);
+    a.href = l.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.referrerPolicy = "no-referrer";
+    return a;
+  }
+  function rgb(hex) { return [1, 3, 5].map(function (k) { return parseInt(hex.slice(k, k + 2), 16); }); }
+  function mix(a, b, t) {
+    var x = rgb(a), y = rgb(b);
+    return "#" + x.map(function (v, k) { return ("0" + Math.round(v + (y[k] - v) * t).toString(16)).slice(-2); }).join("");
+  }
+  function luminance(hex) {
+    var c = rgb(hex).map(function (v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  }
+
+  var theme = obj(TOUR.theme) || {}, zoomSet = obj(TOUR.zoom) || {}, playSet = obj(TOUR.autoplay) || {};
+  var cardStyle = pick(theme.card_style, ["dark", "light", "compact", "auto"], "dark");
+  var accent = TourCore.color(theme.accent, "#5dcaa5");
+  var hotspot = pick(theme.hotspot, ["pulse", "dot", "none"], "pulse");
+  var showBar = bool(theme.progress_bar, true);
+  var soft = bool(theme.spotlight_soft, true);
+  var backdrop = theme.backdrop === "auto" ? null : TourCore.color(theme.backdrop, null);
+  var zoomOn = bool(zoomSet.enabled, true), zoomK = TourCore.num(zoomSet.percent, 105, 140, 118) / 100;
+  var playOn = bool(playSet.enabled, false), playMs = TourCore.num(playSet.seconds, 2, 20, 5) * 1000;
+  var coverSet = obj(TOUR.cover), cover = null;
+  if (coverSet && line(coverSet.title, 80)) {
+    cover = {
+      title: line(coverSet.title, 80), body: para(coverSet.body, 200), button: line(coverSet.button, 24) || "Start",
+      logo: coverSet.logo === "logo.png" || coverSet.logo === "logo.jpg" ? coverSet.logo : null
+    };
+  }
+  var cta = link(TOUR.cta);
+  var endSet = obj(TOUR.end), end = endSet ? { text: para(endSet.text, 200), primary: link(endSet.primary), secondary: link(endSet.secondary), replay: bool(endSet.replay, true) } : null;
+
+  var root = document.documentElement.style;
+  root.setProperty("--accent", accent);
+  root.setProperty("--on-accent", luminance(accent) > 0.36 ? "#0c1d17" : "#ffffff");
+  var a3 = rgb(accent);
+  root.setProperty("--accent-soft", "rgba(" + a3.join(", ") + ", .18)");
+  // "auto" is a calm tint taken from the accent.
+  root.setProperty("--backdrop", backdrop || mix("#111318", accent, 0.06));
+  document.body.className = "v3";
+
+  var stage = $("stage"), frame = $("frame"), view = $("view"), shot = $("shot"), card = $("card");
+  var dim = $("dim"), hole = $("hole"), ring = $("ring"), ctaEl = $("cta"), scrim = $("scrim");
+  var n = steps.length, phase = cover ? "cover" : "step";
+  var boxOn = false, dimTimer = 0, enterTimer = 0, pendingEnter = false, cardKind = "", cardData = null;
+  var preloaded = {};
+
+  if (cta) {
+    ctaEl.textContent = cta.label;
+    ctaEl.href = cta.url;
+    ctaEl.target = "_blank";
+    ctaEl.rel = "noopener noreferrer";
+    ctaEl.referrerPolicy = "no-referrer";
+  }
+  $("bar").hidden = !showBar;
+  ring.classList.toggle("pulse", hotspot === "pulse");
+  if (hotspot === "none") {
+    // No visible hotspot: it still takes a click, but keyboard and screen reader users use Next.
+    ring.classList.add("ghost");
+    ring.tabIndex = -1;
+    ring.setAttribute("aria-hidden", "true");
+  }
+
+  function style() { return cardStyle === "auto" ? (prefersDark.matches ? "dark" : "light") : cardStyle; }
+  function box(s) {
+    var a = obj(s.spotlight), b = a && [num(a.x), num(a.y), num(a.w), num(a.h)];
+    return b && b.indexOf(null) === -1 && b[2] > 0 && b[3] > 0 ? b : null;
+  }
+  function click(s) {
+    var c = obj(s.click), x = c && num(c.x), y = c && num(c.y);
+    return x === null || y === null || !c ? null : [x, y];
+  }
+  function stepCard(s) {
+    var c = obj(s.card);
+    if (!c) return null;
+    var title = line(c.title, 80), body = para(c.body, 300);
+    if (!title && !body) return null;
+    var anchor = pick(c.anchor, ["hotspot", "point", "none"], "hotspot"), point = null;
+    if (anchor === "point") {
+      var p = obj(c.point), x = p && num(p.x), y = p && num(p.y);
+      point = p && x !== null && y !== null ? [x, y] : null;
+    } else if (anchor === "hotspot") point = click(s);
+    return { title: title, body: body, next: line(c.next_label, 24) || "Next", point: point, placement: pick(c.placement, ["auto", "top", "bottom", "left", "right"], "auto") };
+  }
+  function finished() {
+    var s = steps[i];
+    return phase === "step" && (done || (i === n - 1 && !click(s) && !stepCard(s)));
+  }
+  function size() { return { w: shot.clientWidth, h: shot.clientHeight }; }
+
+  // Zoom toward the spotlight's centre, else the hotspot; never past the image edge.
+  function zoomFor(s, sz) {
+    if (phase !== "step" || finished()) return { k: 1, tx: 0, ty: 0 };
+    var on = s.zoom === true || (s.zoom !== false && zoomOn), b = box(s), f = b ? [b[0] + b[2] / 2, b[1] + b[3] / 2] : click(s);
+    if (!on || !f || !sz.w) return { k: 1, tx: 0, ty: 0 };
+    var o = TourCore.zoomOffset(sz.w, sz.h, f[0] / 100 * sz.w, f[1] / 100 * sz.h, zoomK);
+    return { k: zoomK, tx: o.tx, ty: o.ty };
+  }
+  // The box a card must not cover, in displayed pixels after zoom: the spotlight, else a
+  // 44 px square on the anchor point, else nothing.
+  function avoidFor(s, z, sz, c) {
+    var b = box(s);
+    function at(px, py) { return [px / 100 * sz.w * z.k + z.tx, py / 100 * sz.h * z.k + z.ty]; }
+    var r;
+    if (b) {
+      var p0 = at(b[0], b[1]), p1 = at(b[0] + b[2], b[1] + b[3]);
+      r = { x0: p0[0], y0: p0[1], x1: p1[0], y1: p1[1] };
+    } else if (c && c.point) {
+      var p = at(c.point[0], c.point[1]);
+      r = { x0: p[0] - 22, y0: p[1] - 22, x1: p[0] + 22, y1: p[1] + 22 };
+    } else return null;
+    r = { x0: Math.max(0, r.x0), y0: Math.max(0, r.y0), x1: Math.min(sz.w, r.x1), y1: Math.min(sz.h, r.y1) };
+    return r.x1 > r.x0 && r.y1 > r.y0 ? r : null;
+  }
+  function overlaps(a, x, y, w, h) { return !!a && x < a.x1 && x + w > a.x0 && y < a.y1 && y + h > a.y0; }
+
+  // The darkening fades in; between two spotlighted steps its bright box glides instead.
+  function drawSpot(s) {
+    var b = box(s);
+    clearTimeout(dimTimer);
+    if (!b) {
+      if (boxOn) { dim.className = ""; dimTimer = setTimeout(function () { dim.hidden = true; }, ms(400)); }
+      boxOn = false;
+      return;
+    }
+    var strength = TourCore.num(TOUR.spotlight_dim, 10, 90, 60) / 100;
+    hole.classList.toggle("soft", soft);
+    hole.classList.toggle("glide", boxOn && !dim.hidden && !reduced.matches);
+    hole.style.left = b[0] + "%"; hole.style.top = b[1] + "%";
+    hole.style.width = b[2] + "%"; hole.style.height = b[3] + "%";
+    hole.style.boxShadow = soft
+      ? "0 0 0 1px rgba(255, 255, 255, .32), 0 0 22px 200vmax rgba(0, 0, 0, " + strength + ")"
+      : "0 0 0 1.5px rgba(255, 255, 255, .5), 0 0 0 200vmax rgba(0, 0, 0, " + strength + ")";
+    if (!boxOn || dim.hidden) {
+      dim.hidden = false;
+      dim.className = "";
+      void dim.offsetWidth;
+    }
+    dim.className = "on";
+    boxOn = true;
+  }
+  function clearSpot() {
+    clearTimeout(dimTimer);
+    boxOn = false;
+    dim.hidden = true;
+    dim.className = "";
+  }
+
+  // ---- The card: a guide card, the compact bar, or the cover and end panels ----
+  function button(cls, text, label, onclick) {
+    var b = el("button", cls, text);
+    b.type = "button";
+    if (label) b.setAttribute("aria-label", label);
+    b.onclick = onclick;
+    return b;
+  }
+  function buildCard() {
+    var hadFocus = card.contains(document.activeElement);
+    clearTimeout(enterTimer);
+    card.classList.add("now");
+    card.classList.remove("in");
+    card.replaceChildren();
+    card.style.width = ""; card.style.left = ""; card.style.top = "";
+    stage.style.paddingBottom = "";
+    cardKind = ""; cardData = null;
+    var s = steps[i], first = null, kids = [];
+    if (phase === "cover") {
+      cardKind = "panel";
+      if (cover.logo) {
+        var logo = el("img", "p-logo");
+        logo.alt = "";
+        logo.onerror = function () { logo.remove(); };
+        logo.src = cover.logo;
+        kids.push(logo);
+      }
+      kids.push(el("div", "p-title", cover.title));
+      if (cover.body) kids.push(el("p", "p-body", cover.body));
+      first = button("p-btn", cover.button, null, function () { start(); });
+      var row = el("div", "p-actions");
+      row.appendChild(first);
+      kids.push(row);
+      card.setAttribute("aria-label", cover.title);
+    } else if (finished() && end) {
+      cardKind = "panel";
+      if (end.text) kids.push(el("p", "p-title", end.text));
+      var acts = el("div", "p-actions");
+      if (end.primary) acts.appendChild(linkEl(end.primary, "p-btn"));
+      if (end.secondary) acts.appendChild(linkEl(end.secondary, "p-ghost"));
+      if (end.replay) acts.appendChild(button("p-ghost", "Replay", "Replay the tour", function () { replay(); }));
+      if (!acts.firstChild && !end.text) acts.appendChild(button("p-ghost", "Replay", "Replay the tour", function () { replay(); }));
+      first = acts.firstChild;
+      if (acts.firstChild) kids.push(acts);
+      card.setAttribute("aria-label", "End of tour");
+    } else if (!finished() && stepCard(s)) {
+      var c = stepCard(s), compact = style() === "compact";
+      cardKind = compact ? "compact" : "guide";
+      cardData = c;
+      var back = button("c-back", "‹", "Back", function () { go(-1); });
+      back.disabled = i === 0 && !cover;
+      var count = el("span", "c-count", (i + 1) + " of " + n);
+      var next = button("c-next", c.next, null, function () { go(1); });
+      // Bold runs from the shared rules become <strong> around text nodes; line breaks stay as typed.
+      var rich = function (text) {
+        var body = el("div", "c-body");
+        TourCore.parseBold(text).forEach(function (p) { body.appendChild(p.bold ? el("strong", "", p.text) : document.createTextNode(p.text)); });
+        return body;
+      };
+      if (compact) {
+        kids.push(back, count, c.body ? rich(c.body) : el("div", "c-body", c.title), next);
+      } else {
+        if (c.title) kids.push(el("div", "c-title", c.title));
+        if (c.body) kids.push(rich(c.body));
+        var foot = el("div", "c-foot");
+        foot.append(back, count, next);
+        kids.push(foot, el("span", "notch"));
+      }
+      first = next;
+      card.setAttribute("aria-label", "Step " + (i + 1) + " of " + n);
+    }
+    // Cover and end panels of a compact tour use the dark card.
+    var palette = style() === "compact" ? "dark" : style();
+    card.className = cardKind ? (cardKind === "compact" ? "compact now" : palette + (cardKind === "panel" ? " panel now" : " now")) : "now";
+    card.replaceChildren.apply(card, kids);
+    card.hidden = !cardKind;
+    pendingEnter = !!cardKind;
+    // Keyboard users keep their place: focus moves to the new card's main button, or to the
+    // footer's Next when this step has no card.
+    if (hadFocus) (first || ($("next").disabled ? $("prev") : $("next"))).focus({ preventScroll: true });
+  }
+
+  function placeCard(z, sz, avoid) {
+    if (!cardKind) return;
+    var W = sz.w, H = sz.h, w = cardKind === "compact" ? W - 16 : Math.min(cardKind === "panel" ? 380 : 320, W - 16);
+    stage.style.paddingBottom = "";
+    card.style.width = w + "px";
+    var h = card.offsetHeight, x, y, side;
+    if (cardKind === "guide") {
+      var p = TourCore.placeCard(W, H, w, h, avoid, cardData.placement);
+      x = p.x; y = p.y; side = p.side;
+    } else if (cardKind === "compact") {
+      x = 8; side = "bottom";
+      if (!overlaps(avoid, 8, H - h - 8, w, h + 8)) y = H - h - 8;
+      else if (!overlaps(avoid, 8, 8, w, h + 8)) y = 8;
+      else side = "docked";
+    } else if (h <= H - 16) {
+      x = (W - w) / 2; y = (H - h) / 2; side = "none";
+    } else side = "docked";
+    if (h > H - 16) side = "docked";
+    if (side === "docked") {
+      // No room beside the box: the card goes under the image at full width.
+      card.style.width = W + "px";
+      h = card.offsetHeight;
+      x = 0; y = H + 12;
+      stage.style.paddingBottom = (h + 12) + "px";
+    }
+    card.style.left = Math.round(x) + "px";
+    card.style.top = Math.round(y) + "px";
+    var notch = card.querySelector(".notch");
+    if (notch) {
+      var dir = { bottom: "up", top: "down", right: "toleft", left: "toright" }[side];
+      notch.hidden = !dir || !avoid;
+      if (dir && avoid) {
+        notch.className = "notch " + dir;
+        if (dir === "up" || dir === "down") {
+          notch.style.top = ""; notch.style.bottom = "";
+          notch.style.left = Math.max(16, Math.min(w - 28, (avoid.x0 + avoid.x1) / 2 - x - 6)) + "px";
+        } else {
+          notch.style.left = ""; notch.style.right = "";
+          notch.style.top = Math.max(14, Math.min(h - 26, (avoid.y0 + avoid.y1) / 2 - y - 6)) + "px";
+        }
+      }
+    }
+  }
+
+  // Geometry for the current state. `animate` is false on resize, so nothing travels.
+  function layout(animate) {
+    var sz = size();
+    if (!sz.w || !sz.h) return;
+    var s = steps[i], z = zoomFor(s, sz);
+    var t = "translate(" + z.tx + "px, " + z.ty + "px) scale(" + z.k + ")";
+    var moved = view.style.transform !== t && !(z.k === 1 && !view.style.transform);
+    if (!animate) { view.style.transition = "none"; hole.classList.remove("glide"); }
+    view.style.transform = t;
+    var avoid = phase === "step" && !finished() ? avoidFor(s, z, sz, cardData) : null;
+    placeCard(z, sz, avoid);
+    if (cta && !ctaEl.hidden) {
+      var cw = ctaEl.offsetWidth, ch = ctaEl.offsetHeight;
+      ctaEl.classList.toggle("left", overlaps(avoid, sz.w - cw - 12, 12, cw, ch));
+    }
+    if (!animate) { void view.offsetWidth; view.style.transition = ""; }
+    if (pendingEnter) {
+      pendingEnter = false;
+      void card.offsetWidth;
+      if (!animate || reduced.matches) { card.classList.add("in"); void card.offsetWidth; card.classList.remove("now"); }
+      else {
+        card.classList.remove("now");
+        // The card enters about 280 ms after the zoom settles.
+        enterTimer = setTimeout(function () { card.classList.add("in"); }, (moved ? 550 : 0) + 280);
+      }
+    }
+  }
+
+  function announce(text) { $("status").textContent = text; }
+
+  function render() {
+    var s = steps[i], fin = finished(), onStep = phase === "step" && !fin;
+    var src = s.image;
+    if (shot.getAttribute("src") !== src) shot.src = src;
+    if (phase === "cover") {
+      drawn = -1;
+      clearSpot();
+      $("layer").replaceChildren();
+    } else if (i !== drawn) {
+      drawn = i;
+      drawSpot(s);
+      drawNotes(s);
+    }
+    var c = click(s);
+    ring.hidden = !onStep || !c;
+    if (c) { ring.style.left = c[0] + "%"; ring.style.top = c[1] + "%"; }
+    scrim.className = phase === "cover" || (fin && end) ? "on" : "";
+    $("end").className = fin && !end ? "on" : "";
+    ctaEl.hidden = !cta || !onStep;
+    frame.classList.toggle("anywhere", onStep && s.advance === "anywhere");
+    $("bar-fill").style.transform = "scaleX(" + (phase === "cover" ? 0 : (i + 1) / n) + ")";
+    shot.alt = phase === "cover" ? "" : "Step " + (i + 1) + " of " + n;
+    $("count").textContent = phase === "cover" ? "Intro" : "Step " + (i + 1) + " of " + n;
+    $("prev").disabled = phase === "cover" || (i === 0 && !cover);
+    $("next").disabled = fin;
+    buildCard();
+    var sc = stepCard(s);
+    announce(phase === "cover" ? cover.title : fin ? "End of tour. " + (end ? end.text : "") : "Step " + (i + 1) + " of " + n + (sc && sc.title ? ". " + sc.title : ""));
+    if (shot.complete && shot.naturalWidth) layout(true);
+    // Otherwise the image's load event lays it out.
+    var ahead = steps[phase === "cover" ? 0 : i + 1];
+    if (ahead && !preloaded[ahead.image]) { preloaded[ahead.image] = new Image(); preloaded[ahead.image].src = ahead.image; }
+    if (phase === "cover" && steps[1] && !preloaded[steps[1].image]) { preloaded[steps[1].image] = new Image(); preloaded[steps[1].image].src = steps[1].image; }
+    schedule();
+  }
+  shot.addEventListener("load", function () { layout(true); });
+  window.addEventListener("resize", function () { layout(false); });
+
+  // ---- Moving through the tour ----
+  function go(d, auto) {
+    if (!auto) stopAutoplay();
+    if (phase === "cover") { if (d > 0) start(); return; }
+    if (d > 0 && finished()) return;
+    var k = i + d;
+    if (k >= n) {
+      done = true;
+      render();
+      if (!auto) { var f = card.querySelector("a, button") || $("restart"); f.focus({ preventScroll: true }); }
+    } else if (k >= 0) { i = k; done = false; render(); }
+    else if (cover) { phase = "cover"; i = 0; done = false; render(); }
+  }
+  function start() { phase = "step"; i = 0; done = false; render(); }
+  function replay() { stopAutoplay(); start(); }
+  ring.onclick = function () { go(1); };
   $("next").onclick = function () { go(1); };
   $("prev").onclick = function () { go(-1); };
-  $("restart").onclick = function () { i = 0; done = false; show(); };
+  $("restart").onclick = function () { replay(); };
+  frame.addEventListener("click", function (e) {
+    if (phase === "step" && !finished() && steps[i].advance === "anywhere" && !e.target.closest("button, a")) go(1);
+  });
   document.addEventListener("keydown", function (e) {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1);
   });
-  show();
+  // A horizontal swipe of at least 40 px anywhere around the image.
+  var touch = null, area = document.querySelector("main");
+  area.addEventListener("touchstart", function (e) { touch = e.touches.length === 1 ? [e.touches[0].clientX, e.touches[0].clientY] : null; }, { passive: true });
+  area.addEventListener("touchend", function (e) {
+    if (!touch) return;
+    var t = e.changedTouches[0], dx = t.clientX - touch[0], dy = t.clientY - touch[1];
+    touch = null;
+    if (Math.abs(dx) >= 40 && Math.abs(dx) > Math.abs(dy)) go(dx < 0 ? 1 : -1);
+  });
+
+  // ---- Autoplay: pauses on hover and keyboard focus, stops for good on any manual step ----
+  var playBtn = $("autoplay"), playing = false, hoverHold = false, focusHold = false, playTimer = 0;
+  function playable() { return playOn && !reduced.matches; }
+  function showPlay() {
+    playBtn.hidden = !playable();
+    playBtn.textContent = playing ? "Pause" : "Play";
+    playBtn.setAttribute("aria-label", playing ? "Pause autoplay" : "Play autoplay");
+  }
+  function schedule() {
+    clearTimeout(playTimer);
+    if (!playing || hoverHold || focusHold || phase !== "step" || finished()) return;
+    playTimer = setTimeout(function () {
+      if (playing && !hoverHold && !focusHold) go(1, true);
+    }, playMs);
+  }
+  function stopAutoplay() { playing = false; clearTimeout(playTimer); showPlay(); }
+  playBtn.onclick = function () {
+    playing = !playing && playable();
+    showPlay();
+    schedule();
+  };
+  stage.addEventListener("pointerenter", function (e) { if (e.pointerType === "mouse") { hoverHold = true; schedule(); } });
+  stage.addEventListener("pointerleave", function (e) { if (e.pointerType === "mouse") { hoverHold = false; schedule(); } });
+  function checkFocus() {
+    var a = document.activeElement;
+    // Keyboard focus only: a control focused by a mouse click does not hold autoplay.
+    var keyboard = false;
+    try { keyboard = !!a && a.matches(":focus-visible"); } catch (err) { keyboard = true; }
+    focusHold = keyboard && a !== playBtn && a !== document.body && !!a.closest("button, a");
+    schedule();
+  }
+  document.addEventListener("focusin", checkFocus);
+  document.addEventListener("focusout", function () { setTimeout(checkFocus, 0); });
+  reduced.addEventListener("change", function () { if (reduced.matches) stopAutoplay(); else showPlay(); });
+  prefersDark.addEventListener("change", function () { if (cardStyle === "auto") { buildCard(); layout(false); } });
+
+  playing = playable();
+  showPlay();
+  render();
 })();
 </script>
 </body>
