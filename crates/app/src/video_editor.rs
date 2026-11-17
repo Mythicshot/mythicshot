@@ -4,7 +4,7 @@
 //! Annotations are the editor's own items with a frame range; the preview and
 //! every export draw through `video::decorate`, so they match.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +18,7 @@ use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::settings_ui::{click_style_label, key_style_label};
+use crate::tour::{self, StepPlan, TourSummary};
 use crate::video::{self, Edit};
 
 const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
@@ -101,6 +102,61 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
     }
 }
 
+/// The export running in the editor: a file (GIF, APNG, MP4, WebM) or a tour bundle.
+enum ExportJob {
+    File(EncodeJob),
+    Tour(EncodeJob<TourSummary>),
+}
+
+/// What a finished export made.
+enum Exported {
+    File(PathBuf, u64),
+    Tour(TourSummary),
+}
+
+impl ExportJob {
+    fn is_tour(&self) -> bool {
+        matches!(self, ExportJob::Tour(_))
+    }
+
+    fn progress(&self) -> f32 {
+        match self {
+            ExportJob::File(j) => j.progress(),
+            ExportJob::Tour(j) => j.progress(),
+        }
+    }
+
+    /// The outcome once the export has finished.
+    fn take_result(&self) -> Option<Result<Exported, String>> {
+        match self {
+            ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
+            ExportJob::Tour(j) => j.take_result().map(|r| r.map(Exported::Tour)),
+        }
+    }
+}
+
+/// A folder for a new tour bundle inside `parent`: `<stem>-tour`, or with
+/// `-2`, `-3` and so on when that name is taken.
+fn tour_dir(parent: &Path, stem: &str) -> PathBuf {
+    let mut dir = parent.join(format!("{stem}-tour"));
+    let mut n = 2;
+    while dir.exists() {
+        dir = parent.join(format!("{stem}-tour-{n}"));
+        n += 1;
+    }
+    dir
+}
+
+fn step_count(n: usize) -> String {
+    if n == 1 { "1 step".to_string() } else { format!("{n} steps") }
+}
+
+/// The export panel's line under "Tour".
+fn tour_steps_label(steps: &[StepPlan]) -> String {
+    let last_frame = if steps.last().is_some_and(|s| s.click.is_none()) { ", plus the last frame" } else { "" };
+    format!("{} · one per click{last_frame}", step_count(steps.len()))
+}
+
 pub struct VideoState {
     pub rec: Arc<Recording>,
     reader: FrameReader,
@@ -115,7 +171,7 @@ pub struct VideoState {
     loop_forever: bool,
     fps: u32,
     ffmpeg: bool,
-    job: Option<EncodeJob>,
+    job: Option<ExportJob>,
     pub exported: bool,
     pub close_after_export: bool,
     drag: Option<TimelineDrag>,
@@ -286,19 +342,34 @@ impl Editor {
         }
         let finished = v.job.as_ref().and_then(|j| j.take_result());
         let progress = v.job.as_ref().map(|j| j.progress());
+        let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
         if let Some(r) = finished {
             v.job = None;
             match r {
-                Ok((path, size)) => {
+                Ok(done) => {
                     v.exported = true;
                     let close = v.close_after_export;
                     self.doc.mark_saved();
-                    let msg = format!("Exported {} ({:.1} MB)", path.display(), size as f64 / 1_048_576.0);
-                    eprintln!("{msg}");
-                    self.notify(msg);
+                    match done {
+                        Exported::File(path, size) => {
+                            let msg = format!("Exported {} ({:.1} MB)", path.display(), size as f64 / 1_048_576.0);
+                            eprintln!("{msg}");
+                            self.notify(msg);
+                        }
+                        Exported::Tour(tour) => {
+                            let msg = format!("Tour exported: {}", step_count(tour.steps));
+                            eprintln!("{msg} ({:.1} MB) in {}", tour.bytes as f64 / 1_048_576.0, tour.dir.display());
+                            self.notify(msg);
+                            crate::platform::open_path(&tour.dir.join("index.html"));
+                        }
+                    }
                     if close {
                         self.closed = true;
                     }
+                }
+                Err(e) if is_tour => {
+                    eprintln!("Tour export failed: {e}");
+                    self.notify(e);
                 }
                 Err(e) => {
                     eprintln!("Export failed: {e}");
@@ -306,7 +377,8 @@ impl Editor {
                 }
             }
         } else if let Some(p) = progress {
-            self.notify(format!("Exporting… {:.0}%", p * 100.0));
+            let what = if is_tour { "Exporting tour…" } else { "Exporting…" };
+            self.notify(format!("{what} {:.0}%", p * 100.0));
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         self.sync_frame();
@@ -332,9 +404,42 @@ impl Editor {
         let spec = ExportSpec { format: v.format, quality: v.quality, loop_forever: v.loop_forever, video_fps: v.fps };
         let job = EncodeJob::start(v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), spec, path, false);
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(job);
+            v.job = Some(ExportJob::File(job));
         }
         self.notify("Exporting… 0%");
+    }
+
+    /// Ask for a folder, then export a tour bundle into a new subfolder of it.
+    fn export_tour(&mut self) {
+        if let Some(parent) = rfd::FileDialog::new().set_directory(&self.dest.output_dir).pick_folder() {
+            self.start_tour(&parent);
+        }
+    }
+
+    /// Export a tour bundle into a new folder inside `parent`, named like a normal export.
+    fn start_tour(&mut self, parent: &Path) {
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
+        let stem = match dest::new_path_with_extension(&self.dest, v.format.extension()) {
+            Ok(p) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "recording".into()),
+            Err(e) => return self.notify(e),
+        };
+        let dir = tour_dir(parent, &stem);
+        let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
+        let job = EncodeJob::spawn(move |progress| {
+            // The editor's reader stays on the UI thread; this one belongs to the export.
+            let mut reader = FrameReader::new(rec.clone())?;
+            tour::write_bundle(&rec, &items, &events, &edit, &title, &dir, |i| reader.get(i), |f| {
+                progress(f);
+                true
+            })
+        });
+        if let Some(v) = self.video.as_mut() {
+            v.job = Some(ExportJob::Tour(job));
+        }
+        self.notify("Exporting tour… 0%");
     }
 
     fn export_as(&mut self) {
@@ -396,6 +501,10 @@ impl Editor {
         let (w, h) = video::output_size(&v.rec, &v.edit);
         let (frames, end) = video::plan(&v.rec, &v.edit);
         ui.label(RichText::new(format!("{w} × {h} · {} frames · {:.1} s", frames.len(), end as f64 / 1000.0)).color(MUTED).size(12.0));
+        let (tour_line, tour_ok) = match tour::plan_steps(&v.rec, &v.edit, &v.events) {
+            Ok(steps) => (tour_steps_label(&steps), true),
+            Err(e) => (e, false),
+        };
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.add_enabled(!exporting, egui::Button::new(RichText::new("Export").strong()).fill(Color32::from_rgb(47, 111, 235))).clicked() {
@@ -407,6 +516,13 @@ impl Editor {
                 ui.close();
             }
         });
+        ui.separator();
+        ui.label(RichText::new("Tour").strong());
+        ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
+        if ui.add_enabled(tour_ok && !exporting, egui::Button::new("Export tour…")).clicked() {
+            self.export_tour();
+            ui.close();
+        }
         self.remember_export();
     }
 
@@ -675,5 +791,23 @@ mod tests {
         // (0,10) and (11,30) share row 0; (5,20) and (25,40) share row 1.
         assert_eq!(rows, vec![(0, 0), (5, 1), (11, 0), (25, 1)]);
         assert_eq!(lanes, 2);
+    }
+
+    #[test]
+    fn tour_line_counts_steps_and_names_the_last_frame_only_when_it_is_a_step() {
+        let step = |click| StepPlan { src: 0, click, t_ms: 0 };
+        assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0))), step(Some((2.0, 2.0))), step(None)]), "3 steps · one per click, plus the last frame");
+        assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0))), step(Some((2.0, 2.0)))]), "2 steps · one per click");
+        assert_eq!(tour_steps_label(&[step(Some((1.0, 1.0)))]), "1 step · one per click");
+    }
+
+    #[test]
+    fn tour_folder_name_never_collides() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(tour_dir(tmp.path(), "shot-01"), tmp.path().join("shot-01-tour"));
+        std::fs::create_dir(tmp.path().join("shot-01-tour")).unwrap();
+        assert_eq!(tour_dir(tmp.path(), "shot-01"), tmp.path().join("shot-01-tour-2"));
+        std::fs::create_dir(tmp.path().join("shot-01-tour-2")).unwrap();
+        assert_eq!(tour_dir(tmp.path(), "shot-01"), tmp.path().join("shot-01-tour-3"));
     }
 }

@@ -14,6 +14,16 @@ Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Li
 - **GIF editor:** trim, delete frames, speed, reverse, crop, annotations with frame ranges on a timeline, export to GIF, APNG, MP4 or WebM (the last two need ffmpeg on the PATH).
 - **Settings:** every global and editor shortcut can be rebound; settings live in one `settings.toml` you can copy to another PC.
 
+## Tour export
+
+A tour bundle turns a recording into a click-through walkthrough: one image per left click, with the place you clicked marked as a hotspot, plus the last frame as a closing step.
+
+To export one, open the recording editor's export panel, choose "Export tour…" and pick a folder; the bundle goes into a new subfolder named like a normal export with `-tour` added. Trim, deleted frames, crop and annotations apply; the pointer, click and key overlays, speed, reverse and scale do not.
+
+The folder holds the step images (`step-001.png` and so on, JPEG when a PNG would be too large), `tour.json` (the manifest: title, image names and sizes, click positions as percentages; never key presses) and `index.html` (a preview page).
+
+The preview page is local only: it opens in your browser from the folder, loads nothing from the network, and is there to check the tour, not to host it.
+
 ## Build
 
 Built with Rust 1.97 (the oldest working version has not been checked). On Windows, the Visual Studio C++ Build Tools (for the linker and the resource compiler).
