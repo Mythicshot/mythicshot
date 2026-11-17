@@ -479,7 +479,10 @@ impl Editor {
                             self.notify(msg);
                         }
                         Exported::Tour(tour) => {
-                            let msg = format!("Tour exported: {}", step_count(tour.steps));
+                            let mut msg = format!("Tour exported: {}", step_count(tour.steps));
+                            if let Some(note) = tour.squeezed_note() {
+                                msg = format!("{msg} · {note}");
+                            }
                             eprintln!("{msg} ({:.1} MB) in {}", tour.bytes as f64 / 1_048_576.0, tour.dir.display());
                             self.notify(msg);
                             crate::platform::open_path(&tour.dir.join("index.html"));

@@ -49,18 +49,26 @@ pub fn new_card(has_click: bool) -> Card {
 
 /// The card's rectangle on the canvas in frame pixels, from the same rule the players use.
 /// The box to keep clear is the spotlight; without one, a 44-pixel square around the anchor.
-pub fn card_rect(frame: (f32, f32), card_size: (f32, f32), spotlight: Option<Bounds>, anchor_at: Option<Pt>, placement: Placement) -> Placed {
+/// `picked` is a spot chosen with "A spot I pick": the card points at it while still keeping clear of
+/// the spotlight, as every player places it.
+pub fn card_rect(frame: (f32, f32), card_size: (f32, f32), spotlight: Option<Bounds>, anchor_at: Option<Pt>, picked: Option<Pt>, placement: Placement) -> Placed {
     let half = ANCHOR_BOX / 2.0;
     let avoid = spotlight.or_else(|| anchor_at.map(|p| Bounds { x0: p.x - half, y0: p.y - half, x1: p.x + half, y1: p.y + half }));
-    place_card(frame, card_size, avoid, placement)
+    place_card(frame, card_size, avoid, placement, picked.map(|p| (p.x, p.y)))
 }
 
-/// Card colours for a style: (background, text, muted text); `Auto` is drawn as dark in the editor.
+/// Card colours for a style: (background, text, muted text). The compact bar is a light pill, so it
+/// takes Light's colours; `Auto` is drawn as dark in the editor.
 pub fn card_colors(style: CardStyle) -> (Color32, Color32, Color32) {
     match style {
-        CardStyle::Light => (Color32::from_rgb(248, 249, 251), Color32::from_rgb(28, 32, 40), Color32::from_rgb(98, 106, 120)),
-        CardStyle::Dark | CardStyle::Compact | CardStyle::Auto => (Color32::from_rgb(30, 35, 44), Color32::from_rgb(236, 239, 244), Color32::from_rgb(152, 160, 174)),
+        CardStyle::Light | CardStyle::Compact => (Color32::from_rgb(248, 249, 251), Color32::from_rgb(28, 32, 40), Color32::from_rgb(98, 106, 120)),
+        CardStyle::Dark | CardStyle::Auto => (Color32::from_rgb(30, 35, 44), Color32::from_rgb(236, 239, 244), Color32::from_rgb(152, 160, 174)),
     }
+}
+
+/// Corner radius for a pill of height `h`: half its height, within what a corner radius holds.
+pub fn pill_radius(h: f32) -> u8 {
+    (h / 2.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Relative luminance of an sRGB colour.
@@ -85,7 +93,7 @@ pub fn capped(s: &str, cap: usize) -> String {
 }
 
 /// `#rrggbb` as a colour, or None.
-fn parse_hex(s: &str) -> Option<Color32> {
+pub(crate) fn parse_hex(s: &str) -> Option<Color32> {
     let d = s.trim().strip_prefix('#')?;
     if d.len() != 6 || !d.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -155,12 +163,15 @@ pub struct CardUi {
     editing: Option<Field>,
     /// Give the field being edited the keyboard next frame.
     focus: bool,
-    /// The next click on the canvas sets the card's spot.
-    picking: bool,
+    /// The next click on the canvas sets the card's spot: the step being picked on and what the card
+    /// pointed at before, which a cancelled pick restores.
+    picking: Option<(usize, Anchor)>,
     /// The card's height on screen last frame, for placing it this frame.
     height: f32,
     /// Where the card was drawn last frame, in frame pixels, so a click on it selects it.
     drawn: Option<Bounds>,
+    /// The same on screen, so a press off the card can end typing on it.
+    drawn_screen: Option<Rect>,
     /// The last card removed and its step, for "Card removed · Undo".
     removed: Option<(usize, Card)>,
 }
@@ -222,6 +233,53 @@ fn can_undo_removal(doc: &TourDoc, ui: &CardUi, shown: usize) -> bool {
     ui.removed.as_ref().is_some_and(|(s, _)| *s == shown) && doc.steps.get(&shown).is_none_or(|s| s.card.is_none())
 }
 
+/// "A spot I pick" on step `src`: the next click on the picture sets the spot. An earlier spot is used
+/// straight away; what the card pointed at before is kept so a cancelled pick can restore it.
+fn start_pick(doc: &mut TourDoc, ui: &mut CardUi, src: usize) {
+    let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) else { return };
+    let before = match ui.picking {
+        Some((s, before)) if s == src => before,
+        _ => c.anchor,
+    };
+    if c.point.is_some() {
+        c.anchor = Anchor::Point;
+    }
+    ui.picking = Some((src, before));
+}
+
+/// The click that ends a pick: the card points at `p` on the step being picked on.
+fn finish_pick(doc: &mut TourDoc, ui: &mut CardUi, p: Pt) -> bool {
+    let Some((src, _)) = ui.picking.take() else { return false };
+    if let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) {
+        c.anchor = Anchor::Point;
+        c.point = Some(Point { x: p.x, y: p.y });
+    }
+    true
+}
+
+/// A pick that ended without a click on the picture (Esc, focus lost, another step, tool or choice):
+/// the card points at what it did before, so "A spot I pick" is only ever chosen with a spot.
+fn cancel_pick(doc: &mut TourDoc, ui: &mut CardUi) {
+    let Some((src, before)) = ui.picking.take() else { return };
+    if let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) {
+        c.anchor = if before == Anchor::Point && c.point.is_none() { Anchor::None } else { before };
+    }
+}
+
+/// True when a press this frame (`press`) ends typing on the card: any press that is not on the card.
+fn ends_typing(press: Option<Pos2>, on_card: bool) -> bool {
+    press.is_some() && !on_card
+}
+
+/// The choice the "Points at" row shows: "A spot I pick" while picking or with a spot, else the card's anchor.
+fn shown_anchor(card: &Card, picking: bool) -> Anchor {
+    match card.anchor {
+        _ if picking => Anchor::Point,
+        Anchor::Point if card.point.is_none() => Anchor::None,
+        a => a,
+    }
+}
+
 /// The theme to remember after the panel ran: only a change the panel made, never the shared one compared again.
 fn changed_theme(before: &SavedTheme, after: SavedTheme) -> Option<SavedTheme> {
     (*before != after).then_some(after)
@@ -246,14 +304,32 @@ fn link_warning(draft: &str) -> Option<&'static str> {
     (!draft.trim().is_empty() && safe_url(draft).is_none()).then_some(LINK_WARNING)
 }
 
+/// How one of a card's texts is typed and shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lines {
+    /// Typed on one line, shown wrapped (title, button).
+    Wrap,
+    /// Typed and shown as several lines (body).
+    Paragraph,
+    /// Typed on one line and shown on one line, cut with an ellipsis (the compact bar's text).
+    One,
+}
+
 /// Text pieces with `**bold**` marked, laid out at `width`. With `bold_only`, plain pieces are
 /// transparent, so drawing it a hair to the right over the full text makes the bold pieces heavier.
-fn text_job(pieces: &[(String, bool)], font: &FontId, color: Color32, width: f32, bold_only: bool) -> LayoutJob {
+/// With [`Lines::One`] line breaks become spaces and the text is cut to one row with an ellipsis.
+fn text_job(pieces: &[(String, bool)], font: &FontId, color: Color32, width: f32, bold_only: bool, lines: Lines) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
+    if lines == Lines::One {
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+    }
     for (text, bold) in pieces {
         let c = if bold_only && !bold { Color32::TRANSPARENT } else { color };
-        job.append(text, 0.0, TextFormat { font_id: font.clone(), color: c, ..Default::default() });
+        let text = if lines == Lines::One { text.replace('\n', " ") } else { text.clone() };
+        job.append(&text, 0.0, TextFormat { font_id: font.clone(), color: c, ..Default::default() });
     }
     job
 }
@@ -277,9 +353,9 @@ struct FieldCtx {
 /// One of the card's texts: drawn (with bold) until clicked, then typed in place, capped at `cap`.
 /// `all_bold` draws the whole text heavier (title, button); otherwise `**bold**` is honoured.
 #[allow(clippy::too_many_arguments)]
-fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut String, cap: usize, font: FontId, color: Color32, hint: (&str, Color32), width: f32, multiline: bool, all_bold: bool) {
+fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut String, cap: usize, font: FontId, color: Color32, hint: (&str, Color32), width: f32, lines: Lines, all_bold: bool) {
     if fc.editing == Some(which) {
-        let edit = if multiline { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
+        let edit = if lines == Lines::Paragraph { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
         let resp = ui.add(edit.id(field_id(fc.instance, fc.src, which)).frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
         if fc.focus {
             resp.request_focus();
@@ -293,12 +369,12 @@ fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut Str
         return;
     }
     let (pieces, c) = if text.trim().is_empty() { (vec![(hint.0.to_string(), false)], hint.1) } else if all_bold { (vec![(text.clone(), true)], color) } else { (parse_bold(text), color) };
-    let galley = ui.painter().layout_job(text_job(&pieces, &font, c, width, false));
-    let size = vec2(if multiline { width } else { galley.size().x.min(width) }, galley.size().y);
+    let galley = ui.painter().layout_job(text_job(&pieces, &font, c, width, false, lines));
+    let size = vec2(if lines == Lines::Paragraph { width } else { galley.size().x.min(width) }, galley.size().y);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     ui.painter().galley(rect.min, galley, c);
     if pieces.iter().any(|(_, b)| *b) {
-        let bold = ui.painter().layout_job(text_job(&pieces, &font, c, width, true));
+        let bold = ui.painter().layout_job(text_job(&pieces, &font, c, width, true, lines));
         ui.painter().galley(rect.min + vec2(0.55, 0.0), bold, c);
     }
     if resp.hovered() {
@@ -377,11 +453,6 @@ impl Editor {
         self.video.as_ref()?.edit.tour_doc.steps.get(&src)?.card.as_ref()
     }
 
-    fn shown_card_mut(&mut self) -> Option<&mut Card> {
-        let src = self.tour_src()?;
-        self.video.as_mut()?.edit.tour_doc.steps.get_mut(&src)?.card.as_mut()
-    }
-
     /// The shown step's card is selected.
     pub(crate) fn card_selected(&self) -> bool {
         self.video.as_ref().is_some_and(|v| v.tour.card.selected) && self.shown_card().is_some()
@@ -396,9 +467,16 @@ impl Editor {
             let c = &mut v.tour.card;
             c.selected = on;
             if !on {
-                c.editing = None;
-                c.picking = false;
+                (c.editing, c.focus) = (None, false);
+                cancel_pick(&mut v.edit.tour_doc, c);
             }
+        }
+    }
+
+    /// Stop picking the card's spot, if a pick is under way, and point the card where it did before.
+    pub(crate) fn cancel_card_pick(&mut self) {
+        if let Some(v) = self.video.as_mut() {
+            cancel_pick(&mut v.edit.tour_doc, &mut v.tour.card);
         }
     }
 
@@ -406,7 +484,31 @@ impl Editor {
     pub(crate) fn forget_card_ui(&mut self) {
         if let Some(v) = self.video.as_mut() {
             let c = &mut v.tour.card;
-            (c.selected, c.editing, c.picking, c.removed, c.drawn) = (false, None, false, None, None);
+            cancel_pick(&mut v.edit.tour_doc, c);
+            (c.selected, c.editing, c.focus, c.removed, c.drawn) = (false, None, false, None, None);
+        }
+    }
+
+    /// The text box of the card being typed in, while one is.
+    pub(crate) fn card_typing_id(&self) -> Option<egui::Id> {
+        let v = self.video.as_ref()?;
+        let src = self.tour_src()?;
+        v.tour.card.editing.filter(|_| v.tour.card.selected).map(|f| field_id(v.tour.instance, src, f))
+    }
+
+    /// A press anywhere but on the card ends typing on it in the press's own frame, so the card's text
+    /// box hands the keyboard back before the button is released: the click (on a toolbar button,
+    /// "A spot I pick" or Export) then lands on a settled screen and one click is enough. Called after
+    /// the canvas, so a key typed in the same frame has already reached the card.
+    /// `press` is where the pointer went down this frame, in screen points.
+    pub(crate) fn end_card_typing_on_press(&mut self, ctx: &egui::Context, press: Option<Pos2>) {
+        let Some(id) = self.card_typing_id() else { return };
+        let Some(v) = self.video.as_mut() else { return };
+        let on_card = v.tour.card.drawn_screen.is_some_and(|r| press.is_some_and(|p| r.contains(p)));
+        if ends_typing(press, on_card) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+            (v.tour.card.editing, v.tour.card.focus) = (None, false);
+            ctx.request_repaint();
         }
     }
 
@@ -417,8 +519,9 @@ impl Editor {
         }
         let Some(v) = self.video.as_mut() else { return false };
         let c = &mut v.tour.card;
-        if c.editing.is_some() || c.picking {
-            (c.editing, c.picking) = (None, false);
+        if c.editing.is_some() || c.picking.is_some() {
+            (c.editing, c.focus) = (None, false);
+            cancel_pick(&mut v.edit.tour_doc, c);
             return true;
         }
         if c.selected {
@@ -437,12 +540,7 @@ impl Editor {
         let Some(v) = self.video.as_mut() else { return false };
         let ui = &mut v.tour.card;
         let doc = &mut v.edit.tour_doc;
-        if ui.picking {
-            ui.picking = false;
-            if let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) {
-                c.anchor = Anchor::Point;
-                c.point = Some(Point { x: p.x, y: p.y });
-            }
+        if finish_pick(doc, ui, p) {
             return true;
         }
         let on_card = ui.drawn.is_some_and(|b| p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1);
@@ -485,7 +583,8 @@ impl Editor {
             ui.label(RichText::new("Show a step to add its guide card").color(MUTED));
             return;
         };
-        let Some(anchor) = self.shown_card().map(|c| c.anchor) else {
+        let picking = self.video.as_ref().is_some_and(|v| v.tour.card.picking.is_some());
+        let Some(anchor) = self.shown_card().map(|c| shown_anchor(c, picking)) else {
             ui.label(RichText::new("Click the picture to add this step's guide card").color(MUTED));
             return;
         };
@@ -493,7 +592,6 @@ impl Editor {
             ui.label(RichText::new("Click the card to edit it").color(MUTED));
             return;
         }
-        let picking = self.video.as_ref().is_some_and(|v| v.tour.card.picking);
         ui.label("Points at");
         let mut pick = None;
         ui.scope(|ui| {
@@ -502,10 +600,10 @@ impl Editor {
             if hot.on_hover_text("Sit beside the place this step was clicked").on_disabled_hover_text("This step has no click").clicked() {
                 pick = Some(Anchor::Hotspot);
             }
-            if ui.add(egui::Button::selectable(anchor == Anchor::Point || picking, "A spot I pick")).on_hover_text("Click the picture to choose the spot").clicked() {
+            if ui.add(egui::Button::selectable(anchor == Anchor::Point, "A spot I pick")).on_hover_text("Click the picture to choose the spot").clicked() {
                 pick = Some(Anchor::Point);
             }
-            if ui.add(egui::Button::selectable(anchor == Anchor::None && !picking, "Nothing")).on_hover_text("Sit at the bottom of the picture").clicked() {
+            if ui.add(egui::Button::selectable(anchor == Anchor::None, "Nothing")).on_hover_text("Sit at the bottom of the picture").clicked() {
                 pick = Some(Anchor::None);
             }
         });
@@ -518,16 +616,17 @@ impl Editor {
             return;
         }
         let Some(a) = pick else { return };
-        if let Some(c) = self.shown_card_mut() {
-            match a {
-                // An earlier spot is used straight away and the next click can move it; without one, the next click sets it.
-                Anchor::Point if c.point.is_some() => c.anchor = Anchor::Point,
-                Anchor::Point => {}
-                _ => c.anchor = a,
+        let Some(src) = self.tour_src() else { return };
+        let Some(v) = self.video.as_mut() else { return };
+        let (doc, card_ui) = (&mut v.edit.tour_doc, &mut v.tour.card);
+        if a == Anchor::Point {
+            // An earlier spot is used straight away and the next click can move it; without one, the next click sets it.
+            start_pick(doc, card_ui, src);
+        } else {
+            card_ui.picking = None;
+            if let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) {
+                c.anchor = a;
             }
-        }
-        if let Some(v) = self.video.as_mut() {
-            v.tour.card.picking = a == Anchor::Point;
         }
     }
 
@@ -544,7 +643,7 @@ impl Editor {
             _ => None,
         });
         let Some(v) = self.video.as_mut() else { return };
-        v.tour.card.drawn = None;
+        (v.tour.card.drawn, v.tour.card.drawn_screen) = (None, None);
         let Some(mut card) = v.edit.tour_doc.steps.get(&src).and_then(|s| s.card.clone()) else { return };
         let theme = v.edit.tour_doc.theme.clone();
         let accent = parse_hex(&theme.accent).unwrap_or(DEFAULT_GREEN);
@@ -571,7 +670,9 @@ impl Editor {
             (pos2(crop.left() + 8.0, crop.bottom() - h - 8.0), (crop.width() - 16.0).max(CARD_W))
         } else {
             let local = |b: Bounds| Bounds { x0: b.x0 - cx, y0: b.y0 - cy, x1: b.x1 - cx, y1: b.y1 - cy };
-            let placed = card_rect((cw, ch), (CARD_W / z, h / z), spot.map(local), anchor.map(|a| pt(a.x - cx, a.y - cy)), card.placement);
+            let anchor_local = anchor.map(|a| pt(a.x - cx, a.y - cy));
+            let picked = anchor_local.filter(|_| card.anchor == Anchor::Point);
+            let placed = card_rect((cw, ch), (CARD_W / z, h / z), spot.map(local), anchor_local, picked, card.placement);
             if placed.side == Side::Docked { (pos2(crop.left(), crop.bottom() + 8.0), crop.width().max(CARD_W)) } else { (to_scr(pt(cx + placed.x, cy + placed.y)), CARD_W) }
         };
         let selected = state.selected;
@@ -584,7 +685,8 @@ impl Editor {
         let shown = egui::Area::new(egui::Id::unique(("tour-guide-card", instance))).fixed_pos(pos).order(egui::Order::Middle).constrain_to(clip).show(ui.ctx(), |ui| {
             let frame = egui::Frame::new()
                 .fill(bg)
-                .corner_radius(CornerRadius::same(if compact { 8 } else { CARD_RADIUS }))
+                // The compact bar is a pill: fully rounded ends, whatever its height.
+                .corner_radius(CornerRadius::same(if compact { pill_radius(h) } else { CARD_RADIUS }))
                 .inner_margin(if compact { Margin::symmetric(12, 8) } else { Margin::same(CARD_PAD as i8) })
                 .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(80) });
             let inner = width - if compact { 24.0 } else { 2.0 * CARD_PAD };
@@ -593,20 +695,20 @@ impl Editor {
                 ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
                 let counter = format!("{} of {count}", index + 1);
                 let next = |ui: &mut egui::Ui, fc: &mut FieldCtx, label: &mut String| {
-                    egui::Frame::new().fill(next_fill).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
-                        card_field(ui, fc, Field::Next, label, NEXT_LABEL_MAX, FontId::proportional(13.0), next_ink, ("Next", next_ink), 90.0, false, true);
+                    egui::Frame::new().fill(next_fill).corner_radius(CornerRadius::same(if compact { 12 } else { 6 })).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
+                        card_field(ui, fc, Field::Next, label, NEXT_LABEL_MAX, FontId::proportional(13.0), next_ink, ("Next", next_ink), 90.0, Lines::Wrap, true);
                     });
                 };
                 if compact {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&counter).color(muted).size(12.0));
                         let body_w = (ui.available_width() - 110.0).max(60.0);
-                        card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), body_w, false, false);
+                        card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), body_w, Lines::One, false);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| next(ui, &mut fc, &mut card.next_label));
                     });
                 } else {
-                    card_field(ui, &mut fc, Field::Title, &mut card.title, CARD_TITLE_MAX, FontId::proportional(15.0), ink, ("Add a title", muted), inner, false, true);
-                    card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), inner, true, false);
+                    card_field(ui, &mut fc, Field::Title, &mut card.title, CARD_TITLE_MAX, FontId::proportional(15.0), ink, ("Add a title", muted), inner, Lines::Wrap, true);
+                    card_field(ui, &mut fc, Field::Body, &mut card.body, CARD_BODY_MAX, FontId::proportional(13.0), ink, ("Say what to do here", muted), inner, Lines::Paragraph, false);
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         // Back and the counter are filled in by the player, never typed.
@@ -628,6 +730,7 @@ impl Editor {
         }
         let origin = to_scr(pt(0.0, 0.0));
         state.drawn = Some(Bounds { x0: (rect.left() - origin.x) / z, y0: (rect.top() - origin.y) / z, x1: (rect.right() - origin.x) / z, y1: (rect.bottom() - origin.y) / z });
+        state.drawn_screen = Some(rect);
         state.focus = fc.focus;
         if selected {
             state.editing = fc.editing;
@@ -639,11 +742,13 @@ impl Editor {
             *c = card;
         }
         if let Some(f) = clicked {
-            // A click on a text selects the card and types into that text.
+            // A click on a text selects the card and types into that text. The properties row above
+            // was drawn before this click was seen, so draw again now that it shows the card's row.
             self.select_card(true);
             if let Some(v) = self.video.as_mut() {
                 (v.tour.card.editing, v.tour.card.focus) = (Some(f), true);
             }
+            ui.ctx().request_repaint();
         }
     }
 
@@ -673,6 +778,8 @@ impl Editor {
             return;
         }
         let theme_before = saved_theme(&v.edit.tour_doc);
+        let animate_before = self.prefs.tour_animate_hotspot;
+        let mut animate = animate_before;
         let instance = v.tour.instance;
         let mut new_dim: Option<(u8, bool)> = None;
         let mut close = false;
@@ -704,7 +811,7 @@ impl Editor {
                     for (style, label, tip) in [
                         (CardStyle::Dark, "Dark", "A dark card beside the spot"),
                         (CardStyle::Light, "Light", "A light card beside the spot"),
-                        (CardStyle::Compact, "Compact bar", "A slim bar along the bottom of the picture"),
+                        (CardStyle::Compact, "Compact bar", "A light pill along the bottom of the picture: the count, the text and the button on one line"),
                         (CardStyle::Auto, "Match viewer", "Dark or light, following the viewer's system setting"),
                     ] {
                         if ui.add(egui::Button::selectable(t.card_style == style, label)).on_hover_text(tip).clicked() {
@@ -906,6 +1013,9 @@ impl Editor {
                         }
                     }
                 }
+
+                heading(ui, "In this editor");
+                ui.checkbox(&mut animate, "Animate hotspot").on_hover_text("Pulse the hotspot on the picture here, as the tour will. Turn off for a still ring.");
                 ui.add_space(12.0);
             });
         });
@@ -920,6 +1030,10 @@ impl Editor {
         }
         if let Some((d, checkpoint)) = new_dim {
             self.apply_spotlight_dim(d, checkpoint);
+        }
+        if animate != animate_before {
+            self.prefs.tour_animate_hotspot = animate;
+            self.prefs_changed = true;
         }
     }
 
@@ -957,14 +1071,110 @@ mod tests {
     #[test]
     fn the_card_sits_where_the_shared_rule_puts_it() {
         let spot = Bounds { x0: 300.0, y0: 100.0, x1: 500.0, y1: 160.0 };
-        let p = card_rect((800.0, 500.0), (260.0, 120.0), Some(spot), None, Placement::Auto);
+        let p = card_rect((800.0, 500.0), (260.0, 120.0), Some(spot), None, None, Placement::Auto);
         assert_eq!((p.x, p.y, p.side), (270.0, 172.0, Side::Bottom));
         // No spotlight: a 44-pixel box around the anchor.
-        let p = card_rect((800.0, 500.0), (260.0, 120.0), None, Some(pt(400.0, 100.0)), Placement::Auto);
+        let p = card_rect((800.0, 500.0), (260.0, 120.0), None, Some(pt(400.0, 100.0)), None, Placement::Auto);
+        assert_eq!((p.x, p.y, p.side), (270.0, 134.0, Side::Bottom));
+        // A picked spot with no spotlight places the card exactly as before.
+        let p = card_rect((800.0, 500.0), (260.0, 120.0), None, Some(pt(400.0, 100.0)), Some(pt(400.0, 100.0)), Placement::Auto);
         assert_eq!((p.x, p.y, p.side), (270.0, 134.0, Side::Bottom));
         // Neither: bottom centre.
-        let p = card_rect((800.0, 500.0), (260.0, 120.0), None, None, Placement::Auto);
+        let p = card_rect((800.0, 500.0), (260.0, 120.0), None, None, None, Placement::Auto);
         assert_eq!((p.x, p.y, p.side), (270.0, 364.0, Side::None));
+    }
+
+    /// Fixture-style cases for a picked spot on a step with a spotlight: the card points at the spot and
+    /// still keeps clear of the spotlight, as `tour_core.js` places it (the "aim" cases in the fixture).
+    #[test]
+    fn a_picked_spot_moves_the_card_even_with_a_spotlight() {
+        let (frame, card) = ((800.0, 500.0), (260.0, 120.0));
+        let clear = |p: Placed, b: Bounds| p.x + card.0 <= b.x0 || p.x >= b.x1 || p.y + card.1 <= b.y0 || p.y >= b.y1;
+        // Inside the spotlight: the card slides along the bottom to sit under the spot.
+        let spot = Bounds { x0: 300.0, y0: 100.0, x1: 500.0, y1: 160.0 };
+        let at = pt(320.0, 130.0);
+        let p = card_rect(frame, card, Some(spot), Some(at), Some(at), Placement::Auto);
+        assert_eq!((p.x, p.y, p.side), (190.0, 172.0, Side::Bottom));
+        assert!(clear(p, spot));
+        // The hotspot (not a picked spot) keeps the card centred on the spotlight, as before.
+        let p = card_rect(frame, card, Some(spot), Some(at), None, Placement::Auto);
+        assert_eq!((p.x, p.y), (270.0, 172.0));
+        // Above the spotlight: the card goes above the spot.
+        let spot = Bounds { x0: 300.0, y0: 300.0, x1: 500.0, y1: 400.0 };
+        let at = pt(450.0, 200.0);
+        let p = card_rect(frame, card, Some(spot), Some(at), Some(at), Placement::Auto);
+        assert_eq!((p.x, p.y, p.side), (320.0, 68.0, Side::Top));
+        assert!(clear(p, spot) && p.y + card.1 < at.y, "clear of the spotlight and of the spot");
+        // Right of the spotlight: the card goes right of the spot.
+        let spot = Bounds { x0: 100.0, y0: 150.0, x1: 300.0, y1: 350.0 };
+        let at = pt(450.0, 250.0);
+        let p = card_rect(frame, card, Some(spot), Some(at), Some(at), Placement::Auto);
+        assert_eq!((p.x, p.y, p.side), (462.0, 190.0, Side::Right));
+        assert!(clear(p, spot));
+    }
+
+    #[test]
+    fn a_cancelled_pick_restores_what_the_card_pointed_at() {
+        let (mut doc, mut ui) = (TourDoc::default(), CardUi::default());
+        assert!(add_card(&mut doc, &mut ui, 3, true));
+        let anchor = |doc: &TourDoc| doc.steps[&3].card.as_ref().unwrap().anchor;
+        // No spot yet: picking shows "A spot I pick" but the card still points at the hotspot.
+        start_pick(&mut doc, &mut ui, 3);
+        assert_eq!(anchor(&doc), Anchor::Hotspot);
+        assert_eq!(shown_anchor(doc.steps[&3].card.as_ref().unwrap(), ui.picking.is_some()), Anchor::Point);
+        cancel_pick(&mut doc, &mut ui);
+        assert!(ui.picking.is_none());
+        assert_eq!(anchor(&doc), Anchor::Hotspot);
+        assert_eq!(shown_anchor(doc.steps[&3].card.as_ref().unwrap(), false), Anchor::Hotspot, "the row goes back too");
+        // A click on the picture ends the pick with a spot.
+        start_pick(&mut doc, &mut ui, 3);
+        assert!(finish_pick(&mut doc, &mut ui, pt(10.0, 20.0)));
+        let c = doc.steps[&3].card.clone().unwrap();
+        assert_eq!((c.anchor, c.point), (Anchor::Point, Some(Point { x: 10.0, y: 20.0 })));
+        assert!(!finish_pick(&mut doc, &mut ui, pt(1.0, 1.0)), "only one click per pick");
+        // With an earlier spot, choosing Nothing and then picking again uses the old spot at once;
+        // cancelling goes back to Nothing, not to the spot.
+        doc.steps.get_mut(&3).unwrap().card.as_mut().unwrap().anchor = Anchor::None;
+        start_pick(&mut doc, &mut ui, 3);
+        assert_eq!(anchor(&doc), Anchor::Point);
+        start_pick(&mut doc, &mut ui, 3); // a second press keeps the first "before"
+        cancel_pick(&mut doc, &mut ui);
+        assert_eq!(anchor(&doc), Anchor::None);
+        // "A spot I pick" is never left on without a spot, even from a hand-made state.
+        let c = doc.steps.get_mut(&3).unwrap().card.as_mut().unwrap();
+        (c.anchor, c.point) = (Anchor::Point, None);
+        assert_eq!(shown_anchor(c, false), Anchor::None);
+        ui.picking = Some((3, Anchor::Point));
+        cancel_pick(&mut doc, &mut ui);
+        assert_eq!(anchor(&doc), Anchor::None);
+    }
+
+    #[test]
+    fn the_compact_bar_text_is_shown_on_one_line_with_an_ellipsis() {
+        let pieces = vec![("Open the\ninvoices".to_string(), false), (" page".to_string(), true)];
+        let one = text_job(&pieces, &FontId::proportional(13.0), Color32::WHITE, 120.0, false, Lines::One);
+        assert_eq!((one.wrap.max_rows, one.wrap.overflow_character, one.wrap.break_anywhere), (1, Some('…'), true));
+        assert!(!one.text.contains('\n'), "line breaks become spaces on one line");
+        for lines in [Lines::Wrap, Lines::Paragraph] {
+            let job = text_job(&pieces, &FontId::proportional(13.0), Color32::WHITE, 120.0, false, lines);
+            assert_eq!(job.wrap.max_rows, usize::MAX, "{lines:?} still wraps");
+        }
+    }
+
+    #[test]
+    fn a_press_off_the_card_ends_typing_on_it() {
+        assert!(ends_typing(Some(pos2(5.0, 5.0)), false), "a press on the toolbar");
+        assert!(!ends_typing(Some(pos2(5.0, 5.0)), true), "a press on the card keeps typing");
+        assert!(!ends_typing(None, false), "no press, no change");
+    }
+
+    #[test]
+    fn the_compact_bar_is_a_light_pill() {
+        assert_eq!(card_colors(CardStyle::Compact), card_colors(CardStyle::Light));
+        assert_ne!(card_colors(CardStyle::Compact), card_colors(CardStyle::Dark));
+        assert_eq!(card_colors(CardStyle::Auto), card_colors(CardStyle::Dark), "Match viewer is drawn dark in the editor, as before");
+        assert_eq!(pill_radius(44.0), 22);
+        assert_eq!(pill_radius(1000.0), 255);
     }
 
     #[test]

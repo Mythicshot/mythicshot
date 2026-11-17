@@ -6,7 +6,8 @@
 use mythicshot_editor::{Bounds, Item, MAX_DIM, MIN_DIM, Rgba, Shape};
 use mythicshot_recording::Recording;
 
-use super::{Point, pct};
+use super::doc::clean;
+use super::{NOTE_TEXT_MAX, Point, pct};
 use crate::video::{Edit, crop_px};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -104,25 +105,31 @@ fn layer_and_dim(rec: &Recording, edit: &Edit, items: &[Item], src: usize) -> (S
                 // The last pinned spotlight in the list wins; one that leaves the crop is dropped.
                 let b = rect.norm();
                 let c = Bounds { x0: b.x0.max(f.x0), y0: b.y0.max(f.y0), x1: b.x1.min(f.x1), y1: b.y1.min(f.y1) };
-                (layer.spotlight, dim_of_spotlight) = if c.x1 - c.x0 >= 1.0 && c.y1 - c.y0 >= 1.0 {
-                    let (x, y, w, h) = f.area(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0);
-                    (Some(Area { x, y, w, h }), Some((*dim).clamp(MIN_DIM, MAX_DIM)))
-                } else {
-                    (None, None)
+                let area = (c.x1 - c.x0 >= 1.0 && c.y1 - c.y0 >= 1.0).then(|| f.area(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0)).filter(|&(_, _, w, h)| w > 0.0 && h > 0.0);
+                (layer.spotlight, dim_of_spotlight) = match area {
+                    Some((x, y, w, h)) => (Some(Area { x, y, w, h }), Some((*dim).clamp(MIN_DIM, MAX_DIM))),
+                    None => (None, None),
                 };
             }
             Shape::Text { at, text } => {
-                if !text.trim().is_empty() && f.inside(at.x, at.y) {
-                    layer.notes.push(Note::Text { x: f.px(at.x), y: f.py(at.y), text: text.clone(), size, color });
+                // Cleaned like every other tour text; nothing left is no note.
+                let text = clean(text, NOTE_TEXT_MAX, true);
+                if !text.is_empty() && f.inside(at.x, at.y) {
+                    layer.notes.push(Note::Text { x: f.px(at.x), y: f.py(at.y), text, size, color });
                 }
             }
             Shape::Bubble { rect, tail, text } => {
                 let b = rect.norm();
-                if !text.trim().is_empty() && f.inside(b.x0, b.y0) {
+                let text = clean(text, NOTE_TEXT_MAX, true);
+                if !text.is_empty() && f.inside(b.x0, b.y0) {
                     let (x, y, w, h) = f.area(b.x0, b.y0, b.x1.min(f.x1) - b.x0, b.y1.min(f.y1) - b.y0);
+                    // A bubble the crop (or rounding) leaves with no width or height is not drawn by any player.
+                    if w <= 0.0 || h <= 0.0 {
+                        continue;
+                    }
                     let tail = Point { x: f.px(tail.x.clamp(f.x0, f.x1)), y: f.py(tail.y.clamp(f.y0, f.y1)) };
                     let fill = hex(it.style.fill.unwrap_or(Rgba::WHITE));
-                    layer.notes.push(Note::Bubble { x, y, w, h, tail, text: text.clone(), size, color, fill });
+                    layer.notes.push(Note::Bubble { x, y, w, h, tail, text, size, color, fill });
                 }
             }
             _ => {}

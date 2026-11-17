@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use eframe::egui::{self, Color32, ColorImage, FontId, Key, Modifiers, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2};
 use image::RgbaImage;
@@ -16,8 +17,8 @@ use mythicshot_editor::{Bounds, Item, Pt, Shape, pt};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::tour::{self, StepPlan, TourDoc};
-use crate::tour_cards::{CardUi, SettingsUi, card_has_text};
+use crate::tour::{self, HotspotStyle, StepPlan, TourDoc};
+use crate::tour_cards::{CardUi, SettingsUi, card_has_text, parse_hex};
 use crate::video::{Edit, crop_px};
 use crate::video_editor::{VideoState, VideoView};
 
@@ -141,7 +142,7 @@ fn current_step(v: &VideoState, steps: &[StepPlan]) -> usize {
     steps.iter().position(|s| s.src == v.current).unwrap_or_else(|| step_for_frame(steps, v.current))
 }
 
-/// Where the shown step's click landed, in frame pixels, for the amber ring.
+/// Where the shown step's click landed, in frame pixels, for the hotspot.
 /// Only in the Tour view, and never for the end step, which has no click.
 pub(crate) fn click_point(v: &VideoState) -> Option<Pt> {
     if v.view != VideoView::Tour {
@@ -152,6 +153,43 @@ pub(crate) fn click_point(v: &VideoState) -> Option<Pt> {
     let (px, py) = step.click?;
     let (cx, cy, cw, ch) = crop_px(&v.rec, &v.edit);
     Some(pt(cx as f32 + px / 100.0 * cw as f32, cy as f32 + py / 100.0 * ch as f32))
+}
+
+/// Seconds per pulse of the hotspot ring. The preview page keeps the same number as `--pulse-period`
+/// in `tour_preview.html`; a test checks they agree.
+pub const PULSE_PERIOD: f64 = 1.9;
+/// How often a pulsing hotspot is redrawn while the window has focus: about 30 times a second.
+const PULSE_FRAME: Duration = Duration::from_millis(33);
+/// How often it is redrawn while the window is in the background or covered: a few times a second.
+const PULSE_FRAME_IDLE: Duration = Duration::from_millis(250);
+/// The hotspot ring's radius on screen, as the players draw it (30 px across).
+const HOTSPOT_R: f32 = 15.0;
+
+/// The pulse ring at `t` seconds: its scale against the hotspot ring and its opacity (0 to 1). Over the
+/// first 70% of each [`PULSE_PERIOD`] it grows to 2.2 times the ring while fading out, easing off as
+/// it goes; for the rest of the period it is not seen. Only time drives it, so it can be tested.
+pub fn pulse_ring(t: f64) -> (f32, f32) {
+    let phase = (t.rem_euclid(PULSE_PERIOD) / PULSE_PERIOD) as f32;
+    if phase >= 0.7 {
+        return (2.2, 0.0);
+    }
+    let eased = 1.0 - (1.0 - phase / 0.7).powi(3);
+    (1.0 + 1.2 * eased, 0.55 * (1.0 - eased))
+}
+
+/// How soon to redraw a pulsing hotspot, from what the window system says about the window: never
+/// while minimised, quickly while focused, slowly while in the background or covered.
+fn pulse_frame(minimized: Option<bool>, focused: Option<bool>, occluded: Option<bool>) -> Option<Duration> {
+    match (minimized, focused, occluded) {
+        (Some(true), _, _) => None,
+        (_, _, Some(true)) | (_, Some(false), _) => Some(PULSE_FRAME_IDLE),
+        _ => Some(PULSE_FRAME),
+    }
+}
+
+/// The accent at `alpha` (0 to 1) of its strength.
+fn faded(c: Color32, alpha: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 /// The "Timeline | Tour" switch at the left of the bottom panel. Returns the view picked, if it changed.
@@ -257,6 +295,33 @@ pub fn step_src(steps: &Result<Vec<StepPlan>, String>, current: usize) -> Option
 }
 
 impl Editor {
+    /// The shown step's hotspot on the canvas, drawn the way the tour draws it: Pulse (a ring with a
+    /// soft ring growing and fading from it), Dot (the ring, still) or None, in the tour's accent.
+    /// Editor chrome on the screen only, so it never reaches a step image, a GIF or a video. The pulse
+    /// is redrawn only while the Tour view shows it and the window is not minimised, and stands still
+    /// when "Animate hotspot" is off.
+    pub(crate) fn draw_tour_hotspot(&self, ctx: &egui::Context, painter: &egui::Painter, to_scr: &dyn Fn(Pt) -> egui::Pos2) {
+        let Some(v) = self.video.as_ref() else { return };
+        let Some(c) = click_point(v) else { return };
+        let theme = &v.edit.tour_doc.theme;
+        if theme.hotspot == HotspotStyle::None {
+            return;
+        }
+        let accent = parse_hex(&theme.accent).or_else(|| parse_hex(tour::DEFAULT_ACCENT)).unwrap_or(AMBER);
+        let at = to_scr(c);
+        if theme.hotspot == HotspotStyle::Pulse && self.prefs.tour_animate_hotspot {
+            let (scale, alpha) = pulse_ring(ctx.input(|i| i.time));
+            if alpha > 0.0 {
+                painter.circle_stroke(at, (HOTSPOT_R + 1.0) * scale, Stroke::new(2.0, faded(accent, alpha)));
+            }
+            if let Some(after) = ctx.input(|i| pulse_frame(i.viewport().minimized, i.viewport().focused, i.viewport().occluded)) {
+                ctx.request_repaint_after(after);
+            }
+        }
+        painter.circle(at, HOTSPOT_R, faded(accent, 0.18), Stroke::new(2.0, accent));
+        painter.circle_filled(at, 4.0, accent);
+    }
+
     /// The Tour view is open, whether or not there are steps.
     pub(crate) fn in_tour_view(&self) -> bool {
         self.video.as_ref().is_some_and(|v| v.view == VideoView::Tour)
@@ -553,6 +618,36 @@ mod tests {
         doc.steps.insert(9, StepExtras { card: Some(c), ..Default::default() });
         assert_eq!(step_marks(&items, &doc, 9), StepMarks { text: false, spotlight: false, card: true });
         assert!(!step_marks(&items, &doc, 3).card, "the card belongs to its own step");
+    }
+
+    #[test]
+    fn the_pulse_grows_and_fades_then_rests_once_per_period() {
+        let close = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4;
+        assert!(close(pulse_ring(0.0), (1.0, 0.55)), "starts at the ring, half seen");
+        assert!(close(pulse_ring(PULSE_PERIOD * 0.7), (2.2, 0.0)), "gone at 70%");
+        assert!(close(pulse_ring(PULSE_PERIOD * 0.9), (2.2, 0.0)), "rests unseen until the next pulse");
+        // The same at every period, and before the clock's start.
+        for t in [0.2, 0.5, 1.0, 1.5] {
+            assert!(close(pulse_ring(t), pulse_ring(t + PULSE_PERIOD * 3.0)), "{t}");
+            assert!(close(pulse_ring(t), pulse_ring(t - PULSE_PERIOD)), "{t}");
+        }
+        // It only ever grows and fades within a pulse.
+        let mut last = pulse_ring(0.0);
+        for i in 1..=70 {
+            let now = pulse_ring(PULSE_PERIOD * 0.7 * i as f64 / 70.0 - 1e-6);
+            assert!(now.0 >= last.0 - 1e-5 && now.1 <= last.1 + 1e-5, "{i}: {last:?} then {now:?}");
+            last = now;
+        }
+        assert!((PULSE_PERIOD - 1.9).abs() < f64::EPSILON, "the preview page's period, which the owner liked");
+    }
+
+    #[test]
+    fn the_pulse_redraws_quickly_only_while_the_window_is_in_front() {
+        assert_eq!(pulse_frame(Some(false), Some(true), Some(false)), Some(PULSE_FRAME));
+        assert_eq!(pulse_frame(None, None, None), Some(PULSE_FRAME), "nothing known: as if in front");
+        assert_eq!(pulse_frame(Some(false), Some(false), None), Some(PULSE_FRAME_IDLE), "in the background");
+        assert_eq!(pulse_frame(Some(false), Some(true), Some(true)), Some(PULSE_FRAME_IDLE), "covered");
+        assert_eq!(pulse_frame(Some(true), Some(true), None), None, "minimised");
     }
 
     #[test]

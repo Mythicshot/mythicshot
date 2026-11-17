@@ -13,6 +13,8 @@ const GAP: f32 = 12.0;
 const BOTTOM_INSET: f32 = 16.0;
 /// A fit within this many pixels counts, so float32 and float64 callers agree on ties.
 const SLACK: f32 = 0.001;
+/// Half the box kept clear around an aimed spot when nothing else fits: the players' 44 px anchor box.
+const AIM_HALF: f32 = 22.0;
 
 /// Where a card ended up, in image pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,7 +44,13 @@ fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
 
 /// Places a `card` on an `img` (both width, height) so it never covers `avoid` and never leaves the image.
 /// The asked side is tried first, then bottom, top, right, left. A box holding a non-finite value docks the card.
-pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, placement: Placement) -> Placed {
+///
+/// `aim` is a spot the card points at, such as a spot picked inside or beside a spotlight: the card is
+/// centred on the aim along the side it takes, and when the aim lies outside the box the side facing it
+/// is tried right after the asked side. The card first keeps clear of the box and the aim together;
+/// when no side fits that, of the box alone (still pointing at the aim); then of a box around the aim
+/// alone; only then is it docked. An aim that is not finite is ignored.
+pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, placement: Placement, aim: Option<(f32, f32)>) -> Placed {
     let ((iw, ih), (cw, ch)) = (img, card);
     let Some(b) = avoid else {
         return Placed { x: (iw - cw) / 2.0, y: ih - ch - BOTTOM_INSET, side: Side::None };
@@ -52,6 +60,23 @@ pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, plac
         return docked;
     }
     let b = b.norm();
+    let mut order = vec![Side::Bottom, Side::Top, Side::Right, Side::Left];
+    let aim = aim.filter(|(x, y)| x.is_finite() && y.is_finite());
+    if let Some((ax, ay)) = aim {
+        // The side of the box the aim lies beyond, if any: the one it is furthest past.
+        let past = [(Side::Bottom, ay - b.y1), (Side::Top, b.y0 - ay), (Side::Right, ax - b.x1), (Side::Left, b.x0 - ax)];
+        let mut facing = None;
+        let mut most = 0.0;
+        for (side, d) in past {
+            if d > most {
+                (most, facing) = (d, Some(side));
+            }
+        }
+        if let Some(f) = facing {
+            order.retain(|s| *s != f);
+            order.insert(0, f);
+        }
+    }
     let asked = match placement {
         Placement::Auto => None,
         Placement::Top => Some(Side::Top),
@@ -59,23 +84,32 @@ pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, plac
         Placement::Left => Some(Side::Left),
         Placement::Right => Some(Side::Right),
     };
-    let order = [Side::Bottom, Side::Top, Side::Right, Side::Left];
-    for side in asked.into_iter().chain(order.into_iter().filter(|s| Some(*s) != asked)) {
-        let (x, y) = match side {
-            Side::Bottom | Side::Top => {
-                let x = clamp((b.x0 + b.x1) / 2.0 - cw / 2.0, MARGIN, iw - cw - MARGIN);
-                (x, if side == Side::Bottom { b.y1 + GAP } else { b.y0 - GAP - ch })
-            }
-            _ => {
-                let y = clamp((b.y0 + b.y1) / 2.0 - ch / 2.0, MARGIN, ih - ch - MARGIN);
-                (if side == Side::Right { b.x1 + GAP } else { b.x0 - GAP - cw }, y)
-            }
-        };
-        if x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cw <= iw - MARGIN + SLACK && y + ch <= ih - MARGIN + SLACK {
-            return Placed { x, y, side };
-        }
+    if let Some(a) = asked {
+        order.retain(|s| *s != a);
+        order.insert(0, a);
     }
-    docked
+    // The first side of `order` on which the card keeps clear of `k`, centred on `(mx, my)` along it.
+    let fit = |k: Bounds, (mx, my): (f32, f32)| {
+        order.iter().find_map(|&side| {
+            let (x, y) = match side {
+                Side::Bottom | Side::Top => {
+                    let x = clamp(mx - cw / 2.0, MARGIN, iw - cw - MARGIN);
+                    (x, if side == Side::Bottom { k.y1 + GAP } else { k.y0 - GAP - ch })
+                }
+                _ => {
+                    let y = clamp(my - ch / 2.0, MARGIN, ih - ch - MARGIN);
+                    (if side == Side::Right { k.x1 + GAP } else { k.x0 - GAP - cw }, y)
+                }
+            };
+            (x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cw <= iw - MARGIN + SLACK && y + ch <= ih - MARGIN + SLACK).then_some(Placed { x, y, side })
+        })
+    };
+    let Some((ax, ay)) = aim else {
+        return fit(b, ((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0)).unwrap_or(docked);
+    };
+    let both = Bounds { x0: b.x0.min(ax), y0: b.y0.min(ay), x1: b.x1.max(ax), y1: b.y1.max(ay) };
+    let around = Bounds { x0: ax - AIM_HALF, y0: ay - AIM_HALF, x1: ax + AIM_HALF, y1: ay + AIM_HALF };
+    fit(both, (ax, ay)).or_else(|| fit(b, (ax, ay))).or_else(|| fit(around, (ax, ay))).unwrap_or(docked)
 }
 
 /// The `(tx, ty)` translation for a `view` (width, height) zoomed by `k` around `focus` that never shows
@@ -159,7 +193,8 @@ mod tests {
             let name = c["name"].as_str().unwrap();
             let (img, card) = (pair(&c["image"]), pair(&c["card"]));
             let avoid = c["avoid"].as_array().map(|a| Bounds { x0: f(&a[0]), y0: f(&a[1]), x1: f(&a[2]), y1: f(&a[3]) });
-            let p = place_card(img, card, avoid, placement(c["placement"].as_str().unwrap()));
+            let aim = c.get("aim").and_then(|a| a.as_array()).map(|a| (f(&a[0]), f(&a[1])));
+            let p = place_card(img, card, avoid, placement(c["placement"].as_str().unwrap()), aim);
             close(p.x, f(&c["expect"]["x"]), name);
             close(p.y, f(&c["expect"]["y"]), name);
             assert_eq!(side_name(p.side), c["expect"]["side"].as_str().unwrap(), "{name}");

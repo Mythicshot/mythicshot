@@ -31,7 +31,8 @@ test("place cases", () => {
   for (const c of cases.place) {
     const [x0, y0, x1, y1] = (c.avoid || []).map(n);
     const avoid = c.avoid && { x0, y0, x1, y1 };
-    const p = TourCore.placeCard(c.image[0], c.image[1], c.card[0], c.card[1], avoid, c.placement);
+    const aim = c.aim && { x: n(c.aim[0]), y: n(c.aim[1]) };
+    const p = TourCore.placeCard(c.image[0], c.image[1], c.card[0], c.card[1], avoid, c.placement, aim);
     close(p.x, c.expect.x, `${c.name} x`);
     close(p.y, c.expect.y, `${c.name} y`);
     assert.equal(p.side, c.expect.side, c.name);

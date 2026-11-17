@@ -99,6 +99,8 @@ pub struct EditorPrefs {
     pub spotlight_dim: u8,
     /// The last tour's theme and zoom, which the next recording's tour starts with.
     pub tour_theme: SavedTheme,
+    /// The Tour view pulses the hotspot as the tour does; off draws it still.
+    pub tour_animate_hotspot: bool,
 }
 
 /// A tour's look as saved in the settings file: the Tour settings a new recording starts with.
@@ -127,7 +129,7 @@ impl Default for SavedTheme {
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default() }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true }
     }
 }
 
@@ -331,6 +333,16 @@ crop = \"KeyX\"
         let old: Settings = toml::from_str("[editor]\ntool = \"text\"\n").unwrap();
         assert_eq!(old.editor.tour_theme, SavedTheme::default());
         assert_eq!((old.editor.tour_theme.card_style.as_str(), old.editor.tour_theme.accent.as_str(), old.editor.tour_theme.zoom_percent), ("dark", "#5dcaa5", 118));
+    }
+
+    #[test]
+    fn the_animated_hotspot_is_on_by_default_and_remembered() {
+        let old: Settings = toml::from_str("[editor]\ntool = \"text\"\n").unwrap();
+        assert!(old.editor.tour_animate_hotspot, "a file from before the switch animates");
+        let mut s = Settings::default();
+        s.editor.tour_animate_hotspot = false;
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert!(!back.editor.tour_animate_hotspot);
     }
 
     #[test]
