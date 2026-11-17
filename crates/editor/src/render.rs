@@ -2,10 +2,10 @@
 //! export saves it, so screen and file always match.
 
 use image::RgbaImage;
-use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Rect, Stroke, Transform};
+use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Rect, Stroke, Transform};
 
 use crate::text::{draw_lines, line_height_px, wrap_text};
-use crate::{Bounds, Item, ObfuscateMode, Pt, Rgba, Shape, Style, cone_points, measure_text, slice_points, step_radius};
+use crate::{Bounds, Item, MAX_DIM, ObfuscateMode, Pt, Rgba, Shape, Style, cone_points, measure_text, slice_points, step_radius};
 
 const SHADOW_OFFSET: f32 = 3.0;
 const SHADOW_BLUR: usize = 3;
@@ -38,9 +38,38 @@ pub fn render(base: &RgbaImage, items: &[Item]) -> RgbaImage {
 }
 
 pub fn render_items_onto(pm: &mut Pixmap, items: &[Item]) {
+    spotlights(pm, items);
     for it in items {
-        draw_item(pm, it);
+        if !matches!(it.shape, Shape::Spotlight { .. }) {
+            draw_item(pm, it);
+        }
     }
+}
+
+/// All spotlights in one pass, before the other items: black at the largest
+/// strength over everything outside the union of their boxes, so two
+/// spotlights never darken twice and other items stay on top of the dark.
+fn spotlights(pm: &mut Pixmap, items: &[Item]) {
+    let mut dim = None;
+    let mut pb = PathBuilder::new();
+    for it in items {
+        if let Shape::Spotlight { rect, dim: d } = &it.shape {
+            dim = dim.max(Some(*d));
+            if let Some(r) = rect_of(rect) {
+                pb.push_rect(r);
+            }
+        }
+    }
+    let Some(dim) = dim else { return };
+    let Some(mut mask) = Mask::new(pm.width(), pm.height()) else { return };
+    // A mask of the boxes, inverted, so overlapping boxes stay bright too.
+    if let Some(holes) = pb.finish() {
+        mask.fill_path(&holes, FillRule::Winding, true, Transform::identity());
+    }
+    mask.invert();
+    let alpha = (dim.min(MAX_DIM) as f32 / 100.0 * 255.0).round() as u8;
+    let Some(full) = Rect::from_xywh(0.0, 0.0, pm.width() as f32, pm.height() as f32) else { return };
+    pm.fill_rect(full, &paint(Rgba([0, 0, 0, alpha])), Transform::identity(), Some(&mask));
 }
 
 fn paint(c: Rgba) -> Paint<'static> {
@@ -203,7 +232,7 @@ fn draw_shape(pm: &mut Pixmap, shape: &Shape, st: &Style, mono: Option<Rgba>, t:
                 fill_and_stroke(pm, &path, st, mono, &s, t);
             }
         }
-        Shape::Highlight(_) | Shape::Obfuscate { .. } => {}
+        Shape::Highlight(_) | Shape::Obfuscate { .. } | Shape::Spotlight { .. } => {}
     }
 }
 
