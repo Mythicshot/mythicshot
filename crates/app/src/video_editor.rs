@@ -52,8 +52,9 @@ struct Bar {
 }
 
 /// Give each annotation a row: the first row where it overlaps nothing.
+/// Items pinned to a tour step belong to the Tour view and get no bar.
 fn lay_out_bars(items: &[mythicshot_editor::Item]) -> (Vec<Bar>, usize) {
-    let mut ranged: Vec<&mythicshot_editor::Item> = items.iter().filter(|it| it.frames.is_some()).collect();
+    let mut ranged: Vec<&mythicshot_editor::Item> = items.iter().filter(|it| it.frames.is_some() && it.pin.is_none()).collect();
     ranged.sort_by_key(|it| (it.frames.map(|f| f.0), it.id));
     let mut lane_ends: Vec<u32> = Vec::new();
     let mut bars = Vec::new();
@@ -191,15 +192,27 @@ fn tour_steps_label(steps: &[StepPlan]) -> String {
     format!("{} · one per click{last_frame}", step_count(steps.len()))
 }
 
+/// The bottom panel's two modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoView {
+    Timeline,
+    Tour,
+}
+
 pub struct VideoState {
     pub rec: Arc<Recording>,
-    reader: FrameReader,
+    pub(crate) reader: FrameReader,
+    pub view: VideoView,
+    /// Index into the planned tour steps of the step shown in the Tour view.
+    pub tour_step: usize,
+    /// Step thumbnails and the strength slider's drag.
+    pub(crate) tour: crate::tour_view::TourState,
     pub events: Vec<InputEvent>,
     pub edit: Edit,
     pub current: usize,
     loaded: Option<usize>,
     /// Playing since this instant, from this output time.
-    playing: Option<(Instant, u64)>,
+    pub(crate) playing: Option<(Instant, u64)>,
     format: Format,
     quality: u8,
     loop_forever: bool,
@@ -264,6 +277,9 @@ impl Editor {
         editor.video = Some(VideoState {
             rec,
             reader,
+            view: VideoView::Timeline,
+            tour_step: 0,
+            tour: Default::default(),
             events,
             edit,
             current: 0,
@@ -295,6 +311,11 @@ impl Editor {
                 let id = editor.add_item(shape);
                 editor.doc.update(id, |it| it.frames = Some(range));
             }
+        }
+        // Test hook: open in the Tour view with a text, a bubble and a spotlight on the first step.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("MYTHICSHOT_TEST_TOUR_VIEW").is_some() {
+            editor.test_tour_view();
         }
         Ok(editor)
     }
@@ -579,6 +600,10 @@ impl Editor {
         if self.video.is_none() {
             return;
         }
+        if self.in_tour_view() {
+            return self.tour_panel(ui);
+        }
+        let mut switched = None;
         let selected = self.selected;
         let (bars, lanes) = lay_out_bars(self.doc.items());
         let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8, 6));
@@ -589,6 +614,8 @@ impl Editor {
             let v = self.video.as_mut().expect("video");
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                switched = crate::tour_view::view_switch(ui, v.view);
+                ui.separator();
                 let (icon, tip) = if v.playing.is_some() { (Icon::Pause, "Pause (Space)") } else { (Icon::Play, "Play (Space)") };
                 if icons::button(ui, icon, 26.0, false, tip).clicked() {
                     toggle_play(v);
@@ -758,12 +785,18 @@ impl Editor {
         if let Some((id, r)) = new_range {
             self.doc.update(id, |it| it.frames = Some(r));
         }
+        if let Some(view) = switched {
+            self.set_view(view);
+        }
     }
 
-    /// Space plays and pauses in video mode.
+    /// Space plays and pauses in video mode; the arrows step frames, or tour steps in the Tour view.
     pub(crate) fn video_keys(&mut self, ctx: &egui::Context) {
         if self.text_editing() || ctx.egui_wants_keyboard_input() {
             return;
+        }
+        if self.in_tour_view() {
+            return self.tour_keys(ctx);
         }
         if let Some(v) = self.video.as_mut() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
@@ -823,6 +856,22 @@ mod tests {
         // (0,10) and (11,30) share row 0; (5,20) and (25,40) share row 1.
         assert_eq!(rows, vec![(0, 0), (5, 1), (11, 0), (25, 1)]);
         assert_eq!(lanes, 2);
+    }
+
+    #[test]
+    fn pinned_items_get_no_annotation_bar() {
+        let mut d = Document::new(RgbaImage::new(10, 10));
+        let r = || Shape::Rect(Bounds::new(pt(0.0, 0.0), pt(5.0, 5.0)));
+        let pinned = d.add(r(), Style::default());
+        d.update(pinned, |it| {
+            it.frames = Some((0, 4));
+            it.pin = Some(2);
+        });
+        let plain = d.add(r(), Style::default());
+        d.update(plain, |it| it.frames = Some((0, 4)));
+        let (bars, lanes) = lay_out_bars(d.items());
+        assert_eq!(bars.iter().map(|b| b.id).collect::<Vec<_>>(), vec![plain]);
+        assert_eq!(lanes, 1);
     }
 
     #[test]

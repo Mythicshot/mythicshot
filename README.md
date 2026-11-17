@@ -24,6 +24,18 @@ The folder holds the step images (`step-001.png` and so on, JPEG when a PNG woul
 
 The preview page is local only: it opens in your browser from the folder, loads nothing from the network, and is there to check the tour, not to host it.
 
+## Tour view
+
+The Tour view is the second mode of the recording editor's bottom panel ("Timeline | Tour"): it shows the tour's steps as a strip of thumbnails, and anything you draw there belongs to the selected step only.
+
+Text, speech bubbles and a spotlight (everything outside its box is darkened; one strength, 10 to 90 percent, for the whole tour) are saved in `tour.json` as a layer, so they stay editable after export.
+
+Blur, pixelate and every other shape you draw on a step is saved into that step's image, the same as annotations from the timeline.
+
+"Copy to all steps" puts a copy of the selected text, bubble or spotlight on every other step; "Remove step" leaves the step out of the tour, and "Restore N removed" brings removed steps back.
+
+Items drawn in the Tour view are not part of GIF, APNG, MP4 or WebM exports and never show in Timeline mode.
+
 ## Build
 
 Built with Rust 1.97 (the oldest working version has not been checked). On Windows, the Visual Studio C++ Build Tools (for the linker and the resource compiler).

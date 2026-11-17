@@ -92,11 +92,13 @@ pub struct EditorPrefs {
     pub export_quality: u8,
     pub export_loop: bool,
     pub export_fps: u32,
+    /// Spotlight darkening strength in percent, for the next spotlight and the next recording.
+    pub spotlight_dim: u8,
 }
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30 }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM }
     }
 }
 

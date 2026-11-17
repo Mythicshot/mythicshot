@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, ColorImage, CursorIcon, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2};
-use mythicshot_editor::{Bounds, Document, Item, ObfuscateMode, Pixmap, Pt, Rgba, RgbaImage, Shape, Style, effects, pt, render_items_onto, to_pixmap};
+use mythicshot_editor::{Bounds, Document, Item, MAX_DIM, MIN_DIM, ObfuscateMode, Pixmap, Pt, Rgba, RgbaImage, Shape, Style, effects, pt, render_items_onto, to_pixmap};
 
 use mythicshot_destinations::{self as dest, Context, DestId, Sent};
 
@@ -27,11 +27,12 @@ const RAIL: f32 = 84.0;
 /// A tool button on the rail.
 const TOOL_BUTTON: f32 = 36.0;
 /// The rail's sections, like a mockup palette; `None` has no heading.
+/// The Spotlight tool shows only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
     (Some("DRAW"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
     (Some("SHAPES"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
-    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Crop]),
+    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub enum Tool {
     Step,
     Highlight,
     Obfuscate,
+    Spotlight,
     Crop,
 }
 
@@ -79,6 +81,7 @@ impl Tool {
             Tool::Step => "step",
             Tool::Highlight => "highlight",
             Tool::Obfuscate => "obfuscate",
+            Tool::Spotlight => "spotlight",
             Tool::Crop => "crop",
         }
     }
@@ -107,12 +110,13 @@ impl Tool {
             Shape::Step { .. } => Tool::Step,
             Shape::Highlight(_) => Tool::Highlight,
             Shape::Obfuscate { .. } => Tool::Obfuscate,
-            // Pasted pictures and spotlights have no tool, so no style to remember.
-            Shape::Image { .. } | Shape::Spotlight { .. } => Tool::Select,
+            Shape::Spotlight { .. } => Tool::Spotlight,
+            // Pasted pictures have no tool, so no style to remember.
+            Shape::Image { .. } => Tool::Select,
         }
     }
 
-    const ALL: [Tool; 19] = [
+    const ALL: [Tool; 20] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
@@ -131,6 +135,7 @@ impl Tool {
         Tool::Step,
         Tool::Highlight,
         Tool::Obfuscate,
+        Tool::Spotlight,
         Tool::Crop,
     ];
 
@@ -154,6 +159,7 @@ impl Tool {
             Tool::Step => Icon::Step,
             Tool::Highlight => Icon::Highlight,
             Tool::Obfuscate => Icon::Obfuscate,
+            Tool::Spotlight => Icon::Spotlight,
             Tool::Crop => Icon::Crop,
         }
     }
@@ -178,6 +184,7 @@ impl Tool {
             Tool::Step => EditorAction::Step,
             Tool::Highlight => EditorAction::Highlight,
             Tool::Obfuscate => EditorAction::Obfuscate,
+            Tool::Spotlight => EditorAction::Spotlight,
             Tool::Crop => EditorAction::Crop,
         }
     }
@@ -199,6 +206,8 @@ struct TextEdit {
     at: Pt,
     buffer: String,
     focused: bool,
+    /// For new text in the Tour view: the step it was started on, which it is pinned to.
+    step: Option<usize>,
 }
 
 /// What a paste brought from the system clipboard.
@@ -274,7 +283,7 @@ pub struct Editor {
     pub(crate) doc: Document,
     title: String,
     tool: Tool,
-    style: Style,
+    pub(crate) style: Style,
     obfuscate: ObfuscateMode,
     pub(crate) selected: Option<u64>,
     drag: Option<Drag>,
@@ -315,7 +324,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context, prefs: crate::settings::EditorPrefs) -> Self {
-        let tool = Tool::from_key(&prefs.tool).filter(|t| *t != Tool::Crop).unwrap_or(Tool::Rectangle);
+        let tool = Tool::from_key(&prefs.tool).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight)).unwrap_or(Tool::Rectangle);
         let mut editor = Self {
             doc: Document::new(img),
             title,
@@ -406,9 +415,11 @@ impl Editor {
     }
 
     /// Items on the canvas now: all of them for an image, those whose frame
-    /// range includes the current frame for a recording.
-    fn display_items(&self) -> Vec<Item> {
+    /// range includes the current frame for a recording, and in the Tour view
+    /// those plus the items pinned to the step.
+    pub(crate) fn display_items(&self) -> Vec<Item> {
         match &self.video {
+            Some(v) if v.view == crate::video_editor::VideoView::Tour => crate::video::step_items(self.doc.items(), v.current),
             Some(v) => crate::video::visible(self.doc.items(), v.current),
             None => self.doc.items().to_vec(),
         }
@@ -419,8 +430,12 @@ impl Editor {
         self.display_items().iter().rev().find(|i| i.hit(p, tol)).map(|i| i.id)
     }
 
-    /// Add an item; on a recording it shows from the current frame for a while.
+    /// Add an item; on a recording it shows from the current frame for a while,
+    /// and in the Tour view it is pinned to the step.
     pub(crate) fn add_item(&mut self, shape: Shape) -> u64 {
+        if let Some(src) = self.tour_src() {
+            return self.add_pinned(shape, src);
+        }
         let id = self.doc.add(shape, self.style);
         if let Some(r) = self.default_range() {
             self.doc.update(id, |it| it.frames = Some(r));
@@ -503,7 +518,10 @@ impl Editor {
 
     fn run(&mut self, action: EditorAction) {
         if let Some(tool) = Tool::ALL.into_iter().find(|t| t.action() == action) {
-            self.set_tool(tool);
+            // The screenshot editor has no Spotlight tool.
+            if tool != Tool::Spotlight || self.video.is_some() {
+                self.set_tool(tool);
+            }
             return;
         }
         match action {
@@ -711,6 +729,14 @@ impl Editor {
     /// Add `shape` moved `n` steps down and right, and select it so it can be
     /// dragged into place.
     fn add_copy(&mut self, mut shape: Shape, style: Style, n: u32) {
+        // Spotlights belong to recordings; one copied there can reach a screenshot editor through the shared clipboard.
+        if matches!(shape, Shape::Spotlight { .. }) && self.video.is_none() {
+            self.notify("Spotlights are for recordings only");
+            return;
+        }
+        if self.drawing_blocked() {
+            return;
+        }
         let step = PASTE_OFFSET * n as f32;
         shape.translate(step, step);
         let previous = self.style;
@@ -911,6 +937,10 @@ impl Editor {
                 });
         }
 
+        if self.tool == Tool::Spotlight || self.selected_is_spotlight() {
+            self.spotlight_slider(ui);
+        }
+
         // Remember the change as the style of whatever tool it applies to: the
         // selected item's tool, or the current tool for the next item drawn.
         if self.style != before || self.obfuscate != before_mode {
@@ -960,6 +990,7 @@ impl Editor {
                         ui.add_space(4.0);
                         ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(10.0).strong().color(ACCENT)));
                     }
+                    let tools: Vec<Tool> = tools.iter().copied().filter(|t| *t != Tool::Spotlight || self.video.is_some()).collect();
                     for row in tools.chunks(2) {
                         ui.horizontal(|ui| {
                             for &tool in row {
@@ -1000,6 +1031,10 @@ impl Editor {
                     (Some(_), true) => "Unsaved changes",
                     (Some(_), false) => "Saved",
                 };
+                if self.in_tour_view() {
+                    ui.label(egui::RichText::new(crate::tour_view::STATUS).color(muted));
+                    ui.separator();
+                }
                 match &self.status {
                     Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
                     None => ui.label(egui::RichText::new(dirty).color(muted)),
@@ -1027,6 +1062,43 @@ impl Editor {
                 });
             });
         });
+    }
+
+    fn selected_is_spotlight(&self) -> bool {
+        self.selected.and_then(|id| self.doc.item(id)).is_some_and(|it| matches!(it.shape, Shape::Spotlight { .. }))
+    }
+
+    /// "Spotlight · darken": one strength for every spotlight in the recording,
+    /// one undo step per drag, remembered for the next spotlight and recording.
+    fn spotlight_slider(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected.and_then(|id| self.doc.item(id)).and_then(|it| match it.shape {
+            Shape::Spotlight { dim, .. } => Some(dim),
+            _ => None,
+        });
+        let mut dim = selected.unwrap_or(self.prefs.spotlight_dim).clamp(MIN_DIM, MAX_DIM);
+        ui.label("Spotlight · darken");
+        let resp = ui.add(egui::Slider::new(&mut dim, MIN_DIM..=MAX_DIM).suffix("%")).on_hover_text("How dark everything outside a spotlight gets. One strength for every spotlight.");
+        let dragging = self.video.as_ref().is_some_and(|v| v.tour.dim_dragging);
+        if resp.changed() {
+            let ids: Vec<u64> = self.doc.items().iter().filter(|it| matches!(it.shape, Shape::Spotlight { .. })).map(|it| it.id).collect();
+            if !ids.is_empty() && !dragging {
+                self.doc.checkpoint();
+            }
+            for id in ids {
+                self.doc.update(id, |it| {
+                    if let Shape::Spotlight { dim: d, .. } = &mut it.shape {
+                        *d = dim;
+                    }
+                });
+            }
+            if self.prefs.spotlight_dim != dim {
+                self.prefs.spotlight_dim = dim;
+                self.prefs_changed = true;
+            }
+        }
+        if let Some(v) = self.video.as_mut() {
+            v.tour.dim_dragging = resp.dragged();
+        }
     }
 
     fn selected_is_obfuscate(&self) -> bool {
@@ -1129,8 +1201,10 @@ impl Editor {
             match self.tool {
                 Tool::Text => match self.hit(p, tol).filter(|id| matches!(self.doc.item(*id).map(|i| &i.shape), Some(Shape::Text { .. }))) {
                     Some(id) => self.edit_text(id),
-                    None => self.text = Some(TextEdit { item: None, at: p, buffer: String::new(), focused: false }),
+                    None if self.drawing_blocked() => {}
+                    None => self.text = Some(TextEdit { item: None, at: p, buffer: String::new(), focused: false, step: self.tour_src() }),
                 },
+                Tool::Step if self.drawing_blocked() => {}
                 Tool::Step => {
                     let n = self.doc.next_step_number();
                     let id = self.add_item(Shape::Step { center: p, number: n });
@@ -1172,6 +1246,8 @@ impl Editor {
                 }
             }
             Tool::Crop => self.drag = Some(Drag::Crop { start: p, now: p }),
+            // Tour view without a step on this frame: nothing to pin a new item to.
+            _ if self.drawing_blocked() => {}
             Tool::Freehand => {
                 self.drag = Some(Drag::Freehand(vec![p]));
                 self.build_cache(None);
@@ -1280,6 +1356,7 @@ impl Editor {
             Tool::Slice => Shape::Slice(a, b),
             Tool::Highlight => Shape::Highlight(r),
             Tool::Obfuscate => Shape::Obfuscate { rect: r, mode: self.obfuscate },
+            Tool::Spotlight => Shape::Spotlight { rect: r, dim: self.prefs.spotlight_dim.clamp(MIN_DIM, MAX_DIM) },
             Tool::Bubble => Shape::Bubble { rect: r, tail: pt(r.x0 + r.width() * 0.25, r.y1 + (r.height() * 0.5).max(30.0)), text: String::new() },
             _ => return None,
         })
@@ -1292,7 +1369,7 @@ impl Editor {
                 Shape::Bubble { rect, .. } => pt(rect.norm().x0, rect.norm().y0),
                 _ => return,
             };
-            self.text = Some(TextEdit { item: Some(id), at, buffer: it.shape.text().unwrap_or_default().to_string(), focused: false });
+            self.text = Some(TextEdit { item: Some(id), at, buffer: it.shape.text().unwrap_or_default().to_string(), focused: false, step: None });
         }
     }
 
@@ -1306,7 +1383,13 @@ impl Editor {
                 }
             }
             None if !t.buffer.trim().is_empty() => {
-                let id = self.add_item(Shape::Text { at: t.at, text: t.buffer });
+                let shape = Shape::Text { at: t.at, text: t.buffer };
+                let id = match t.step {
+                    // Pinned to the step it was typed on, even if another step is shown now.
+                    Some(src) => self.add_pinned(shape, src),
+                    None if self.drawing_blocked() => return,
+                    None => self.add_item(shape),
+                };
                 self.selected = Some(id);
             }
             None => {}
@@ -1421,8 +1504,9 @@ impl Editor {
     }
 
     /// Key and click overlays on a recording frame, the same way export draws them.
+    /// None in the Tour view, which shows the step as exported, without pointer, ripple, halo or keys.
     fn draw_video_overlays(&self, pm: &mut Pixmap) {
-        if let Some(v) = &self.video {
+        if let Some(v) = self.video.as_ref().filter(|v| v.view == crate::video_editor::VideoView::Timeline) {
             let meta = &v.rec.frames[v.current];
             mythicshot_editor::overlays::draw_overlays(pm, meta.t_ms, meta.cursor, &v.events, &v.edit.overlays);
         }
@@ -1437,16 +1521,15 @@ impl Editor {
                     Drag::Move { id, .. } | Drag::Resize { id, .. } | Drag::Endpoint { id, .. } | Drag::Tail { id } => self.doc.item(*id).cloned(),
                     Drag::Crop { .. } => None,
                 };
-                let mut pm = cache.clone();
-                if let Some(it) = extra {
-                    render_items_onto(&mut pm, std::slice::from_ref(&it));
-                }
+                let mut pm = drag_frame(self.doc.base(), cache, extra, || self.display_items());
                 self.draw_video_overlays(&mut pm);
                 self.shown = None;
                 pm
             }
             _ => {
-                let key = (self.doc.version, self.video.as_ref().map(|v| v.current).unwrap_or(0), self.video.as_ref().map(|v| v.edit.overlays));
+                // The Tour view draws no overlays and adds the step's pinned items: a different picture.
+                let overlays = self.video.as_ref().filter(|v| v.view == crate::video_editor::VideoView::Timeline).map(|v| v.edit.overlays);
+                let key = (self.doc.version, self.video.as_ref().map(|v| v.current).unwrap_or(0), overlays);
                 if self.shown == Some(key) && self.texture.is_some() {
                     return;
                 }
@@ -1500,6 +1583,10 @@ impl Editor {
                 }
             }
         }
+        // Tour view: an amber ring where the step's click landed. Editor chrome, never exported.
+        if let Some(c) = self.video.as_ref().and_then(crate::tour_view::click_point) {
+            painter.circle_stroke(to_scr(c), 16.0, Stroke::new(3.0, crate::tour_view::AMBER));
+        }
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
@@ -1543,6 +1630,28 @@ fn handles(it: &Item) -> Vec<(Pt, HandleKind)> {
             }
             v
         }
+    }
+}
+
+/// The canvas while something is dragged: the cache (base plus every other
+/// item) with the dragged item on top. A spotlight darkens the whole frame,
+/// so dragging one redraws from the base with every item on the canvas
+/// (`shown`) and the dragged one in its place, instead of darkening the cache again.
+fn drag_frame(base: &RgbaImage, cache: &Pixmap, extra: Option<Item>, shown: impl FnOnce() -> Vec<Item>) -> Pixmap {
+    match extra {
+        Some(it) if matches!(it.shape, Shape::Spotlight { .. }) => {
+            let mut items: Vec<Item> = shown().into_iter().filter(|i| i.id != it.id).collect();
+            items.push(it);
+            let mut pm = to_pixmap(base);
+            render_items_onto(&mut pm, &items);
+            pm
+        }
+        Some(it) => {
+            let mut pm = cache.clone();
+            render_items_onto(&mut pm, std::slice::from_ref(&it));
+            pm
+        }
+        None => cache.clone(),
     }
 }
 
@@ -1626,6 +1735,7 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Crop => "Drag the area to keep, then Enter.",
         Tool::Obfuscate => "Drag over anything private to pixelate or blur it.",
         Tool::Highlight => "Drag over text to highlight it.",
+        Tool::Spotlight => "Drag around what matters; everything else is darkened.",
         Tool::Freehand => "Draw with the mouse held down.",
         Tool::Circle => "Drag out a circle. It stays round.",
         Tool::Group => "Drag around an area to mark it as a group.",
@@ -1853,6 +1963,62 @@ mod tests {
         e.remember_style(owner);
         assert_eq!(e.prefs.styles.get("arrow").map(|s| s.width), Some(9.0));
         assert!(e.prefs.styles.get("rectangle").is_none());
+    }
+
+    /// A spotlight darkens the whole frame, so dragging one must not draw it
+    /// over a cache that already holds the other spotlight's darkening.
+    #[test]
+    fn dragging_one_of_two_spotlights_previews_like_a_normal_render() {
+        let base = RgbaImage::from_pixel(100, 80, image::Rgba([200, 200, 200, 255]));
+        let spot = |id, x0, y0, x1, y1| Item { id, shape: Shape::Spotlight { rect: Bounds { x0, y0, x1, y1 }, dim: 60 }, style: Style::default(), frames: None, pin: None };
+        let red = Style { stroke: Rgba([255, 0, 0, 255]), fill: Some(Rgba([255, 0, 0, 255])), shadow: false, ..Style::default() };
+        let mark = Item { id: 3, shape: Shape::Rect(Bounds { x0: 70.0, y0: 5.0, x1: 90.0, y1: 15.0 }), style: red, frames: None, pin: None };
+        let items = vec![spot(1, 10.0, 10.0, 30.0, 30.0), spot(2, 50.0, 40.0, 90.0, 70.0), mark];
+        let mut normal = to_pixmap(&base);
+        render_items_onto(&mut normal, &items);
+        for dragged in [1, 2] {
+            let mut cache = to_pixmap(&base);
+            let others: Vec<Item> = items.iter().filter(|i| i.id != dragged).cloned().collect();
+            render_items_onto(&mut cache, &others);
+            let it = items.iter().find(|i| i.id == dragged).cloned();
+            let preview = drag_frame(&base, &cache, it, || items.clone());
+            assert!(preview.data() == normal.data(), "spotlight {dragged}: the preview differs from a normal render");
+        }
+        // A new spotlight being drawn (id 0) joins the others the same way.
+        let new = spot(0, 40.0, 0.0, 60.0, 20.0);
+        let mut with_new = to_pixmap(&base);
+        render_items_onto(&mut with_new, &[items.clone(), vec![new.clone()]].concat());
+        let mut cache = to_pixmap(&base);
+        render_items_onto(&mut cache, &items);
+        assert!(drag_frame(&base, &cache, Some(new), || items.clone()).data() == with_new.data());
+    }
+
+    /// A spotlight copied in a recording editor can reach the screenshot
+    /// editor through the shared clipboard; it has no spotlights, so pasting or duplicating one adds nothing.
+    #[test]
+    fn the_screenshot_editor_refuses_pasted_spotlights() {
+        let mut ed = editor(EditorPrefs::default());
+        let spot = Shape::Spotlight { rect: Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }, dim: 60 };
+        ed.add_copy(spot.clone(), Style::default(), 1);
+        assert!(ed.doc.items().is_empty(), "a pasted spotlight is refused");
+        let id = ed.doc.add(spot, Style::default());
+        ed.select(Some(id));
+        ed.duplicate();
+        assert_eq!(ed.doc.items().len(), 1, "nor is it duplicated");
+        // Everything else still pastes.
+        ed.add_copy(Shape::Rect(Bounds { x0: 1.0, y0: 1.0, x1: 9.0, y1: 9.0 }), Style::default(), 0);
+        assert_eq!(ed.doc.items().len(), 2);
+    }
+
+    /// Text typed on one tour step stays on that step even when the shown step changes before it is committed.
+    #[test]
+    fn new_text_is_pinned_to_the_step_it_was_started_on() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: Some(4) });
+        ed.commit_text();
+        let it = ed.doc.items().last().expect("the text was added");
+        assert_eq!((it.pin, it.frames), (Some(4), None));
+        assert_eq!(ed.selected, Some(it.id));
     }
 
     #[test]

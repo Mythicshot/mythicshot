@@ -96,6 +96,7 @@ pub enum EditorAction {
     Step,
     Highlight,
     Obfuscate,
+    Spotlight,
     Crop,
     Undo,
     Redo,
@@ -127,6 +128,7 @@ impl EditorAction {
         EditorAction::Step,
         EditorAction::Highlight,
         EditorAction::Obfuscate,
+        EditorAction::Spotlight,
         EditorAction::Crop,
         EditorAction::Undo,
         EditorAction::Redo,
@@ -158,6 +160,7 @@ impl EditorAction {
             EditorAction::Step => "Step label tool",
             EditorAction::Highlight => "Highlight tool",
             EditorAction::Obfuscate => "Obfuscate tool",
+            EditorAction::Spotlight => "Spotlight tool (recordings)",
             EditorAction::Crop => "Crop tool",
             EditorAction::Undo => "Undo",
             EditorAction::Redo => "Redo",
@@ -190,6 +193,8 @@ impl EditorAction {
             EditorAction::Step => "KeyN",
             EditorAction::Highlight => "KeyH",
             EditorAction::Obfuscate => "KeyB",
+            // Unbound until the user picks a key.
+            EditorAction::Spotlight => "",
             EditorAction::Crop => "KeyK",
             EditorAction::Undo => "control+KeyZ",
             EditorAction::Redo => "control+KeyY",
@@ -662,7 +667,7 @@ mod tests {
 
     #[test]
     fn editor_defaults_parse_for_egui() {
-        for a in EditorAction::ALL {
+        for a in EditorAction::ALL.iter().filter(|a| !a.default_binding().is_empty()) {
             assert!(egui_shortcut(a.default_binding()).is_some(), "{a:?}");
         }
         let (m, k) = egui_shortcut("control+KeyZ").unwrap();
