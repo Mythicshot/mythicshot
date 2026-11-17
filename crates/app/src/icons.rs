@@ -24,6 +24,7 @@ pub enum Icon {
     Step,
     Highlight,
     Obfuscate,
+    Spotlight,
     Crop,
     Undo,
     Redo,
@@ -182,6 +183,16 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 }
             }
             p.rect_stroke(r, 0.0, thin, StrokeKind::Middle);
+        }
+        Icon::Spotlight => {
+            // A dimmed frame around a bright box.
+            let dark = c.gamma_multiply(0.35);
+            let (x0, y0, x1, y1) = (0.3, 0.32, 0.74, 0.68);
+            p.rect_filled(rect(0.0, 0.1, 1.0, y0), 0.0, dark);
+            p.rect_filled(rect(0.0, y1, 1.0, 0.9), 0.0, dark);
+            p.rect_filled(rect(0.0, y0, x0, y1), 0.0, dark);
+            p.rect_filled(rect(x1, y0, 1.0, y1), 0.0, dark);
+            p.rect_stroke(rect(x0, y0, x1, y1), 1.0, s, StrokeKind::Middle);
         }
         Icon::Crop => {
             p.add(line(&[(0.25, 0.0), (0.25, 0.75), (1.0, 0.75)]));
