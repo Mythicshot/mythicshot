@@ -568,4 +568,26 @@ mod tests {
         assert_eq!(err, "Every step has been removed from the tour.");
         assert!(!dir.exists());
     }
+
+    #[test]
+    fn preview_draws_the_layer_from_data_as_plain_text() {
+        assert!(PREVIEW_TEMPLATE.contains("spotlight_dim") && PREVIEW_TEMPLATE.contains(".notes"));
+        assert!(PREVIEW_TEMPLATE.contains("textContent"));
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+            assert!(!PREVIEW_TEMPLATE.contains(banned), "{banned} must not be used");
+        }
+        assert!(PREVIEW_TEMPLATE.contains("prefers-reduced-motion"));
+    }
+
+    #[test]
+    fn note_text_cannot_break_out_of_the_preview_page() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let items = [text(10.0, 20.0, "</script><img src=x onerror=alert(1)>", 1)];
+        write_bundle(&r, &items, &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(!html.contains("</script><img"));
+        assert_eq!(read_json(&dir)["steps"][0]["notes"][0]["text"], "</script><img src=x onerror=alert(1)>");
+    }
 }
