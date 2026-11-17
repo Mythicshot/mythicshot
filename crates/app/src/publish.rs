@@ -15,7 +15,6 @@
 //! 409 `already_sent` if the first copy did arrive, and commit, which the server treats
 //! as idempotent (a repeated commit answers with the first one's result).
 
-#![allow(dead_code)] // The "Publish tour" UI that calls this comes in a later change.
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -234,7 +233,13 @@ impl SecretStore for OsStore {
 }
 
 fn load_token_from(store: &dyn SecretStore) -> Result<Option<String>, String> {
-    Ok(store.get()?.and_then(|stored| Token::parse(&stored).ok()).map(|t| t.0))
+    match store.get()? {
+        None => Ok(None),
+        Some(stored) => match Token::parse(&stored) {
+            Ok(t) => Ok(Some(t.0)),
+            Err(_) => Err("Could not use the credential store: the stored token could not be read. Forget it and save the token again.".into()),
+        },
+    }
 }
 
 fn store_token_in(store: &dyn SecretStore, token: &str) -> Result<(), String> {
@@ -1268,8 +1273,10 @@ mod tests {
         assert_eq!(load_token_from(&store).unwrap().as_deref(), Some(TOKEN));
         forget_token_in(&store).unwrap();
         assert_eq!(load_token_from(&store), Ok(None));
+        // Something stored that is not a token is reported, not taken for "no token", so it can be forgotten.
         *store.value.borrow_mut() = Some("garbage".into());
-        assert_eq!(load_token_from(&store), Ok(None));
+        let err = load_token_from(&store).unwrap_err();
+        assert!(err.contains("could not be read") && !err.contains("garbage"), "{err}");
     }
 
     #[test]

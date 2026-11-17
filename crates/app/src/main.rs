@@ -18,6 +18,7 @@ mod password;
 mod platform;
 mod popups;
 mod publish;
+mod publish_ui;
 mod recorder_ui;
 mod settings;
 mod settings_ui;
@@ -131,6 +132,7 @@ impl App {
         }));
 
         let settings = Settings::load();
+        publish_ui::init(&settings);
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
@@ -679,6 +681,7 @@ impl App {
 
     fn settings_changed(&mut self) {
         self.settings.save();
+        publish_ui::set_server(&self.settings.publish_server);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
@@ -864,6 +867,7 @@ impl App {
                     self.settings.record_keys = edited.record_keys;
                     self.settings.overlays = edited.overlays;
                     self.settings.gif_quality = edited.gif_quality;
+                    self.settings.publish_server = edited.publish_server.clone();
                     self.settings_changed();
                 }
                 UiAction::SetTakePrintScreen(on) => {
@@ -881,6 +885,9 @@ impl App {
         if close {
             self.stop_listening();
             self.settings_open = false;
+            if let Ok(mut s) = self.settings_shared.lock() {
+                s.state.publishing.clear_token_field(ctx);
+            }
             return;
         }
 
@@ -900,6 +907,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// A publish still running is cancelled; its temporary folder goes if it has not ended in time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        publish_ui::shutdown(std::time::Duration::from_secs(5));
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent, so the recording frame window can be see-through. Every
         // other window paints its own background.

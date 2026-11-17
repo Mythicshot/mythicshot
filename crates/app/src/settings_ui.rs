@@ -1,12 +1,14 @@
 //! The settings window (screen 5 of the mockup): General and Hotkeys tabs.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, vec2};
 
 use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_pattern};
 
 use crate::hotkeys::{self, Action, EditorAction};
+use crate::publish_ui::{self, TokenStatus};
 use crate::settings::Settings;
 
 const WARN_BG: Color32 = Color32::from_rgb(58, 42, 16);
@@ -48,6 +50,108 @@ impl Bind {
 pub struct SettingsState {
     pub tab: Tab,
     pub listening: Option<Bind>,
+    pub publishing: PublishingState,
+}
+
+/// The "Tour publishing" group's own state. The token field is only ever a masked
+/// input. It is emptied, wiped and given a new id (dropping its undo history) on Save,
+/// on Forget, when the page changes and when the window closes, and a saved token is
+/// never read back.
+#[derive(Default)]
+pub struct PublishingState {
+    token_input: String,
+    /// Part of the token field's id; a new value gives the field a fresh, empty state.
+    field: u64,
+    /// The token field's id as last drawn, so its stored state can be removed.
+    field_id: Option<egui::Id>,
+    /// The last Save, Forget or Test connection result.
+    message: Arc<Mutex<Option<Outcome>>>,
+    /// A Save, Forget or Test connection is running on its background thread.
+    busy: Arc<Mutex<bool>>,
+}
+
+/// A finished Save, Forget or Test connection.
+#[derive(Clone)]
+struct Outcome {
+    text: String,
+    ok: bool,
+    /// For Test connection: the address it tested. The result shows only while the field still holds it.
+    server: Option<String>,
+}
+
+impl PublishingState {
+    fn is_busy(&self) -> bool {
+        self.busy.lock().map(|b| *b).unwrap_or(false)
+    }
+
+    /// Empty the token field: wipe its text, remove its stored state with the undo
+    /// history, and give it a new id.
+    pub fn clear_token_field(&mut self, ctx: &egui::Context) {
+        publish_ui::wipe(&mut self.token_input);
+        if let Some(id) = self.field_id.take() {
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+        }
+        self.field += 1;
+    }
+
+    /// The typed token for Save; the field is cleared as it is taken.
+    fn take_for_save(&mut self, ctx: &egui::Context) -> String {
+        let entered = self.token_input.clone();
+        self.clear_token_field(ctx);
+        entered
+    }
+
+    /// Run `work` on a background thread and show what it returns. `server` is the
+    /// address a Test connection checks.
+    fn run(&self, server: Option<String>, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        if let Ok(mut b) = self.busy.lock() {
+            *b = true;
+        }
+        if let Ok(mut m) = self.message.lock() {
+            *m = None;
+        }
+        let (busy, message) = (self.busy.clone(), self.message.clone());
+        std::thread::spawn(move || {
+            let (text, ok) = match work() {
+                Ok(text) => (text, true),
+                Err(text) => (text, false),
+            };
+            if let Ok(mut m) = message.lock() {
+                *m = Some(Outcome { text, ok, server });
+            }
+            if let Ok(mut b) = busy.lock() {
+                *b = false;
+            }
+        });
+    }
+
+    /// The result to show beside Test connection, if it still applies to `server`.
+    fn current_message(&self, server: &str) -> Option<(String, bool)> {
+        let m = self.message.lock().ok()?.clone()?;
+        match &m.server {
+            Some(tested) if tested.trim() != server.trim() => None,
+            _ => Some((m.text, m.ok)),
+        }
+    }
+
+    fn clear_message(&self) {
+        if let Ok(mut m) = self.message.lock() {
+            *m = None;
+        }
+    }
+}
+
+/// The masked token field. Egui's undo history for it is dropped every frame, so an
+/// earlier text can never be brought back with Ctrl+Z.
+fn token_field(ui: &mut egui::Ui, p: &mut PublishingState, hint: &str, width: f32) -> egui::Response {
+    let edit = egui::TextEdit::singleline(&mut p.token_input).id_salt(("publish-token", p.field)).password(true).hint_text(hint).desired_width(width);
+    let resp = ui.add(edit);
+    p.field_id = Some(resp.id);
+    if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), resp.id) {
+        state.clear_undoer();
+        state.store(ui.ctx(), resp.id);
+    }
+    resp
 }
 
 pub enum UiAction {
@@ -90,6 +194,7 @@ pub fn show(ctx: &egui::Context, shared: &std::sync::Arc<std::sync::Mutex<Shared
         }
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             s.close_requested = true;
+            s.state.publishing.clear_token_field(ui.ctx());
         }
         let view = View { settings: &mut s.settings, errors: &s.errors, snipping_tool: s.snipping_tool, autostart: s.autostart };
         let out = self::ui(ui, &mut s.state, view);
@@ -113,6 +218,9 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
         for (tab, name) in [(Tab::General, "General"), (Tab::Output, "Output"), (Tab::Hotkeys, "Hotkeys")] {
             let selected = state.tab == tab;
             if ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(selected, name)).clicked() {
+                if state.tab != tab {
+                    state.publishing.clear_token_field(ui.ctx());
+                }
                 state.tab = tab;
                 out.push(UiAction::StopListening);
             }
@@ -125,7 +233,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     });
     egui::CentralPanel::default().show(ui, |ui| match state.tab {
         Tab::General => general(ui, view, &mut out),
-        Tab::Output => output_tab(ui, view, &mut out),
+        Tab::Output => output_tab(ui, &mut state.publishing, view, &mut out),
         Tab::Hotkeys => hotkeys_tab(ui, state, view, &mut out),
     });
     out
@@ -148,7 +256,11 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     }
 }
 
-fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
+fn output_tab(ui: &mut egui::Ui, publishing: &mut PublishingState, view: View<'_>, out: &mut Vec<UiAction>) {
+    egui::ScrollArea::vertical().show(ui, |ui| output_page(ui, publishing, view, out));
+}
+
+fn output_page(ui: &mut egui::Ui, publishing: &mut PublishingState, view: View<'_>, out: &mut Vec<UiAction>) {
     let s = view.settings;
     let mut changed = false;
     ui.heading("Output");
@@ -250,9 +362,103 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
         changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
     });
     ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(MUTED).size(12.0));
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("TOUR PUBLISHING").size(11.0).color(MUTED));
+    ui.add_space(4.0);
+    changed |= tour_publishing(ui, publishing, &mut s.publish_server);
+    ui.add_space(8.0);
     if changed {
         out.push(UiAction::SettingsChanged);
     }
+}
+
+/// The "Tour publishing" group: the server, the API token (Save and Forget) and Test
+/// connection. Returns whether the server address changed.
+fn tour_publishing(ui: &mut egui::Ui, p: &mut PublishingState, server: &mut String) -> bool {
+    let busy = p.is_busy();
+    if busy {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    let token = publish_ui::token_status();
+    if token == TokenStatus::Checking {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    let mut changed = false;
+    ui.label("Server");
+    let test_server = publish_ui::test_server();
+    let effective = match &test_server {
+        Some(t) => {
+            let mut shown = t.clone();
+            ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(ui.available_width() - 90.0));
+            ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(MUTED).size(12.0));
+            t.clone()
+        }
+        None => {
+            if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(ui.available_width() - 90.0)).changed() {
+                changed = true;
+                p.clear_message();
+            }
+            server.clone()
+        }
+    };
+    if !effective.trim().is_empty()
+        && let Err(e) = crate::publish::check_server(&effective)
+    {
+        ui.label(RichText::new(e).color(WARN_TEXT).size(12.0));
+    }
+    ui.add_space(8.0);
+    ui.label("API token");
+    ui.horizontal(|ui| {
+        let hint = if token == TokenStatus::Saved { "A token is saved; paste a new one to replace it" } else { "Paste the token from the server's setup page" };
+        let width = ui.available_width() - 150.0;
+        token_field(ui, p, hint, width);
+        if ui.add_enabled(!busy && !p.token_input.trim().is_empty(), egui::Button::new("Save")).clicked() {
+            // The field is emptied now; the token goes to the background thread and nowhere else.
+            let mut entered = p.take_for_save(ui.ctx());
+            p.run(None, move || {
+                let saved = crate::publish::store_token(&entered);
+                publish_ui::wipe(&mut entered);
+                publish_ui::refresh_token_now();
+                saved.map(|()| "Token saved.".to_string())
+            });
+        }
+        // Forget stays available when the store holds something it cannot read, so it can be removed.
+        if ui.add_enabled(!busy && token != TokenStatus::Missing, egui::Button::new("Forget")).clicked() {
+            p.clear_token_field(ui.ctx());
+            p.run(None, || {
+                let forgotten = crate::publish::forget_token();
+                publish_ui::refresh_token_now();
+                forgotten.map(|()| "Token removed from Windows Credential Manager.".to_string())
+            });
+        }
+    });
+    match &token {
+        TokenStatus::Checking => ui.label(RichText::new("Checking for a saved token…").color(MUTED).size(12.0)),
+        TokenStatus::Saved => ui.label(RichText::new("A token is saved.").color(MUTED).size(12.0)),
+        TokenStatus::Missing => ui.label(RichText::new("No token saved.").color(MUTED).size(12.0)),
+        TokenStatus::Unavailable(e) => ui.label(RichText::new(e).color(WARN_TEXT).size(12.0)),
+    };
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, egui::Button::new("Test connection")).clicked() {
+            let tested = effective.clone();
+            p.run(Some(tested.clone()), move || {
+                let server = crate::publish::check_server(&tested)?;
+                let token = publish_ui::token_for_job()?;
+                let name = crate::publish::workspace_name(&server, &token)?;
+                Ok(format!("Connected to workspace \"{name}\""))
+            });
+        }
+        if busy {
+            ui.add(egui::Spinner::new());
+        } else if let Some((text, ok)) = p.current_message(&effective) {
+            let color = if ok { Color32::from_rgb(125, 211, 140) } else { WARN_TEXT };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+        }
+    });
+    ui.label(RichText::new("The token is kept in Windows Credential Manager, not in the settings file.").color(MUTED).size(12.0));
+    changed
 }
 
 pub fn key_style_label(k: mythicshot_editor::overlays::KeyStyle) -> &'static str {
@@ -388,4 +594,97 @@ fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bi
         });
     });
     ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
+
+    /// One frame of just the token field, `t` seconds in, with these input events.
+    fn frame(ctx: &egui::Context, p: &mut PublishingState, t: f64, events: Vec<egui::Event>) {
+        let input = egui::RawInput { time: Some(t), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            token_field(ui, p, "", 300.0);
+        });
+        out.textures_delta.clear();
+    }
+
+    fn focus(ctx: &egui::Context, p: &PublishingState) {
+        let id = p.field_id.expect("drawn");
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+
+    fn undo() -> egui::Event {
+        egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }
+    }
+
+    #[test]
+    fn after_save_the_token_cannot_be_brought_back_by_undo() {
+        let ctx = egui::Context::default();
+        let mut p = PublishingState::default();
+        frame(&ctx, &mut p, 0.0, vec![]);
+        focus(&ctx, &p);
+        frame(&ctx, &mut p, 1.0, vec![]);
+        frame(&ctx, &mut p, 2.0, vec![egui::Event::Text(TOKEN.into())]);
+        for t in 3..8 {
+            frame(&ctx, &mut p, t as f64 * 2.0, vec![]);
+        }
+        assert_eq!(p.token_input, TOKEN);
+        let old = p.field_id.unwrap();
+        let taken = p.take_for_save(&ctx);
+        assert_eq!(taken, TOKEN);
+        assert!(p.token_input.is_empty());
+        assert!(egui::text_edit::TextEditState::load(&ctx, old).is_none(), "the old field's state is gone");
+        frame(&ctx, &mut p, 20.0, vec![]);
+        assert_ne!(p.field_id, Some(old), "the field has a fresh id");
+        focus(&ctx, &p);
+        frame(&ctx, &mut p, 21.0, vec![]);
+        frame(&ctx, &mut p, 22.0, vec![undo()]);
+        frame(&ctx, &mut p, 23.0, vec![undo()]);
+        assert!(p.token_input.is_empty(), "undo brought back {:?}", p.token_input);
+    }
+
+    #[test]
+    fn undo_never_restores_a_token_even_in_the_same_field() {
+        let ctx = egui::Context::default();
+        let mut p = PublishingState::default();
+        frame(&ctx, &mut p, 0.0, vec![]);
+        focus(&ctx, &p);
+        frame(&ctx, &mut p, 1.0, vec![]);
+        frame(&ctx, &mut p, 2.0, vec![egui::Event::Text(TOKEN.into())]);
+        for t in 3..8 {
+            frame(&ctx, &mut p, t as f64 * 2.0, vec![]);
+        }
+        // Select all and delete, then undo.
+        let key = |k, m| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m };
+        frame(&ctx, &mut p, 20.0, vec![key(egui::Key::A, egui::Modifiers::COMMAND), key(egui::Key::Backspace, egui::Modifiers::NONE)]);
+        assert!(p.token_input.is_empty());
+        frame(&ctx, &mut p, 22.0, vec![]);
+        frame(&ctx, &mut p, 24.0, vec![undo()]);
+        assert!(p.token_input.is_empty(), "undo brought back {:?}", p.token_input);
+    }
+
+    #[test]
+    fn closing_or_leaving_the_page_clears_an_unsaved_token() {
+        let ctx = egui::Context::default();
+        let mut p = PublishingState { token_input: TOKEN.into(), ..Default::default() };
+        let before = p.field;
+        p.clear_token_field(&ctx);
+        assert!(p.token_input.is_empty());
+        assert_ne!(p.field, before);
+    }
+
+    #[test]
+    fn a_test_result_only_shows_for_the_address_it_tested() {
+        let p = PublishingState::default();
+        *p.message.lock().unwrap() = Some(Outcome { text: "Connected to workspace \"Acme\"".into(), ok: true, server: Some("https://a.example.com".into()) });
+        assert!(p.current_message("https://a.example.com").is_some());
+        assert!(p.current_message(" https://a.example.com ").is_some());
+        assert!(p.current_message("https://b.example.com").is_none());
+        // Save and Forget results are not tied to an address.
+        *p.message.lock().unwrap() = Some(Outcome { text: "Token saved.".into(), ok: true, server: None });
+        assert!(p.current_message("https://b.example.com").is_some());
+    }
 }
