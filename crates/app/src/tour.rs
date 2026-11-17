@@ -5,8 +5,10 @@
 //! overlays off, so annotations and crop match every other export.
 
 mod encode;
+mod layer;
 
 pub use encode::*;
+pub use layer::*;
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +17,7 @@ use mythicshot_editor::Item;
 use mythicshot_editor::overlays::{ClickStyle, InputEvent, InputKind, KeyStyle, MouseButton, OverlayStyle};
 use mythicshot_recording::Recording;
 
-use crate::video::{Edit, crop_px, decorate};
+use crate::video::{Edit, crop_px, decorate, step_items};
 
 /// Presses closer together than this are one step.
 pub const MERGE_MS: u64 = 400;
@@ -31,12 +33,14 @@ pub struct StepPlan {
 }
 
 const NO_CLICKS: &str = "This recording has no left clicks inside the kept frames, so there are no tour steps.";
+const ALL_REMOVED: &str = "Every step has been removed from the tour.";
 
 fn pct(v: f32) -> f32 {
     (v * 100.0).round() / 100.0
 }
 
 /// One step per left press (merged within [`MERGE_MS`]), then a final step on the last kept frame.
+/// Steps removed in the Tour view (`edit.tour_removed`) are dropped afterwards.
 pub fn plan_steps(rec: &Recording, edit: &Edit, events: &[InputEvent]) -> Result<Vec<StepPlan>, String> {
     if rec.frames.is_empty() {
         return Err(NO_CLICKS.to_string());
@@ -80,10 +84,14 @@ pub fn plan_steps(rec: &Recording, edit: &Edit, events: &[InputEvent]) -> Result
     {
         steps.push(StepPlan { src: last, click: None, t_ms: rec.frames[last].t_ms });
     }
+    steps.retain(|s| !edit.tour_removed.contains(&s.src));
+    if steps.is_empty() {
+        return Err(ALL_REMOVED.to_string());
+    }
     Ok(steps)
 }
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Point {
@@ -99,6 +107,9 @@ pub struct ManifestStep {
     pub bytes: u64,
     pub click: Option<Point>,
     pub t_ms: u64,
+    /// Tour layer: the step's spotlight (null when none) and its notes.
+    pub spotlight: Option<Area>,
+    pub notes: Vec<Note>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -107,6 +118,9 @@ pub struct Manifest {
     pub generator: String,
     pub title: String,
     pub steps: Vec<ManifestStep>,
+    /// Darkening strength in percent, shared by every spotlight; present only when a step has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spotlight_dim: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,7 +190,11 @@ fn write_into(
         if !progress(i as f32 / n as f32) {
             return Err("cancelled".to_string());
         }
-        let img = decorate(rec, step.src, frame(step.src)?, items, events, &tour_edit, true);
+        // Layer items are data; everything else on the step is burned in. Pins and ranges are
+        // cleared because `step_items` already chose what this step shows.
+        let burned: Vec<Item> = step_items(items, step.src).into_iter().filter(|it| !is_layer(it)).map(|it| Item { pin: None, frames: None, ..it }).collect();
+        let img = decorate(rec, step.src, frame(step.src)?, &burned, events, &tour_edit, true);
+        let layer = step_layer(rec, edit, items, step.src);
         let img = fit_image(img);
         let (bytes, ext) = encode_step(&img)?;
         let name = format!("step-{:03}.{ext}", i + 1);
@@ -189,9 +207,13 @@ fn write_into(
             bytes: bytes.len() as u64,
             click: step.click.map(|(x, y)| Point { x, y }),
             t_ms: step.t_ms,
+            spotlight: layer.spotlight,
+            notes: layer.notes,
         });
     }
-    let manifest = Manifest { version: MANIFEST_VERSION, generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")), title: title.to_string(), steps };
+    let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
+    let spotlight_dim = if steps.iter().any(|s| s.spotlight.is_some()) { tour_dim(items, &srcs) } else { None };
+    let manifest = Manifest { version: MANIFEST_VERSION, generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")), title: title.to_string(), steps, spotlight_dim };
 
     let pretty = serde_json::to_string_pretty(&manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
     std::fs::write(dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
@@ -318,7 +340,7 @@ mod tests {
         let sum = write_bundle(&r, &[], &[left(750, 50, 40), left(1750, 10, 20)], &edit(&r), "My tour", &dir, flat, |_| true).unwrap();
         assert_eq!(sum.steps, 3);
         let j = read_json(&dir);
-        assert_eq!(j["version"], 1);
+        assert_eq!(j["version"], 2);
         assert_eq!(j["title"], "My tour");
         assert!(j["generator"].as_str().unwrap().starts_with("mythicshot "));
         assert_eq!(j["steps"].as_array().unwrap().len(), 3);
@@ -424,5 +446,126 @@ mod tests {
         assert!(!json.contains("Hunter2Key") && !html.contains("Hunter2Key"));
         assert!(!html.contains("</script><b>x"));
         assert_eq!(read_json(&dir)["title"], "</script><b>x");
+    }
+
+    use mythicshot_editor::{Item, Rgba, Shape, Style, pt};
+    fn pinned(shape: Shape, src: u32) -> Item {
+        Item { id: 0, shape, style: Style { stroke: Rgba([255, 0, 0, 255]), fill: None, width: 3.0, font_size: 20.0, shadow: false }, frames: None, pin: Some(src) }
+    }
+    fn text(x: f32, y: f32, s: &str, src: u32) -> Item { pinned(Shape::Text { at: pt(x, y), text: s.into() }, src) }
+    fn spot(b: Bounds, src: u32) -> Item { pinned(Shape::Spotlight { rect: b, dim: 60 }, src) }
+    const CLICKS: [(u64, i32, i32); 2] = [(750, 50, 40), (1750, 10, 20)]; // steps on frames 1, 3, then the end step on 4
+    fn clicks() -> Vec<InputEvent> { CLICKS.iter().map(|&(t, x, y)| left(t, x, y)).collect() }
+
+    #[test]
+    fn pinned_text_and_spotlight_become_layer_data_as_percentages() {
+        let r = rec();
+        let items = [text(10.0, 20.0, "Unpaid invoices", 1), spot(Bounds { x0: 20.0, y0: 20.0, x1: 70.0, y1: 60.0 }, 1)];
+        let l = step_layer(&r, &edit(&r), &items, 1);
+        assert_eq!(l.spotlight, Some(Area { x: 20.0, y: 25.0, w: 50.0, h: 50.0 }));
+        assert_eq!(l.notes, vec![Note::Text { x: 10.0, y: 25.0, text: "Unpaid invoices".into(), size: 25.0, color: "#ff0000".into() }]);
+        assert_eq!(step_layer(&r, &edit(&r), &items, 3), StepLayer::default());
+        assert_eq!(tour_dim(&items, &[1, 3, 4]), Some(60));
+        assert_eq!(tour_dim(&items, &[3, 4]), None);
+    }
+
+    #[test]
+    fn bubbles_carry_their_box_tail_and_fill() {
+        let r = rec();
+        let mut b = pinned(Shape::Bubble { rect: Bounds { x0: 50.0, y0: 40.0, x1: 90.0, y1: 60.0 }, tail: pt(25.0, 20.0), text: "Here".into() }, 1);
+        b.style.fill = None; // bubbles default to white
+        let l = step_layer(&r, &edit(&r), &[b], 1);
+        assert_eq!(l.notes, vec![Note::Bubble { x: 50.0, y: 50.0, w: 40.0, h: 25.0, tail: Point { x: 25.0, y: 25.0 }, text: "Here".into(), size: 25.0, color: "#ff0000".into(), fill: "#ffffff".into() }]);
+    }
+
+    #[test]
+    fn crop_clips_the_spotlight_and_drops_notes_outside_it() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 50.0, y0: 0.0, x1: 100.0, y1: 80.0 });
+        let items = [text(10.0, 20.0, "gone", 1), text(60.0, 20.0, "kept", 1), spot(Bounds { x0: 20.0, y0: 20.0, x1: 70.0, y1: 60.0 }, 1)];
+        let l = step_layer(&r, &e, &items, 1);
+        assert_eq!(l.spotlight, Some(Area { x: 0.0, y: 25.0, w: 40.0, h: 50.0 }));
+        assert_eq!(l.notes.len(), 1);
+        assert!(matches!(&l.notes[0], Note::Text { x, text, .. } if *x == 20.0 && text == "kept"));
+        // A spotlight wholly outside the crop is dropped.
+        let l = step_layer(&r, &e, &[spot(Bounds { x0: 0.0, y0: 0.0, x1: 40.0, y1: 40.0 }, 1)], 1);
+        assert_eq!(l.spotlight, None);
+    }
+
+    #[test]
+    fn layer_items_are_data_and_everything_else_is_burned_into_its_own_step() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let mut cover = pinned(Shape::Rect(Bounds { x0: 0.0, y0: 0.0, x1: 20.0, y1: 20.0 }), 1);
+        cover.style.fill = Some(Rgba([255, 0, 0, 255]));
+        let items = [text(40.0, 40.0, "note", 1), spot(Bounds { x0: 30.0, y0: 30.0, x1: 90.0, y1: 70.0 }, 1), cover];
+        write_bundle(&r, &items, &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let one = image::open(dir.join("step-001.png")).unwrap().to_rgba8();
+        assert_eq!(one.get_pixel(10, 10).0, [255, 0, 0, 255], "the pinned box is burned in");
+        assert_eq!(one.get_pixel(95, 75).0, [200, 200, 200, 255], "the pinned spotlight is not");
+        assert_eq!(one.get_pixel(45, 45).0, [200, 200, 200, 255], "the pinned text is not");
+        let two = image::open(dir.join("step-002.png")).unwrap().to_rgba8();
+        assert!(two.pixels().all(|p| p.0 == [200, 200, 200, 255]), "pinned items stay on their own step");
+        let j = read_json(&dir);
+        assert_eq!(j["version"], 2);
+        assert_eq!(j["spotlight_dim"], 60);
+        assert_eq!(j["steps"][0]["spotlight"]["w"], 60.0);
+        assert_eq!(j["steps"][0]["notes"][0]["kind"], "text");
+        assert!(j["steps"][1]["spotlight"].is_null());
+        assert_eq!(j["steps"][1]["notes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_unpinned_spotlight_is_burned_in_and_a_plain_recording_has_an_empty_layer() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let mut s = spot(Bounds { x0: 30.0, y0: 30.0, x1: 90.0, y1: 70.0 }, 0);
+        s.pin = None; // on every frame, as drawn in Timeline mode with its range stretched
+        write_bundle(&r, &[s], &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let one = image::open(dir.join("step-001.png")).unwrap().to_rgba8();
+        assert_eq!(one.get_pixel(5, 5).0, [80, 80, 80, 255]);
+        let j = read_json(&dir);
+        assert!(j.get("spotlight_dim").is_none());
+        assert!(j["steps"].as_array().unwrap().iter().all(|s| s["spotlight"].is_null() && s["notes"].as_array().unwrap().is_empty()));
+    }
+
+    #[test]
+    fn pinned_items_never_show_in_timeline_mode_or_file_exports() {
+        let items = [text(10.0, 20.0, "tour only", 1)];
+        assert!(crate::video::visible(&items, 1).is_empty());
+        assert_eq!(crate::video::step_items(&items, 1).len(), 1);
+        assert!(crate::video::step_items(&items, 3).is_empty());
+    }
+
+    #[test]
+    fn removed_and_trimmed_steps_drop_out_with_their_layer_and_come_back() {
+        let r = rec();
+        let items = [text(10.0, 20.0, "Sticky", 1)];
+        let mut e = edit(&r);
+        e.tour_removed.insert(1);
+        assert_eq!(shape(&plan_steps(&r, &e, &clicks()).unwrap()), vec![(3, Some((10.0, 25.0))), (4, None)]);
+        e.tour_removed.clear();
+        e.trim = (2, 4);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &items, &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
+        assert!(!std::fs::read_to_string(dir.join("tour.json")).unwrap().contains("Sticky"));
+        e.trim = (0, 4);
+        assert_eq!(step_layer(&r, &e, &items, 1).notes.len(), 1);
+    }
+
+    #[test]
+    fn removing_every_step_is_an_error_and_writes_nothing() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.tour_removed.extend([1, 3, 4]);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let err = write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap_err();
+        assert_eq!(err, "Every step has been removed from the tour.");
+        assert!(!dir.exists());
     }
 }

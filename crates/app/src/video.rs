@@ -24,11 +24,13 @@ pub struct Edit {
     /// Output size as a percentage of the (cropped) frame.
     pub scale: u32,
     pub overlays: OverlayStyle,
+    /// Source frames of the tour steps removed in the Tour view.
+    pub tour_removed: BTreeSet<usize>,
 }
 
 impl Edit {
     pub fn new(rec: &Recording, overlays: OverlayStyle) -> Self {
-        Self { trim: (0, rec.frames.len().saturating_sub(1)), deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays }
+        Self { trim: (0, rec.frames.len().saturating_sub(1)), deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays, tour_removed: BTreeSet::new() }
     }
 
     pub fn kept(&self, i: usize) -> bool {
@@ -79,9 +81,14 @@ pub fn output_size(rec: &Recording, edit: &Edit) -> (u32, u32) {
     ((w * s / 100).max(1), (h * s / 100).max(1))
 }
 
-/// Annotations shown on frame `i`.
+/// Annotations shown on frame `i` in Timeline mode and in file exports. Pinned items are never included.
 pub fn visible(items: &[Item], i: usize) -> Vec<Item> {
-    items.iter().filter(|it| it.frames.is_none_or(|(a, b)| a as usize <= i && i <= b as usize)).cloned().collect()
+    items.iter().filter(|it| it.pin.is_none() && it.frames.is_none_or(|(a, b)| a as usize <= i && i <= b as usize)).cloned().collect()
+}
+
+/// What a tour step shows: `visible(items, src)` plus the items pinned to `src`.
+pub fn step_items(items: &[Item], src: usize) -> Vec<Item> {
+    items.iter().filter(|it| match it.pin { Some(p) => p as usize == src, None => it.frames.is_none_or(|(a, b)| a as usize <= src && src <= b as usize) }).cloned().collect()
 }
 
 /// The finished picture for source frame `src`: annotations, overlays, then
