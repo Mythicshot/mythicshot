@@ -29,8 +29,12 @@ const KEYRING_SERVICE: &str = "mythicshot";
 const KEYRING_USER: &str = "demo-platform-token";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Whole-request timeout, sending and receiving included.
+/// Whole-request timeout for a request without a body; a body adds time, see [`request_timeout`].
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bytes of request body per extra second of timeout: one second per 20 KB, about 160 kbit/s.
+const BODY_BYTES_PER_SECOND: usize = 20_000;
+/// Longest any one request may take.
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Cap on any response body read from the server.
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// The server's own caps, checked here so a bad bundle fails before anything is created.
@@ -137,11 +141,19 @@ pub fn list_tours(server: &str, token: &str) -> Result<Vec<RemoteTour>, String> 
 }
 
 /// Uploads the bundle in `dir`. `progress` gets 0.0–1.0 and returns false to cancel.
+///
+/// For the caller: this blocks for as long as the upload takes, up to minutes on a slow
+/// line (each request may take up to five minutes). Cancel is only checked between
+/// requests, so a cancel takes effect when the request in flight finishes. Run it off
+/// the UI thread, and show "Cancelling…" from the moment `progress` returns false until
+/// this returns. A chapter upload never sends the bundle's logo: the tour keeps its own.
 pub fn upload_bundle(server: &str, token: &str, dir: &Path, target: &Target, progress: impl FnMut(f32) -> bool) -> Result<Published, String> {
     Client::new(server, token, Timeouts::default())?.upload_bundle(dir, target, progress)
 }
 
-pub fn load_token() -> Option<String> {
+/// The stored token: `Ok(None)` when none is stored, `Err` when the credential store
+/// cannot be used (locked, unavailable), so the UI can say so instead of asking for a new token.
+pub fn load_token() -> Result<Option<String>, String> {
     load_token_from(&OsStore)
 }
 
@@ -221,9 +233,8 @@ impl SecretStore for OsStore {
     }
 }
 
-fn load_token_from(store: &dyn SecretStore) -> Option<String> {
-    let stored = store.get().ok().flatten()?;
-    Token::parse(&stored).ok().map(|t| t.0)
+fn load_token_from(store: &dyn SecretStore) -> Result<Option<String>, String> {
+    Ok(store.get()?.and_then(|stored| Token::parse(&stored).ok()).map(|t| t.0))
 }
 
 fn store_token_in(store: &dyn SecretStore, token: &str) -> Result<(), String> {
@@ -254,6 +265,7 @@ struct Client {
     base: String,
     token: Token,
     agent: AgentDebug,
+    timeouts: Timeouts,
 }
 
 /// The agent, with a `Debug` that prints nothing of its state.
@@ -269,6 +281,8 @@ impl fmt::Debug for AgentDebug {
 struct Reply {
     status: u16,
     body: Vec<u8>,
+    /// `Retry-After` in seconds, when the server sent a plain number.
+    retry_after: Option<u32>,
 }
 
 impl Reply {
@@ -308,7 +322,7 @@ impl Client {
             .user_agent("Mythicshot")
             .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
             .build();
-        Ok(Client { base, token, agent: AgentDebug(config.new_agent()) })
+        Ok(Client { base, token, agent: AgentDebug(config.new_agent()), timeouts })
     }
 
     /// One request to `path` on the configured server, with the token. Never retried here.
@@ -317,18 +331,21 @@ impl Client {
         let url = format!("{}{}", self.base, path);
         let auth = format!("Bearer {}", self.token.0);
         let a = &self.agent.0;
+        // Sending the body counts against the timeout, so a bigger body gets more time.
+        let limit = Some(request_timeout(self.timeouts.request, body.map_or(0, |(_, d)| d.len())));
         let result = match (method, body) {
-            (Method::Get, _) => a.get(&url).header("Authorization", &auth).call(),
-            (Method::Delete, _) => a.delete(&url).header("Authorization", &auth).call(),
-            (Method::Post, None) => a.post(&url).header("Authorization", &auth).send_empty(),
-            (Method::Put, None) => a.put(&url).header("Authorization", &auth).send_empty(),
-            (Method::Post, Some((ct, data))) => a.post(&url).header("Authorization", &auth).header("Content-Type", ct).send(data),
-            (Method::Put, Some((ct, data))) => a.put(&url).header("Authorization", &auth).header("Content-Type", ct).send(data),
+            (Method::Get, _) => a.get(&url).config().timeout_global(limit).build().header("Authorization", &auth).call(),
+            (Method::Delete, _) => a.delete(&url).config().timeout_global(limit).build().header("Authorization", &auth).call(),
+            (Method::Post, None) => a.post(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
+            (Method::Put, None) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
+            (Method::Post, Some((ct, data))) => a.post(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
+            (Method::Put, Some((ct, data))) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
         };
         let mut resp = result.map_err(|e| transport(&e))?;
         let status = resp.status().as_u16();
+        let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u32>().ok());
         let body = resp.body_mut().with_config().limit(MAX_RESPONSE_BYTES).read_to_vec().map_err(|e| transport(&e))?;
-        Ok(Reply { status, body })
+        Ok(Reply { status, body, retry_after })
     }
 
     /// Sends a request and turns anything but a 2xx answer into a message starting with `what`.
@@ -342,6 +359,11 @@ impl Client {
             200..=299 => Ok(reply),
             401 => Err(REJECTED_TOKEN.into()),
             300..=399 => Err(format!("{what}: the server answered with a redirect (HTTP {}), which is not followed. Check the server address.", reply.status)),
+            429 if reply.error_code().as_deref() == Some("too_many_uploads") => Err(format!(
+                "{what}: the server already has too many unfinished uploads for this workspace. Wait for another upload to finish{}, then try again.",
+                reply.retry_after.map(|s| format!(" or about {} seconds", s.min(3600))).unwrap_or_default()
+            )),
+            429 => Err(format!("{what}: the server is busy (HTTP 429). Try again later.")),
             s => Err(match self.server_detail(&reply) {
                 Some(d) => format!("{what}: {d} (HTTP {s})."),
                 None => format!("{what}: the server answered HTTP {s}."),
@@ -353,7 +375,7 @@ impl Client {
     fn server_detail(&self, reply: &Reply) -> Option<String> {
         let v = reply.json()?;
         let text = v.get("detail").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str))?;
-        let clean: String = text.chars().filter(|c| !c.is_control()).take(MAX_DETAIL_CHARS).collect();
+        let clean: String = text.chars().filter(|&c| !c.is_control() && !is_invisible(c)).take(MAX_DETAIL_CHARS).collect();
         let clean = clean.replace(&self.token.0, "[token]").replace("dp_", "dp-");
         let clean = clean.trim().to_string();
         (!clean.is_empty()).then_some(clean)
@@ -381,7 +403,8 @@ impl Client {
     }
 
     fn upload_bundle(&self, dir: &Path, target: &Target, mut progress: impl FnMut(f32) -> bool) -> Result<Published, String> {
-        let bundle = Bundle::read(dir)?;
+        // An upload into an existing tour keeps that tour's logo; the server refuses another (409 logo_not_used).
+        let bundle = Bundle::read(dir, matches!(target, Target::New))?;
         let total = (bundle.steps.len() + usize::from(bundle.logo.is_some()) + 2) as f32;
         if !progress(0.0) {
             return Err(CANCELLED.into());
@@ -399,23 +422,17 @@ impl Client {
             return Err(not_understood(what));
         }
 
+        // From here every exit but a successful commit, a panic included, sends exactly one abort.
+        let guard = AbortGuard { client: self, id: &id, armed: true };
         let mut done = 1.0;
-        let sent = self.send_parts(&id, dir, &bundle, &mut || {
+        let published = self.send_parts(&id, dir, &bundle, &mut || {
             let go = progress(done / total);
             done += 1.0;
             go
-        });
-        match sent {
-            Ok(published) => {
-                progress(1.0);
-                Ok(published)
-            }
-            Err(e) => {
-                // Exactly one abort, whatever it answers. After a commit that did land, the server ignores it.
-                let _ = self.send(Method::Delete, &format!("/api/v1/uploads/{id}"), None);
-                Err(e)
-            }
-        }
+        })?;
+        guard.disarm();
+        progress(1.0);
+        Ok(published)
     }
 
     /// Every image, the logo, then commit. `next` reports progress and says whether to go on.
@@ -426,7 +443,7 @@ impl Client {
             }
             let n = i + 1;
             let what = format!("Could not send step {n}");
-            let data = std::fs::read(dir.join(&step.file)).map_err(|_| format!("{what}: could not read {}.", step.file))?;
+            let data = read_bundle_file(dir, step).map_err(|e| format!("{what}: {e}"))?;
             self.send_image(&what, &format!("/api/v1/uploads/{id}/steps/{n}"), step.content_type, &data)?;
         }
         if let Some(logo) = &bundle.logo {
@@ -434,7 +451,7 @@ impl Client {
                 return Err(CANCELLED.into());
             }
             let what = "Could not send the logo";
-            let data = std::fs::read(dir.join(&logo.file)).map_err(|_| format!("{what}: could not read {}.", logo.file))?;
+            let data = read_bundle_file(dir, logo).map_err(|e| format!("{what}: {e}"))?;
             self.send_image(what, &format!("/api/v1/uploads/{id}/logo"), logo.content_type, &data)?;
         }
         if !next() {
@@ -480,6 +497,44 @@ fn is_upload_id(id: &str) -> bool {
     id.len() == 27 && id.starts_with("up_") && id[3..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The timeout for one request: `base`, plus a second per 20 KB of body, at most five minutes.
+fn request_timeout(base: Duration, body_bytes: usize) -> Duration {
+    let extra = u64::try_from(body_bytes / BODY_BYTES_PER_SECOND).unwrap_or(u64::MAX);
+    base.saturating_add(Duration::from_secs(extra)).min(MAX_REQUEST_TIMEOUT)
+}
+
+/// Characters that show nothing but can reorder or hide text: bidi controls, zero-width marks, the BOM.
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// Sends the upload's abort when dropped, unless disarmed after a successful commit.
+struct AbortGuard<'a> {
+    client: &'a Client,
+    id: &'a str,
+    armed: bool,
+}
+
+impl AbortGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbortGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            // Whatever it answers. After a commit that did land, the server ignores it. A panic
+            // here while already unwinding would abort the process, so it is caught.
+            let path = format!("/api/v1/uploads/{}", self.id);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.client.send(Method::Delete, &path, None);
+            }));
+        }
+    }
+}
+
 fn transport(e: &ureq::Error) -> Transport {
     use ureq::Error as E;
     Transport(match e {
@@ -499,6 +554,10 @@ fn transport(e: &ureq::Error) -> Transport {
 struct BundleFile {
     file: String,
     content_type: &'static str,
+    /// The size `tour.json` gives, or for the logo its cap.
+    bytes: u64,
+    /// Whether `bytes` must match exactly.
+    exact: bool,
 }
 
 struct Bundle {
@@ -509,8 +568,9 @@ struct Bundle {
 }
 
 impl Bundle {
-    /// Reads `tour.json` and checks every file it names, so a bad bundle fails before anything is created.
-    fn read(dir: &Path) -> Result<Bundle, String> {
+    /// Reads `tour.json` and checks every file it names (the logo only when `with_logo`),
+    /// so a bad bundle fails before anything is created.
+    fn read(dir: &Path, with_logo: bool) -> Result<Bundle, String> {
         let text = std::fs::read_to_string(dir.join("tour.json")).map_err(|_| "Could not read tour.json in the export folder.".to_string())?;
         let manifest: Value = serde_json::from_str(&text).map_err(|_| "tour.json is not valid JSON.".to_string())?;
         let steps = manifest.get("steps").and_then(Value::as_array).ok_or("tour.json has no steps.")?;
@@ -522,19 +582,21 @@ impl Bundle {
             .enumerate()
             .map(|(i, s)| {
                 let name = s.get("image").and_then(Value::as_str).ok_or_else(|| format!("Step {} in tour.json has no image.", i + 1))?;
-                bundle_file(dir, name, MAX_IMAGE_BYTES).map_err(|e| format!("Step {}: {e}", i + 1))
+                let bytes = s.get("bytes").and_then(Value::as_u64).filter(|&b| b <= MAX_IMAGE_BYTES).ok_or_else(|| format!("Step {} in tour.json has no valid size.", i + 1))?;
+                bundle_file(dir, name, bytes, true).map_err(|e| format!("Step {}: {e}", i + 1))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let logo = match manifest.get("cover").and_then(|c| c.get("logo")).and_then(Value::as_str) {
-            Some(name) => Some(bundle_file(dir, name, MAX_LOGO_BYTES).map_err(|e| format!("Logo: {e}"))?),
-            None => None,
+            Some(name) if with_logo => Some(bundle_file(dir, name, MAX_LOGO_BYTES, false).map_err(|e| format!("Logo: {e}"))?),
+            _ => None,
         };
         Ok(Bundle { manifest, steps, logo })
     }
 }
 
-/// A file named in `tour.json`: a plain name inside the folder, PNG or JPEG by name, within `max` bytes.
-fn bundle_file(dir: &Path, name: &str, max: u64) -> Result<BundleFile, String> {
+/// A file named in `tour.json`: a plain name directly inside the folder, a regular file
+/// (not a link or a folder), PNG or JPEG by name, of exactly `bytes` bytes (`exact`) or at most.
+fn bundle_file(dir: &Path, name: &str, bytes: u64, exact: bool) -> Result<BundleFile, String> {
     let mut parts = Path::new(name).components();
     let plain = matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) && !name.contains([':', '/', '\\']) && !name.chars().any(char::is_control);
     if !plain {
@@ -548,11 +610,43 @@ fn bundle_file(dir: &Path, name: &str, max: u64) -> Result<BundleFile, String> {
     } else {
         return Err(format!("{name} is not a PNG or JPEG file."));
     };
-    let meta = std::fs::metadata(dir.join(name)).map_err(|_| format!("{name} is missing from the export folder."))?;
-    if !meta.is_file() || meta.len() > max {
-        return Err(format!("{name} is larger than {max} bytes."));
+    let meta = std::fs::symlink_metadata(dir.join(name)).map_err(|_| format!("{name} is missing from the export folder."))?;
+    check_regular(name, &meta)?;
+    let size_ok = if exact { meta.len() == bytes } else { meta.len() <= bytes };
+    if !size_ok {
+        return Err(if exact { format!("{name} is not the size tour.json gives.") } else { format!("{name} is larger than {bytes} bytes.") });
     }
-    Ok(BundleFile { file: name.to_string(), content_type })
+    Ok(BundleFile { file: name.to_string(), content_type, bytes, exact })
+}
+
+fn check_regular(name: &str, meta: &std::fs::Metadata) -> Result<(), String> {
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!("{name} is not a regular file."));
+    }
+    Ok(())
+}
+
+/// Opens a checked bundle file once, without following a link on Windows, and reads at
+/// most its size plus one byte, refusing it if it is no longer what was checked.
+fn read_bundle_file(dir: &Path, f: &BundleFile) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(dir.join(&f.file)).map_err(|_| format!("could not read {}.", f.file))?;
+    check_regular(&f.file, &file.metadata().map_err(|_| format!("could not read {}.", f.file))?)?;
+    let mut data = Vec::new();
+    file.take(f.bytes + 1).read_to_end(&mut data).map_err(|_| format!("could not read {}.", f.file))?;
+    let len = data.len() as u64;
+    if len > f.bytes || (f.exact && len != f.bytes) {
+        return Err(format!("{} changed since it was checked.", f.file));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -1000,12 +1094,12 @@ mod tests {
         assert!(err.contains("step-002.png is missing"), "{err}");
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tour.json"), r#"{"steps":[{"image":"../secret.png"}]}"#).unwrap();
+        std::fs::write(dir.path().join("tour.json"), r#"{"steps":[{"image":"../secret.png","bytes":15}]}"#).unwrap();
         let err = upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err();
         assert!(err.contains("not a plain file name"), "{err}");
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tour.json"), r#"{"steps":[{"image":"step-001.png"}],"cover":{"logo":"C:logo.png"}}"#).unwrap();
+        std::fs::write(dir.path().join("tour.json"), r#"{"steps":[{"image":"step-001.png","bytes":15}],"cover":{"logo":"C:logo.png"}}"#).unwrap();
         std::fs::write(dir.path().join("step-001.png"), PNG).unwrap();
         assert!(upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err().starts_with("Logo:"));
         assert!(s.lines().is_empty());
@@ -1022,13 +1116,133 @@ mod tests {
         assert!(local.agent.0.config().proxy().is_none());
     }
 
+    #[test]
+    fn a_chapter_upload_of_a_bundle_with_a_logo_leaves_the_logo_out() {
+        let s = stub(|req, seen| if req.line.ends_with("/logo") { reply(409, r#"{"error":"logo_not_used","detail":"do not send one"}"#) } else { platform(req, seen) });
+        let dir = bundle(2, true);
+        let mut seen = Vec::new();
+        upload_bundle(&s.base, TOKEN, dir.path(), &Target::Chapter("tour_bbbbbbbbbbbbbbbbbbbbbbbb".into()), |p| {
+            seen.push(p);
+            true
+        })
+        .unwrap();
+        assert!(!s.lines().iter().any(|l| l.ends_with("/logo")), "{:?}", s.lines());
+        assert_eq!(seen, [0.0, 0.25, 0.5, 0.75, 1.0]);
+
+        // A chapter upload does not even need the logo file.
+        let dir = bundle(1, true);
+        std::fs::remove_file(dir.path().join("logo.png")).unwrap();
+        let s = stub(platform);
+        upload_bundle(&s.base, TOKEN, dir.path(), &Target::Chapter("tour_bbbbbbbbbbbbbbbbbbbbbbbb".into()), |_| true).unwrap();
+    }
+
+    #[test]
+    fn a_request_gets_more_time_for_a_bigger_body() {
+        let base = Duration::from_secs(30);
+        assert_eq!(request_timeout(base, 0), base);
+        assert_eq!(request_timeout(base, 2_000_000), Duration::from_secs(130));
+        assert_eq!(request_timeout(base, 200_000), Duration::from_secs(40));
+        assert_eq!(request_timeout(base, usize::MAX), MAX_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn a_panic_mid_upload_still_aborts_once() {
+        let s = stub(platform);
+        let dir = bundle(3, false);
+        let mut calls = 0;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| {
+                calls += 1;
+                assert!(calls < 3, "progress callback fails");
+                true
+            })
+        }));
+        assert!(caught.is_err());
+        let lines = s.lines();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("DELETE ")).count(), 1, "{lines:?}");
+        assert!(!lines.iter().any(|l| l.ends_with("/commit")));
+    }
+
+    #[test]
+    fn a_bundle_file_must_be_a_regular_file_of_the_declared_size() {
+        let s = stub(platform);
+        let dir = bundle(1, false);
+        std::fs::remove_file(dir.path().join("step-001.png")).unwrap();
+        std::fs::create_dir(dir.path().join("step-001.png")).unwrap();
+        let err = upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err();
+        assert!(err.contains("step-001.png is not a regular file"), "{err}");
+
+        let dir = bundle(1, false);
+        std::fs::write(dir.path().join("step-001.png"), b"\x89PNG\r\n\x1a\nfakepng and more").unwrap();
+        let err = upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err();
+        assert!(err.contains("step-001.png is not the size tour.json gives"), "{err}");
+        assert!(s.lines().is_empty());
+
+        // A file that grows after the check is read only up to its declared size plus one byte, and refused.
+        let dir = bundle(1, false);
+        let b = Bundle::read(dir.path(), true).unwrap();
+        std::fs::write(dir.path().join("step-001.png"), vec![7u8; 5_000_000]).unwrap();
+        let err = read_bundle_file(dir.path(), &b.steps[0]).unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+    }
+
+    #[test]
+    fn a_symlinked_bundle_file_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.png"), PNG).unwrap();
+        let dir = bundle(1, false);
+        std::fs::remove_file(dir.path().join("step-001.png")).unwrap();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(outside.path().join("secret.png"), dir.path().join("step-001.png"));
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path().join("secret.png"), dir.path().join("step-001.png"));
+        if made.is_err() {
+            eprintln!("cannot make symlinks here; skipped");
+            return;
+        }
+        let s = stub(platform);
+        let err = upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(s.lines().is_empty());
+    }
+
+    #[test]
+    fn server_text_loses_invisible_characters_and_is_capped() {
+        let detail = format!("a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{00AD}f\u{061C}g\u{2060}h{}", "x".repeat(1000));
+        let body = json!({ "error": "bad", "detail": detail }).to_string();
+        let s = stub(move |_, _| Answer::Reply(400, body.clone(), vec![]));
+        let err = workspace_name(&s.base, TOKEN).unwrap_err();
+        assert!(err.contains("abcdefgh"), "{err}");
+        assert!(!err.chars().any(|c| is_invisible(c) || c.is_control()), "{err:?}");
+        assert!(err.chars().count() < MAX_DETAIL_CHARS + 60, "{}", err.len());
+    }
+
+    #[test]
+    fn too_many_open_uploads_is_explained_and_not_retried() {
+        let s = stub(|req, seen| {
+            if req.line == "POST /api/v1/uploads" {
+                Answer::Reply(429, r#"{"error":"too_many_uploads","detail":"this workspace already has 5 open uploads; finish or cancel one first"}"#.into(), vec![("Retry-After", "60".into())])
+            } else {
+                platform(req, seen)
+            }
+        });
+        let err = upload(&s, 1, false, &Target::New).unwrap_err();
+        assert!(err.contains("too many unfinished uploads"), "{err}");
+        assert!(err.contains("60 seconds"), "{err}");
+        assert_eq!(s.lines(), ["POST /api/v1/uploads"]);
+    }
+
     #[derive(Default)]
     struct FakeStore {
         value: RefCell<Option<String>>,
+        locked: bool,
     }
 
     impl SecretStore for FakeStore {
         fn get(&self) -> Result<Option<String>, String> {
+            if self.locked {
+                return Err("Could not use the credential store: the credential store is locked or not reachable.".into());
+            }
             Ok(self.value.borrow().clone())
         }
         fn set(&self, secret: &str) -> Result<(), String> {
@@ -1044,18 +1258,26 @@ mod tests {
     #[test]
     fn the_token_store_keeps_only_a_valid_token() {
         let store = FakeStore::default();
-        assert_eq!(load_token_from(&store), None);
+        assert_eq!(load_token_from(&store), Ok(None));
         store_token_in(&store, &format!("  {TOKEN}\n")).unwrap();
         assert_eq!(store.value.borrow().as_deref(), Some(TOKEN));
-        assert_eq!(load_token_from(&store).as_deref(), Some(TOKEN));
+        assert_eq!(load_token_from(&store).unwrap().as_deref(), Some(TOKEN));
         for bad in ["", "dp_", "dp_0123", &TOKEN.to_uppercase(), &format!("{TOKEN}\r\nX-Evil: 1")] {
             assert!(store_token_in(&store, bad).is_err(), "{bad:?}");
         }
-        assert_eq!(load_token_from(&store).as_deref(), Some(TOKEN));
+        assert_eq!(load_token_from(&store).unwrap().as_deref(), Some(TOKEN));
         forget_token_in(&store).unwrap();
-        assert_eq!(load_token_from(&store), None);
+        assert_eq!(load_token_from(&store), Ok(None));
         *store.value.borrow_mut() = Some("garbage".into());
-        assert_eq!(load_token_from(&store), None);
+        assert_eq!(load_token_from(&store), Ok(None));
+    }
+
+    #[test]
+    fn a_locked_credential_store_is_not_the_same_as_no_token() {
+        let store = FakeStore { value: RefCell::new(Some(TOKEN.into())), locked: true };
+        let err = load_token_from(&store).unwrap_err();
+        assert!(err.contains("locked or not reachable"), "{err}");
+        assert!(!err.contains(TOKEN));
     }
 
     #[test]
