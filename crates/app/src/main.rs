@@ -17,6 +17,7 @@ mod overlay;
 mod password;
 mod platform;
 mod popups;
+mod publish;
 mod recorder_ui;
 mod settings;
 mod settings_ui;
