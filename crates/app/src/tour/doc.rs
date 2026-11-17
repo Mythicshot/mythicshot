@@ -30,6 +30,8 @@ pub const COVER_BUTTON_MAX: usize = 24;
 pub const BUTTON_LABEL_MAX: usize = 24;
 pub const END_TEXT_MAX: usize = 200;
 pub const LINK_MAX: usize = 500;
+pub const NOTE_TEXT_MAX: usize = 500;
+pub const TITLE_MAX: usize = 200;
 pub const ZOOM_MIN: u16 = 105;
 pub const ZOOM_MAX: u16 = 140;
 pub const AUTOPLAY_MIN: u8 = 2;
@@ -193,12 +195,13 @@ fn is_format(c: char) -> bool {
         | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
-/// Tour text cleaned and capped: `\r\n` and `\r` become `\n`; a tab becomes a space; every other
-/// control (Cc) and format (Cf) character is removed; `\n` is kept only when `multiline` and becomes
-/// a space otherwise; then the text is trimmed and cut at `max`. The cap counts Unicode code points
-/// (Rust `char`s) after this cleaning, the same way the server counts them.
+/// Tour text cleaned and capped: `\r\n`, `\r` and the line and paragraph separators (U+2028, U+2029)
+/// become `\n`; a tab becomes a space; every other control (Cc) and format (Cf) character is removed;
+/// `\n` is kept only when `multiline` and becomes a space otherwise; then the text is trimmed, cut at
+/// `max` and trimmed again at its end, so a cut never leaves a trailing space. The cap counts Unicode
+/// code points (Rust `char`s) after this cleaning, the same way the server counts them.
 pub(super) fn clean(s: &str, max: usize, multiline: bool) -> String {
-    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let s = s.replace("\r\n", "\n").replace(['\r', '\u{2028}', '\u{2029}'], "\n");
     let cleaned: String = s
         .chars()
         .filter_map(|c| match c {
@@ -208,7 +211,8 @@ pub(super) fn clean(s: &str, max: usize, multiline: bool) -> String {
             c => Some(c),
         })
         .collect();
-    cleaned.trim().chars().take(max).collect()
+    let cut: String = cleaned.trim().chars().take(max).collect();
+    cut.trim_end().to_string()
 }
 
 /// A single-line field (titles, labels): see [`clean`].

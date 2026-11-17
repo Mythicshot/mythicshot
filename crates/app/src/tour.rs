@@ -144,6 +144,96 @@ pub struct TourSummary {
     pub dir: PathBuf,
     pub steps: usize,
     pub bytes: u64,
+    /// Step images re-encoded at a lower quality (or shrunk) to fit [`MAX_STEP_BYTES`].
+    pub squeezed: usize,
+}
+
+impl TourSummary {
+    /// What the export summary adds when step images had to be made smaller, else None.
+    pub fn squeezed_note(&self) -> Option<String> {
+        let mb = MAX_STEP_BYTES as f64 / 1_000_000.0;
+        match self.squeezed {
+            0 => None,
+            1 => Some(format!("1 step image was saved at a lower quality to stay under {mb} MB")),
+            n => Some(format!("{n} step images were saved at a lower quality to stay under {mb} MB")),
+        }
+    }
+}
+
+// The server's caps (`LIMITS` in its manifest rules). An export never writes a bundle over them.
+/// The most steps a tour may have.
+pub const MAX_STEPS: usize = 200;
+/// The most notes (text and bubbles) one step may have.
+pub const MAX_NOTES_PER_STEP: usize = 20;
+/// The largest manifest, in bytes of compact JSON, the server takes.
+pub const MAX_MANIFEST_BYTES: usize = 262_144;
+
+/// The tour's title as the manifest holds it: cleaned like every other one-line text and capped at
+/// [`TITLE_MAX`]; a title with nothing left becomes "Untitled tour", since the server needs one.
+pub fn tour_title(title: &str) -> String {
+    let t = doc::clean(title, TITLE_MAX, false);
+    if t.is_empty() { "Untitled tour".to_string() } else { t }
+}
+
+/// Refuse a tour with more steps, or a step with more notes, than the server takes.
+fn check_counts(steps: &[ManifestStep]) -> Result<(), String> {
+    if steps.len() > MAX_STEPS {
+        return Err(format!("A tour can have at most {MAX_STEPS} steps, and this one has {}. Remove steps in the Tour view or trim the recording.", steps.len()));
+    }
+    if let Some((i, s)) = steps.iter().enumerate().find(|(_, s)| s.notes.len() > MAX_NOTES_PER_STEP) {
+        return Err(format!("Step {} has {} notes, and a step can have at most {MAX_NOTES_PER_STEP}. Remove some of its text or bubbles.", i + 1, s.notes.len()));
+    }
+    Ok(())
+}
+
+/// Refuse a manifest larger than the server takes.
+fn check_size(manifest: &Manifest) -> Result<(), String> {
+    let n = serde_json::to_vec(manifest).map_err(|e| format!("Could not write tour.json: {e}"))?.len();
+    if n > MAX_MANIFEST_BYTES {
+        return Err(format!("This tour has too much text to publish: its tour.json would be {} KB, and the limit is {} KB. Shorten or remove some notes or cards.", n.div_ceil(1024), MAX_MANIFEST_BYTES / 1024));
+    }
+    Ok(())
+}
+
+/// Each step's manifest entry with everything but its image: the name, size and bytes are filled in
+/// once the image is written.
+fn step_entries(rec: &Recording, edit: &Edit, items: &[Item], plan: &[StepPlan], doc: &TourDoc) -> Vec<ManifestStep> {
+    plan.iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let layer = step_layer(rec, edit, items, step.src);
+            let extras = doc.steps.get(&step.src);
+            ManifestStep {
+                image: format!("step-{:03}.png", i + 1),
+                width: 1,
+                height: 1,
+                bytes: 1,
+                click: step.click.map(|(x, y)| Point { x, y }),
+                t_ms: step.t_ms,
+                spotlight: layer.spotlight,
+                notes: layer.notes,
+                card: step_card(rec, edit, step.src, step.click),
+                advance: extras.map(|x| x.advance).unwrap_or_default(),
+                zoom: extras.and_then(|x| x.zoom),
+            }
+        })
+        .collect()
+}
+
+fn manifest(title: String, steps: Vec<ManifestStep>, spotlight_dim: Option<u8>, doc: TourDoc) -> Manifest {
+    Manifest {
+        version: MANIFEST_VERSION,
+        generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")),
+        title,
+        steps,
+        spotlight_dim,
+        theme: doc.theme,
+        zoom: doc.zoom,
+        cover: doc.cover,
+        cta: doc.cta,
+        end: doc.end,
+        autoplay: doc.autoplay,
+    }
 }
 
 const PREVIEW_TEMPLATE: &str = include_str!("tour_preview.html");
@@ -179,17 +269,28 @@ pub fn write_bundle(
     }
     // The settings are sanitised and the logo loaded before the folder exists, so a bad logo writes nothing.
     // A logo travels only with a cover.
-    let doc = sanitize(&edit.tour_doc);
+    let mut doc = sanitize(&edit.tour_doc);
     let logo = match (&doc.cover, &doc.logo_path) {
         (Some(_), Some(path)) => Some(load_logo(path)?),
         _ => None,
     };
+    if let (Some(c), Some((_, ext))) = (doc.cover.as_mut(), &logo) {
+        c.logo = Some(format!("logo.{ext}"));
+    }
+    // Everything but the images is known now, so a tour the server would refuse writes nothing.
+    // The size check here counts every image at its smallest; the exact one runs before tour.json is written.
+    let steps = step_entries(rec, edit, items, &plan, &doc);
+    check_counts(&steps)?;
+    let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
+    let spotlight_dim = tour_dim(rec, edit, items, &srcs);
+    let draft = manifest(tour_title(title), steps, spotlight_dim, doc);
+    check_size(&draft)?;
     // Not create_dir_all: a missing parent is an error, and a folder that appears
     // between the check above and here makes this call fail instead of being reused.
     std::fs::create_dir(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{} already exists", dir.display()) } else { format!("Could not create {}: {e}", dir.display()) }
     })?;
-    match write_into(rec, items, events, edit, title, dir, &plan, doc, logo, frame, progress) {
+    match write_into(rec, items, events, edit, dir, &plan, draft, logo, frame, progress) {
         Ok(summary) => Ok(summary),
         Err(e) => match std::fs::remove_dir_all(dir) {
             Ok(()) => Err(e),
@@ -204,10 +305,9 @@ fn write_into(
     items: &[Item],
     events: &[InputEvent],
     edit: &Edit,
-    title: &str,
     dir: &Path,
     plan: &[StepPlan],
-    doc: TourDoc,
+    mut manifest: Manifest,
     logo: Option<(Vec<u8>, &'static str)>,
     mut frame: impl FnMut(usize) -> Result<RgbaImage, String>,
     mut progress: impl FnMut(f32) -> bool,
@@ -218,9 +318,9 @@ fn write_into(
     tour_edit.overlays = OverlayStyle { keys: KeyStyle::Off, clicks: ClickStyle::Off, halo: false, pointer: false };
 
     let n = plan.len();
-    let mut steps = Vec::with_capacity(n);
     let mut total = 0u64;
-    for (i, step) in plan.iter().enumerate() {
+    let mut squeezed = 0;
+    for (i, (step, entry)) in plan.iter().zip(manifest.steps.iter_mut()).enumerate() {
         if !progress(i as f32 / n as f32) {
             return Err("cancelled".to_string());
         }
@@ -228,49 +328,18 @@ fn write_into(
         // cleared because `step_items` already chose what this step shows.
         let burned: Vec<Item> = step_items(items, step.src).into_iter().filter(|it| !is_layer(it)).map(|it| Item { pin: None, frames: None, ..it }).collect();
         let img = decorate(rec, step.src, frame(step.src)?, &burned, events, &tour_edit, true);
-        let layer = step_layer(rec, edit, items, step.src);
-        let img = fit_image(img);
-        let (bytes, ext) = encode_step(&img)?;
+        let (bytes, ext, img, smaller) = encode_within(fit_image(img), MAX_STEP_BYTES)?;
+        squeezed += usize::from(smaller);
         let name = format!("step-{:03}.{ext}", i + 1);
         std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
         total += bytes.len() as u64;
-        let extras = doc.steps.get(&step.src);
-        steps.push(ManifestStep {
-            image: name,
-            width: img.width(),
-            height: img.height(),
-            bytes: bytes.len() as u64,
-            click: step.click.map(|(x, y)| Point { x, y }),
-            t_ms: step.t_ms,
-            spotlight: layer.spotlight,
-            notes: layer.notes,
-            card: step_card(rec, edit, step.src, step.click),
-            advance: extras.map(|x| x.advance).unwrap_or_default(),
-            zoom: extras.and_then(|x| x.zoom),
-        });
+        (entry.image, entry.width, entry.height, entry.bytes) = (name, img.width(), img.height(), bytes.len() as u64);
     }
-    let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
-    let spotlight_dim = tour_dim(rec, edit, items, &srcs);
-    let mut cover = doc.cover;
-    if let (Some(c), Some((bytes, ext))) = (cover.as_mut(), &logo) {
-        let name = format!("logo.{ext}");
+    if let (Some(name), Some((bytes, _))) = (manifest.cover.as_ref().and_then(|c| c.logo.clone()), &logo) {
         std::fs::write(dir.join(&name), bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
         total += bytes.len() as u64;
-        c.logo = Some(name);
     }
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
-        generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")),
-        title: title.to_string(),
-        steps,
-        spotlight_dim,
-        theme: doc.theme,
-        zoom: doc.zoom,
-        cover,
-        cta: doc.cta,
-        end: doc.end,
-        autoplay: doc.autoplay,
-    };
+    check_size(&manifest)?;
 
     let pretty = serde_json::to_string_pretty(&manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
     std::fs::write(dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
@@ -281,7 +350,7 @@ fn write_into(
     std::fs::write(dir.join("index.html"), html).map_err(|e| format!("Could not write index.html: {e}"))?;
 
     progress(1.0);
-    Ok(TourSummary { dir: dir.to_path_buf(), steps: n, bytes: total })
+    Ok(TourSummary { dir: dir.to_path_buf(), steps: n, bytes: total, squeezed })
 }
 
 #[cfg(test)]
@@ -1012,6 +1081,262 @@ mod tests {
         assert!(PREVIEW_TEMPLATE.contains(r#"var palette = style() === "compact" ? "light" : style();"#));
         assert!(PREVIEW_TEMPLATE.contains("TourCore.placeCard(W, H, w, h, avoid, cardData.placement, aim)"));
         assert!(PREVIEW_TEMPLATE.contains(r#"picked: anchor === "point" && !!point"#));
+    }
+
+    /// A recording with `n` clicks, one per frame, the last on the last frame: exactly `n` steps.
+    fn many(n: usize) -> (Recording, Vec<InputEvent>) {
+        let times: Vec<u64> = (0..n as u64).map(|i| i * 500).collect();
+        let r = Recording::timing_only(100, 80, &times, n as u64 * 500);
+        let ev = (0..n as u64).map(|i| left(i * 500 + 250, 50, 40)).collect();
+        (r, ev)
+    }
+
+    #[test]
+    fn more_than_200_steps_is_refused_with_the_limit_and_the_count() {
+        let (r, ev) = many(201);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let err = write_bundle(&r, &[], &ev, &edit(&r), "t", &dir, flat, |_| true).unwrap_err();
+        assert!(err.contains("200") && err.contains("201"), "{err}");
+        assert!(!dir.exists(), "nothing is written");
+        let (r, ev) = many(200);
+        assert_eq!(write_bundle(&r, &[], &ev, &edit(&r), "t", &dir, flat, |_| true).unwrap().steps, 200);
+    }
+
+    #[test]
+    fn more_than_20_notes_on_a_step_is_refused_with_the_limit_and_the_count() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let notes: Vec<Item> = (0..21).map(|i| text(5.0 + i as f32, 20.0, "n", 3)).collect();
+        let err = write_bundle(&r, &notes, &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap_err();
+        assert!(err.contains("Step 2") && err.contains("21") && err.contains("20"), "{err}");
+        assert!(!dir.exists());
+        write_bundle(&r, &notes[..20], &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        assert_eq!(read_json(&dir)["steps"][1]["notes"].as_array().unwrap().len(), 20);
+    }
+
+    #[test]
+    fn a_manifest_over_the_servers_size_is_refused_and_writes_nothing() {
+        let (r, ev) = many(200);
+        let long = "a".repeat(500);
+        let items: Vec<Item> = (0..200u32).flat_map(|s| (0..5).map(move |i| (s, i))).map(|(s, i)| text(5.0 + i as f32, 20.0, &long, s)).collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let err = write_bundle(&r, &items, &ev, &edit(&r), "t", &dir, flat, |_| true).unwrap_err();
+        assert!(err.contains("256 KB"), "{err}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn the_title_and_notes_are_cleaned_like_every_other_text() {
+        assert_eq!(tour_title("My\ttour\r\nnow\u{2028}\u{202E}!"), "My tour now !");
+        assert_eq!(tour_title(&"t".repeat(300)).chars().count(), 200);
+        assert_eq!(tour_title(" \u{200B}\t"), "Untitled tour", "the server needs a title");
+        let r = rec();
+        let bubble = pinned(Shape::Bubble { rect: Bounds { x0: 50.0, y0: 40.0, x1: 90.0, y1: 60.0 }, tail: pt(25.0, 20.0), text: "One\u{2029}two\t3\u{0}".into() }, 1);
+        let l = step_layer(&r, &edit(&r), &[text(10.0, 20.0, "A\r\nB\u{2028}C\u{FEFF}", 1), text(10.0, 30.0, "\u{200B}\u{200B}", 1), text(10.0, 40.0, &"x".repeat(700), 1), bubble], 1);
+        let texts: Vec<String> = l.notes.iter().map(|n| match n { Note::Text { text, .. } | Note::Bubble { text, .. } => text.clone() }).collect();
+        assert_eq!(texts, vec!["A\nB\nC".to_string(), "x".repeat(500), "One\ntwo 3".to_string()], "an invisible-only note is dropped");
+    }
+
+    #[test]
+    fn a_bubble_the_crop_leaves_with_no_width_or_height_is_dropped() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 0.0, y0: 0.0, x1: 50.0, y1: 80.0 });
+        let flat_bubble = |b: Bounds| pinned(Shape::Bubble { rect: b, tail: pt(10.0, 10.0), text: "Hi".into() }, 1);
+        let zero_w = flat_bubble(Bounds { x0: 20.0, y0: 20.0, x1: 20.0, y1: 40.0 });
+        let zero_h = flat_bubble(Bounds { x0: 20.0, y0: 30.0, x1: 40.0, y1: 30.0 });
+        let kept = flat_bubble(Bounds { x0: 40.0, y0: 20.0, x1: 90.0, y1: 40.0 });
+        let l = step_layer(&r, &e, &[zero_w, zero_h, kept], 1);
+        assert_eq!(l.notes.len(), 1, "{:?}", l.notes);
+        assert!(matches!(l.notes[0], Note::Bubble { w, h, .. } if w > 0.0 && h > 0.0));
+    }
+
+    #[test]
+    fn a_tall_step_image_is_shrunk_and_a_heavy_one_reencoded_and_reported() {
+        let r = Recording::timing_only(120, 5000, &[0, 500], 1000);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let tall = |_: usize| Ok(RgbaImage::from_pixel(120, 5000, image::Rgba([200, 200, 200, 255])));
+        let sum = write_bundle(&r, &[], &[left(250, 60, 100)], &edit(&r), "t", &dir, tall, |_| true).unwrap();
+        let j = read_json(&dir);
+        assert_eq!((j["steps"][0]["width"].as_u64(), j["steps"][0]["height"].as_u64()), (Some(98), Some(4096)));
+        let img = image::open(dir.join(j["steps"][0]["image"].as_str().unwrap())).unwrap();
+        assert_eq!(img.height(), 4096);
+        assert_eq!((sum.squeezed, sum.squeezed_note()), (0, None));
+        let two = TourSummary { squeezed: 2, ..sum };
+        assert!(two.squeezed_note().unwrap().contains("2 step images") && two.squeezed_note().unwrap().contains("2 MB"));
+    }
+
+    /// The server's caps, copied from `LIMITS` in the server's manifest rules (`src/manifest.ts` in the
+    /// demo platform), so this test fails if the export ever writes what the server refuses.
+    mod server {
+        pub const STEPS: usize = 200;
+        pub const IMAGE_BYTES: u64 = 2_000_000;
+        pub const IMAGE_SIDE: u64 = 4096;
+        pub const TITLE: usize = 200;
+        pub const GENERATOR: usize = 100;
+        pub const NOTES_PER_STEP: usize = 20;
+        pub const NOTE_TEXT: usize = 500;
+        pub const CARD_TITLE: usize = 80;
+        pub const CARD_BODY: usize = 300;
+        pub const NEXT_LABEL: usize = 24;
+        pub const COVER_TITLE: usize = 80;
+        pub const COVER_BODY: usize = 200;
+        pub const COVER_BUTTON: usize = 24;
+        pub const BUTTON_LABEL: usize = 24;
+        pub const END_TEXT: usize = 200;
+        pub const LINK: usize = 500;
+        pub const MANIFEST_BYTES: usize = 262_144;
+    }
+
+    /// The server's text rule: a string with no control, format, line or paragraph separator characters
+    /// (a line feed only when `multi`), already trimmed, from `min` to `max` code points.
+    fn server_text(v: &serde_json::Value, min: usize, max: usize, multi: bool, what: &str) {
+        let s = v.as_str().unwrap_or_else(|| panic!("{what} is not a string"));
+        let n = s.chars().count();
+        assert!((min..=max).contains(&n), "{what}: {n} characters, not {min} to {max}");
+        assert_eq!(s.trim(), s, "{what} is not trimmed");
+        for c in s.chars() {
+            let format = matches!(c as u32, 0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F);
+            let bad = (c.is_control() && !(multi && c == '\n')) || format || c == '\u{2028}' || c == '\u{2029}';
+            assert!(!bad, "{what} holds U+{:04X}", c as u32);
+        }
+    }
+
+    fn server_percent(v: &serde_json::Value, what: &str) -> f64 {
+        let x = v.as_f64().unwrap_or_else(|| panic!("{what} is not a number"));
+        assert!((0.0..=100.0).contains(&x), "{what} = {x}");
+        x
+    }
+
+    fn server_box(o: &serde_json::Value, what: &str) {
+        let (x, y, w, h) = (server_percent(&o["x"], what), server_percent(&o["y"], what), server_percent(&o["w"], what), server_percent(&o["h"], what));
+        assert!(w > 0.0 && h > 0.0, "{what}: {w} x {h}");
+        assert!(x + w <= 100.01 && y + h <= 100.01, "{what} ends outside the image");
+    }
+
+    fn server_link(o: &serde_json::Value, what: &str) {
+        server_text(&o["label"], 1, server::BUTTON_LABEL, false, what);
+        let url = o["url"].as_str().unwrap();
+        assert!(url.starts_with("https://") && url.chars().count() <= server::LINK && !url.chars().any(char::is_whitespace), "{what}: {url}");
+    }
+
+    #[test]
+    fn a_worst_case_tour_stays_inside_every_server_limit() {
+        // Text that tries every rule at once: tabs, CR, LF, separators, controls, bidi, zero-width, emoji, markup.
+        let nasty = "\t <b>Hi</b>\r\nthere\u{2028}now\u{2029}\u{202E}rtl\u{200B}\u{0}\u{7F}\u{85}\u{FEFF}😀 ";
+        let long = |n: usize| nasty.repeat(n / nasty.chars().count() + 2);
+        let (r, ev) = many(200);
+        // Step 1 carries 20 notes at full length, a flat bubble (dropped, so not counted) and a spotlight out of range.
+        let mut items: Vec<Item> = (0..10).map(|i| text(1.0 + i as f32 * 9.0, 70.0, &long(700), 0)).collect();
+        items.extend((0..10).map(|i| pinned(Shape::Bubble { rect: Bounds { x0: 1.0 + i as f32 * 9.0, y0: 1.0, x1: 9.0 + i as f32 * 9.0, y1: 30.0 }, tail: pt(-50.0, 500.0), text: long(700) }, 0)));
+        items.push(pinned(Shape::Bubble { rect: Bounds { x0: 99.0, y0: 50.0, x1: 99.0, y1: 60.0 }, tail: pt(1.0, 1.0), text: "flat".into() }, 0));
+        items.push(pinned(Shape::Spotlight { rect: Bounds { x0: -40.0, y0: -40.0, x1: 400.0, y1: 400.0 }, dim: 255 }, 0));
+        items.push(pinned(Shape::Spotlight { rect: Bounds { x0: 99.9, y0: 79.9, x1: 100.0, y1: 80.0 }, dim: 0 }, 1));
+        let mut e = edit(&r);
+        for (i, s) in plan_steps(&r, &e, &ev).unwrap().iter().enumerate() {
+            let mut c = card(&long(120), &long(400));
+            c.next_label = long(40);
+            if i % 2 == 0 {
+                c.anchor = Anchor::Point;
+                c.point = Some(Point { x: if i % 4 == 0 { 99.99 } else { -5.0 }, y: 79.99 });
+            }
+            e.tour_doc.steps.insert(s.src, StepExtras { card: Some(c), advance: Advance::Anywhere, zoom: Some(true) });
+        }
+        e.tour_doc.theme.accent = "#GGGGGG".into();
+        e.tour_doc.theme.backdrop = "url(x)".into();
+        e.tour_doc.zoom.percent = 999;
+        e.tour_doc.autoplay = Autoplay { enabled: true, seconds: 0 };
+        e.tour_doc.cover = Some(Cover { title: long(120), body: long(300), button: long(40), logo: None });
+        e.tour_doc.cta = Some(Link { label: long(40), url: format!(" https://tours.example.com/{} ", "p".repeat(470)) });
+        let link = Some(Link { label: long(40), url: "HTTPS://tours.example.com:8443/a?b=c#d".into() });
+        e.tour_doc.end = Some(EndCard { text: long(300), primary: link.clone(), secondary: link, replay: true });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &items, &ev, &e, &long(300), &dir, flat, |_| true).unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("tour.json")).unwrap();
+        let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(serde_json::to_vec(&j).unwrap().len() <= server::MANIFEST_BYTES, "the manifest is over the server's size");
+        assert_eq!(j["version"], 3);
+        server_text(&j["generator"], 0, server::GENERATOR, false, "generator");
+        server_text(&j["title"], 1, server::TITLE, false, "title");
+        let dim = j["spotlight_dim"].as_u64().unwrap();
+        assert!((10..=90).contains(&dim), "spotlight_dim {dim}");
+        let t = &j["theme"];
+        assert!(["dark", "light", "compact", "auto"].contains(&t["card_style"].as_str().unwrap()));
+        assert!(["pulse", "dot", "none"].contains(&t["hotspot"].as_str().unwrap()));
+        assert_eq!((t["accent"].as_str(), t["backdrop"].as_str()), (Some("#5dcaa5"), Some("auto")));
+        let zoom = j["zoom"]["percent"].as_u64().unwrap();
+        let secs = j["autoplay"]["seconds"].as_u64().unwrap();
+        assert!((105..=140).contains(&zoom) && (2..=20).contains(&secs), "zoom {zoom}, autoplay {secs}");
+        server_text(&j["cover"]["title"], 1, server::COVER_TITLE, false, "cover.title");
+        server_text(&j["cover"]["body"], 0, server::COVER_BODY, true, "cover.body");
+        server_text(&j["cover"]["button"], 1, server::COVER_BUTTON, false, "cover.button");
+        server_link(&j["cta"], "cta");
+        server_text(&j["end"]["text"], 0, server::END_TEXT, true, "end.text");
+        server_link(&j["end"]["primary"], "end.primary");
+        server_link(&j["end"]["secondary"], "end.secondary");
+
+        let steps = j["steps"].as_array().unwrap();
+        assert!(!steps.is_empty() && steps.len() <= server::STEPS, "{} steps", steps.len());
+        assert_eq!(steps.len(), 200);
+        let mut images = std::collections::HashSet::new();
+        for (i, s) in steps.iter().enumerate() {
+            let what = |f: &str| format!("steps[{i}].{f}");
+            let image = s["image"].as_str().unwrap();
+            assert!(image.len() == 12 && image.starts_with("step-") && image[5..8].bytes().all(|b| b.is_ascii_digit()) && (image.ends_with(".png") || image.ends_with(".jpg")), "{image}");
+            assert!(images.insert(image.to_string()), "{image} repeats");
+            for side in ["width", "height"] {
+                assert!((1..=server::IMAGE_SIDE).contains(&s[side].as_u64().unwrap()), "{}", what(side));
+            }
+            let bytes = s["bytes"].as_u64().unwrap();
+            assert!((1..=server::IMAGE_BYTES).contains(&bytes) && bytes == std::fs::metadata(dir.join(image)).unwrap().len(), "{}", what("bytes"));
+            let click = &s["click"];
+            assert!(!click.is_null(), "every step here has a click");
+            server_percent(&click["x"], &what("click.x"));
+            server_percent(&click["y"], &what("click.y"));
+            if !s["spotlight"].is_null() {
+                server_box(&s["spotlight"], &what("spotlight"));
+            }
+            let notes = s["notes"].as_array().unwrap();
+            assert!(notes.len() <= server::NOTES_PER_STEP, "{}", what("notes"));
+            for (k, n) in notes.iter().enumerate() {
+                let w = what(&format!("notes[{k}]"));
+                server_text(&n["text"], 1, server::NOTE_TEXT, true, &w);
+                let size = n["size"].as_f64().unwrap();
+                assert!(size > 0.0 && size <= 100.0, "{w}.size");
+                match n["kind"].as_str().unwrap() {
+                    "text" => {
+                        server_percent(&n["x"], &w);
+                        server_percent(&n["y"], &w);
+                    }
+                    "bubble" => {
+                        server_box(n, &w);
+                        server_percent(&n["tail"]["x"], &w);
+                        server_percent(&n["tail"]["y"], &w);
+                    }
+                    other => panic!("{w}: kind {other}"),
+                }
+            }
+            let c = &s["card"];
+            server_text(&c["title"], 0, server::CARD_TITLE, false, &what("card.title"));
+            server_text(&c["body"], 0, server::CARD_BODY, true, &what("card.body"));
+            server_text(&c["next_label"], 1, server::NEXT_LABEL, false, &what("card.next_label"));
+            match c["anchor"].as_str().unwrap() {
+                "point" => {
+                    server_percent(&c["point"]["x"], &what("card.point"));
+                    server_percent(&c["point"]["y"], &what("card.point"));
+                }
+                "hotspot" | "none" => assert!(c["point"].is_null(), "{}", what("card.point")),
+                other => panic!("{}: {other}", what("card.anchor")),
+            }
+            assert_eq!(s["advance"], "anywhere");
+        }
+        assert_eq!(steps[0]["notes"].as_array().unwrap().len(), 20, "the flat bubble was dropped");
     }
 
     #[test]

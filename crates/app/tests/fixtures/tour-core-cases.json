@@ -116,7 +116,11 @@
     {"name": "C1 controls are stripped, NEL included", "input": "a\u0085b\u009fc\u007f", "max": 80, "multiline": true, "expect": "abc"},
     {"name": "hostile markup is just characters", "input": "</script><img src=x onerror=alert(1)>", "max": 300, "multiline": true, "expect": "</script><img src=x onerror=alert(1)>"},
     {"name": "cut after trimming", "input": "   abcdef", "max": 3, "multiline": false, "expect": "abc"},
-    {"name": "tags and other astral format characters are stripped", "input": "a\udb40\udc41\ud834\udd73b", "max": 80, "multiline": false, "expect": "ab"}
+    {"name": "tags and other astral format characters are stripped", "input": "a\udb40\udc41\ud834\udd73b", "max": 80, "multiline": false, "expect": "ab"},
+    {"name": "line and paragraph separators become line breaks in a body", "input": "one\u2028two\u2029three", "max": 300, "multiline": true, "expect": "one\ntwo\nthree"},
+    {"name": "line and paragraph separators become spaces in a title", "input": "one\u2028two\u2029three", "max": 80, "multiline": false, "expect": "one two three"},
+    {"name": "a separator at either end is trimmed away", "input": "\u2029\u2028Hi\u2028", "max": 80, "multiline": true, "expect": "Hi"},
+    {"name": "a cut never leaves a trailing space or line break", "input": "ab \n\u2028cd", "max": 4, "multiline": true, "expect": "ab"}
   ],
   "color": [
     {"input": "#FFAA00", "expect": "#ffaa00"},

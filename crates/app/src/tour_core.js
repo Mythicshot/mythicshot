@@ -155,20 +155,21 @@ var TourCore = (function () {
     return out;
   }
 
-  // Tour text cleaned and capped, as clean in tour/doc.rs: CRLF and CR become LF; a tab becomes a
-  // space; every other control and format character is removed; LF is kept only when `multiline`
-  // and becomes a space otherwise; then the text is trimmed and cut at `max` code points.
+  // Tour text cleaned and capped, as clean in tour/doc.rs: CRLF, CR and the line and paragraph
+  // separators (U+2028, U+2029) become LF; a tab becomes a space; every other control and format
+  // character is removed; LF is kept only when `multiline` and becomes a space otherwise; then the
+  // text is trimmed, cut at `max` code points and trimmed again, so a cut never leaves a trailing space.
   function cleanText(s, max, multiline) {
     if (typeof s !== "string") return "";
     var cps = codePoints(s.replace(/\r\n?/g, "\n"));
     var kept = [];
     for (var i = 0; i < cps.length; i++) {
       var c = cps[i];
-      if (c === 0x0a) kept.push(multiline ? 0x0a : 0x20);
+      if (c === 0x0a || c === 0x2028 || c === 0x2029) kept.push(multiline ? 0x0a : 0x20);
       else if (c === 0x09) kept.push(0x20);
       else if (!isControl(c) && !isFormat(c)) kept.push(c);
     }
-    return fromPoints(trimPoints(kept).slice(0, max));
+    return fromPoints(trimPoints(trimPoints(kept).slice(0, max)));
   }
 
   // The link when it is safe, else null, as safe_url in tour/doc.rs: trimmed; `https://` in any case
