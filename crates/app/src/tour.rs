@@ -4,9 +4,11 @@
 //! click landed. Step images are drawn by [`crate::video::decorate`] with the
 //! overlays off, so annotations and crop match every other export.
 
+mod doc;
 mod encode;
 mod layer;
 
+pub use doc::*;
 pub use encode::*;
 pub use layer::*;
 
@@ -91,7 +93,7 @@ pub fn plan_steps(rec: &Recording, edit: &Edit, events: &[InputEvent]) -> Result
     Ok(steps)
 }
 
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Point {
@@ -110,6 +112,11 @@ pub struct ManifestStep {
     /// Tour layer: the step's spotlight (null when none) and its notes.
     pub spotlight: Option<Area>,
     pub notes: Vec<Note>,
+    /// Version 3: the step's guide card (null when none), how the step advances and its zoom
+    /// (null follows the tour).
+    pub card: Option<Card>,
+    pub advance: Advance,
+    pub zoom: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -121,6 +128,13 @@ pub struct Manifest {
     /// Darkening strength in percent, shared by every spotlight; present only when a step has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spotlight_dim: Option<u8>,
+    /// Version 3 tour settings, always written, sanitised by [`sanitize`].
+    pub theme: Theme,
+    pub zoom: Zoom,
+    pub cover: Option<Cover>,
+    pub cta: Option<Link>,
+    pub end: Option<EndCard>,
+    pub autoplay: Autoplay,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,12 +166,19 @@ pub fn write_bundle(
     if dir.symlink_metadata().is_ok() {
         return Err(format!("{} already exists", dir.display()));
     }
+    // The settings are sanitised and the logo loaded before the folder exists, so a bad logo writes nothing.
+    // A logo travels only with a cover.
+    let doc = sanitize(&edit.tour_doc);
+    let logo = match (&doc.cover, &doc.logo_path) {
+        (Some(_), Some(path)) => Some(load_logo(path)?),
+        _ => None,
+    };
     // Not create_dir_all: a missing parent is an error, and a folder that appears
     // between the check above and here makes this call fail instead of being reused.
     std::fs::create_dir(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{} already exists", dir.display()) } else { format!("Could not create {}: {e}", dir.display()) }
     })?;
-    match write_into(rec, items, events, edit, title, dir, &plan, frame, progress) {
+    match write_into(rec, items, events, edit, title, dir, &plan, doc, logo, frame, progress) {
         Ok(summary) => Ok(summary),
         Err(e) => match std::fs::remove_dir_all(dir) {
             Ok(()) => Err(e),
@@ -175,6 +196,8 @@ fn write_into(
     title: &str,
     dir: &Path,
     plan: &[StepPlan],
+    doc: TourDoc,
+    logo: Option<(Vec<u8>, &'static str)>,
     mut frame: impl FnMut(usize) -> Result<RgbaImage, String>,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<TourSummary, String> {
@@ -200,6 +223,7 @@ fn write_into(
         let name = format!("step-{:03}.{ext}", i + 1);
         std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
         total += bytes.len() as u64;
+        let extras = doc.steps.get(&step.src);
         steps.push(ManifestStep {
             image: name,
             width: img.width(),
@@ -209,11 +233,33 @@ fn write_into(
             t_ms: step.t_ms,
             spotlight: layer.spotlight,
             notes: layer.notes,
+            card: step_card(rec, edit, step.src, step.click),
+            advance: extras.map(|x| x.advance).unwrap_or_default(),
+            zoom: extras.and_then(|x| x.zoom),
         });
     }
     let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
     let spotlight_dim = tour_dim(rec, edit, items, &srcs);
-    let manifest = Manifest { version: MANIFEST_VERSION, generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")), title: title.to_string(), steps, spotlight_dim };
+    let mut cover = doc.cover;
+    if let (Some(c), Some((bytes, ext))) = (cover.as_mut(), &logo) {
+        let name = format!("logo.{ext}");
+        std::fs::write(dir.join(&name), bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
+        total += bytes.len() as u64;
+        c.logo = Some(name);
+    }
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")),
+        title: title.to_string(),
+        steps,
+        spotlight_dim,
+        theme: doc.theme,
+        zoom: doc.zoom,
+        cover,
+        cta: doc.cta,
+        end: doc.end,
+        autoplay: doc.autoplay,
+    };
 
     let pretty = serde_json::to_string_pretty(&manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
     std::fs::write(dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
@@ -340,7 +386,7 @@ mod tests {
         let sum = write_bundle(&r, &[], &[left(750, 50, 40), left(1750, 10, 20)], &edit(&r), "My tour", &dir, flat, |_| true).unwrap();
         assert_eq!(sum.steps, 3);
         let j = read_json(&dir);
-        assert_eq!(j["version"], 2);
+        assert_eq!(j["version"], 3);
         assert_eq!(j["title"], "My tour");
         assert!(j["generator"].as_str().unwrap().starts_with("mythicshot "));
         assert_eq!(j["steps"].as_array().unwrap().len(), 3);
@@ -509,7 +555,7 @@ mod tests {
         let two = image::open(dir.join("step-002.png")).unwrap().to_rgba8();
         assert!(two.pixels().all(|p| p.0 == [200, 200, 200, 255]), "pinned items stay on their own step");
         let j = read_json(&dir);
-        assert_eq!(j["version"], 2);
+        assert_eq!(j["version"], 3);
         assert_eq!(j["spotlight_dim"], 60);
         assert_eq!(j["steps"][0]["spotlight"]["w"], 60.0);
         assert_eq!(j["steps"][0]["notes"][0]["kind"], "text");
@@ -657,5 +703,144 @@ mod tests {
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
         assert!(!html.contains("</script><img"));
         assert_eq!(read_json(&dir)["steps"][0]["notes"][0]["text"], "</script><img src=x onerror=alert(1)>");
+    }
+
+    const HOSTILE: &str = "</script><img src=x onerror=alert(1)>";
+    fn card(title: &str, body: &str) -> Card { Card { title: title.into(), body: body.into(), next_label: String::new(), anchor: Anchor::Hotspot, point: None, placement: Placement::Auto } }
+
+    #[test]
+    fn a_plain_recording_writes_version_3_with_only_defaults() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &[], &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let j = read_json(&dir);
+        assert_eq!(j["version"], 3);
+        assert_eq!(j["theme"], serde_json::json!({"card_style":"dark","accent":"#5dcaa5","hotspot":"pulse","progress_bar":true,"backdrop":"auto","spotlight_soft":true}));
+        assert_eq!(j["zoom"], serde_json::json!({"enabled":true,"percent":118}));
+        assert_eq!(j["autoplay"], serde_json::json!({"enabled":false,"seconds":5}));
+        assert!(j["cover"].is_null() && j["cta"].is_null() && j["end"].is_null());
+        for s in j["steps"].as_array().unwrap() {
+            assert!(s["card"].is_null() && s["zoom"].is_null());
+            assert_eq!(s["advance"], "hotspot");
+        }
+        assert_eq!(j["steps"][0]["click"]["x"], 50.0); // unchanged from version 2
+    }
+
+    #[test]
+    fn cards_export_per_step_with_their_anchor_resolved() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Unpaid invoices", "One click away.\n**Try it**")), advance: Advance::Anywhere, zoom: Some(false) });
+        let mut end = card("Done", "");
+        end.next_label = "Finish".into();
+        e.tour_doc.steps.insert(4, StepExtras { card: Some(end), ..Default::default() }); // the end step has no click
+        let mut picked = card("Here", "");
+        picked.anchor = Anchor::Point;
+        picked.point = Some(Point { x: 20.0, y: 40.0 });
+        e.tour_doc.steps.insert(3, StepExtras { card: Some(picked), ..Default::default() });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
+        let j = read_json(&dir);
+        assert_eq!(j["steps"][0]["card"], serde_json::json!({"title":"Unpaid invoices","body":"One click away.\n**Try it**","next_label":"Next","anchor":"hotspot","point":null,"placement":"auto"}));
+        assert_eq!(j["steps"][0]["advance"], "anywhere");
+        assert_eq!(j["steps"][0]["zoom"], false);
+        assert_eq!(j["steps"][1]["card"]["anchor"], "point");
+        assert_eq!(j["steps"][1]["card"]["point"], serde_json::json!({"x":20.0,"y":50.0}));
+        assert_eq!(j["steps"][2]["card"]["anchor"], "none");
+        assert_eq!(j["steps"][2]["card"]["next_label"], "Finish");
+        // No card ever reaches the pixels.
+        let img = image::open(dir.join("step-001.png")).unwrap().to_rgba8();
+        assert!(img.pixels().all(|p| p.0 == [200, 200, 200, 255]));
+    }
+
+    #[test]
+    fn a_card_is_dropped_when_empty_and_its_point_when_cropped_away() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 50.0, y0: 0.0, x1: 100.0, y1: 80.0 });
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("  ", "")), ..Default::default() });
+        assert_eq!(step_card(&r, &e, 1, Some((50.0, 50.0))), None);
+        let mut c = card("Here", "");
+        c.anchor = Anchor::Point;
+        c.point = Some(Point { x: 20.0, y: 40.0 }); // left of the crop
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(c), ..Default::default() });
+        assert_eq!(step_card(&r, &e, 1, Some((50.0, 50.0))).unwrap().anchor, Anchor::None);
+    }
+
+    #[test]
+    fn only_https_links_survive() {
+        assert_eq!(safe_url(" https://tours.example.com/book "), Some("https://tours.example.com/book".into()));
+        for bad in ["javascript:alert(1)", "http://tours.example.com", "https://", "https://a b.example", "//tours.example.com", "data:text/html,x", "HTTPS://\u{0}x"] {
+            assert_eq!(safe_url(bad), None, "{bad}");
+        }
+        assert_eq!(safe_url(&format!("https://tours.example.com/{}", "a".repeat(500))), None);
+    }
+
+    #[test]
+    fn sanitize_cuts_clamps_and_drops() {
+        let mut d = TourDoc::default();
+        d.theme.accent = "RED;background:url(//x)".into();
+        d.theme.backdrop = "#AABBCC".into();
+        d.zoom.percent = 400;
+        d.autoplay.seconds = 0;
+        d.cta = Some(Link { label: "Book a call".into(), url: "javascript:alert(1)".into() });
+        d.cover = Some(Cover { title: " ".into(), body: "x".into(), button: String::new(), logo: None });
+        d.end = Some(EndCard { text: "t".repeat(300), primary: Some(Link { label: "L".repeat(40), url: "https://tours.example.com".into() }), secondary: Some(Link { label: "x".into(), url: "http://tours.example.com".into() }), replay: true });
+        let s = sanitize(&d);
+        assert_eq!(s.theme.accent, "#5dcaa5");
+        assert_eq!(s.theme.backdrop, "#aabbcc");
+        assert_eq!((s.zoom.percent, s.autoplay.seconds), (140, 2));
+        assert!(s.cta.is_none() && s.cover.is_none());
+        let end = s.end.unwrap();
+        assert_eq!(end.text.chars().count(), 200);
+        assert_eq!(end.primary.unwrap().label.chars().count(), 24);
+        assert!(end.secondary.is_none());
+    }
+
+    #[test]
+    fn hostile_text_is_kept_as_data_in_every_new_field() {
+        let r = rec();
+        let mut e = edit(&r);
+        let mut c = card(HOSTILE, HOSTILE);
+        c.next_label = "<b>go</b>".into();
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(c), ..Default::default() });
+        e.tour_doc.cover = Some(Cover { title: HOSTILE.into(), body: HOSTILE.into(), button: "<i>".into(), logo: None });
+        e.tour_doc.cta = Some(Link { label: HOSTILE.chars().take(24).collect(), url: "https://tours.example.com".into() });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
+        let j = read_json(&dir);
+        assert_eq!(j["steps"][0]["card"]["title"], HOSTILE);
+        assert_eq!(j["cover"]["title"], HOSTILE);
+        assert!(!std::fs::read_to_string(dir.join("index.html")).unwrap().contains("</script><img"));
+    }
+
+    #[test]
+    fn the_logo_is_checked_shrunk_and_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let html = tmp.path().join("logo.png");
+        std::fs::write(&html, b"<html>").unwrap();
+        assert!(load_logo(&html).unwrap_err().contains("PNG or JPEG"));
+        let big = tmp.path().join("big.png");
+        RgbaImage::from_pixel(4000, 1000, image::Rgba([10, 20, 30, 255])).save(&big).unwrap();
+        let (bytes, ext) = load_logo(&big).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height(), ext), (512, 128, "png"));
+        assert!(bytes.len() <= LOGO_MAX_BYTES);
+        // A bad logo stops the export before any folder exists.
+        let r = rec();
+        let mut e = edit(&r);
+        e.tour_doc.cover = Some(Cover { title: "Hi".into(), body: String::new(), button: String::new(), logo: None });
+        e.tour_doc.logo_path = Some(html);
+        let dir = tmp.path().join("t");
+        assert!(write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).is_err());
+        assert!(!dir.exists());
+        // A good one lands in the bundle and in the manifest.
+        e.tour_doc.logo_path = Some(big);
+        write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
+        assert_eq!(read_json(&dir)["cover"]["logo"], "logo.png");
+        assert!(dir.join("logo.png").exists());
     }
 }
