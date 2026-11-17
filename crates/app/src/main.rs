@@ -23,6 +23,7 @@ mod settings;
 mod settings_ui;
 mod tray;
 mod tour;
+mod tour_cards;
 mod tour_view;
 mod video;
 mod video_editor;

@@ -36,6 +36,18 @@ Blur, pixelate and every other shape you draw on a step is saved into that step'
 
 Items drawn in the Tour view are not part of GIF, APNG, MP4 or WebM exports and never show in Timeline mode.
 
+## Guide cards and tour settings
+
+A guide card is the small panel a tour shows on a step: a title, a body (line breaks and `**bold**` work) and a button, with "‹ 2 of 6" filled in for you. Pick the Guide card tool in the Tour view and click the picture to give the shown step its card (one per step), then type straight onto the card.
+
+The card places itself beside the hotspot, the step's spotlight or a spot you pick ("Points at": Hotspot, A spot I pick or Nothing), by the same rule the preview uses, so it never covers the bright box; it is not dragged. "Remove card" takes it away and "Card removed · Undo" in the status bar brings it back.
+
+"Tour settings", beside "Step N of M", holds the card style (Dark, Light, Compact bar, or Match viewer, which follows the viewer's light or dark system setting), the accent colour, zoom, the spotlight's soft edge and strength, the hotspot style, the backdrop, the progress bar, a cover card with an optional logo, an always-on button, an end card, autoplay, and for the shown step "Zoom to the spotlight" and "Continue on a click anywhere". The style, accent and zoom you used last are where the next recording's tour starts.
+
+Button links must be plain `https://` addresses; anything else shows a warning beside the field and is not saved into the tour.
+
+Guide cards, the cover, the end card, the buttons, the hotspot and the progress bar are tour data saved in `tour.json`: none of it is drawn into the step images or appears in GIF, APNG, MP4 or WebM exports.
+
 ## Build
 
 Built with Rust 1.97 (the oldest working version has not been checked). On Windows, the Visual Studio C++ Build Tools (for the linker and the resource compiler).

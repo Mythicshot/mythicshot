@@ -12,6 +12,7 @@ mod layer;
 pub use doc::*;
 pub use encode::*;
 pub use layer::*;
+pub use self::core::{Placed, Side, parse_bold, place_card};
 
 use std::path::{Path, PathBuf};
 
@@ -147,6 +148,15 @@ pub struct TourSummary {
 
 const PREVIEW_TEMPLATE: &str = include_str!("tour_preview.html");
 const JSON_PLACEHOLDER: &str = "/*TOUR_JSON*/";
+/// The shared rules every player uses, inlined into the preview's first script block.
+const TOUR_CORE_JS: &str = include_str!("tour_core.js");
+const CORE_PLACEHOLDER: &str = "/*TOUR_CORE*/";
+
+/// The preview page for an already escaped compact manifest. The rules go in first, from the
+/// template, so text in the manifest can never be taken for a placeholder.
+fn preview_page(compact_json: &str) -> String {
+    PREVIEW_TEMPLATE.replacen(CORE_PLACEHOLDER, TOUR_CORE_JS, 1).replacen(JSON_PLACEHOLDER, compact_json, 1)
+}
 
 /// Write a tour bundle into `dir`, which must not exist yet; its parent folder must.
 /// `frame(i)` returns source frame `i`. `progress` gets 0.0-1.0 and returns false to cancel.
@@ -267,7 +277,7 @@ fn write_into(
 
     // `<` becomes a JSON escape so no title can close the page's script block.
     let compact = serde_json::to_string(&manifest).map_err(|e| format!("Could not write index.html: {e}"))?.replace('<', r"\u003c");
-    let html = PREVIEW_TEMPLATE.replacen(JSON_PLACEHOLDER, &compact, 1);
+    let html = preview_page(&compact);
     std::fs::write(dir.join("index.html"), html).map_err(|e| format!("Could not write index.html: {e}"))?;
 
     progress(1.0);
@@ -930,5 +940,81 @@ mod tests {
         let (out, ext) = load_logo(&photo).unwrap();
         let img = image::load_from_memory(&out).unwrap();
         assert_eq!((img.width(), img.height(), ext), (20, 40, "jpg"));
+    }
+
+    #[test]
+    fn preview_inlines_the_shared_rules_and_uses_them() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &[], &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(!html.contains("/*TOUR_CORE*/") && html.contains("placeCard") && html.contains("zoomOffset"));
+        for needed in ["TourCore.safeUrl", "TourCore.parseBold", "prefers-reduced-motion", "noopener noreferrer", "cubic-bezier(.22,.8,.26,1)"] {
+            assert!(PREVIEW_TEMPLATE.contains(needed), "{needed}");
+        }
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "localStorage", "sessionStorage", "document.cookie", "fetch(", "XMLHttpRequest"] {
+            assert!(!PREVIEW_TEMPLATE.contains(banned), "{banned} must not be used");
+        }
+    }
+
+    #[test]
+    fn preview_still_reads_a_version_2_manifest() {
+        // The page must not require any version 3 field.
+        for field in ["TOUR.theme.", "TOUR.zoom.", "TOUR.autoplay.", "TOUR.cover.", "TOUR.end.", "TOUR.cta."] {
+            assert!(!PREVIEW_TEMPLATE.contains(field), "{field} is read without a fallback");
+        }
+    }
+
+    #[test]
+    fn the_shared_rules_cannot_break_out_of_their_script_block() {
+        // Inlined as-is, so the rules file must never close its script or hold the data placeholder.
+        let lower = TOUR_CORE_JS.to_ascii_lowercase();
+        assert!(!lower.contains("</script") && !lower.contains("<!--"));
+        assert!(!TOUR_CORE_JS.contains(JSON_PLACEHOLDER) && !TOUR_CORE_JS.contains(CORE_PLACEHOLDER));
+        // The rules come before the page script that uses them, and a title holding the
+        // placeholder text stays data.
+        let page = preview_page(r#"{"title":"/*TOUR_CORE*/","steps":[]}"#);
+        let core_at = page.find("var TourCore").unwrap();
+        let data_at = page.find("const TOUR = ").unwrap();
+        assert!(core_at < data_at);
+        assert!(page.contains(r#""title":"/*TOUR_CORE*/""#));
+    }
+
+    #[test]
+    fn preview_links_open_safely_and_only_known_logo_names_load() {
+        assert!(PREVIEW_TEMPLATE.contains(r#""_blank""#) && PREVIEW_TEMPLATE.contains("no-referrer"));
+        assert!(PREVIEW_TEMPLATE.contains(r#""logo.png""#) && PREVIEW_TEMPLATE.contains(r#""logo.jpg""#));
+        // Autoplay has a visible, keyboard-reachable pause control.
+        assert!(PREVIEW_TEMPLATE.contains(r#"<button id="autoplay""#));
+        assert!(PREVIEW_TEMPLATE.contains("Pause autoplay"));
+        // Kept from version 2.
+        assert!(PREVIEW_TEMPLATE.contains("Local preview"));
+    }
+
+    #[test]
+    fn preview_allows_no_network_and_only_its_own_step_images() {
+        let csp = PREVIEW_TEMPLATE.split("Content-Security-Policy\" content=\"").nth(1).expect("a CSP meta tag").split('"').next().unwrap();
+        assert!(PREVIEW_TEMPLATE.find("Content-Security-Policy").unwrap() < PREVIEW_TEMPLATE.find("<script").unwrap());
+        for part in ["default-src 'none'", "script-src 'unsafe-inline'", "style-src 'unsafe-inline'", "img-src 'self'", "base-uri 'none'", "form-action 'none'"] {
+            assert!(csp.contains(part), "{part}");
+        }
+        assert!(!csp.contains("http") && !csp.contains('*') && !csp.contains("data:") && !csp.contains("connect-src"), "{csp}");
+        // Step images are taken only by the bundle's own names, in the page and in the preload.
+        assert!(PREVIEW_TEMPLATE.contains(r"/^step-[0-9]{3,}\.(png|jpg)$/"));
+        assert!(!PREVIEW_TEMPLATE.contains("s.image;") && !PREVIEW_TEMPLATE.contains("= ahead.image"));
+    }
+
+    #[test]
+    fn preview_handles_broken_tours_and_keeps_controls_reachable() {
+        // No steps, a missing picture, and a card whose controls are inert until it is visible.
+        assert!(PREVIEW_TEMPLATE.contains("This tour has no steps."));
+        assert!(PREVIEW_TEMPLATE.contains(r#"addEventListener("error""#) && PREVIEW_TEMPLATE.contains(r#"<div id="missing" hidden>"#));
+        assert!(PREVIEW_TEMPLATE.contains("card.inert = true") && PREVIEW_TEMPLATE.contains("card.inert = false"));
+        // Leaving the end card backwards shows the last step, and focus follows the control used.
+        assert!(PREVIEW_TEMPLATE.contains("if (d < 0 && done) { done = false; render(); return; }"));
+        assert!(PREVIEW_TEMPLATE.contains(r#"go(-1, false, "back")"#) && PREVIEW_TEMPLATE.contains(r#"go(1, false, "next")"#));
+        // A hidden tab holds autoplay.
+        assert!(PREVIEW_TEMPLATE.contains(r#"addEventListener("visibilitychange""#) && PREVIEW_TEMPLATE.contains("document.hidden"));
     }
 }

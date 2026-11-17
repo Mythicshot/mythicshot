@@ -42,7 +42,6 @@ pub const LOGO_MAX_SOURCE_SIDE: u32 = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[expect(dead_code, reason = "the other choices are made in the Tour settings panel, which is not built yet")]
 pub enum CardStyle {
     #[default]
     Dark,
@@ -53,7 +52,6 @@ pub enum CardStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[expect(dead_code, reason = "the other choices are made in the Tour settings panel, which is not built yet")]
 pub enum HotspotStyle {
     #[default]
     Pulse,
@@ -63,7 +61,6 @@ pub enum HotspotStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(not(test), expect(dead_code, reason = "the other choices are made in the Tour view, which does not offer them yet"))]
 pub enum Anchor {
     #[default]
     Hotspot,
@@ -73,7 +70,7 @@ pub enum Anchor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(not(test), expect(dead_code, reason = "the other choices are made in the Tour settings panel, which is not built yet"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "the Tour view always places cards by the shared rule; the sides are for a manifest that asks for one"))]
 pub enum Placement {
     #[default]
     Auto,
@@ -85,7 +82,6 @@ pub enum Placement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(not(test), expect(dead_code, reason = "the other choices are made in the Tour view, which does not offer them yet"))]
 pub enum Advance {
     #[default]
     Hotspot,
