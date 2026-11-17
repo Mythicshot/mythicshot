@@ -4,6 +4,7 @@
 //! click landed. Step images are drawn by [`crate::video::decorate`] with the
 //! overlays off, so annotations and crop match every other export.
 
+mod core;
 mod doc;
 mod encode;
 mod layer;

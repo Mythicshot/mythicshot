@@ -73,7 +73,7 @@ pub enum Anchor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[expect(dead_code, reason = "the other choices are made in the Tour settings panel, which is not built yet")]
+#[cfg_attr(not(test), expect(dead_code, reason = "the other choices are made in the Tour settings panel, which is not built yet"))]
 pub enum Placement {
     #[default]
     Auto,
@@ -201,7 +201,7 @@ fn is_format(c: char) -> bool {
 /// control (Cc) and format (Cf) character is removed; `\n` is kept only when `multiline` and becomes
 /// a space otherwise; then the text is trimmed and cut at `max`. The cap counts Unicode code points
 /// (Rust `char`s) after this cleaning, the same way the server counts them.
-fn clean(s: &str, max: usize, multiline: bool) -> String {
+pub(super) fn clean(s: &str, max: usize, multiline: bool) -> String {
     let s = s.replace("\r\n", "\n").replace('\r', "\n");
     let cleaned: String = s
         .chars()
@@ -226,7 +226,7 @@ fn text(s: &str, max: usize) -> String {
 }
 
 /// `#rrggbb` lowercased, or None.
-fn hex_colour(s: &str) -> Option<String> {
+pub(super) fn hex_colour(s: &str) -> Option<String> {
     let s = s.trim();
     let digits = s.strip_prefix('#')?;
     (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
