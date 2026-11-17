@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Tour preview</title>
 <style>
   :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); }
@@ -106,6 +107,8 @@
   .p-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px; }
   #card .p-actions > * { display: inline-block; }
   #autoplay { min-width: 76px; }
+  #missing { display: flex; align-items: center; justify-content: center; padding: 16px; background: #1b1f27 repeating-linear-gradient(135deg, rgba(255, 255, 255, .03) 0 14px, transparent 14px 28px); color: #8e97a8; font-size: 13px; line-height: 1.4; text-align: center; }
+  .empty { margin: 0; color: #9aa3b5; font-size: 15px; line-height: 1.4; }
   .v3 #end { border-radius: 0; }
   .v3 #restart { color: var(--accent); }
 
@@ -124,6 +127,7 @@
     <div id="frame">
       <div id="view">
         <img id="shot" alt="">
+        <div id="missing" hidden>This step's picture could not be loaded.</div>
         <div id="dim" hidden><div id="hole"></div></div>
         <div id="layer" aria-live="polite"></div>
         <button id="ring" type="button" aria-label="Next step" hidden></button>
@@ -147,10 +151,22 @@
 <script>
 const TOUR = /*TOUR_JSON*/;
 (function () {
-  var steps = TOUR.steps, i = 0, done = false, drawn = -1;
+  // Steps that are not objects are skipped.
+  var steps = (Array.isArray(TOUR.steps) ? TOUR.steps : []).filter(function (s) { return s && typeof s === "object" && !Array.isArray(s); });
+  var i = 0, done = false, drawn = -1;
   var $ = function (id) { return document.getElementById(id); };
   document.title = TOUR.title + " (local preview)";
   $("title").textContent = TOUR.title;
+  if (!steps.length) {
+    var empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "This tour has no steps.";
+    document.querySelector("main").replaceChildren(empty);
+    document.querySelector("footer").hidden = true;
+    return;
+  }
+  // Only the bundle's own step images are loaded: step-001.png, step-002.jpg and so on.
+  function stepImage(s) { return typeof s.image === "string" && /^step-[0-9]{3,}\.(png|jpg)$/.test(s.image) ? s.image : null; }
   var SVG = "http://www.w3.org/2000/svg";
   // Layer values come from the manifest: numbers must be finite and colours plain #rrggbb.
   function num(v) { return typeof v === "number" && isFinite(v) ? Math.min(100, Math.max(0, v)) : null; }
@@ -232,8 +248,8 @@ const TOUR = /*TOUR_JSON*/;
   if (!V3) {
     // Versions 1 and 2: the plain step-through, exactly as before.
     var show = function () {
-      var s = steps[i], last = i === steps.length - 1;
-      $("shot").src = s.image;
+      var s = steps[i], last = i === steps.length - 1, img = stepImage(s);
+      if (img) $("shot").src = img; else $("shot").removeAttribute("src");
       // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
       if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
       var finished = done || (last && !s.click);
@@ -331,7 +347,11 @@ const TOUR = /*TOUR_JSON*/;
   var stage = $("stage"), frame = $("frame"), view = $("view"), shot = $("shot"), card = $("card");
   var dim = $("dim"), hole = $("hole"), ring = $("ring"), ctaEl = $("cta"), scrim = $("scrim");
   var n = steps.length, phase = cover ? "cover" : "step";
-  var boxOn = false, dimTimer = 0, enterTimer = 0, pendingEnter = false, cardKind = "", cardData = null;
+  var missing = $("missing");
+  var boxOn = false, dimTimer = 0, enterTimer = 0, safetyTimer = 0, pendingEnter = false, cardKind = "", cardData = null;
+  // How the viewer moved, so focus can follow the control they used.
+  var nav = { via: "", from: null, force: false };
+  var pendingFocus = null, defaultFocus = null, backBtn = null, nextBtn = null, announced = "";
   var preloaded = {};
 
   if (cta) {
@@ -375,7 +395,25 @@ const TOUR = /*TOUR_JSON*/;
     var s = steps[i];
     return phase === "step" && (done || (i === n - 1 && !click(s) && !stepCard(s)));
   }
-  function size() { return { w: shot.clientWidth, h: shot.clientHeight }; }
+  function size() { var e = missing.hidden ? shot : missing; return { w: e.clientWidth, h: e.clientHeight }; }
+
+  // A missing or broken step image: a calm placeholder of the step's shape, laid out like the picture.
+  function showMissing() {
+    var s = steps[i], ar = s.width > 0 && s.height > 0 ? s.width / s.height : 1.6;
+    var w = Math.max(160, Math.min(document.querySelector("main").clientWidth - 32, (window.innerHeight - 140) * ar));
+    missing.style.width = Math.round(w) + "px";
+    missing.style.height = Math.round(w / ar) + "px";
+    missing.hidden = false;
+    shot.hidden = true;
+  }
+  function setImage(src) {
+    if (!src) { shot.removeAttribute("src"); showMissing(); return; }
+    if (shot.getAttribute("src") !== src) shot.src = src;
+    // The load or error event lays it out.
+  }
+  function imageReady() { return !missing.hidden || (shot.complete && shot.naturalWidth > 0); }
+  shot.addEventListener("load", function () { missing.hidden = true; shot.hidden = false; layout(true); });
+  shot.addEventListener("error", function () { showMissing(); layout(true); });
 
   // Zoom toward the spotlight's centre, else the hotspot; never past the image edge.
   function zoomFor(s, sz) {
@@ -444,14 +482,17 @@ const TOUR = /*TOUR_JSON*/;
     return b;
   }
   function buildCard() {
-    var hadFocus = card.contains(document.activeElement);
     clearTimeout(enterTimer);
+    clearTimeout(safetyTimer);
     card.classList.add("now");
     card.classList.remove("in");
+    // Until it has entered, the card's controls cannot take focus or clicks.
+    card.inert = true;
+    pendingFocus = null;
     card.replaceChildren();
     card.style.width = ""; card.style.left = ""; card.style.top = "";
     stage.style.paddingBottom = "";
-    cardKind = ""; cardData = null;
+    cardKind = ""; cardData = null; backBtn = null; nextBtn = null; defaultFocus = null;
     var s = steps[i], first = null, kids = [];
     if (phase === "cover") {
       cardKind = "panel";
@@ -471,23 +512,26 @@ const TOUR = /*TOUR_JSON*/;
       card.setAttribute("aria-label", cover.title);
     } else if (finished() && end) {
       cardKind = "panel";
-      if (end.text) kids.push(el("p", "p-title", end.text));
+      var heading = el("p", "p-title", end.text || "End of tour");
+      heading.tabIndex = -1;
+      kids.push(heading);
       var acts = el("div", "p-actions");
       if (end.primary) acts.appendChild(linkEl(end.primary, "p-btn"));
       if (end.secondary) acts.appendChild(linkEl(end.secondary, "p-ghost"));
       if (end.replay) acts.appendChild(button("p-ghost", "Replay", "Replay the tour", function () { replay(); }));
-      if (!acts.firstChild && !end.text) acts.appendChild(button("p-ghost", "Replay", "Replay the tour", function () { replay(); }));
-      first = acts.firstChild;
+      // With no buttons at all, focus goes to the heading.
+      first = acts.firstChild || heading;
       if (acts.firstChild) kids.push(acts);
       card.setAttribute("aria-label", "End of tour");
     } else if (!finished() && stepCard(s)) {
       var c = stepCard(s), compact = style() === "compact";
       cardKind = compact ? "compact" : "guide";
       cardData = c;
-      var back = button("c-back", "‹", "Back", function () { go(-1); });
+      var back = button("c-back", "‹", "Back", function () { go(-1, false, "back"); });
       back.disabled = i === 0 && !cover;
       var count = el("span", "c-count", (i + 1) + " of " + n);
-      var next = button("c-next", c.next, null, function () { go(1); });
+      var next = button("c-next", c.next, null, function () { go(1, false, "next"); });
+      backBtn = back; nextBtn = next;
       // Bold runs from the shared rules become <strong> around text nodes; line breaks stay as typed.
       var rich = function (text) {
         var body = el("div", "c-body");
@@ -511,10 +555,34 @@ const TOUR = /*TOUR_JSON*/;
     card.className = cardKind ? (cardKind === "compact" ? "compact now" : palette + (cardKind === "panel" ? " panel now" : " now")) : "now";
     card.replaceChildren.apply(card, kids);
     card.hidden = !cardKind;
+    defaultFocus = first;
     pendingEnter = !!cardKind;
-    // Keyboard users keep their place: focus moves to the new card's main button, or to the
-    // footer's Next when this step has no card.
-    if (hadFocus) (first || ($("next").disabled ? $("prev") : $("next"))).focus({ preventScroll: true });
+    // Should the picture never lay out, the card still enters rather than staying invisible.
+    if (cardKind) safetyTimer = setTimeout(function () { if (pendingEnter) { pendingEnter = false; enterCard(true); } }, 1500);
+  }
+  function enterCard(instant) {
+    clearTimeout(enterTimer);
+    clearTimeout(safetyTimer);
+    if (instant) { card.classList.add("now"); card.classList.add("in"); void card.offsetWidth; card.classList.remove("now"); }
+    else card.classList.add("in");
+    card.inert = false;
+    if (pendingFocus && card.contains(pendingFocus)) pendingFocus.focus({ preventScroll: true });
+    pendingFocus = null;
+  }
+  function visible(e) { return !!e && e !== document.body && document.contains(e) && !e.closest("[hidden]") && !e.disabled; }
+  // Focus follows the control the viewer used: Back stays on Back, Next on Next. A step reached by
+  // the hotspot, a key or autoplay focuses the card's main control; with no card, the footer.
+  function refocus() {
+    var from = nav.from, lost = !visible(document.activeElement);
+    var wasOn = from && from !== document.body;
+    if (!nav.force && !(wasOn && (card.contains(from) || lost || !document.contains(from)))) return;
+    var t;
+    if (cardKind) t = nav.via === "back" && backBtn && !backBtn.disabled ? backBtn : nav.via === "next" && nextBtn ? nextBtn : defaultFocus;
+    else if ($("end").className === "on") t = $("restart");
+    else t = !$("next").disabled ? $("next") : $("prev");
+    if (!t) return;
+    if (card.contains(t) && card.inert) pendingFocus = t;
+    else t.focus({ preventScroll: true });
   }
 
   function placeCard(z, sz, avoid) {
@@ -580,21 +648,22 @@ const TOUR = /*TOUR_JSON*/;
     if (pendingEnter) {
       pendingEnter = false;
       void card.offsetWidth;
-      if (!animate || reduced.matches) { card.classList.add("in"); void card.offsetWidth; card.classList.remove("now"); }
+      if (!animate || reduced.matches) enterCard(true);
       else {
         card.classList.remove("now");
         // The card enters about 280 ms after the zoom settles.
-        enterTimer = setTimeout(function () { card.classList.add("in"); }, (moved ? 550 : 0) + 280);
+        enterTimer = setTimeout(function () { enterCard(false); }, (moved ? 550 : 0) + 280);
       }
     }
   }
 
   function announce(text) { $("status").textContent = text; }
 
+  function plain(text) { return TourCore.parseBold(text).map(function (p) { return p.text; }).join(""); }
+
   function render() {
     var s = steps[i], fin = finished(), onStep = phase === "step" && !fin;
-    var src = s.image;
-    if (shot.getAttribute("src") !== src) shot.src = src;
+    setImage(stepImage(s));
     if (phase === "cover") {
       drawn = -1;
       clearSpot();
@@ -617,43 +686,62 @@ const TOUR = /*TOUR_JSON*/;
     $("prev").disabled = phase === "cover" || (i === 0 && !cover);
     $("next").disabled = fin;
     buildCard();
-    var sc = stepCard(s);
-    announce(phase === "cover" ? cover.title : fin ? "End of tour. " + (end ? end.text : "") : "Step " + (i + 1) + " of " + n + (sc && sc.title ? ". " + sc.title : ""));
-    if (shot.complete && shot.naturalWidth) layout(true);
-    // Otherwise the image's load event lays it out.
-    var ahead = steps[phase === "cover" ? 0 : i + 1];
-    if (ahead && !preloaded[ahead.image]) { preloaded[ahead.image] = new Image(); preloaded[ahead.image].src = ahead.image; }
-    if (phase === "cover" && steps[1] && !preloaded[steps[1].image]) { preloaded[steps[1].image] = new Image(); preloaded[steps[1].image].src = steps[1].image; }
+    // Announced politely, once per step: where the viewer is, then the card's title and body.
+    var sc = stepCard(s), key = phase + ":" + i + ":" + fin;
+    if (key !== announced) {
+      announced = key;
+      var words = phase === "cover" ? [cover.title, cover.body]
+        : fin ? ["End of tour", end ? end.text : ""]
+        : ["Step " + (i + 1) + " of " + n, sc ? sc.title : "", sc ? plain(sc.body) : ""];
+      announce(words.filter(Boolean).join(". "));
+    }
+    if (imageReady()) layout(true);
+    // Otherwise the image's load or error event lays it out.
+    // Only the next and the previous pictures are kept loaded ahead.
+    var keep = {};
+    (phase === "cover" ? [steps[1]] : [steps[i + 1], steps[i - 1]]).forEach(function (t) {
+      var src = t && stepImage(t);
+      if (src) keep[src] = preloaded[src] || Object.assign(new Image(), { src: src });
+    });
+    preloaded = keep;
+    refocus();
+    nav = { via: "", from: null, force: false };
     schedule();
   }
-  shot.addEventListener("load", function () { layout(true); });
-  window.addEventListener("resize", function () { layout(false); });
+  window.addEventListener("resize", function () { if (!missing.hidden) showMissing(); layout(false); });
 
   // ---- Moving through the tour ----
-  function go(d, auto) {
+  // `via` names the control used: "back" and "next" for the card's buttons, "key" for the arrows.
+  function go(d, auto, via) {
     if (!auto) stopAutoplay();
-    if (phase === "cover") { if (d > 0) start(); return; }
-    if (d > 0 && finished()) return;
+    nav = { via: auto ? "auto" : via || "", from: document.activeElement, force: false };
+    if (phase === "cover") { if (d > 0) start(); else nav.from = null; return; }
+    if (d > 0 && finished()) { nav.from = null; return; }
+    // Leaving the end backwards shows the last step again.
+    if (d < 0 && done) { done = false; render(); return; }
     var k = i + d;
     if (k >= n) {
       done = true;
+      nav.force = !auto;
       render();
-      if (!auto) { var f = card.querySelector("a, button") || $("restart"); f.focus({ preventScroll: true }); }
     } else if (k >= 0) { i = k; done = false; render(); }
     else if (cover) { phase = "cover"; i = 0; done = false; render(); }
   }
-  function start() { phase = "step"; i = 0; done = false; render(); }
-  function replay() { stopAutoplay(); start(); }
-  ring.onclick = function () { go(1); };
+  function start() {
+    if (!nav.from) nav = { via: "", from: document.activeElement, force: false };
+    phase = "step"; i = 0; done = false; render();
+  }
+  function replay() { stopAutoplay(); nav = { via: "", from: document.activeElement, force: false }; start(); }
+  ring.onclick = function () { go(1, false, "hotspot"); };
   $("next").onclick = function () { go(1); };
   $("prev").onclick = function () { go(-1); };
   $("restart").onclick = function () { replay(); };
   frame.addEventListener("click", function (e) {
-    if (phase === "step" && !finished() && steps[i].advance === "anywhere" && !e.target.closest("button, a")) go(1);
+    if (phase === "step" && !finished() && steps[i].advance === "anywhere" && !e.target.closest("button, a")) go(1, false, "hotspot");
   });
   document.addEventListener("keydown", function (e) {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
-    if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1);
+    if (e.key === "ArrowRight") go(1, false, "key"); else if (e.key === "ArrowLeft") go(-1, false, "key");
   });
   // A horizontal swipe of at least 40 px anywhere around the image.
   var touch = null, area = document.querySelector("main");
@@ -675,11 +763,13 @@ const TOUR = /*TOUR_JSON*/;
   }
   function schedule() {
     clearTimeout(playTimer);
-    if (!playing || hoverHold || focusHold || phase !== "step" || finished()) return;
+    if (!playing || hoverHold || focusHold || document.hidden || phase !== "step" || finished()) return;
     playTimer = setTimeout(function () {
-      if (playing && !hoverHold && !focusHold) go(1, true);
+      if (playing && !hoverHold && !focusHold && !document.hidden) go(1, true);
     }, playMs);
   }
+  // A hidden tab holds autoplay; it carries on when shown again only if it was playing.
+  document.addEventListener("visibilitychange", schedule);
   function stopAutoplay() { playing = false; clearTimeout(playTimer); showPlay(); }
   playBtn.onclick = function () {
     playing = !playing && playable();
@@ -699,7 +789,12 @@ const TOUR = /*TOUR_JSON*/;
   document.addEventListener("focusin", checkFocus);
   document.addEventListener("focusout", function () { setTimeout(checkFocus, 0); });
   reduced.addEventListener("change", function () { if (reduced.matches) stopAutoplay(); else showPlay(); });
-  prefersDark.addEventListener("change", function () { if (cardStyle === "auto") { buildCard(); layout(false); } });
+  prefersDark.addEventListener("change", function () {
+    if (cardStyle !== "auto") return;
+    nav = { via: "", from: document.activeElement, force: false };
+    buildCard(); refocus(); layout(false);
+    nav = { via: "", from: null, force: false };
+  });
 
   playing = playable();
   showPlay();

@@ -990,4 +990,30 @@ mod tests {
         // Kept from version 2.
         assert!(PREVIEW_TEMPLATE.contains("Local preview"));
     }
+
+    #[test]
+    fn preview_allows_no_network_and_only_its_own_step_images() {
+        let csp = PREVIEW_TEMPLATE.split("Content-Security-Policy\" content=\"").nth(1).expect("a CSP meta tag").split('"').next().unwrap();
+        assert!(PREVIEW_TEMPLATE.find("Content-Security-Policy").unwrap() < PREVIEW_TEMPLATE.find("<script").unwrap());
+        for part in ["default-src 'none'", "script-src 'unsafe-inline'", "style-src 'unsafe-inline'", "img-src 'self'", "base-uri 'none'", "form-action 'none'"] {
+            assert!(csp.contains(part), "{part}");
+        }
+        assert!(!csp.contains("http") && !csp.contains('*') && !csp.contains("data:") && !csp.contains("connect-src"), "{csp}");
+        // Step images are taken only by the bundle's own names, in the page and in the preload.
+        assert!(PREVIEW_TEMPLATE.contains(r"/^step-[0-9]{3,}\.(png|jpg)$/"));
+        assert!(!PREVIEW_TEMPLATE.contains("s.image;") && !PREVIEW_TEMPLATE.contains("= ahead.image"));
+    }
+
+    #[test]
+    fn preview_handles_broken_tours_and_keeps_controls_reachable() {
+        // No steps, a missing picture, and a card whose controls are inert until it is visible.
+        assert!(PREVIEW_TEMPLATE.contains("This tour has no steps."));
+        assert!(PREVIEW_TEMPLATE.contains(r#"addEventListener("error""#) && PREVIEW_TEMPLATE.contains(r#"<div id="missing" hidden>"#));
+        assert!(PREVIEW_TEMPLATE.contains("card.inert = true") && PREVIEW_TEMPLATE.contains("card.inert = false"));
+        // Leaving the end card backwards shows the last step, and focus follows the control used.
+        assert!(PREVIEW_TEMPLATE.contains("if (d < 0 && done) { done = false; render(); return; }"));
+        assert!(PREVIEW_TEMPLATE.contains(r#"go(-1, false, "back")"#) && PREVIEW_TEMPLATE.contains(r#"go(1, false, "next")"#));
+        // A hidden tab holds autoplay.
+        assert!(PREVIEW_TEMPLATE.contains(r#"addEventListener("visibilitychange""#) && PREVIEW_TEMPLATE.contains("document.hidden"));
+    }
 }
