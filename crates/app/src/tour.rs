@@ -790,7 +790,7 @@ mod tests {
             assert_eq!(safe_url(bad), None, "{bad:?}");
         }
         assert_eq!(safe_url("HTTPS://Tours.example.com:8443/a?b=c#d"), Some("https://Tours.example.com:8443/a?b=c#d".into()));
-        assert_eq!(safe_url("https://localhost"), Some("https://localhost".into()));
+        assert_eq!(safe_url("https://localhost"), None);
     }
 
     #[test]

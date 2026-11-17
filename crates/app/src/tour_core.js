@@ -6,6 +6,11 @@
 // be inlined into a page as a classic script or loaded as a CommonJS module.
 // Nothing here builds HTML: text comes back as pieces for the caller to turn into
 // text nodes.
+//
+// In a Worker: the file has no `export` statement, so it stays valid inline. Import it
+// from the Worker's ES module (`import TourCore from "./tour_core.js"`) and let the
+// Worker's bundler wrap the CommonJS `module.exports` line below, or vendor a copy with
+// `export default TourCore;` appended.
 var TourCore = (function () {
   "use strict";
 
@@ -13,6 +18,8 @@ var TourCore = (function () {
   var GAP = 12;
   var BOTTOM_INSET = 16;
   var LINK_MAX = 500;
+  // A fit within this many pixels counts, so float32 and float64 callers agree on ties.
+  var SLACK = 0.001;
 
   // Unicode White_Space, the set Rust's char::is_whitespace and str::trim use.
   function isSpace(c) {
@@ -59,6 +66,10 @@ var TourCore = (function () {
     return out;
   }
 
+  function finite(v) {
+    return typeof v === "number" && isFinite(v);
+  }
+
   function clamp(v, lo, hi) {
     return Math.min(Math.max(v, lo), hi);
   }
@@ -66,10 +77,14 @@ var TourCore = (function () {
   // Where a card of cardW x cardH goes on an imgW x imgH image so it never covers
   // `avoid` ({x0,y0,x1,y1} or null) and never leaves the image. `placement` is
   // "auto", "top", "bottom", "left" or "right". Returns {x, y, side}; side
-  // "docked" means under the image at full width.
+  // "docked" means under the image at full width, also when the box holds a value
+  // that is not a finite number.
   function placeCard(imgW, imgH, cardW, cardH, avoid, placement) {
     if (!avoid) {
       return { x: (imgW - cardW) / 2, y: imgH - cardH - BOTTOM_INSET, side: "none" };
+    }
+    if (!finite(avoid.x0) || !finite(avoid.y0) || !finite(avoid.x1) || !finite(avoid.y1)) {
+      return { x: 0, y: imgH, side: "docked" };
     }
     var x0 = Math.min(avoid.x0, avoid.x1), x1 = Math.max(avoid.x0, avoid.x1);
     var y0 = Math.min(avoid.y0, avoid.y1), y1 = Math.max(avoid.y0, avoid.y1);
@@ -86,7 +101,7 @@ var TourCore = (function () {
         y = clamp((y0 + y1) / 2 - cardH / 2, MARGIN, imgH - cardH - MARGIN);
         x = side === "right" ? x1 + GAP : x0 - GAP - cardW;
       }
-      if (x >= MARGIN && y >= MARGIN && x + cardW <= imgW - MARGIN && y + cardH <= imgH - MARGIN) {
+      if (x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cardW <= imgW - MARGIN + SLACK && y + cardH <= imgH - MARGIN + SLACK) {
         return { x: x, y: y, side: side };
       }
     }
@@ -94,8 +109,12 @@ var TourCore = (function () {
   }
 
   // The translation for a view zoomed by k around (focusX, focusY) that never
-  // shows anything outside the image.
+  // shows anything outside the image. Any input that is not a finite number means no
+  // zoom: the offset is {tx: 0, ty: 0} and the caller draws at scale 1.
   function zoomOffset(viewW, viewH, focusX, focusY, k) {
+    if (!finite(viewW) || !finite(viewH) || !finite(focusX) || !finite(focusY) || !finite(k)) {
+      return { tx: 0, ty: 0 };
+    }
     return {
       tx: clamp(viewW / 2 - focusX * k, viewW - viewW * k, 0),
       ty: clamp(viewH / 2 - focusY * k, viewH - viewH * k, 0),
@@ -103,9 +122,11 @@ var TourCore = (function () {
   }
 
   // Text split into [{text, bold}]: text between a pair of ** is bold, an unpaired
-  // ** stays as typed, empty pieces are dropped. CRLF and CR become LF.
+  // ** stays as typed, empty pieces are dropped. CRLF and CR become LF. Anything but
+  // a string gives no pieces.
   function parseBold(text) {
-    var parts = String(text).replace(/\r\n?/g, "\n").split("**");
+    if (typeof text !== "string") return [];
+    var parts = text.replace(/\r\n?/g, "\n").split("**");
     if (parts.length % 2 === 0) {
       var last = parts.pop();
       parts[parts.length - 1] += "**" + last;
@@ -134,8 +155,9 @@ var TourCore = (function () {
   }
 
   // The link when it is safe, else null, as safe_url in tour/doc.rs: trimmed; `https://` in any case
-  // (written back lowercase); an authority with no `@` that is one or more non-empty labels of ASCII
-  // letters, digits and `-` separated by `.`, with an optional `:` and 1 to 5 digits; no whitespace,
+  // (written back lowercase); an authority with no `@` that is two or more non-empty labels of ASCII
+  // letters, digits and `-` separated by `.`, no label starting or ending with `-`, the last label
+  // holding at least one letter, with an optional `:` and a port of 1 to 5 digits from 1 to 65535; no whitespace,
   // control or format character anywhere; at most 500 code points. No URL parser is used, so every
   // player gives the same answer as the editor.
   function safeUrl(s) {
@@ -152,8 +174,10 @@ var TourCore = (function () {
     var colon = authority.indexOf(":");
     var host = colon < 0 ? authority : authority.slice(0, colon);
     var port = colon < 0 ? null : authority.slice(colon + 1);
-    var hostOk = host !== "" && host.split(".").every(function (l) { return /^[A-Za-z0-9-]+$/.test(l); });
-    var portOk = port === null || /^[0-9]{1,5}$/.test(port);
+    var labels = host.split(".");
+    var hostOk = labels.length >= 2 && labels.every(function (l) { return /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(l); }) &&
+      /[A-Za-z]/.test(labels[labels.length - 1]);
+    var portOk = port === null || (/^[0-9]{1,5}$/.test(port) && Number(port) >= 1 && Number(port) <= 65535);
     return hostOk && portOk ? "https://" + rest : null;
   }
 
