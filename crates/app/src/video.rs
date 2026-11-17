@@ -11,6 +11,8 @@ use mythicshot_editor::{Bounds, Item, render_items_onto, to_pixmap, to_rgba_imag
 use mythicshot_recording::Recording;
 use mythicshot_recording::export::OutFrame;
 
+use crate::tour::TourDoc;
+
 #[derive(Debug, Clone)]
 pub struct Edit {
     /// First and last frame kept, inclusive.
@@ -26,11 +28,13 @@ pub struct Edit {
     pub overlays: OverlayStyle,
     /// Source frames of the tour steps removed in the Tour view.
     pub tour_removed: BTreeSet<usize>,
+    /// Tour settings and guide cards, edited in the Tour view.
+    pub tour_doc: TourDoc,
 }
 
 impl Edit {
     pub fn new(rec: &Recording, overlays: OverlayStyle) -> Self {
-        Self { trim: (0, rec.frames.len().saturating_sub(1)), deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays, tour_removed: BTreeSet::new() }
+        Self { trim: (0, rec.frames.len().saturating_sub(1)), deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays, tour_removed: BTreeSet::new(), tour_doc: TourDoc::default() }
     }
 
     pub fn kept(&self, i: usize) -> bool {
