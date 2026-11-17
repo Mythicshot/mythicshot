@@ -60,7 +60,7 @@ pub fn plan(rec: &Recording, edit: &Edit) -> (Vec<OutFrame>, u64) {
     (out, t.round() as u64)
 }
 
-fn crop_px(rec: &Recording, edit: &Edit) -> (u32, u32, u32, u32) {
+pub(crate) fn crop_px(rec: &Recording, edit: &Edit) -> (u32, u32, u32, u32) {
     match edit.crop.map(|b| b.norm()) {
         Some(b) => {
             let x0 = b.x0.clamp(0.0, rec.width as f32) as u32;
