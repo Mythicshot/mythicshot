@@ -632,6 +632,15 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_spotlights_keep_their_overlap_bright() {
+        let out = render(&grey(), &[spot(10.0, 10.0, 50.0, 50.0, 60), spot(30.0, 30.0, 80.0, 70.0, 60)]);
+        assert_eq!(out.get_pixel(40, 40).0, [200, 200, 200, 255]); // in both boxes
+        assert_eq!(out.get_pixel(20, 20).0, [200, 200, 200, 255]); // first box only
+        assert_eq!(out.get_pixel(70, 60).0, [200, 200, 200, 255]); // second box only
+        assert_eq!(out.get_pixel(90, 5).0, [80, 80, 80, 255]);
+    }
+
+    #[test]
     fn spotlight_strength_is_capped_and_other_items_draw_on_top_of_the_dark() {
         let out = render(&grey(), &[spot(20.0, 20.0, 60.0, 60.0, 100)]);
         assert_eq!(out.get_pixel(5, 5).0, [20, 20, 20, 255]); // 90 percent, not black
