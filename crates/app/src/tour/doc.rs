@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{ImageEncoder, ImageFormat};
+use image::codecs::jpeg::JpegDecoder;
+use image::codecs::png::PngDecoder;
+use image::{DynamicImage, ImageDecoder, ImageEncoder};
 use mythicshot_recording::Recording;
 
 use super::{JPEG_QUALITY, Point, fit_width, pct};
@@ -35,6 +37,8 @@ pub const AUTOPLAY_MAX: u8 = 20;
 
 /// A logo file larger than this is refused before it is decoded.
 const LOGO_MAX_FILE_BYTES: u64 = 30_000_000;
+/// A logo wider or taller than this is refused from its header, before it is decoded.
+pub const LOGO_MAX_SOURCE_SIDE: u32 = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -184,9 +188,41 @@ pub struct TourDoc {
     pub steps: BTreeMap<usize, StepExtras>,
 }
 
-/// Trimmed and cut at `max` characters.
-fn cap(s: &str, max: usize) -> String {
-    s.trim().chars().take(max).collect()
+/// True for a Unicode format (Cf) character: soft hyphen, bidi controls and isolates, zero-width
+/// characters, the byte order mark, tags and the like. None of them is ever wanted in tour text.
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Tour text cleaned and capped: `\r\n` and `\r` become `\n`; a tab becomes a space; every other
+/// control (Cc) and format (Cf) character is removed; `\n` is kept only when `multiline` and becomes
+/// a space otherwise; then the text is trimmed and cut at `max`. The cap counts Unicode code points
+/// (Rust `char`s) after this cleaning, the same way the server counts them.
+fn clean(s: &str, max: usize, multiline: bool) -> String {
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = s
+        .chars()
+        .filter_map(|c| match c {
+            '\n' if multiline => Some('\n'),
+            '\n' | '\t' => Some(' '),
+            c if c.is_control() || is_format(c) => None,
+            c => Some(c),
+        })
+        .collect();
+    cleaned.trim().chars().take(max).collect()
+}
+
+/// A single-line field (titles, labels): see [`clean`].
+fn line(s: &str, max: usize) -> String {
+    clean(s, max, false)
+}
+
+/// A multi-line field (card body, cover body, end text): see [`clean`].
+fn text(s: &str, max: usize) -> String {
+    clean(s, max, true)
 }
 
 /// `#rrggbb` lowercased, or None.
@@ -196,23 +232,33 @@ fn hex_colour(s: &str) -> Option<String> {
     (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
 }
 
-/// `https://` with a host, no whitespace or control characters, at most 500 characters.
+/// `https://` (the scheme in any case, written back lowercase), then an authority with no `@` that is
+/// a host of one or more non-empty labels of ASCII letters, digits and `-` separated by `.`, with an
+/// optional `:` and 1 to 5 digits; no whitespace, control (Cc) or format (Cf) character anywhere; at
+/// most 500 characters.
 pub fn safe_url(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.chars().count() > LINK_MAX || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if s.chars().count() > LINK_MAX || s.chars().any(|c| c.is_whitespace() || c.is_control() || is_format(c)) {
         return None;
     }
-    let rest = s.strip_prefix("https://")?;
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
+    let scheme = s.get(..8)?;
+    if !scheme.eq_ignore_ascii_case("https://") {
         return None;
     }
-    Some(s.to_string())
+    let rest = &s[8..];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let host_ok = !host.is_empty() && host.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    let port_ok = port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    (host_ok && port_ok).then(|| format!("https://{rest}"))
 }
 
 /// A button with its label cut at the cap, or None when its link is not safe or it has no label.
 fn safe_link(l: &Link) -> Option<Link> {
-    let label = cap(&l.label, BUTTON_LABEL_MAX);
+    let label = line(&l.label, BUTTON_LABEL_MAX);
     let url = safe_url(&l.url)?;
     (!label.is_empty()).then_some(Link { label, url })
 }
@@ -224,12 +270,12 @@ pub fn sanitize(doc: &TourDoc) -> TourDoc {
     let backdrop = if doc.theme.backdrop.trim() == "auto" { "auto".to_string() } else { hex_colour(&doc.theme.backdrop).unwrap_or_else(|| "auto".to_string()) };
     let theme = Theme { accent: hex_colour(&doc.theme.accent).unwrap_or_else(|| DEFAULT_ACCENT.to_string()), backdrop, ..doc.theme.clone() };
     let cover = doc.cover.as_ref().and_then(|c| {
-        let title = cap(&c.title, COVER_TITLE_MAX);
-        let button = cap(&c.button, COVER_BUTTON_MAX);
+        let title = line(&c.title, COVER_TITLE_MAX);
+        let button = line(&c.button, COVER_BUTTON_MAX);
         let button = if button.is_empty() { "Start".to_string() } else { button };
-        (!title.is_empty()).then(|| Cover { title, body: cap(&c.body, COVER_BODY_MAX), button, logo: None })
+        (!title.is_empty()).then(|| Cover { title, body: text(&c.body, COVER_BODY_MAX), button, logo: None })
     });
-    let end = doc.end.as_ref().map(|e| EndCard { text: cap(&e.text, END_TEXT_MAX), primary: e.primary.as_ref().and_then(safe_link), secondary: e.secondary.as_ref().and_then(safe_link), replay: e.replay });
+    let end = doc.end.as_ref().map(|e| EndCard { text: text(&e.text, END_TEXT_MAX), primary: e.primary.as_ref().and_then(safe_link), secondary: e.secondary.as_ref().and_then(safe_link), replay: e.replay });
     TourDoc {
         theme,
         zoom: Zoom { enabled: doc.zoom.enabled, percent: doc.zoom.percent.clamp(ZOOM_MIN, ZOOM_MAX) },
@@ -245,11 +291,11 @@ pub fn sanitize(doc: &TourDoc) -> TourDoc {
 /// The step's card for the manifest, or None when it has neither title nor body. `click` is the step's hotspot in percent.
 pub fn step_card(rec: &Recording, edit: &Edit, src: usize, click: Option<(f32, f32)>) -> Option<Card> {
     let c = edit.tour_doc.steps.get(&src)?.card.as_ref()?;
-    let (title, body) = (cap(&c.title, CARD_TITLE_MAX), cap(&c.body, CARD_BODY_MAX));
+    let (title, body) = (line(&c.title, CARD_TITLE_MAX), text(&c.body, CARD_BODY_MAX));
     if title.is_empty() && body.is_empty() {
         return None;
     }
-    let next_label = cap(&c.next_label, NEXT_LABEL_MAX);
+    let next_label = line(&c.next_label, NEXT_LABEL_MAX);
     let next_label = if next_label.is_empty() { "Next".to_string() } else { next_label };
     let (anchor, point) = match c.anchor {
         Anchor::Hotspot if click.is_some() => (Anchor::Hotspot, None),
@@ -266,9 +312,10 @@ pub fn step_card(rec: &Recording, edit: &Edit, src: usize, click: Option<(f32, f
     Some(Card { title, body, next_label, anchor, point, placement: c.placement })
 }
 
-/// The logo ready for the bundle: bytes and "png" or "jpg". It is decoded and encoded again (which
-/// also drops any metadata), shrunk to at most [`LOGO_MAX_SIDE`] on either side, and refused when it
-/// is not a PNG or JPEG by its first bytes or is still over [`LOGO_MAX_BYTES`].
+/// The logo ready for the bundle: bytes and "png" or "jpg". It is decoded, turned upright by its EXIF
+/// orientation and encoded again (which also drops any metadata), shrunk to at most [`LOGO_MAX_SIDE`]
+/// on either side, and refused when it is not a PNG or JPEG by its first bytes, is over
+/// [`LOGO_MAX_SOURCE_SIDE`] on either side, or is still over [`LOGO_MAX_BYTES`].
 pub fn load_logo(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
     let name = path.display();
     let size = std::fs::metadata(path).map_err(|e| format!("Could not read the cover logo {name}: {e}"))?.len();
@@ -276,14 +323,14 @@ pub fn load_logo(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
         return Err(format!("The cover logo {name} is too large; use a PNG or JPEG under {} KB.", LOGO_MAX_BYTES / 1000));
     }
     let raw = std::fs::read(path).map_err(|e| format!("Could not read the cover logo {name}: {e}"))?;
-    let (format, ext) = if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
-        (ImageFormat::Png, "png")
+    let unreadable = |e: image::ImageError| format!("The cover logo {name} could not be read as a PNG or JPEG image: {e}");
+    let (img, ext) = if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
+        (decode_upright(PngDecoder::new(std::io::Cursor::new(&raw[..])).map_err(unreadable)?, &name)?, "png")
     } else if raw.starts_with(b"\xFF\xD8\xFF") {
-        (ImageFormat::Jpeg, "jpg")
+        (decode_upright(JpegDecoder::new(std::io::Cursor::new(&raw[..])).map_err(unreadable)?, &name)?, "jpg")
     } else {
         return Err(format!("The cover logo {name} is not a PNG or JPEG image."));
     };
-    let img = image::load_from_memory_with_format(&raw, format).map_err(|e| format!("The cover logo {name} could not be read as a PNG or JPEG image: {e}"))?;
     let (w, h) = (img.width(), img.height());
     let (nw, nh) = if w >= h { fit_width(w, h, LOGO_MAX_SIDE) } else { let (a, b) = fit_width(h, w, LOGO_MAX_SIDE); (b, a) };
     let img = if (nw, nh) == (w, h) { img } else { img.resize_exact(nw, nh, FilterType::Lanczos3) };
@@ -299,4 +346,18 @@ pub fn load_logo(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
         return Err(format!("The cover logo {name} is still over {} KB after shrinking to {LOGO_MAX_SIDE} pixels; use a simpler or smaller image.", LOGO_MAX_BYTES / 1000));
     }
     Ok((out, ext))
+}
+
+/// Decode a logo whose header has been read, refusing it first when either side is over
+/// [`LOGO_MAX_SOURCE_SIDE`], then turned upright by its EXIF orientation.
+fn decode_upright(mut decoder: impl ImageDecoder, name: &impl std::fmt::Display) -> Result<DynamicImage, String> {
+    let (w, h) = decoder.dimensions();
+    if w > LOGO_MAX_SOURCE_SIDE || h > LOGO_MAX_SOURCE_SIDE {
+        return Err(format!("The cover logo {name} is {w} x {h} pixels; use an image at most {LOGO_MAX_SOURCE_SIDE} pixels on either side."));
+    }
+    // A missing or unreadable orientation leaves the image as it is.
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| format!("The cover logo {name} could not be read as a PNG or JPEG image: {e}"))?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }

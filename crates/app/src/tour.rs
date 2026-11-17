@@ -776,6 +776,35 @@ mod tests {
             assert_eq!(safe_url(bad), None, "{bad}");
         }
         assert_eq!(safe_url(&format!("https://tours.example.com/{}", "a".repeat(500))), None);
+        for bad in ["https://@", "https://:443", "https://user:pw@evil.example", "https://tours.example.com@evil.example/", "https://tours\u{202E}.example.com", "https://tours\u{200B}example.com", "https://tours.example.com/\u{202E}x", "https://tours..example.com", "https://.example.com", "https://tours.example.com:", "https://tours.example.com:123456", "https://tours.example.com:44a", "https://tours_example.com", "https://tours.example.com\\@evil.example"] {
+            assert_eq!(safe_url(bad), None, "{bad:?}");
+        }
+        assert_eq!(safe_url("HTTPS://Tours.example.com:8443/a?b=c#d"), Some("https://Tours.example.com:8443/a?b=c#d".into()));
+        assert_eq!(safe_url("https://localhost"), Some("https://localhost".into()));
+    }
+
+    #[test]
+    fn text_is_cleaned_before_it_is_capped() {
+        let r = rec();
+        let mut e = edit(&r);
+        let mut c = card("A\u{202E}B\r\nC\u{0}\u{FEFF}", "x\r\ny\rz\u{2066}\n**w**");
+        c.next_label = "Go\non\u{200B}".into();
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(c), ..Default::default() });
+        let got = step_card(&r, &e, 1, Some((50.0, 50.0))).unwrap();
+        assert_eq!((got.title.as_str(), got.body.as_str(), got.next_label.as_str()), ("AB C", "x\ny\nz\n**w**", "Go on"));
+        // Caps count code points after cleaning: invisible characters never use up the cap.
+        let long = format!("{}{}", "\u{200B}".repeat(10), "a".repeat(90));
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card(&long, "")), ..Default::default() });
+        assert_eq!(step_card(&r, &e, 1, None).unwrap().title, "a".repeat(80));
+        let mut d = TourDoc::default();
+        d.cover = Some(Cover { title: "Line\none".into(), body: "Para\r\ntwo".into(), button: "Sta\u{202D}rt\n".into(), logo: None });
+        d.cta = Some(Link { label: "Book\r\na call".into(), url: "https://tours.example.com".into() });
+        d.end = Some(EndCard { text: "Thanks\r\nBye\u{0}".into(), primary: None, secondary: None, replay: true });
+        let s = sanitize(&d);
+        let cover = s.cover.unwrap();
+        assert_eq!((cover.title.as_str(), cover.body.as_str(), cover.button.as_str()), ("Line one", "Para\ntwo", "Start"));
+        assert_eq!(s.cta.unwrap().label, "Book a call");
+        assert_eq!(s.end.unwrap().text, "Thanks\nBye");
     }
 
     #[test]
@@ -808,12 +837,23 @@ mod tests {
         e.tour_doc.steps.insert(1, StepExtras { card: Some(c), ..Default::default() });
         e.tour_doc.cover = Some(Cover { title: HOSTILE.into(), body: HOSTILE.into(), button: "<i>".into(), logo: None });
         e.tour_doc.cta = Some(Link { label: HOSTILE.chars().take(24).collect(), url: "https://tours.example.com".into() });
+        let short: String = HOSTILE.chars().take(24).collect();
+        let button = |url: &str| Some(Link { label: short.clone(), url: url.into() });
+        e.tour_doc.end = Some(EndCard { text: HOSTILE.into(), primary: button("https://tours.example.com/a"), secondary: button("https://tours.example.com/b"), replay: true });
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("t");
         write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
         let j = read_json(&dir);
         assert_eq!(j["steps"][0]["card"]["title"], HOSTILE);
+        assert_eq!(j["steps"][0]["card"]["body"], HOSTILE);
+        assert_eq!(j["steps"][0]["card"]["next_label"], "<b>go</b>");
         assert_eq!(j["cover"]["title"], HOSTILE);
+        assert_eq!(j["cover"]["body"], HOSTILE);
+        assert_eq!(j["cover"]["button"], "<i>");
+        assert_eq!(j["cta"]["label"], short.as_str());
+        assert_eq!(j["end"]["text"], HOSTILE);
+        assert_eq!(j["end"]["primary"]["label"], short.as_str());
+        assert_eq!(j["end"]["secondary"]["label"], short.as_str());
         assert!(!std::fs::read_to_string(dir.join("index.html")).unwrap().contains("</script><img"));
     }
 
@@ -842,5 +882,52 @@ mod tests {
         write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap();
         assert_eq!(read_json(&dir)["cover"]["logo"], "logo.png");
         assert!(dir.join("logo.png").exists());
+    }
+
+    #[test]
+    fn a_logo_over_the_byte_cap_after_shrinking_is_refused_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let noisy = tmp.path().join("noisy.png");
+        let mut s = 7u32;
+        RgbaImage::from_fn(512, 512, |_, _| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            image::Rgba([(s >> 24) as u8, (s >> 16) as u8, (s >> 8) as u8, 255])
+        })
+        .save(&noisy)
+        .unwrap();
+        assert!(load_logo(&noisy).unwrap_err().contains("200 KB"));
+        let r = rec();
+        let mut e = edit(&r);
+        e.tour_doc.cover = Some(Cover { title: "Hi".into(), body: String::new(), button: String::new(), logo: None });
+        e.tour_doc.logo_path = Some(noisy);
+        let dir = tmp.path().join("t");
+        assert!(write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).is_err());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_logo_over_8192_pixels_is_refused_before_decoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wide = tmp.path().join("wide.png");
+        RgbaImage::from_pixel(8193, 2, image::Rgba([1, 2, 3, 255])).save(&wide).unwrap();
+        assert!(load_logo(&wide).unwrap_err().contains("8192"));
+    }
+
+    #[test]
+    fn a_jpeg_logo_is_turned_upright_by_its_exif_orientation() {
+        use image::ImageEncoder;
+        let tmp = tempfile::tempdir().unwrap();
+        let photo = tmp.path().join("photo.jpg");
+        // A little-endian TIFF block with one entry: Orientation (0x0112) = 6, rotate 90 degrees clockwise.
+        let exif: Vec<u8> = [&b"II*\0"[..], &8u32.to_le_bytes(), &1u16.to_le_bytes(), &0x0112u16.to_le_bytes(), &3u16.to_le_bytes(), &1u32.to_le_bytes(), &6u16.to_le_bytes(), &[0, 0], &0u32.to_le_bytes()].concat();
+        let rgb = image::RgbImage::from_pixel(40, 20, image::Rgb([90, 120, 150]));
+        let mut bytes = Vec::new();
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90);
+        enc.set_exif_metadata(exif).unwrap();
+        enc.write_image(rgb.as_raw(), 40, 20, image::ExtendedColorType::Rgb8).unwrap();
+        std::fs::write(&photo, &bytes).unwrap();
+        let (out, ext) = load_logo(&photo).unwrap();
+        let img = image::load_from_memory(&out).unwrap();
+        assert_eq!((img.width(), img.height(), ext), (20, 40, "jpg"));
     }
 }
