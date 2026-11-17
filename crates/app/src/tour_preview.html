@@ -96,10 +96,13 @@
   .notch.down { bottom: -7px; border-width: 0 1px 1px 0; }
   .notch.toleft { left: -7px; border-width: 0 0 1px 1px; }
   .notch.toright { right: -7px; border-width: 1px 1px 0 0; }
-  #card.compact { display: flex; align-items: center; gap: 10px; padding: 9px 10px 9px 6px; border-radius: 12px; background: rgba(22, 26, 33, .94); border-color: rgba(255, 255, 255, .08); color: #eef1f6; box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
-  #card.compact .c-body { flex: 1; min-width: 0; color: #c9d0db; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  /* The compact bar: a light pill with the counter, the text and the button on one line, in Light's colours. */
+  #card.compact { display: flex; align-items: center; gap: 10px; padding: 6px 6px 6px 8px; border-radius: 999px; background: #fcfcfd; border-color: rgba(16, 22, 32, .08); color: #1b2029; box-shadow: 0 10px 30px rgba(8, 14, 24, .22), 0 2px 6px rgba(8, 14, 24, .1); }
+  #card.compact .c-body { flex: 1; min-width: 0; color: #4a5262; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #card.compact strong { color: #12161d; }
+  #card.compact .c-back { border-radius: 999px; }
   #card.compact .c-count { flex: none; }
-  #card.compact .c-next { flex: none; padding: 7px 14px; }
+  #card.compact .c-next { flex: none; padding: 7px 14px; border-radius: 999px; }
   #card.panel { padding: 22px 24px 20px; text-align: center; }
   .p-logo { display: block; max-width: 140px; max-height: 48px; margin: 0 auto 14px; }
   .p-title { margin: 0 0 6px; font-size: 19px; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
@@ -389,7 +392,7 @@ const TOUR = /*TOUR_JSON*/;
       var p = obj(c.point), x = p && num(p.x), y = p && num(p.y);
       point = p && x !== null && y !== null ? [x, y] : null;
     } else if (anchor === "hotspot") point = click(s);
-    return { title: title, body: body, next: line(c.next_label, 24) || "Next", point: point, placement: pick(c.placement, ["auto", "top", "bottom", "left", "right"], "auto") };
+    return { title: title, body: body, next: line(c.next_label, 24) || "Next", point: point, picked: anchor === "point" && !!point, placement: pick(c.placement, ["auto", "top", "bottom", "left", "right"], "auto") };
   }
   function finished() {
     var s = steps[i];
@@ -438,6 +441,13 @@ const TOUR = /*TOUR_JSON*/;
     } else return null;
     r = { x0: Math.max(0, r.x0), y0: Math.max(0, r.y0), x1: Math.min(sz.w, r.x1), y1: Math.min(sz.h, r.y1) };
     return r.x1 > r.x0 && r.y1 > r.y0 ? r : null;
+  }
+  // A spot picked for the card, in displayed pixels after zoom, while it is on the picture: the card
+  // points at it and still keeps clear of the spotlight. Null for the hotspot or no anchor.
+  function aimFor(z, sz, c) {
+    if (!c || !c.picked) return null;
+    var x = c.point[0] / 100 * sz.w * z.k + z.tx, y = c.point[1] / 100 * sz.h * z.k + z.ty;
+    return x >= 0 && x <= sz.w && y >= 0 && y <= sz.h ? { x: x, y: y } : null;
   }
   function overlaps(a, x, y, w, h) { return !!a && x < a.x1 && x + w > a.x0 && y < a.y1 && y + h > a.y0; }
 
@@ -550,8 +560,8 @@ const TOUR = /*TOUR_JSON*/;
       first = next;
       card.setAttribute("aria-label", "Step " + (i + 1) + " of " + n);
     }
-    // Cover and end panels of a compact tour use the dark card.
-    var palette = style() === "compact" ? "dark" : style();
+    // A compact tour follows Light's colours, so its cover and end panels use the light card.
+    var palette = style() === "compact" ? "light" : style();
     card.className = cardKind ? (cardKind === "compact" ? "compact now" : palette + (cardKind === "panel" ? " panel now" : " now")) : "now";
     card.replaceChildren.apply(card, kids);
     card.hidden = !cardKind;
@@ -585,14 +595,14 @@ const TOUR = /*TOUR_JSON*/;
     else t.focus({ preventScroll: true });
   }
 
-  function placeCard(z, sz, avoid) {
+  function placeCard(z, sz, avoid, aim) {
     if (!cardKind) return;
     var W = sz.w, H = sz.h, w = cardKind === "compact" ? W - 16 : Math.min(cardKind === "panel" ? 380 : 320, W - 16);
     stage.style.paddingBottom = "";
     card.style.width = w + "px";
     var h = card.offsetHeight, x, y, side;
     if (cardKind === "guide") {
-      var p = TourCore.placeCard(W, H, w, h, avoid, cardData.placement);
+      var p = TourCore.placeCard(W, H, w, h, avoid, cardData.placement, aim);
       x = p.x; y = p.y; side = p.side;
     } else if (cardKind === "compact") {
       x = 8; side = "bottom";
@@ -617,13 +627,15 @@ const TOUR = /*TOUR_JSON*/;
       var dir = { bottom: "up", top: "down", right: "toleft", left: "toright" }[side];
       notch.hidden = !dir || !avoid;
       if (dir && avoid) {
+        // The notch points at the picked spot when there is one, else at the middle of the box.
+        var tx = aim ? aim.x : (avoid.x0 + avoid.x1) / 2, ty = aim ? aim.y : (avoid.y0 + avoid.y1) / 2;
         notch.className = "notch " + dir;
         if (dir === "up" || dir === "down") {
           notch.style.top = ""; notch.style.bottom = "";
-          notch.style.left = Math.max(16, Math.min(w - 28, (avoid.x0 + avoid.x1) / 2 - x - 6)) + "px";
+          notch.style.left = Math.max(16, Math.min(w - 28, tx - x - 6)) + "px";
         } else {
           notch.style.left = ""; notch.style.right = "";
-          notch.style.top = Math.max(14, Math.min(h - 26, (avoid.y0 + avoid.y1) / 2 - y - 6)) + "px";
+          notch.style.top = Math.max(14, Math.min(h - 26, ty - y - 6)) + "px";
         }
       }
     }
@@ -639,7 +651,7 @@ const TOUR = /*TOUR_JSON*/;
     if (!animate) { view.style.transition = "none"; hole.classList.remove("glide"); }
     view.style.transform = t;
     var avoid = phase === "step" && !finished() ? avoidFor(s, z, sz, cardData) : null;
-    placeCard(z, sz, avoid);
+    placeCard(z, sz, avoid, avoid && cardKind === "guide" ? aimFor(z, sz, cardData) : null);
     if (cta && !ctaEl.hidden) {
       var cw = ctaEl.offsetWidth, ch = ctaEl.offsetHeight;
       ctaEl.classList.toggle("left", overlaps(avoid, sz.w - cw - 12, 12, cw, ch));

@@ -42,7 +42,12 @@ fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
 
 /// Places a `card` on an `img` (both width, height) so it never covers `avoid` and never leaves the image.
 /// The asked side is tried first, then bottom, top, right, left. A box holding a non-finite value docks the card.
-pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, placement: Placement) -> Placed {
+///
+/// `aim` is a spot the card points at while it keeps clear of `avoid`, such as a spot picked inside or
+/// beside a spotlight: the card is centred on the aim along the side it takes, keeps clear of the aim as
+/// well as the box, and when the aim lies outside the box the side facing it is tried right after the
+/// asked side. An aim that is not finite is ignored.
+pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, placement: Placement, aim: Option<(f32, f32)>) -> Placed {
     let ((iw, ih), (cw, ch)) = (img, card);
     let Some(b) = avoid else {
         return Placed { x: (iw - cw) / 2.0, y: ih - ch - BOTTOM_INSET, side: Side::None };
@@ -51,7 +56,26 @@ pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, plac
     if ![b.x0, b.y0, b.x1, b.y1].iter().all(|v| v.is_finite()) {
         return docked;
     }
-    let b = b.norm();
+    let mut b = b.norm();
+    let (mut mx, mut my) = ((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0);
+    let mut order = vec![Side::Bottom, Side::Top, Side::Right, Side::Left];
+    if let Some((ax, ay)) = aim.filter(|(x, y)| x.is_finite() && y.is_finite()) {
+        // The side of the box the aim lies beyond, if any: the one it is furthest past.
+        let past = [(Side::Bottom, ay - b.y1), (Side::Top, b.y0 - ay), (Side::Right, ax - b.x1), (Side::Left, b.x0 - ax)];
+        let mut facing = None;
+        let mut most = 0.0;
+        for (side, d) in past {
+            if d > most {
+                (most, facing) = (d, Some(side));
+            }
+        }
+        if let Some(f) = facing {
+            order.retain(|s| *s != f);
+            order.insert(0, f);
+        }
+        b = Bounds { x0: b.x0.min(ax), y0: b.y0.min(ay), x1: b.x1.max(ax), y1: b.y1.max(ay) };
+        (mx, my) = (ax, ay);
+    }
     let asked = match placement {
         Placement::Auto => None,
         Placement::Top => Some(Side::Top),
@@ -59,15 +83,18 @@ pub fn place_card(img: (f32, f32), card: (f32, f32), avoid: Option<Bounds>, plac
         Placement::Left => Some(Side::Left),
         Placement::Right => Some(Side::Right),
     };
-    let order = [Side::Bottom, Side::Top, Side::Right, Side::Left];
-    for side in asked.into_iter().chain(order.into_iter().filter(|s| Some(*s) != asked)) {
+    if let Some(a) = asked {
+        order.retain(|s| *s != a);
+        order.insert(0, a);
+    }
+    for side in order {
         let (x, y) = match side {
             Side::Bottom | Side::Top => {
-                let x = clamp((b.x0 + b.x1) / 2.0 - cw / 2.0, MARGIN, iw - cw - MARGIN);
+                let x = clamp(mx - cw / 2.0, MARGIN, iw - cw - MARGIN);
                 (x, if side == Side::Bottom { b.y1 + GAP } else { b.y0 - GAP - ch })
             }
             _ => {
-                let y = clamp((b.y0 + b.y1) / 2.0 - ch / 2.0, MARGIN, ih - ch - MARGIN);
+                let y = clamp(my - ch / 2.0, MARGIN, ih - ch - MARGIN);
                 (if side == Side::Right { b.x1 + GAP } else { b.x0 - GAP - cw }, y)
             }
         };
@@ -159,7 +186,8 @@ mod tests {
             let name = c["name"].as_str().unwrap();
             let (img, card) = (pair(&c["image"]), pair(&c["card"]));
             let avoid = c["avoid"].as_array().map(|a| Bounds { x0: f(&a[0]), y0: f(&a[1]), x1: f(&a[2]), y1: f(&a[3]) });
-            let p = place_card(img, card, avoid, placement(c["placement"].as_str().unwrap()));
+            let aim = c.get("aim").and_then(|a| a.as_array()).map(|a| (f(&a[0]), f(&a[1])));
+            let p = place_card(img, card, avoid, placement(c["placement"].as_str().unwrap()), aim);
             close(p.x, f(&c["expect"]["x"]), name);
             close(p.y, f(&c["expect"]["y"]), name);
             assert_eq!(side_name(p.side), c["expect"]["side"].as_str().unwrap(), "{name}");

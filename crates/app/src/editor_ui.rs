@@ -484,6 +484,13 @@ impl Editor {
             }
         }
         self.shift = ctx.input(|i| i.modifiers.shift);
+        // A pick for the guide card's spot ends when the window loses the keyboard.
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
+            self.cancel_card_pick();
+        }
+        // A press off the guide card ends typing on it before anything else sees the press.
+        let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
+        self.end_card_typing_on_press(&ctx, press);
         self.video_keys(&ctx);
         self.shortcuts(&ctx);
         self.video_tick(&ctx);
@@ -586,6 +593,10 @@ impl Editor {
     }
 
     fn set_tool(&mut self, tool: Tool) {
+        if tool != self.tool {
+            // Another tool ends a pick for the guide card's spot.
+            self.cancel_card_pick();
+        }
         self.tool = tool;
         self.crop = None;
         if tool != Tool::Select {
@@ -1073,10 +1084,16 @@ impl Editor {
                     ui.separator();
                     self.card_undo_status(ui);
                 }
-                match &self.status {
-                    Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
-                    None => ui.label(egui::RichText::new(dirty).color(muted)),
+                // A long message (an export path) is cut with an ellipsis before the zoom controls and shown whole on hover.
+                let text = match &self.status {
+                    Some((msg, clock)) => format!("{clock} – {msg}"),
+                    None => dirty.to_string(),
                 };
+                ui.scope(|ui| {
+                    ui.set_max_width(status_width(ui.available_width()));
+                    // A cut label shows its whole text as a tooltip by itself.
+                    ui.add(egui::Label::new(egui::RichText::new(&text).color(muted)).truncate());
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let z = self.zoom.unwrap_or(self.last_canvas.zoom);
@@ -1630,10 +1647,8 @@ impl Editor {
                 }
             }
         }
-        // Tour view: an amber ring where the step's click landed. Editor chrome, never exported.
-        if let Some(c) = self.video.as_ref().and_then(crate::tour_view::click_point) {
-            painter.circle_stroke(to_scr(c), 16.0, Stroke::new(3.0, crate::tour_view::AMBER));
-        }
+        // Tour view: the step's hotspot as the tour draws it. Editor chrome, never exported.
+        self.draw_tour_hotspot(ui.ctx(), &painter, to_scr);
         // Tour view: the step's guide card, drawn over the canvas and never into the frame.
         if self.in_tour_view() {
             self.draw_guide_card(ui, &painter, z, to_scr);
@@ -1800,6 +1815,15 @@ fn tool_hint(tool: Tool) -> &'static str {
     }
 }
 
+/// Room the zoom controls take at the right of the status bar: the zoom menu, two buttons and spacing.
+const STATUS_ZOOM_W: f32 = 150.0;
+
+/// The width the status message may use when `available` is left in the status bar, so it never
+/// runs under the zoom controls.
+fn status_width(available: f32) -> f32 {
+    (available - STATUS_ZOOM_W).max(0.0)
+}
+
 fn to_color32(c: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(c.0[0], c.0[1], c.0[2], c.0[3])
 }
@@ -1867,6 +1891,12 @@ mod tests {
     fn ctrl(key: Key) -> egui::Event {
         // On Windows egui reports Ctrl as both ctrl and command.
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::CTRL | Modifiers::COMMAND }
+    }
+
+    #[test]
+    fn the_status_message_stops_before_the_zoom_controls() {
+        assert_eq!(status_width(900.0), 900.0 - STATUS_ZOOM_W);
+        assert_eq!(status_width(40.0), 0.0, "never a negative width on a narrow window");
     }
 
     /// Ctrl+C, X and V arrive as egui's Copy, Cut and Paste events, never as

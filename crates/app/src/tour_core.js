@@ -79,7 +79,12 @@ var TourCore = (function () {
   // "auto", "top", "bottom", "left" or "right". Returns {x, y, side}; side
   // "docked" means under the image at full width, also when the box holds a value
   // that is not a finite number.
-  function placeCard(imgW, imgH, cardW, cardH, avoid, placement) {
+  //
+  // `aim` ({x, y} or omitted) is a spot the card points at while it keeps clear of `avoid`, such as
+  // a spot picked inside or beside a spotlight: the card is centred on the aim along the side it
+  // takes, keeps clear of the aim as well as the box, and when the aim lies outside the box the
+  // side facing it is tried right after the asked side. An aim that is not finite is ignored.
+  function placeCard(imgW, imgH, cardW, cardH, avoid, placement, aim) {
     if (!avoid) {
       return { x: (imgW - cardW) / 2, y: imgH - cardH - BOTTOM_INSET, side: "none" };
     }
@@ -88,17 +93,29 @@ var TourCore = (function () {
     }
     var x0 = Math.min(avoid.x0, avoid.x1), x1 = Math.max(avoid.x0, avoid.x1);
     var y0 = Math.min(avoid.y0, avoid.y1), y1 = Math.max(avoid.y0, avoid.y1);
+    var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     var order = ["bottom", "top", "right", "left"];
+    if (aim && finite(aim.x) && finite(aim.y)) {
+      // The side of the box the aim lies beyond, if any: the one it is furthest past.
+      var past = [["bottom", aim.y - y1], ["top", y0 - aim.y], ["right", aim.x - x1], ["left", x0 - aim.x]], facing = null, most = 0;
+      for (var k = 0; k < past.length; k++) {
+        if (past[k][1] > most) { most = past[k][1]; facing = past[k][0]; }
+      }
+      if (facing) order = [facing].concat(order.filter(function (s) { return s !== facing; }));
+      x0 = Math.min(x0, aim.x); x1 = Math.max(x1, aim.x);
+      y0 = Math.min(y0, aim.y); y1 = Math.max(y1, aim.y);
+      cx = aim.x; cy = aim.y;
+    }
     if (order.indexOf(placement) >= 0) {
       order = [placement].concat(order.filter(function (s) { return s !== placement; }));
     }
     for (var i = 0; i < order.length; i++) {
       var side = order[i], x, y;
       if (side === "bottom" || side === "top") {
-        x = clamp((x0 + x1) / 2 - cardW / 2, MARGIN, imgW - cardW - MARGIN);
+        x = clamp(cx - cardW / 2, MARGIN, imgW - cardW - MARGIN);
         y = side === "bottom" ? y1 + GAP : y0 - GAP - cardH;
       } else {
-        y = clamp((y0 + y1) / 2 - cardH / 2, MARGIN, imgH - cardH - MARGIN);
+        y = clamp(cy - cardH / 2, MARGIN, imgH - cardH - MARGIN);
         x = side === "right" ? x1 + GAP : x0 - GAP - cardW;
       }
       if (x >= MARGIN - SLACK && y >= MARGIN - SLACK && x + cardW <= imgW - MARGIN + SLACK && y + cardH <= imgH - MARGIN + SLACK) {

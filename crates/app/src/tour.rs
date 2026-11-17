@@ -1006,6 +1006,15 @@ mod tests {
     }
 
     #[test]
+    fn preview_draws_the_compact_bar_as_a_light_pill_and_aims_cards_at_a_picked_spot() {
+        let compact = PREVIEW_TEMPLATE.split("#card.compact {").nth(1).unwrap().split('}').next().unwrap();
+        assert!(compact.contains("border-radius: 999px") && compact.contains("background: #fcfcfd") && compact.contains("color: #1b2029"), "{compact}");
+        assert!(PREVIEW_TEMPLATE.contains(r#"var palette = style() === "compact" ? "light" : style();"#));
+        assert!(PREVIEW_TEMPLATE.contains("TourCore.placeCard(W, H, w, h, avoid, cardData.placement, aim)"));
+        assert!(PREVIEW_TEMPLATE.contains(r#"picked: anchor === "point" && !!point"#));
+    }
+
+    #[test]
     fn preview_handles_broken_tours_and_keeps_controls_reachable() {
         // No steps, a missing picture, and a card whose controls are inert until it is visible.
         assert!(PREVIEW_TEMPLATE.contains("This tour has no steps."));
