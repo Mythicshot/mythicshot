@@ -107,8 +107,8 @@ impl Tool {
             Shape::Step { .. } => Tool::Step,
             Shape::Highlight(_) => Tool::Highlight,
             Shape::Obfuscate { .. } => Tool::Obfuscate,
-            // Pasted pictures have no tool, so no style to remember.
-            Shape::Image { .. } => Tool::Select,
+            // Pasted pictures and spotlights have no tool, so no style to remember.
+            Shape::Image { .. } | Shape::Spotlight { .. } => Tool::Select,
         }
     }
 
@@ -669,7 +669,7 @@ impl Editor {
     fn paste_annotation_at(&mut self, at: Option<Pt>) {
         let Some(at) = at else { return self.paste_item(None) };
         let Some((mut shape, style)) = ITEM_CLIPBOARD.lock().ok().and_then(|c| c.as_ref().map(|c| (c.shape.clone(), c.style))) else { return };
-        let b = Item { id: 0, shape: shape.clone(), style, frames: None }.bounds().norm();
+        let b = Item { id: 0, shape: shape.clone(), style, frames: None, pin: None }.bounds().norm();
         shape.translate(at.x - b.x0, at.y - b.y0);
         self.add_copy(shape, style, 0);
     }
@@ -1432,8 +1432,8 @@ impl Editor {
         let pm = match (&self.drag, &self.drag_cache) {
             (Some(drag), Some(cache)) => {
                 let extra: Option<Item> = match drag {
-                    Drag::Create { start, now } => self.shape_from_drag(*start, *now).map(|shape| Item { id: 0, shape, style: self.style, frames: None }),
-                    Drag::Freehand(ps) => Some(Item { id: 0, shape: Shape::Freehand(ps.clone()), style: self.style, frames: None }),
+                    Drag::Create { start, now } => self.shape_from_drag(*start, *now).map(|shape| Item { id: 0, shape, style: self.style, frames: None, pin: None }),
+                    Drag::Freehand(ps) => Some(Item { id: 0, shape: Shape::Freehand(ps.clone()), style: self.style, frames: None, pin: None }),
                     Drag::Move { id, .. } | Drag::Resize { id, .. } | Drag::Endpoint { id, .. } | Drag::Tail { id } => self.doc.item(*id).cloned(),
                     Drag::Crop { .. } => None,
                 };

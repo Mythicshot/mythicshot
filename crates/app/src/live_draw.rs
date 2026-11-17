@@ -165,7 +165,7 @@ impl LiveDraw {
             .iter()
             .filter_map(|st| {
                 let frames = frame_range(&times, st.from_ms, st.until_ms.unwrap_or(u64::MAX))?;
-                Some(Item { id: 0, shape: st.shape.clone(), style: st.style, frames: Some(frames) })
+                Some(Item { id: 0, shape: st.shape.clone(), style: st.style, frames: Some(frames), pin: None })
             })
             .collect()
     }
@@ -231,7 +231,7 @@ fn draw_window(ui: &mut egui::Ui, s: &mut State, size: (u32, u32)) {
 
     // Finished strokes, drawn by the export renderer so they look the same as in the GIF.
     if s.texture.as_ref().is_none_or(|(v, _)| *v != s.version) {
-        let items: Vec<Item> = s.on_screen().map(|st| Item { id: 0, shape: st.shape.clone(), style: st.style, frames: None }).collect();
+        let items: Vec<Item> = s.on_screen().map(|st| Item { id: 0, shape: st.shape.clone(), style: st.style, frames: None, pin: None }).collect();
         if let Some(mut pm) = Pixmap::new(size.0.max(1), size.1.max(1)) {
             render_items_onto(&mut pm, &items);
             let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());

@@ -147,7 +147,14 @@ pub enum Shape {
     Cone(Pt, Pt),
     /// A cone whose wide end is an arc, like a slice of pizza.
     Slice(Pt, Pt),
+    /// Everything outside `rect` is darkened by `dim` percent.
+    Spotlight { rect: Bounds, dim: u8 },
 }
+
+/// Spotlight darkening strength, in percent.
+pub const DEFAULT_DIM: u8 = 60;
+pub const MIN_DIM: u8 = 10;
+pub const MAX_DIM: u8 = 90;
 
 /// How wide cones and slices open, in degrees.
 pub const CONE_SPREAD_DEG: f32 = 45.0;
@@ -193,7 +200,7 @@ impl Shape {
             p.y += dy;
         };
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => *b = b.translate(dx, dy),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } | Shape::Spotlight { rect: b, .. } => *b = b.translate(dx, dy),
             Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => *b = b.translate(dx, dy),
             Shape::Line(a, b) | Shape::Arrow(a, b) | Shape::Cone(a, b) | Shape::Slice(a, b) => {
                 mv(a);
@@ -212,7 +219,7 @@ impl Shape {
     /// The rectangle a shape is resized through, if it has one.
     pub fn rect(&self) -> Option<Bounds> {
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => Some(*b),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } | Shape::Spotlight { rect: b, .. } => Some(*b),
             Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => Some(*b),
             _ => None,
         }
@@ -220,7 +227,7 @@ impl Shape {
 
     pub fn set_rect(&mut self, nb: Bounds) {
         match self {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } => *b = nb,
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Bubble { rect: b, .. } | Shape::Image { rect: b, .. } | Shape::Spotlight { rect: b, .. } => *b = nb,
             Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => *b = nb,
             _ => {}
         }
@@ -263,6 +270,8 @@ pub struct Item {
     pub style: Style,
     /// For recordings (Phase 5): the frames this item shows on. `None` = all.
     pub frames: Option<(u32, u32)>,
+    /// Tour-only: the source frame of the tour step this item belongs to.
+    pub pin: Option<u32>,
 }
 
 impl Item {
@@ -270,7 +279,7 @@ impl Item {
     pub fn bounds(&self) -> Bounds {
         let pad = self.style.width / 2.0;
         match &self.shape {
-            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } => b.norm(),
+            Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Obfuscate { rect: b, .. } | Shape::Image { rect: b, .. } | Shape::Spotlight { rect: b, .. } => b.norm(),
             Shape::Circle(b) | Shape::Group(b) | Shape::Donut(b) | Shape::Cross(b) | Shape::Asterisk(b) => b.norm(),
             Shape::Line(a, b) | Shape::Arrow(a, b) => Bounds::new(*a, *b).norm(),
             Shape::Cone(a, b) => points_bounds(&cone_points(*a, *b)),
@@ -303,13 +312,17 @@ impl Item {
         match &self.shape {
             Shape::Line(a, b) | Shape::Arrow(a, b) => seg_dist(p, *a, *b) <= tol,
             Shape::Freehand(ps) => ps.windows(2).any(|w| seg_dist(p, w[0], w[1]) <= tol),
-            Shape::Rect(b) if self.style.fill.is_none() => {
-                let n = b.norm();
-                n.contains(p, tol) && !Bounds { x0: n.x0 + tol, y0: n.y0 + tol, x1: n.x1 - tol, y1: n.y1 - tol }.contains(p, 0.0)
-            }
+            Shape::Rect(b) if self.style.fill.is_none() => border_hit(b, p, tol),
+            // Only the border, so things inside the box stay clickable.
+            Shape::Spotlight { rect, .. } => border_hit(rect, p, tol),
             _ => self.bounds().contains(p, tol),
         }
     }
+}
+
+fn border_hit(b: &Bounds, p: Pt, tol: f32) -> bool {
+    let n = b.norm();
+    n.contains(p, tol) && !Bounds { x0: n.x0 + tol, y0: n.y0 + tol, x1: n.x1 - tol, y1: n.y1 - tol }.contains(p, 0.0)
 }
 
 pub fn step_radius(font_size: f32) -> f32 {
@@ -422,7 +435,7 @@ impl Document {
         self.checkpoint();
         let id = self.next_id;
         self.next_id += 1;
-        self.items.push(Item { id, shape, style, frames: None });
+        self.items.push(Item { id, shape, style, frames: None, pin: None });
         self.touch();
         id
     }
@@ -565,7 +578,7 @@ mod tests {
             Shape::Slice(pt(10.0, 40.0), pt(90.0, 40.0)),
         ];
         for shape in shapes {
-            let it = Item { id: 1, shape: shape.clone(), style: Style { stroke: Rgba::WHITE, fill, shadow: false, ..Style::default() }, frames: None };
+            let it = Item { id: 1, shape: shape.clone(), style: Style { stroke: Rgba::WHITE, fill, shadow: false, ..Style::default() }, frames: None, pin: None };
             let mut pm = Pixmap::new(100, 80).unwrap();
             render_items_onto(&mut pm, std::slice::from_ref(&it));
             let painted = pm.pixels().iter().filter(|p| p.alpha() > 0).count();
@@ -581,7 +594,7 @@ mod tests {
         assert!(((l.y - r.y).abs() - 66.27).abs() < 0.05);
         // The donut has a hole: its middle stays clear.
         let mut pm = Pixmap::new(100, 80).unwrap();
-        render_items_onto(&mut pm, &[Item { id: 1, shape: Shape::Donut(b), style: Style { fill, ..Style::default() }, frames: None }]);
+        render_items_onto(&mut pm, &[Item { id: 1, shape: Shape::Donut(b), style: Style { fill, ..Style::default() }, frames: None, pin: None }]);
         assert_eq!(pm.pixel(50, 40).unwrap().alpha(), 0);
     }
 
@@ -595,6 +608,47 @@ mod tests {
         // An unfilled rectangle is only hit on its outline.
         assert_eq!(d.hit(pt(40.0, 40.0), 2.0), None);
         assert_eq!(d.next_step_number(), 1);
+    }
+
+    fn grey() -> RgbaImage { RgbaImage::from_pixel(100, 80, image::Rgba([200, 200, 200, 255])) }
+    fn spot(x0: f32, y0: f32, x1: f32, y1: f32, dim: u8) -> Item {
+        Item { id: 1, shape: Shape::Spotlight { rect: Bounds { x0, y0, x1, y1 }, dim }, style: Style::default(), frames: None, pin: None }
+    }
+
+    #[test]
+    fn spotlight_darkens_outside_its_box_only() {
+        let out = render(&grey(), &[spot(20.0, 20.0, 60.0, 60.0, 60)]);
+        assert_eq!(out.get_pixel(40, 40).0, [200, 200, 200, 255]);
+        assert_eq!(out.get_pixel(5, 5).0, [80, 80, 80, 255]);
+        assert_eq!(out.get_pixel(90, 70).0, [80, 80, 80, 255]);
+    }
+
+    #[test]
+    fn two_spotlights_darken_once_and_both_boxes_stay_bright() {
+        let out = render(&grey(), &[spot(10.0, 10.0, 30.0, 30.0, 60), spot(60.0, 40.0, 90.0, 70.0, 60)]);
+        assert_eq!(out.get_pixel(20, 20).0, [200, 200, 200, 255]);
+        assert_eq!(out.get_pixel(75, 55).0, [200, 200, 200, 255]);
+        assert_eq!(out.get_pixel(45, 35).0, [80, 80, 80, 255]);
+    }
+
+    #[test]
+    fn spotlight_strength_is_capped_and_other_items_draw_on_top_of_the_dark() {
+        let out = render(&grey(), &[spot(20.0, 20.0, 60.0, 60.0, 100)]);
+        assert_eq!(out.get_pixel(5, 5).0, [20, 20, 20, 255]); // 90 percent, not black
+        let red = Style { stroke: Rgba([255, 0, 0, 255]), fill: Some(Rgba([255, 0, 0, 255])), shadow: false, ..Style::default() };
+        let rect = Item { id: 2, shape: Shape::Rect(Bounds { x0: 70.0, y0: 10.0, x1: 90.0, y1: 20.0 }), style: red, frames: None, pin: None };
+        // The rectangle comes first in the list and is still drawn over the darkening.
+        let out = render(&grey(), &[rect, spot(20.0, 20.0, 60.0, 60.0, 60)]);
+        assert_eq!(out.get_pixel(80, 15).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn spotlight_is_picked_by_its_border_and_moves_like_a_rectangle() {
+        let mut it = spot(20.0, 20.0, 60.0, 60.0, 60);
+        assert!(it.hit(pt(20.0, 40.0), 4.0));
+        assert!(!it.hit(pt(40.0, 40.0), 4.0));
+        it.shape.translate(5.0, 5.0);
+        assert_eq!(it.bounds(), Bounds { x0: 25.0, y0: 25.0, x1: 65.0, y1: 65.0 });
     }
 
     #[test]

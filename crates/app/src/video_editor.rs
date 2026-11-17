@@ -99,6 +99,7 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
         Shape::Slice(..) => "Pizza slice".into(),
         Shape::Cross(_) => "Cross".into(),
         Shape::Asterisk(_) => "Asterisk".into(),
+        Shape::Spotlight { .. } => "Spotlight".into(),
     }
 }
 
