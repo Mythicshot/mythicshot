@@ -287,10 +287,11 @@ pub struct ExportSpec {
     pub video_fps: u32,
 }
 
-/// An export running on a background thread.
-pub struct EncodeJob {
+/// An export running on a background thread. `T` is what a finished export
+/// reports: the file and its size for GIF, APNG, MP4 and WebM.
+pub struct EncodeJob<T = (PathBuf, u64)> {
     progress: Arc<AtomicU32>,
-    result: Arc<Mutex<Option<Result<(PathBuf, u64), String>>>>,
+    result: Arc<Mutex<Option<Result<T, String>>>>,
 }
 
 impl EncodeJob {
@@ -324,13 +325,30 @@ impl EncodeJob {
         });
         EncodeJob { progress, result }
     }
+}
+
+impl<T: Send + 'static> EncodeJob<T> {
+    /// Run `work` on a background thread. It reports progress, 0.0 to 1.0,
+    /// through the function it is given.
+    pub fn spawn(work: impl FnOnce(&dyn Fn(f32)) -> Result<T, String> + Send + 'static) -> EncodeJob<T> {
+        let progress = Arc::new(AtomicU32::new(0));
+        let result = Arc::new(Mutex::new(None));
+        let (p, r) = (progress.clone(), result.clone());
+        std::thread::spawn(move || {
+            let res = work(&|f| p.store((f * 1000.0) as u32, Ordering::Relaxed));
+            if let Ok(mut slot) = r.lock() {
+                *slot = Some(res);
+            }
+        });
+        EncodeJob { progress, result }
+    }
 
     pub fn progress(&self) -> f32 {
         self.progress.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// The outcome once encoding has finished.
-    pub fn take_result(&self) -> Option<Result<(PathBuf, u64), String>> {
+    /// The outcome once the export has finished.
+    pub fn take_result(&self) -> Option<Result<T, String>> {
         self.result.lock().ok().and_then(|mut r| r.take())
     }
 }
