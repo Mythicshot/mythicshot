@@ -50,6 +50,9 @@ pub struct Settings {
     /// Files from before it existed read as 0, not as today's defaults.
     #[serde(default)]
     pub editor_keys_version: u32,
+    /// Tour platform address for "Publish tour", empty until set. The API token is never
+    /// kept here, only in the OS credential store (see `publish`).
+    pub publish_server: String,
 
     // Phase 1–2 options, read once to fill `destinations`, never written.
     #[serde(skip_serializing)]
@@ -125,6 +128,7 @@ impl Default for Settings {
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor: EditorPrefs::default(),
             editor_keys_version: EDITOR_KEYS_VERSION,
+            publish_server: String::new(),
             open_editor: None,
             save_to_file: None,
             copy_to_clipboard: None,
