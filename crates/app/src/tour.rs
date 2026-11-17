@@ -630,4 +630,32 @@ mod tests {
         write_bundle(&r, &items, &clicks(), &e, "t", &back, flat, |_| true).unwrap();
         assert_eq!(read_json(&back)["steps"][0]["notes"][0]["text"], "Sticky");
     }
+
+    #[test]
+    fn preview_draws_the_layer_from_data_as_plain_text() {
+        assert!(PREVIEW_TEMPLATE.contains("spotlight_dim") && PREVIEW_TEMPLATE.contains(".notes"));
+        assert!(PREVIEW_TEMPLATE.contains("textContent"));
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+            assert!(!PREVIEW_TEMPLATE.contains(banned), "{banned} must not be used");
+        }
+        assert!(PREVIEW_TEMPLATE.contains("prefers-reduced-motion"));
+    }
+
+    #[test]
+    fn preview_notes_are_clipped_to_the_image_and_announced() {
+        assert!(PREVIEW_TEMPLATE.contains(r#"<div id="layer" aria-live="polite">"#));
+        assert!(PREVIEW_TEMPLATE.contains("#layer { position: absolute; inset: 0; z-index: 2; overflow: hidden;"));
+    }
+
+    #[test]
+    fn note_text_cannot_break_out_of_the_preview_page() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let items = [text(10.0, 20.0, "</script><img src=x onerror=alert(1)>", 1)];
+        write_bundle(&r, &items, &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(!html.contains("</script><img"));
+        assert_eq!(read_json(&dir)["steps"][0]["notes"][0]["text"], "</script><img src=x onerror=alert(1)>");
+    }
 }
