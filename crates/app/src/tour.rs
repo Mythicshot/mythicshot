@@ -212,7 +212,7 @@ fn write_into(
         });
     }
     let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
-    let spotlight_dim = if steps.iter().any(|s| s.spotlight.is_some()) { tour_dim(items, &srcs) } else { None };
+    let spotlight_dim = tour_dim(rec, edit, items, &srcs);
     let manifest = Manifest { version: MANIFEST_VERSION, generator: format!("mythicshot {}", env!("CARGO_PKG_VERSION")), title: title.to_string(), steps, spotlight_dim };
 
     let pretty = serde_json::to_string_pretty(&manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
@@ -465,8 +465,8 @@ mod tests {
         assert_eq!(l.spotlight, Some(Area { x: 20.0, y: 25.0, w: 50.0, h: 50.0 }));
         assert_eq!(l.notes, vec![Note::Text { x: 10.0, y: 25.0, text: "Unpaid invoices".into(), size: 25.0, color: "#ff0000".into() }]);
         assert_eq!(step_layer(&r, &edit(&r), &items, 3), StepLayer::default());
-        assert_eq!(tour_dim(&items, &[1, 3, 4]), Some(60));
-        assert_eq!(tour_dim(&items, &[3, 4]), None);
+        assert_eq!(tour_dim(&r, &edit(&r), &items, &[1, 3, 4]), Some(60));
+        assert_eq!(tour_dim(&r, &edit(&r), &items, &[3, 4]), None);
     }
 
     #[test]
@@ -567,5 +567,95 @@ mod tests {
         let err = write_bundle(&r, &[], &clicks(), &e, "t", &dir, flat, |_| true).unwrap_err();
         assert_eq!(err, "Every step has been removed from the tour.");
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn note_size_never_exceeds_100() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 0.0, y0: 0.0, x1: 100.0, y1: 10.0 });
+        let l = step_layer(&r, &e, &[text(5.0, 2.0, "big", 1)], 1);
+        assert!(matches!(&l.notes[0], Note::Text { size, .. } if *size == 100.0), "{:?}", l.notes);
+    }
+
+    #[test]
+    fn rounding_never_pushes_a_box_past_the_edge() {
+        let r = rec();
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 0.0, y0: 0.0, x1: 3.0, y1: 3.0 });
+        // 0.00075 px is 0.03 percent of 3 px; the box to the edge is 99.975, which rounds up to 99.98.
+        let b = Bounds { x0: 0.00075, y0: 0.00075, x1: 10.0, y1: 10.0 };
+        let bubble = pinned(Shape::Bubble { rect: b, tail: pt(1.0, 1.0), text: "Edge".into() }, 1);
+        let l = step_layer(&r, &e, &[bubble, spot(b, 1)], 1);
+        let Note::Bubble { x, y, w, h, size, .. } = l.notes[0].clone() else { panic!("{:?}", l.notes) };
+        assert!(x + w <= 100.0 && y + h <= 100.0, "{x} + {w}, {y} + {h}");
+        assert!(size > 0.0 && size <= 100.0);
+        let a = l.spotlight.unwrap();
+        assert!(a.x + a.w <= 100.0 && a.y + a.h <= 100.0, "{a:?}");
+    }
+
+    #[test]
+    fn tour_dim_counts_only_exported_spotlights_and_stays_in_range() {
+        let r = rec();
+        let dimmed = |b: Bounds, src: u32, dim: u8| pinned(Shape::Spotlight { rect: b, dim }, src);
+        let inside = Bounds { x0: 60.0, y0: 10.0, x1: 90.0, y1: 40.0 };
+        let left_half = Bounds { x0: 0.0, y0: 0.0, x1: 40.0, y1: 40.0 };
+        assert_eq!(tour_dim(&r, &edit(&r), &[dimmed(inside, 1, 0)], &[1, 3, 4]), Some(10));
+        let mut e = edit(&r);
+        e.crop = Some(Bounds { x0: 50.0, y0: 0.0, x1: 100.0, y1: 80.0 });
+        assert_eq!(tour_dim(&r, &e, &[dimmed(left_half, 1, 90), dimmed(inside, 3, 60)], &[1, 3, 4]), Some(60));
+        assert_eq!(tour_dim(&r, &edit(&r), &[dimmed(inside, 1, 80), dimmed(left_half, 1, 40)], &[1, 3, 4]), Some(40));
+    }
+
+    #[test]
+    fn empty_or_blank_text_is_not_a_note() {
+        let r = rec();
+        let blank = pinned(Shape::Bubble { rect: Bounds { x0: 50.0, y0: 40.0, x1: 90.0, y1: 60.0 }, tail: pt(25.0, 20.0), text: " \n\t".into() }, 1);
+        let l = step_layer(&r, &edit(&r), &[text(10.0, 20.0, "", 1), text(10.0, 30.0, "   ", 1), blank], 1);
+        assert!(l.notes.is_empty(), "{:?}", l.notes);
+    }
+
+    #[test]
+    fn a_deleted_step_frame_drops_its_notes_and_undeleting_brings_them_back() {
+        let r = rec();
+        let items = [text(10.0, 20.0, "Sticky", 1)];
+        let mut e = edit(&r);
+        e.deleted.insert(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        write_bundle(&r, &items, &clicks(), &e, "t", &gone, flat, |_| true).unwrap();
+        assert!(!std::fs::read_to_string(gone.join("tour.json")).unwrap().contains("Sticky"));
+        e.deleted.clear();
+        let back = tmp.path().join("back");
+        write_bundle(&r, &items, &clicks(), &e, "t", &back, flat, |_| true).unwrap();
+        assert_eq!(read_json(&back)["steps"][0]["notes"][0]["text"], "Sticky");
+    }
+
+    #[test]
+    fn preview_draws_the_layer_from_data_as_plain_text() {
+        assert!(PREVIEW_TEMPLATE.contains("spotlight_dim") && PREVIEW_TEMPLATE.contains(".notes"));
+        assert!(PREVIEW_TEMPLATE.contains("textContent"));
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+            assert!(!PREVIEW_TEMPLATE.contains(banned), "{banned} must not be used");
+        }
+        assert!(PREVIEW_TEMPLATE.contains("prefers-reduced-motion"));
+    }
+
+    #[test]
+    fn preview_notes_are_clipped_to_the_image_and_announced() {
+        assert!(PREVIEW_TEMPLATE.contains(r#"<div id="layer" aria-live="polite">"#));
+        assert!(PREVIEW_TEMPLATE.contains("#layer { position: absolute; inset: 0; z-index: 2; overflow: hidden;"));
+    }
+
+    #[test]
+    fn note_text_cannot_break_out_of_the_preview_page() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let items = [text(10.0, 20.0, "</script><img src=x onerror=alert(1)>", 1)];
+        write_bundle(&r, &items, &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(!html.contains("</script><img"));
+        assert_eq!(read_json(&dir)["steps"][0]["notes"][0]["text"], "</script><img src=x onerror=alert(1)>");
     }
 }

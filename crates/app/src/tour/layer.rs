@@ -3,7 +3,7 @@
 //!
 //! Positions and sizes are percentages of the exported (cropped) image.
 
-use mythicshot_editor::{Bounds, Item, MAX_DIM, Rgba, Shape};
+use mythicshot_editor::{Bounds, Item, MAX_DIM, MIN_DIM, Rgba, Shape};
 use mythicshot_recording::Recording;
 
 use super::{Point, pct};
@@ -76,51 +76,63 @@ impl Frame {
     fn ph(&self, h: f32) -> f32 {
         pct(h / self.h() * 100.0)
     }
+
+    /// A box at `x0,y0` of size `w,h` in frame pixels as percentages, never ending past 100
+    /// after rounding.
+    fn area(&self, x0: f32, y0: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+        let (x, y) = (self.px(x0), self.py(y0));
+        (x, y, self.pw(w).min(pct(100.0 - x)), self.ph(h).min(pct(100.0 - y)))
+    }
 }
 
 /// The layer of the step whose source frame is `src`, mapped through the crop.
 pub fn step_layer(rec: &Recording, edit: &Edit, items: &[Item], src: usize) -> StepLayer {
+    layer_and_dim(rec, edit, items, src).0
+}
+
+/// The step's layer plus the darkening strength of its exported spotlight, if any.
+fn layer_and_dim(rec: &Recording, edit: &Edit, items: &[Item], src: usize) -> (StepLayer, Option<u8>) {
     let (cx, cy, cw, ch) = crop_px(rec, edit);
     let f = Frame { x0: cx as f32, y0: cy as f32, x1: (cx + cw) as f32, y1: (cy + ch) as f32 };
     let mut layer = StepLayer::default();
+    let mut dim_of_spotlight = None;
     for it in items.iter().filter(|it| is_layer(it) && it.pin.is_some_and(|p| p as usize == src)) {
-        let size = pct(it.style.font_size / f.h() * 100.0);
+        let size = pct(it.style.font_size / f.h() * 100.0).clamp(0.01, 100.0);
         let color = hex(it.style.stroke);
         match &it.shape {
-            Shape::Spotlight { rect, .. } => {
+            Shape::Spotlight { rect, dim } => {
                 // The last pinned spotlight in the list wins; one that leaves the crop is dropped.
                 let b = rect.norm();
                 let c = Bounds { x0: b.x0.max(f.x0), y0: b.y0.max(f.y0), x1: b.x1.min(f.x1), y1: b.y1.min(f.y1) };
-                layer.spotlight = if c.x1 - c.x0 >= 1.0 && c.y1 - c.y0 >= 1.0 { Some(Area { x: f.px(c.x0), y: f.py(c.y0), w: f.pw(c.x1 - c.x0), h: f.ph(c.y1 - c.y0) }) } else { None };
+                (layer.spotlight, dim_of_spotlight) = if c.x1 - c.x0 >= 1.0 && c.y1 - c.y0 >= 1.0 {
+                    let (x, y, w, h) = f.area(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0);
+                    (Some(Area { x, y, w, h }), Some((*dim).clamp(MIN_DIM, MAX_DIM)))
+                } else {
+                    (None, None)
+                };
             }
             Shape::Text { at, text } => {
-                if f.inside(at.x, at.y) {
+                if !text.trim().is_empty() && f.inside(at.x, at.y) {
                     layer.notes.push(Note::Text { x: f.px(at.x), y: f.py(at.y), text: text.clone(), size, color });
                 }
             }
             Shape::Bubble { rect, tail, text } => {
                 let b = rect.norm();
-                if f.inside(b.x0, b.y0) {
-                    let (w, h) = (b.x1.min(f.x1) - b.x0, b.y1.min(f.y1) - b.y0);
+                if !text.trim().is_empty() && f.inside(b.x0, b.y0) {
+                    let (x, y, w, h) = f.area(b.x0, b.y0, b.x1.min(f.x1) - b.x0, b.y1.min(f.y1) - b.y0);
                     let tail = Point { x: f.px(tail.x.clamp(f.x0, f.x1)), y: f.py(tail.y.clamp(f.y0, f.y1)) };
                     let fill = hex(it.style.fill.unwrap_or(Rgba::WHITE));
-                    layer.notes.push(Note::Bubble { x: f.px(b.x0), y: f.py(b.y0), w: f.pw(w), h: f.ph(h), tail, text: text.clone(), size, color, fill });
+                    layer.notes.push(Note::Bubble { x, y, w, h, tail, text: text.clone(), size, color, fill });
                 }
             }
             _ => {}
         }
     }
-    layer
+    (layer, dim_of_spotlight)
 }
 
-/// The tour's darkening strength: the largest `dim` among pinned spotlights on `srcs`, or None.
-pub fn tour_dim(items: &[Item], srcs: &[usize]) -> Option<u8> {
-    items
-        .iter()
-        .filter(|it| it.pin.is_some_and(|p| srcs.contains(&(p as usize))))
-        .filter_map(|it| match it.shape {
-            Shape::Spotlight { dim, .. } => Some(dim.min(MAX_DIM)),
-            _ => None,
-        })
-        .max()
+/// The tour's darkening strength: the largest `dim` (within [`MIN_DIM`]..=[`MAX_DIM`]) among the
+/// spotlights actually exported on the steps `srcs`, or None when no step has one.
+pub fn tour_dim(rec: &Recording, edit: &Edit, items: &[Item], srcs: &[usize]) -> Option<u8> {
+    srcs.iter().filter_map(|&src| layer_and_dim(rec, edit, items, src).1).max()
 }

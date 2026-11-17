@@ -15,11 +15,19 @@
   main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
   #stage { position: relative; display: inline-block; line-height: 0; }
   #shot { display: block; max-width: calc(100vw - 32px); max-height: calc(100vh - 130px); border-radius: 6px; box-shadow: 0 6px 30px rgba(0, 0, 0, .5); }
-  #ring { position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px; padding: 0; border: 3px solid #f2b84b; border-radius: 50%; background: rgba(242, 184, 75, .18); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
+  #dim { position: absolute; inset: 0; z-index: 1; overflow: hidden; border-radius: 6px; pointer-events: none; opacity: 0; transition: opacity .4s ease-out; }
+  #dim.on { opacity: 1; }
+  #dim[hidden] { display: none; }
+  #hole { position: absolute; border-radius: 3px; }
+  #layer { position: absolute; inset: 0; z-index: 2; overflow: hidden; border-radius: 6px; container-type: size; pointer-events: none; line-height: 1.25; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #layer svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .note { position: absolute; white-space: pre; }
+  .bubble-text { position: absolute; display: flex; align-items: center; padding: .45em .6em; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #ring { position: absolute; z-index: 3; width: 36px; height: 36px; margin: -18px 0 0 -18px; padding: 0; border: 3px solid #f2b84b; border-radius: 50%; background: rgba(242, 184, 75, .18); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
   #ring[hidden] { display: none; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(242, 184, 75, .6); } 100% { box-shadow: 0 0 0 20px rgba(242, 184, 75, 0); } }
-  @media (prefers-reduced-motion: reduce) { #ring { animation: none; } }
-  #end { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(22, 24, 29, .72); border-radius: 6px; line-height: 1.4; font-size: 18px; }
+  @media (prefers-reduced-motion: reduce) { #ring { animation: none; } #dim { transition: none; } }
+  #end { display: none; position: absolute; inset: 0; z-index: 4; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(22, 24, 29, .72); border-radius: 6px; line-height: 1.4; font-size: 18px; }
   #end.on { display: flex; }
   #restart { color: #f2b84b; }
   :focus-visible { outline: 3px solid #8ab4ff; outline-offset: 3px; }
@@ -33,6 +41,8 @@
 <main>
   <div id="stage">
     <img id="shot" alt="">
+    <div id="dim" hidden><div id="hole"></div></div>
+    <div id="layer" aria-live="polite"></div>
     <button id="ring" type="button" aria-label="Next step" hidden></button>
     <div id="end"><span>End of tour</span><button id="restart" type="button">Restart</button></div>
   </div>
@@ -45,13 +55,91 @@
 <script>
 const TOUR = /*TOUR_JSON*/;
 (function () {
-  var steps = TOUR.steps, i = 0, done = false;
+  var steps = TOUR.steps, i = 0, done = false, drawn = -1;
   var $ = function (id) { return document.getElementById(id); };
   document.title = TOUR.title + " (local preview)";
   $("title").textContent = TOUR.title;
+  var SVG = "http://www.w3.org/2000/svg";
+  // Layer values come from the manifest: numbers must be finite and colours plain #rrggbb.
+  function num(v) { return typeof v === "number" && isFinite(v) ? Math.min(100, Math.max(0, v)) : null; }
+  function colour(v, fallback) { return typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v) ? v : fallback; }
+  function fontSize(n) { var v = num(n.size); return (v === null || v <= 0 ? 3 : v) + "cqh"; }
+  function svgEl(name, attrs) {
+    var el = document.createElementNS(SVG, name);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+  // The darkening: everything outside the spotlight box, fading in on every step.
+  function drawSpotlight(s) {
+    var dim = $("dim"), a = s.spotlight, strength = typeof TOUR.spotlight_dim === "number" ? TOUR.spotlight_dim : 60;
+    var box = a && [num(a.x), num(a.y), num(a.w), num(a.h)];
+    if (!box || box.indexOf(null) !== -1) { dim.hidden = true; dim.className = ""; return; }
+    var hole = $("hole");
+    hole.style.left = box[0] + "%"; hole.style.top = box[1] + "%";
+    hole.style.width = box[2] + "%"; hole.style.height = box[3] + "%";
+    var alpha = Math.min(90, Math.max(10, strength)) / 100;
+    hole.style.boxShadow = "0 0 0 1.5px rgba(255, 255, 255, .5), 0 0 0 200vmax rgba(0, 0, 0, " + alpha + ")";
+    dim.hidden = false;
+    dim.style.transition = "none"; dim.className = "";
+    void dim.offsetWidth;
+    dim.style.transition = ""; dim.className = "on";
+  }
+  // A rounded box whose outline runs out to the tail point on the side facing it.
+  function bubblePath(x, y, w, h, tx, ty) {
+    var r = Math.min(w, h) * 0.18, cx = x + w / 2, cy = y + h / 2, dx = tx - cx, dy = ty - cy;
+    var inside = tx > x && tx < x + w && ty > y && ty < y + h;
+    var side = inside ? "" : (Math.abs(dy) * w >= Math.abs(dx) * h ? (dy > 0 ? "b" : "t") : (dx > 0 ? "r" : "l"));
+    var sx = Math.max(0, Math.min(w * 0.18, w / 2 - r)), sy = Math.max(0, Math.min(h * 0.18, h / 2 - r));
+    var tail = " L" + tx + " " + ty;
+    var d = "M" + (x + r) + " " + y;
+    if (side === "t") d += " L" + (cx - sx) + " " + y + tail + " L" + (cx + sx) + " " + y;
+    d += " L" + (x + w - r) + " " + y + " Q" + (x + w) + " " + y + " " + (x + w) + " " + (y + r);
+    if (side === "r") d += " L" + (x + w) + " " + (cy - sy) + tail + " L" + (x + w) + " " + (cy + sy);
+    d += " L" + (x + w) + " " + (y + h - r) + " Q" + (x + w) + " " + (y + h) + " " + (x + w - r) + " " + (y + h);
+    if (side === "b") d += " L" + (cx + sx) + " " + (y + h) + tail + " L" + (cx - sx) + " " + (y + h);
+    d += " L" + (x + r) + " " + (y + h) + " Q" + x + " " + (y + h) + " " + x + " " + (y + h - r);
+    if (side === "l") d += " L" + x + " " + (cy + sy) + tail + " L" + x + " " + (cy - sy);
+    d += " L" + x + " " + (y + r) + " Q" + x + " " + y + " " + (x + r) + " " + y + " Z";
+    return d;
+  }
+  // Notes sit at their percentages; font sizes are a share of the displayed image height (cqh).
+  function drawNotes(s) {
+    var layer = $("layer"), notes = Array.isArray(s.notes) ? s.notes : [];
+    var W = s.width > 0 ? s.width : 100, H = s.height > 0 ? s.height : 100;
+    var shapes = svgEl("svg", { viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", "aria-hidden": "true" });
+    var texts = [];
+    notes.forEach(function (n) {
+      if (!n || typeof n !== "object") return;
+      var x = num(n.x), y = num(n.y), el = document.createElement("div");
+      if (x === null || y === null || typeof n.text !== "string") return;
+      el.style.left = x + "%"; el.style.top = y + "%";
+      el.style.fontSize = fontSize(n);
+      el.textContent = n.text;
+      if (n.kind === "bubble") {
+        var w = num(n.w), h = num(n.h), tx = n.tail && num(n.tail.x), ty = n.tail && num(n.tail.y);
+        if (w === null || h === null || w <= 0 || h <= 0) return;
+        if (tx === null || ty === null) { tx = x + w / 2; ty = y + h / 2; }
+        shapes.appendChild(svgEl("path", {
+          d: bubblePath(x * W / 100, y * H / 100, w * W / 100, h * H / 100, tx * W / 100, ty * H / 100),
+          fill: colour(n.fill, "#ffffff"), stroke: colour(n.color, "#1f2430"),
+          "stroke-width": Math.max(2, H / 320), "stroke-linejoin": "round"
+        }));
+        el.className = "bubble-text";
+        el.style.width = w + "%"; el.style.height = h + "%";
+        el.style.color = colour(n.color, "#1f2430");
+      } else if (n.kind === "text") {
+        el.className = "note";
+        el.style.color = colour(n.color, "#ffffff");
+      } else return;
+      texts.push(el);
+    });
+    layer.replaceChildren.apply(layer, [shapes].concat(texts));
+  }
   function show() {
     var s = steps[i], last = i === steps.length - 1;
     $("shot").src = s.image;
+    // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
+    if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
     var finished = done || (last && !s.click);
     var ring = $("ring");
     ring.hidden = !s.click || finished;
