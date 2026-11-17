@@ -4,6 +4,7 @@
 //! click landed. Step images are drawn by [`crate::video::decorate`] with the
 //! overlays off, so annotations and crop match every other export.
 
+mod core;
 mod doc;
 mod encode;
 mod layer;
@@ -780,7 +781,7 @@ mod tests {
             assert_eq!(safe_url(bad), None, "{bad:?}");
         }
         assert_eq!(safe_url("HTTPS://Tours.example.com:8443/a?b=c#d"), Some("https://Tours.example.com:8443/a?b=c#d".into()));
-        assert_eq!(safe_url("https://localhost"), Some("https://localhost".into()));
+        assert_eq!(safe_url("https://localhost"), None);
     }
 
     #[test]
