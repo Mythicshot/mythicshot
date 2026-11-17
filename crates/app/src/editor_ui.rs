@@ -27,12 +27,12 @@ const RAIL: f32 = 84.0;
 /// A tool button on the rail.
 const TOOL_BUTTON: f32 = 36.0;
 /// The rail's sections, like a mockup palette; `None` has no heading.
-/// The Spotlight tool shows only when editing a recording.
+/// The Spotlight and Guide card tools show only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
     (Some("DRAW"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
     (Some("SHAPES"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
-    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Crop]),
+    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub enum Tool {
     Highlight,
     Obfuscate,
     Spotlight,
+    /// A tour step's guide card; Tour view only.
+    Card,
     Crop,
 }
 
@@ -82,6 +84,7 @@ impl Tool {
             Tool::Highlight => "highlight",
             Tool::Obfuscate => "obfuscate",
             Tool::Spotlight => "spotlight",
+            Tool::Card => "card",
             Tool::Crop => "crop",
         }
     }
@@ -116,7 +119,7 @@ impl Tool {
         }
     }
 
-    const ALL: [Tool; 20] = [
+    const ALL: [Tool; 21] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
@@ -136,6 +139,7 @@ impl Tool {
         Tool::Highlight,
         Tool::Obfuscate,
         Tool::Spotlight,
+        Tool::Card,
         Tool::Crop,
     ];
 
@@ -160,6 +164,7 @@ impl Tool {
             Tool::Highlight => Icon::Highlight,
             Tool::Obfuscate => Icon::Obfuscate,
             Tool::Spotlight => Icon::Spotlight,
+            Tool::Card => Icon::Card,
             Tool::Crop => Icon::Crop,
         }
     }
@@ -185,6 +190,7 @@ impl Tool {
             Tool::Highlight => EditorAction::Highlight,
             Tool::Obfuscate => EditorAction::Obfuscate,
             Tool::Spotlight => EditorAction::Spotlight,
+            Tool::Card => EditorAction::Card,
             Tool::Crop => EditorAction::Crop,
         }
     }
@@ -324,7 +330,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context, prefs: crate::settings::EditorPrefs) -> Self {
-        let tool = Tool::from_key(&prefs.tool).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight)).unwrap_or(Tool::Rectangle);
+        let tool = Tool::from_key(&prefs.tool).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle);
         let mut editor = Self {
             doc: Document::new(img),
             title,
@@ -410,6 +416,11 @@ impl Editor {
         self.status = Some((msg.into(), chrono::Local::now().format("%H:%M:%S").to_string()));
     }
 
+    /// The Guide card tool is the current tool.
+    pub(crate) fn tool_is_card(&self) -> bool {
+        self.tool == Tool::Card
+    }
+
     pub(crate) fn text_editing(&self) -> bool {
         self.text.is_some()
     }
@@ -444,6 +455,9 @@ impl Editor {
     }
 
     pub(crate) fn select(&mut self, id: Option<u64>) {
+        if id.is_some() {
+            self.select_card(false);
+        }
         self.selected = id;
         if let Some(it) = id.and_then(|i| self.doc.item(i)) {
             self.style = it.style;
@@ -481,7 +495,9 @@ impl Editor {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            if self.text.take().is_none() && self.crop.take().is_none() && self.drag.take().is_none() {
+            if self.card_escape() {
+                // The guide card stopped typing or was unselected.
+            } else if self.text.take().is_none() && self.crop.take().is_none() && self.drag.take().is_none() {
                 self.select(None);
             }
             self.drag_cache = None;
@@ -518,8 +534,13 @@ impl Editor {
 
     fn run(&mut self, action: EditorAction) {
         if let Some(tool) = Tool::ALL.into_iter().find(|t| t.action() == action) {
-            // The screenshot editor has no Spotlight tool.
-            if tool != Tool::Spotlight || self.video.is_some() {
+            // The screenshot editor has no Spotlight tool, and guide cards live in the Tour view.
+            let usable = match tool {
+                Tool::Spotlight => self.video.is_some(),
+                Tool::Card => self.in_tour_view(),
+                _ => true,
+            };
+            if usable {
                 self.set_tool(tool);
             }
             return;
@@ -538,6 +559,8 @@ impl Editor {
             EditorAction::Delete => {
                 if let Some(id) = self.selected.take() {
                     self.doc.remove(id);
+                } else if self.card_selected() {
+                    self.remove_card();
                 }
             }
             EditorAction::Copy if self.selected.is_some() => self.copy_item(),
@@ -563,6 +586,9 @@ impl Editor {
         if tool != Tool::Select {
             self.selected = None;
             self.load_tool_style(tool);
+        }
+        if !matches!(tool, Tool::Select | Tool::Card) {
+            self.select_card(false);
         }
         if tool != Tool::Crop && self.prefs.tool != tool.key() {
             self.prefs.tool = tool.key().to_string();
@@ -905,6 +931,10 @@ impl Editor {
     /// Colour, fill, width, text size, shadow and, for a selection, its actions.
     fn properties_row(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.x = 6.0;
+        // A guide card has no colours or widths of its own: the tour's style draws it.
+        if self.in_tour_view() && (self.tool == Tool::Card || self.card_selected()) {
+            return self.card_properties(ui);
+        }
         let before = self.style;
         let before_mode = self.obfuscate;
 
@@ -990,7 +1020,7 @@ impl Editor {
                         ui.add_space(4.0);
                         ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(10.0).strong().color(ACCENT)));
                     }
-                    let tools: Vec<Tool> = tools.iter().copied().filter(|t| *t != Tool::Spotlight || self.video.is_some()).collect();
+                    let tools: Vec<Tool> = tools.iter().copied().filter(|t| !matches!(t, Tool::Spotlight | Tool::Card) || self.video.is_some()).collect();
                     for row in tools.chunks(2) {
                         ui.horizontal(|ui| {
                             for &tool in row {
@@ -1007,7 +1037,9 @@ impl Editor {
     fn rail_button(&mut self, ui: &mut egui::Ui, tool: Tool) {
         let binding = self.keys.get(&tool.action()).map(String::as_str).unwrap_or("");
         let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
-        let resp = icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip);
+        // Guide cards belong to tour steps: the tool works only in the Tour view.
+        let usable = tool != Tool::Card || self.in_tour_view();
+        let resp = ui.add_enabled_ui(usable, |ui| icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip)).inner.on_disabled_hover_text("Open the Tour view to add guide cards");
         let key = hotkeys::display(binding);
         if !key.is_empty() && key.chars().count() <= 2 {
             let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
@@ -1034,6 +1066,7 @@ impl Editor {
                 if self.in_tour_view() {
                     ui.label(egui::RichText::new(crate::tour_view::STATUS).color(muted));
                     ui.separator();
+                    self.card_undo_status(ui);
                 }
                 match &self.status {
                     Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
@@ -1080,24 +1113,29 @@ impl Editor {
         let resp = ui.add(egui::Slider::new(&mut dim, MIN_DIM..=MAX_DIM).suffix("%")).on_hover_text("How dark everything outside a spotlight gets. One strength for every spotlight.");
         let dragging = self.video.as_ref().is_some_and(|v| v.tour.dim_dragging);
         if resp.changed() {
-            let ids: Vec<u64> = self.doc.items().iter().filter(|it| matches!(it.shape, Shape::Spotlight { .. })).map(|it| it.id).collect();
-            if !ids.is_empty() && !dragging {
-                self.doc.checkpoint();
-            }
-            for id in ids {
-                self.doc.update(id, |it| {
-                    if let Shape::Spotlight { dim: d, .. } = &mut it.shape {
-                        *d = dim;
-                    }
-                });
-            }
-            if self.prefs.spotlight_dim != dim {
-                self.prefs.spotlight_dim = dim;
-                self.prefs_changed = true;
-            }
+            self.apply_spotlight_dim(dim, !dragging);
         }
         if let Some(v) = self.video.as_mut() {
             v.tour.dim_dragging = resp.dragged();
+        }
+    }
+
+    /// Set every spotlight in the recording to `dim`, in a new undo step when `checkpoint`, and remember it.
+    pub(crate) fn apply_spotlight_dim(&mut self, dim: u8, checkpoint: bool) {
+        let ids: Vec<u64> = self.doc.items().iter().filter(|it| matches!(it.shape, Shape::Spotlight { .. })).map(|it| it.id).collect();
+        if !ids.is_empty() && checkpoint {
+            self.doc.checkpoint();
+        }
+        for id in ids {
+            self.doc.update(id, |it| {
+                if let Shape::Spotlight { dim: d, .. } = &mut it.shape {
+                    *d = dim;
+                }
+            });
+        }
+        if self.prefs.spotlight_dim != dim {
+            self.prefs.spotlight_dim = dim;
+            self.prefs_changed = true;
         }
     }
 
@@ -1198,6 +1236,10 @@ impl Editor {
         }
         if resp.clicked() {
             let Some(p) = resp.interact_pointer_pos().map(to_img) else { return };
+            // A picked spot, a click on the guide card, or the Guide card tool.
+            if self.in_tour_view() && self.card_click(p) {
+                return;
+            }
             match self.tool {
                 Tool::Text => match self.hit(p, tol).filter(|id| matches!(self.doc.item(*id).map(|i| &i.shape), Some(Shape::Text { .. }))) {
                     Some(id) => self.edit_text(id),
@@ -1252,7 +1294,7 @@ impl Editor {
                 self.drag = Some(Drag::Freehand(vec![p]));
                 self.build_cache(None);
             }
-            Tool::Text | Tool::Step => {}
+            Tool::Text | Tool::Step | Tool::Card => {}
             _ => {
                 self.drag = Some(Drag::Create { start: p, now: p });
                 self.build_cache(None);
@@ -1587,6 +1629,10 @@ impl Editor {
         if let Some(c) = self.video.as_ref().and_then(crate::tour_view::click_point) {
             painter.circle_stroke(to_scr(c), 16.0, Stroke::new(3.0, crate::tour_view::AMBER));
         }
+        // Tour view: the step's guide card, drawn over the canvas and never into the frame.
+        if self.in_tour_view() {
+            self.draw_guide_card(ui, &painter, z, to_scr);
+        }
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
@@ -1736,6 +1782,7 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Obfuscate => "Drag over anything private to pixelate or blur it.",
         Tool::Highlight => "Drag over text to highlight it.",
         Tool::Spotlight => "Drag around what matters; everything else is darkened.",
+        Tool::Card => "Click the picture to give this tour step its guide card, then type on the card.",
         Tool::Freehand => "Draw with the mouse held down.",
         Tool::Circle => "Drag out a circle. It stays round.",
         Tool::Group => "Drag around an area to mark it as a group.",

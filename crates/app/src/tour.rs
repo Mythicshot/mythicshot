@@ -12,6 +12,7 @@ mod layer;
 pub use doc::*;
 pub use encode::*;
 pub use layer::*;
+pub use self::core::{Placed, Side, parse_bold, place_card};
 
 use std::path::{Path, PathBuf};
 

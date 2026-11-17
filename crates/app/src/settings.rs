@@ -94,11 +94,37 @@ pub struct EditorPrefs {
     pub export_fps: u32,
     /// Spotlight darkening strength in percent, for the next spotlight and the next recording.
     pub spotlight_dim: u8,
+    /// The last tour's theme and zoom, which the next recording's tour starts with.
+    pub tour_theme: SavedTheme,
+}
+
+/// A tour's look as saved in the settings file: the Tour settings a new recording starts with.
+/// Cover, buttons, end card and autoplay are never remembered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedTheme {
+    /// "dark", "light", "compact" or "auto".
+    pub card_style: String,
+    pub accent: String,
+    /// "pulse", "dot" or "none".
+    pub hotspot: String,
+    pub progress_bar: bool,
+    /// "auto" or "#rrggbb".
+    pub backdrop: String,
+    pub spotlight_soft: bool,
+    pub zoom_enabled: bool,
+    pub zoom_percent: u16,
+}
+
+impl Default for SavedTheme {
+    fn default() -> Self {
+        Self { card_style: "dark".into(), accent: crate::tour::DEFAULT_ACCENT.into(), hotspot: "pulse".into(), progress_bar: true, backdrop: "auto".into(), spotlight_soft: true, zoom_enabled: true, zoom_percent: 118 }
+    }
 }
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default() }
     }
 }
 
@@ -289,6 +315,18 @@ crop = \"KeyX\"
         // The old keys are never written back.
         let text = toml::to_string(&Settings { destinations: Some(vec![DestId::File]), ..old }).unwrap();
         assert!(!text.contains("open_editor") && text.contains("destinations"));
+    }
+
+    #[test]
+    fn the_tour_theme_round_trips_and_old_files_get_the_defaults() {
+        let mut s = Settings::default();
+        s.editor.tour_theme = SavedTheme { card_style: "light".into(), accent: "#6aa8f0".into(), hotspot: "dot".into(), progress_bar: false, backdrop: "#20252e".into(), spotlight_soft: false, zoom_enabled: false, zoom_percent: 130 };
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.editor.tour_theme, s.editor.tour_theme);
+        // A file from before guide cards: the defaults, with the calm green accent.
+        let old: Settings = toml::from_str("[editor]\ntool = \"text\"\n").unwrap();
+        assert_eq!(old.editor.tour_theme, SavedTheme::default());
+        assert_eq!((old.editor.tour_theme.card_style.as_str(), old.editor.tour_theme.accent.as_str(), old.editor.tour_theme.zoom_percent), ("dark", "#5dcaa5", 118));
     }
 
     #[test]

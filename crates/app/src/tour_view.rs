@@ -3,7 +3,8 @@
 //!
 //! Items added here are pinned to the step's source frame (`Item::pin`), so
 //! they show only on that step and are written to `tour.json` as the layer.
-//! The canvas, tools and undo are the editor's own.
+//! The canvas, tools and undo are the editor's own. Guide cards and Tour settings
+//! are tour data, not items; see `tour_cards`.
 
 use std::collections::HashMap;
 
@@ -13,7 +14,8 @@ use mythicshot_editor::{Item, Pt, Shape, pt};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::tour::{self, StepPlan};
+use crate::tour::{self, StepPlan, TourDoc};
+use crate::tour_cards::{CardUi, SettingsUi, card_has_text};
 use crate::video::crop_px;
 use crate::video_editor::{VideoState, VideoView};
 
@@ -33,17 +35,23 @@ pub struct TourState {
     thumbs: HashMap<usize, Option<TextureHandle>>,
     /// The strength slider is being dragged, so the drag is one undo step.
     pub dim_dragging: bool,
+    /// The shown step's guide card: selection, typing, the spot being picked, the last removal.
+    pub(crate) card: CardUi,
+    /// The Tour settings panel.
+    pub(crate) settings: SettingsUi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StepMarks {
     pub text: bool,
     pub spotlight: bool,
+    /// A guide card with a title or a body, as it would be exported.
+    pub card: bool,
 }
 
 /// Which badges a step's thumbnail shows.
-pub fn step_marks(items: &[Item], src: usize) -> StepMarks {
-    let mut marks = StepMarks::default();
+pub fn step_marks(items: &[Item], doc: &TourDoc, src: usize) -> StepMarks {
+    let mut marks = StepMarks { card: doc.steps.get(&src).and_then(|s| s.card.as_ref()).is_some_and(card_has_text), ..Default::default() };
     for it in items.iter().filter(|it| it.pin == Some(src as u32)) {
         match it.shape {
             Shape::Text { .. } | Shape::Bubble { .. } => marks.text = true,
@@ -156,9 +164,15 @@ fn step_thumb(ui: &mut egui::Ui, tex: Option<&TextureHandle>, size: Vec2, label:
         Stroke::new(1.0, Color32::from_rgb(52, 59, 72))
     };
     p.rect_stroke(img, 3.0, outline, StrokeKind::Outside);
-    // Badges in the top-right corner: "T" for text or a bubble, the spotlight icon for a spotlight.
+    // Badges in the top-right corner: the card icon for a guide card, "T" for text or a bubble, the spotlight icon for a spotlight.
     let badge_bg = Color32::from_black_alpha(180);
     let mut right = img.right() - 3.0;
+    if marks.card {
+        let r = Rect::from_min_size(pos2(right - 16.0, img.top() + 3.0), Vec2::splat(16.0));
+        p.rect_filled(r, 3.0, badge_bg);
+        icons::paint(p, r.shrink(3.0), Icon::Card, Color32::WHITE);
+        right -= 18.0;
+    }
     if marks.spotlight {
         let r = Rect::from_min_size(pos2(right - 16.0, img.top() + 3.0), Vec2::splat(16.0));
         p.rect_filled(r, 3.0, badge_bg);
@@ -184,6 +198,7 @@ enum TourAction {
     CopyToAll,
     Remove,
     Restore,
+    Settings,
 }
 
 /// `current` when it is the source frame of a planned step, else None
@@ -271,9 +286,13 @@ impl Editor {
     /// Show step `i`: its source frame becomes the current frame.
     fn show_step(&mut self, steps: &[StepPlan], i: usize) {
         let (Some(v), Some(s)) = (self.video.as_mut(), steps.get(i)) else { return };
+        let changed = v.tour_step != i || v.current != s.src;
         v.tour_step = i;
         v.current = s.src;
         v.playing = None;
+        if changed {
+            self.forget_card_ui();
+        }
         self.drop_hidden_selection();
     }
 
@@ -338,8 +357,10 @@ impl Editor {
         // An item pinned to the step that dropped out is off the canvas now: never leave it selected.
         if moved {
             self.drop_hidden_selection();
+            self.forget_card_ui();
         }
-        let marks: Vec<StepMarks> = steps.as_ref().map(|s| s.iter().map(|st| step_marks(self.doc.items(), st.src)).collect()).unwrap_or_default();
+        let doc = &self.video.as_ref().expect("video").edit.tour_doc;
+        let marks: Vec<StepMarks> = steps.as_ref().map(|s| s.iter().map(|st| step_marks(self.doc.items(), doc, st.src)).collect()).unwrap_or_default();
         let can_copy = self.selected.and_then(|id| self.doc.item(id)).is_some_and(|it| it.pin.is_some());
         let mut action = None;
         let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8, 6));
@@ -354,6 +375,9 @@ impl Editor {
                 }
                 if count > 0 {
                     ui.label(RichText::new(format!("Step {} of {count}", v.tour_step + 1)).color(MUTED));
+                }
+                if ui.add(egui::Button::selectable(v.tour.settings.open, "Tour settings")).on_hover_text("Card style, accent colour, zoom, cover, buttons, end card and autoplay").clicked() {
+                    action = Some(TourAction::Settings);
                 }
                 ui.separator();
                 let copy = ui.add_enabled(can_copy, egui::Button::new("Copy to all steps"));
@@ -409,6 +433,7 @@ impl Editor {
                     v.current = steps[next].src;
                     v.tour_step = if next > i { i } else { next };
                     self.drop_hidden_selection();
+                    self.forget_card_ui();
                     ctx.request_repaint();
                 }
             }
@@ -418,10 +443,17 @@ impl Editor {
                 }
                 ctx.request_repaint();
             }
+            Some(TourAction::Settings) => {
+                if let Some(v) = self.video.as_mut() {
+                    v.tour.settings.open = !v.tour.settings.open;
+                }
+            }
         }
+        self.tour_settings_panel(ui);
     }
 
-    /// Debug test hook: the Tour view with a text, a bubble and a spotlight pinned to the first step.
+    /// Debug test hook: the Tour view with a text, a bubble and a spotlight pinned to the first step,
+    /// guide cards on the first two steps, a cover card and an always-on button.
     #[cfg(debug_assertions)]
     pub(crate) fn test_tour_view(&mut self) {
         use mythicshot_editor::Bounds;
@@ -435,13 +467,14 @@ impl Editor {
         let dim = self.prefs.spotlight_dim;
         let id = self.add_item(Shape::Spotlight { rect: Bounds::new(pt(w * 0.25, h * 0.3), pt(w * 0.6, h * 0.7)), dim });
         self.select(Some(id));
+        self.test_guide_cards();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tour::StepPlan;
+    use crate::tour::{StepExtras, StepPlan, TourDoc};
     use mythicshot_editor::{Bounds, Item, Shape, Style, pt};
 
     fn item(id: u64, shape: Shape, pin: Option<u32>) -> Item { Item { id, shape, style: Style::default(), frames: None, pin } }
@@ -451,9 +484,18 @@ mod tests {
     #[test]
     fn badges_follow_the_items_pinned_to_the_step() {
         let items = [item(1, text(), Some(3)), item(2, spot(), Some(7)), item(3, text(), None)];
-        assert_eq!(step_marks(&items, 3), StepMarks { text: true, spotlight: false });
-        assert_eq!(step_marks(&items, 7), StepMarks { text: false, spotlight: true });
-        assert_eq!(step_marks(&items, 9), StepMarks::default());
+        let mut doc = TourDoc::default();
+        assert_eq!(step_marks(&items, &doc, 3), StepMarks { text: true, spotlight: false, card: false });
+        assert_eq!(step_marks(&items, &doc, 7), StepMarks { text: false, spotlight: true, card: false });
+        assert_eq!(step_marks(&items, &doc, 9), StepMarks::default());
+        // A guide card counts once it has a title or a body, as on export.
+        let mut c = crate::tour_cards::new_card(true);
+        doc.steps.insert(9, StepExtras { card: Some(c.clone()), ..Default::default() });
+        assert!(!step_marks(&items, &doc, 9).card, "an empty card is not exported");
+        c.body = "Click Save".into();
+        doc.steps.insert(9, StepExtras { card: Some(c), ..Default::default() });
+        assert_eq!(step_marks(&items, &doc, 9), StepMarks { text: false, spotlight: false, card: true });
+        assert!(!step_marks(&items, &doc, 3).card, "the card belongs to its own step");
     }
 
     #[test]
