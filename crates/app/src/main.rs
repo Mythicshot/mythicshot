@@ -131,8 +131,8 @@ impl App {
             }
         }));
 
-        let mut settings = Settings::load();
-        publish_ui::init(&mut settings);
+        let settings = Settings::load();
+        publish_ui::init(&settings);
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
@@ -885,6 +885,9 @@ impl App {
         if close {
             self.stop_listening();
             self.settings_open = false;
+            if let Ok(mut s) = self.settings_shared.lock() {
+                s.state.publishing.clear_token_field(ctx);
+            }
             return;
         }
 
@@ -904,6 +907,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// A publish still running is cancelled; its temporary folder goes if it has not ended in time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        publish_ui::shutdown(std::time::Duration::from_secs(5));
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent, so the recording frame window can be see-through. Every
         // other window paints its own background.

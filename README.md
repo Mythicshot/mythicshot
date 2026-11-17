@@ -57,7 +57,7 @@ First set it up in Settings › Output › Tour publishing: enter the server add
 > [!WARNING]
 > The API token is a password for your whole workspace: it is kept in Windows Credential Manager, never in `settings.toml`, and is never shown again after you save it.
 
-In the "Publish tour" dialog, upload it as a new tour (the title starts as the recording's) or add it as a new chapter to one of the workspace's tours, then press "Upload draft". The status bar shows the progress; "Cancel publishing" in the export panel stops the upload once the request in flight finishes, and a cancelled or failed upload is withdrawn from the server. The bundle is written to a temporary folder for the upload and removed afterwards; the tour export's limits apply unchanged.
+In the "Publish tour" dialog, upload it as a new tour (the title starts as the recording's) or add it as a new chapter to one of the workspace's tours, then press "Upload draft". The status bar shows the progress; "Cancel publishing" in the export panel stops the upload once the request in flight finishes, and a cancelled or failed upload is withdrawn from the server. Closing the editor or quitting Mythicshot cancels a publish still running. The bundle is written to a temporary folder for the upload and removed afterwards (a folder left behind by a crash is removed at the next start after a day); the tour export's limits apply unchanged.
 
 ## Build
 

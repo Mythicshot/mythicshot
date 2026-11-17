@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, CornerRadius, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
@@ -18,7 +17,7 @@ use mythicshot_recording::{FrameReader, Recording};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::publish::{Published, Target};
-use crate::publish_ui::{self, Picker, PickerOutcome};
+use crate::publish_ui::{self, Picker, PickerOutcome, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::settings_ui::{click_style_label, key_style_label};
 use crate::tour::{self, StepPlan, TourSummary};
@@ -112,7 +111,7 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
 enum ExportJob {
     File(EncodeJob),
     Tour(EncodeJob<TourSummary>),
-    Publish(EncodeJob<Published>, Arc<AtomicBool>),
+    Publish(EncodeJob<Published>, Arc<Run>),
 }
 
 /// What a finished export made.
@@ -148,7 +147,7 @@ impl ExportJob {
     /// For a publish: whether cancel was asked for (None for any other export).
     fn cancelling(&self) -> Option<bool> {
         match self {
-            ExportJob::Publish(_, cancel) => Some(cancel.load(Ordering::Relaxed)),
+            ExportJob::Publish(_, run) => Some(run.is_cancelled()),
             _ => None,
         }
     }
@@ -166,6 +165,14 @@ fn progress_message(is_tour: bool, cancelling: Option<bool>, progress: f32) -> S
 
 /// Share of a publish's progress spent writing the bundle; the upload takes the rest.
 const PUBLISH_WRITE_SHARE: f32 = 0.3;
+
+/// Run a publish's work so that it always ends: a panic becomes a failed publish, and
+/// the run is marked finished either way.
+fn guarded<T>(run: &Arc<Run>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| Err("Publishing failed because of an internal error.".to_string()));
+    run.finish();
+    result
+}
 
 /// A folder for a new tour bundle inside `parent`: `<stem>-tour`, or with
 /// `-2`, `-3` and so on when that name is taken.
@@ -260,8 +267,11 @@ pub struct VideoState {
 
 impl Drop for VideoState {
     /// The recording's temp files go with the editor; an export still running
-    /// keeps them until it finishes.
+    /// keeps them until it finishes. A publish is cancelled: nobody would see its result.
     fn drop(&mut self) {
+        if let Some(ExportJob::Publish(_, run)) = &self.job {
+            run.cancel();
+        }
         let rec = self.rec.clone();
         match self.job.take() {
             None => rec.delete_files(),
@@ -430,11 +440,24 @@ impl Editor {
                 ctx.request_repaint();
             }
         }
-        // The "Publish tour" dialog.
-        if let Some(outcome) = v.picker.as_mut().and_then(|p| p.show(ctx)) {
-            v.picker = None;
-            if let PickerOutcome::Upload { title, target } = outcome {
-                self.start_publish(title, target);
+        // The "Publish tour" dialog. "Upload draft" either starts the upload or keeps the
+        // dialog open with the reason it cannot.
+        match v.picker.as_mut().and_then(|p| p.show(ctx)) {
+            None => {}
+            Some(PickerOutcome::Cancel) => v.picker = None,
+            Some(PickerOutcome::Upload { title, target }) => {
+                let has_steps = tour::plan_steps(&v.rec, &v.edit, &v.events).is_ok();
+                match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status()) {
+                    Some(blocked) => {
+                        if let Some(p) = v.picker.as_mut() {
+                            p.refuse(blocked.refusal());
+                        }
+                    }
+                    None => {
+                        v.picker = None;
+                        self.start_publish(title, target);
+                    }
+                }
             }
         }
         let Some(v) = self.video.as_mut() else { return };
@@ -549,6 +572,11 @@ impl Editor {
     }
 
     /// Open the "Publish tour" dialog, unless an export is running.
+    /// The "Publish tour" dialog is open: the editor takes no shortcuts or canvas input.
+    pub(crate) fn publish_picker_open(&self) -> bool {
+        self.video.as_ref().is_some_and(|v| v.picker.is_some())
+    }
+
     fn open_publish_picker(&mut self) {
         let title = self.title().to_string();
         let Some(v) = self.video.as_mut() else { return };
@@ -567,35 +595,38 @@ impl Editor {
         }
         let server = publish_ui::server();
         let (rec, items, events, edit) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone());
-        let cancel = Arc::new(AtomicBool::new(false));
-        let stop = cancel.clone();
+        let run = Run::begin();
+        let worker = run.clone();
         let job = EncodeJob::spawn(move |progress| {
-            let tmp = tempfile::Builder::new().prefix("mythicshot-publish-").tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
-            let result = (|| {
-                let dir = tmp.path().join("tour");
-                // The editor's reader stays on the UI thread; this one belongs to the publish.
-                let mut reader = FrameReader::new(rec.clone())?;
-                tour::write_bundle(&rec, &items, &events, &edit, &title, &dir, |i| reader.get(i), |f| {
-                    progress(f * PUBLISH_WRITE_SHARE);
-                    !stop.load(Ordering::Relaxed)
-                })?;
-                if stop.load(Ordering::Relaxed) {
-                    return Err(crate::publish::CANCELLED.to_string());
+            guarded(&worker, || {
+                let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
+                worker.set_dir(Some(tmp.path().to_path_buf()));
+                let result = (|| {
+                    let dir = tmp.path().join("tour");
+                    // The editor's reader stays on the UI thread; this one belongs to the publish.
+                    let mut reader = FrameReader::new(rec.clone())?;
+                    tour::write_bundle(&rec, &items, &events, &edit, &title, &dir, |i| reader.get(i), |f| {
+                        progress(f * PUBLISH_WRITE_SHARE);
+                        !worker.is_cancelled()
+                    })?;
+                    if worker.is_cancelled() {
+                        return Err(crate::publish::CANCELLED.to_string());
+                    }
+                    let token = publish_ui::token_for_job()?;
+                    crate::publish::upload_bundle(&server, &token, &dir, &target, |f| {
+                        progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
+                        !worker.is_cancelled()
+                    })
+                })();
+                let shown = tmp.path().display().to_string();
+                if let Err(e) = tmp.close() {
+                    eprintln!("Publish tour: could not remove the temporary folder {shown}: {e}");
                 }
-                let token = publish_ui::token_for_job()?;
-                crate::publish::upload_bundle(&server, &token, &dir, &target, |f| {
-                    progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
-                    !stop.load(Ordering::Relaxed)
-                })
-            })();
-            let shown = tmp.path().display().to_string();
-            if let Err(e) = tmp.close() {
-                eprintln!("Publish tour: could not remove the temporary folder {shown}: {e}");
-            }
-            result
+                result
+            })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Publish(job, cancel));
+            v.job = Some(ExportJob::Publish(job, run));
         }
         self.notify("Publishing tour… 0%");
     }
@@ -604,8 +635,8 @@ impl Editor {
     /// "Cancelling…" shows until it does.
     pub(crate) fn cancel_publish(&mut self) {
         let Some(v) = self.video.as_ref() else { return };
-        if let Some(ExportJob::Publish(_, cancel)) = &v.job {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(ExportJob::Publish(_, run)) = &v.job {
+            run.cancel();
             self.notify("Cancelling…");
         }
     }
@@ -1033,6 +1064,24 @@ mod tests {
         assert_eq!(after_export(true, false, true), StartFileExport);
         assert_eq!(after_export(true, true, false), Nothing);
         assert_eq!(after_export(true, false, false), Nothing);
+    }
+
+    #[test]
+    fn a_panicking_publish_ends_as_a_failure() {
+        let run = Run::begin();
+        let r: Result<(), String> = guarded(&run, || panic!("boom"));
+        assert_eq!(r, Err("Publishing failed because of an internal error.".to_string()));
+        let run = Run::begin();
+        assert_eq!(guarded(&run, || Ok(3)), Ok(3));
+        // A job built on it always gets a result.
+        let job = EncodeJob::spawn(|_| guarded(&Run::begin(), || -> Result<u8, String> { panic!("boom") }));
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut result = None;
+        while result.is_none() && Instant::now() < deadline {
+            result = job.take_result();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(result, Some(Err(_))));
     }
 
     #[test]

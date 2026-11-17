@@ -1,11 +1,14 @@
 //! "Publish tour": the server and token state the editor reads, the reason the
-//! export panel's button is disabled, and the tour picker.
+//! export panel's button is disabled, the running publishes, and the tour picker.
 //!
 //! Everything that talks to the network or the credential store runs on a background
 //! thread. The token is never held here: each background job loads it from the store
 //! itself and drops it when done, so it never reaches the UI thread after it is saved.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
@@ -15,6 +18,17 @@ const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 const ERROR: Color32 = Color32::from_rgb(255, 140, 140);
 const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
 
+/// The server's cap on a tour title, in characters.
+pub const TITLE_MAX: usize = 200;
+/// From this many characters the title field shows its count.
+const TITLE_COUNT_FROM: usize = 180;
+/// Longest tour title shown in a picker row before it is cut with an ellipsis.
+const ROW_TITLE_MAX: usize = 40;
+/// Prefix of the temporary folder a publish writes its bundle into.
+pub const TEMP_PREFIX: &str = "mythicshot-publish-";
+/// A leftover publish folder older than this is removed at start-up.
+const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Whether an API token is saved. The token itself is never kept here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenStatus {
@@ -22,7 +36,8 @@ pub enum TokenStatus {
     Checking,
     Saved,
     Missing,
-    /// The credential store cannot be used (locked, unavailable): the store's message.
+    /// The credential store cannot be used (locked, unavailable), or what it holds is
+    /// not a token: the store's message.
     Unavailable(String),
 }
 
@@ -31,33 +46,46 @@ pub enum TokenStatus {
 /// after a newer one leave the newer answer in place.
 struct Config {
     server: String,
+    /// Debug builds: the server from `MYTHICSHOT_TEST_PUBLISH`, used instead of the saved one
+    /// and never written to the settings file.
+    test_server: Option<String>,
     token: TokenStatus,
     generation: u64,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), token: TokenStatus::Checking, generation: 0 });
+static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0 });
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// At start-up: take the server from the settings and look up the token.
-pub fn init(settings: &mut crate::settings::Settings) {
-    // Test hook: the server to publish to, for a check against a local server. Never the token.
+/// At start-up: take the server from the settings, look up the token and remove
+/// publish folders a crash or a forced quit left behind.
+pub fn init(settings: &crate::settings::Settings) {
+    // Test hook: the server to publish to, for a check against a local server. In memory
+    // only, never saved, and never the token.
     #[cfg(debug_assertions)]
     if let Ok(server) = std::env::var("MYTHICSHOT_TEST_PUBLISH") {
-        settings.publish_server = server;
+        config().test_server = Some(server);
     }
     set_server(&settings.publish_server);
     refresh_token();
+    std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
 }
 
 pub fn set_server(server: &str) {
     config().server = server.to_string();
 }
 
+/// The server publishes go to: the test hook's when set, else the saved one.
 pub fn server() -> String {
-    config().server.clone()
+    let c = config();
+    c.test_server.clone().unwrap_or_else(|| c.server.clone())
+}
+
+/// The test hook's server, when it overrides the saved one.
+pub fn test_server() -> Option<String> {
+    config().test_server.clone()
 }
 
 pub fn token_status() -> TokenStatus {
@@ -97,6 +125,113 @@ pub fn token_for_job() -> Result<String, String> {
         Err(e) => Err(e),
     }
 }
+
+/// Overwrite a string's bytes, then empty it, so a token typed into a field does not
+/// linger in freed memory.
+pub fn wipe(s: &mut String) {
+    let mut bytes = std::mem::take(s).into_bytes();
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference into `bytes`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    drop(bytes);
+}
+
+// ---- Running publishes ----
+
+/// One publish in progress: its cancel flag, whether it has ended, and its temporary folder.
+#[derive(Default)]
+pub struct Run {
+    cancel: AtomicBool,
+    done: AtomicBool,
+    dir: Mutex<Option<PathBuf>>,
+}
+
+static RUNS: Mutex<Vec<Arc<Run>>> = Mutex::new(Vec::new());
+
+fn runs() -> std::sync::MutexGuard<'static, Vec<Arc<Run>>> {
+    RUNS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Run {
+    /// A new publish, known to [`shutdown`] until it finishes.
+    pub fn begin() -> Arc<Run> {
+        let run = Arc::new(Run::default());
+        runs().push(run.clone());
+        run
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dir(&self, dir: Option<PathBuf>) {
+        if let Ok(mut d) = self.dir.lock() {
+            *d = dir;
+        }
+    }
+
+    /// The publish has ended and removed its folder.
+    pub fn finish(self: &Arc<Self>) {
+        self.set_dir(None);
+        self.done.store(true, Ordering::Relaxed);
+        runs().retain(|r| !Arc::ptr_eq(r, self));
+    }
+}
+
+/// On quit: cancel every publish, give them up to `wait` to send their abort, then
+/// remove the temporary folder of any that is still running.
+pub fn shutdown(wait: Duration) {
+    let list: Vec<Arc<Run>> = runs().clone();
+    if list.is_empty() {
+        return;
+    }
+    for r in &list {
+        r.cancel();
+    }
+    let until = Instant::now() + wait;
+    while Instant::now() < until && list.iter().any(|r| !r.done.load(Ordering::Relaxed)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for r in list.iter().filter(|r| !r.done.load(Ordering::Relaxed)) {
+        let dir = r.dir.lock().ok().and_then(|d| d.clone());
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// A folder name `tempfile` gives a publish: the prefix and six letters or digits.
+pub fn is_publish_dir_name(name: &str) -> bool {
+    name.strip_prefix(TEMP_PREFIX).is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Remove publish folders in `temp` older than `age`: only real folders (not links) with
+/// exactly the publish name, holding nothing but the bundle folder `tour`.
+pub fn sweep_stale(temp: &Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(temp) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_str().is_some_and(is_publish_dir_name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !meta.is_dir() || meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|a| a < age) {
+            continue;
+        }
+        let only_bundle = std::fs::read_dir(e.path()).map(|inner| inner.flatten().all(|i| i.file_name() == "tour")).unwrap_or(false);
+        if only_bundle {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+// ---- Why the button is disabled ----
 
 /// Why "Publish tour…" cannot be used right now.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +280,15 @@ impl Blocked {
             Blocked::Checking => Some("Checking for a saved token…".to_string()),
         }
     }
+
+    /// What the picker says when "Upload draft" cannot start: always a sentence.
+    pub fn refusal(&self) -> String {
+        match self {
+            Blocked::Exporting => "Wait for the running export to finish, then upload.".to_string(),
+            Blocked::NoSteps => "This recording has no tour steps to upload.".to_string(),
+            other => other.reason().unwrap_or_default(),
+        }
+    }
 }
 
 fn count(n: u32, one: &str, many: &str) -> String {
@@ -157,8 +301,20 @@ pub fn tour_row_detail(t: &RemoteTour) -> String {
 }
 
 /// A whole picker row as one line: "Title · 3 chapters · 14 steps · draft".
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tour_row_label(t: &RemoteTour) -> String {
     format!("{} · {}", t.title, tour_row_detail(t))
+}
+
+/// A title cut to `max` characters, the last one an ellipsis, when it is longer.
+pub fn short_title(title: &str, max: usize) -> String {
+    if title.chars().count() <= max { title.to_string() } else { format!("{}…", title.chars().take(max.saturating_sub(1)).collect::<String>().trim_end()) }
+}
+
+/// The count shown beside the title field near the limit, "185 / 200".
+pub fn title_count(title: &str) -> Option<String> {
+    let n = title.chars().count();
+    (n >= TITLE_COUNT_FROM).then(|| format!("{n} / {TITLE_MAX}"))
 }
 
 // ---- The picker ----
@@ -191,13 +347,25 @@ pub struct Picker {
     default_title: String,
     choice: Choice,
     list: Arc<Mutex<ListState>>,
+    /// Why the last "Upload draft" could not start.
+    refused: Option<String>,
 }
 
 impl Picker {
+    fn new(server: String, title: &str) -> Picker {
+        let title = short_title(title, TITLE_MAX);
+        Picker { server, title: title.clone(), default_title: title, choice: Choice::New, list: Arc::new(Mutex::new(ListState::Loading)), refused: None }
+    }
+
     pub fn open(server: String, title: String) -> Picker {
-        let picker = Picker { server, title: title.clone(), default_title: title, choice: Choice::New, list: Arc::new(Mutex::new(ListState::Loading)) };
+        let picker = Picker::new(server, &title);
         picker.load();
         picker
+    }
+
+    /// Keep the dialog open and say why the upload did not start.
+    pub fn refuse(&mut self, why: String) {
+        self.refused = Some(why);
     }
 
     fn load(&self) {
@@ -217,10 +385,29 @@ impl Picker {
         });
     }
 
-    /// Draw the dialog; Some once the user cancels or chooses.
+    fn can_upload(&self) -> bool {
+        match self.choice {
+            Choice::New => !self.title.trim().is_empty(),
+            Choice::Tour(_) => true,
+        }
+    }
+
+    fn upload(&self) -> PickerOutcome {
+        match &self.choice {
+            Choice::New => PickerOutcome::Upload { title: self.title.trim().to_string(), target: Target::New },
+            Choice::Tour(id) => PickerOutcome::Upload { title: self.default_title.clone(), target: Target::Chapter(id.clone()) },
+        }
+    }
+
+    /// Draw the dialog; Some once the user cancels or chooses. Escape cancels and Enter
+    /// is "Upload draft" when it can be used; both keys are taken from the editor.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<PickerOutcome> {
         let mut outcome = None;
         let mut retry = false;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            return Some(PickerOutcome::Cancel);
+        }
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         egui::Modal::new(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -232,9 +419,14 @@ impl Picker {
             }
             ui.horizontal(|ui| {
                 ui.add_space(24.0);
-                let edit = egui::TextEdit::singleline(&mut self.title).hint_text("Tour title").desired_width(ui.available_width());
+                let count = title_count(&self.title);
+                let width = ui.available_width() - if count.is_some() { 70.0 } else { 0.0 };
+                let edit = egui::TextEdit::singleline(&mut self.title).char_limit(TITLE_MAX).hint_text("Tour title").desired_width(width);
                 if ui.add_enabled(self.choice == Choice::New, edit).gained_focus() {
                     self.choice = Choice::New;
+                }
+                if let Some(count) = count {
+                    ui.label(RichText::new(count).color(MUTED).size(12.0));
                 }
             });
             ui.add_space(12.0);
@@ -248,7 +440,7 @@ impl Picker {
                         ui.add(egui::Spinner::new());
                         ui.label(RichText::new("Loading tours…").color(MUTED));
                     });
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 ListState::Failed(e) => {
                     ui.add(egui::Label::new(RichText::new(e).color(ERROR)).wrap());
@@ -264,7 +456,7 @@ impl Picker {
                         for t in tours {
                             let chosen = self.choice == Choice::Tour(t.id.clone());
                             ui.horizontal(|ui| {
-                                if ui.radio(chosen, &t.title).on_hover_text(tour_row_label(t)).clicked() {
+                                if ui.radio(chosen, short_title(&t.title, ROW_TITLE_MAX)).on_hover_text(&t.title).clicked() {
                                     self.choice = Choice::Tour(t.id.clone());
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -276,27 +468,24 @@ impl Picker {
                 }
             }
             drop(list);
+            if let Some(why) = &self.refused {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(why).color(ERROR)).wrap());
+            }
             ui.add_space(16.0);
-            let title_ok = !self.title.trim().is_empty();
-            let can_upload = match self.choice {
-                Choice::New => title_ok,
-                Choice::Tour(_) => true,
-            };
+            let can_upload = self.can_upload();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let upload = egui::Button::new(RichText::new("Upload draft").strong()).fill(PRIMARY);
                 if ui.add_enabled(can_upload, upload).clicked() {
-                    outcome = Some(match &self.choice {
-                        Choice::New => PickerOutcome::Upload { title: self.title.trim().to_string(), target: Target::New },
-                        Choice::Tour(id) => PickerOutcome::Upload { title: self.default_title.clone(), target: Target::Chapter(id.clone()) },
-                    });
+                    outcome = Some(self.upload());
                 }
                 if ui.button("Cancel").clicked() {
                     outcome = Some(PickerOutcome::Cancel);
                 }
             });
         });
-        if outcome.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            outcome = Some(PickerOutcome::Cancel);
+        if outcome.is_none() && enter && self.can_upload() {
+            outcome = Some(self.upload());
         }
         if retry {
             self.choice = Choice::New;
@@ -348,10 +537,100 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_upload_always_says_why() {
+        let all = [Blocked::Exporting, Blocked::NoSteps, Blocked::NoServer, Blocked::BadServer("Bad address.".into()), Blocked::NoToken, Blocked::Checking, Blocked::Store("Locked.".into())];
+        for b in all {
+            assert!(!b.refusal().is_empty(), "{b:?}");
+        }
+        assert!(Blocked::Exporting.refusal().contains("export"));
+        assert_eq!(Blocked::NoToken.refusal(), ADD_SERVER_AND_TOKEN);
+    }
+
+    #[test]
     fn picker_rows_name_chapters_steps_and_status() {
         assert_eq!(tour_row_label(&tour("Title", 3, 14, "draft")), "Title · 3 chapters · 14 steps · draft");
         assert_eq!(tour_row_detail(&tour("Customer onboarding", 3, 14, "published")), "3 chapters · 14 steps · published");
         assert_eq!(tour_row_detail(&tour("One", 1, 1, "draft")), "1 chapter · 1 step · draft");
         assert_eq!(tour_row_detail(&tour("Empty", 0, 0, "draft")), "0 chapters · 0 steps · draft");
+    }
+
+    #[test]
+    fn long_titles_are_cut_with_an_ellipsis_and_the_count_shows_near_the_limit() {
+        assert_eq!(short_title("Customer onboarding", 40), "Customer onboarding");
+        assert_eq!(short_title("abcdefghij", 5), "abcd…");
+        assert_eq!(short_title("ab de fghij", 4), "ab…");
+        assert_eq!(short_title(&"é".repeat(41), 40).chars().count(), 40);
+        assert_eq!(title_count(&"a".repeat(179)), None);
+        assert_eq!(title_count(&"a".repeat(185)).as_deref(), Some("185 / 200"));
+        assert_eq!(Picker::new(String::new(), &"x".repeat(250)).title.chars().count(), TITLE_MAX);
+    }
+
+    #[test]
+    fn only_old_publish_folders_with_the_exact_name_are_swept() {
+        assert!(is_publish_dir_name("mythicshot-publish-a1B2c3"));
+        for name in ["mythicshot-publish-", "mythicshot-publish-abc", "mythicshot-publish-abcdefg", "mythicshot-publish-ab.def", "other-abcdef", "Mythicshot-publish-abcdef"] {
+            assert!(!is_publish_dir_name(name), "{name}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, inner: &[&str]| {
+            let d = tmp.path().join(name);
+            std::fs::create_dir(&d).unwrap();
+            for i in inner {
+                std::fs::create_dir(d.join(i)).unwrap();
+            }
+            d
+        };
+        let ours = mk("mythicshot-publish-abc123", &["tour"]);
+        let empty = mk("mythicshot-publish-def456", &[]);
+        let foreign = mk("mythicshot-publish-ghi789", &["tour", "other"]);
+        let unrelated = mk("something-else", &[]);
+        let file = tmp.path().join("mythicshot-publish-jkl012");
+        std::fs::write(&file, b"x").unwrap();
+        // Nothing is old enough yet.
+        sweep_stale(tmp.path(), Duration::from_secs(3600));
+        assert!(ours.exists() && empty.exists());
+        // With no age limit, only our own folders go.
+        sweep_stale(tmp.path(), Duration::ZERO);
+        assert!(!ours.exists() && !empty.exists());
+        assert!(foreign.exists() && unrelated.exists() && file.exists());
+    }
+
+    #[test]
+    fn shutdown_cancels_and_removes_the_folder_of_a_publish_still_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mythicshot-publish-zzz999");
+        std::fs::create_dir_all(dir.join("tour")).unwrap();
+        let run = Run::begin();
+        run.set_dir(Some(dir.clone()));
+        shutdown(Duration::from_millis(100));
+        assert!(run.is_cancelled());
+        assert!(!dir.exists());
+        run.finish();
+        assert!(!runs().iter().any(|r| Arc::ptr_eq(r, &run)));
+    }
+
+    #[test]
+    fn wipe_empties_the_string() {
+        let mut s = String::from("dp_secret");
+        wipe(&mut s);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn enter_uploads_and_escape_cancels_the_picker() {
+        let ctx = egui::Context::default();
+        let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
+        let mut p = Picker::new(String::new(), "Demo");
+        let mut out = None;
+        ctx.run_ui(key(egui::Key::Enter), |ui| out = p.show(ui.ctx())).textures_delta.clear();
+        assert!(matches!(out, Some(PickerOutcome::Upload { ref title, target: Target::New }) if title == "Demo"));
+        let mut out = None;
+        ctx.run_ui(key(egui::Key::Escape), |ui| out = p.show(ui.ctx())).textures_delta.clear();
+        assert!(matches!(out, Some(PickerOutcome::Cancel)));
+        // With no title, Enter does nothing.
+        let mut p = Picker::new(String::new(), "  ");
+        let mut out = None;
+        ctx.run_ui(key(egui::Key::Enter), |ui| out = p.show(ui.ctx())).textures_delta.clear();
+        assert!(out.is_none());
     }
 }
