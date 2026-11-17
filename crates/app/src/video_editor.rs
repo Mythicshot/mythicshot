@@ -600,7 +600,7 @@ impl Editor {
         if self.video.is_none() {
             return;
         }
-        if self.tour_src().is_some() {
+        if self.in_tour_view() {
             return self.tour_panel(ui);
         }
         let mut switched = None;
@@ -795,7 +795,7 @@ impl Editor {
         if self.text_editing() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        if self.tour_src().is_some() {
+        if self.in_tour_view() {
             return self.tour_keys(ctx);
         }
         if let Some(v) = self.video.as_mut() {

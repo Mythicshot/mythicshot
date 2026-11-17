@@ -186,10 +186,27 @@ enum TourAction {
     Restore,
 }
 
+/// `current` when it is the source frame of a planned step, else None
+/// (no plan, or a frame that is not a step), when nothing can be pinned.
+pub fn step_src(steps: &Result<Vec<StepPlan>, String>, current: usize) -> Option<usize> {
+    steps.as_ref().ok()?.iter().any(|s| s.src == current).then_some(current)
+}
+
 impl Editor {
-    /// The source frame of the step shown, while the Tour view is open.
+    /// The Tour view is open, whether or not there are steps.
+    pub(crate) fn in_tour_view(&self) -> bool {
+        self.video.as_ref().is_some_and(|v| v.view == VideoView::Tour)
+    }
+
+    /// The source frame of the step shown, while the Tour view is open and shows a step.
     pub(crate) fn tour_src(&self) -> Option<usize> {
-        self.video.as_ref().filter(|v| v.view == VideoView::Tour).map(|v| v.current)
+        let v = self.video.as_ref().filter(|v| v.view == VideoView::Tour)?;
+        step_src(&tour::plan_steps(&v.rec, &v.edit, &v.events), v.current)
+    }
+
+    /// The Tour view is open without a step to pin to: nothing new may be drawn.
+    pub(crate) fn drawing_blocked(&self) -> bool {
+        self.in_tour_view() && self.tour_src().is_none()
     }
 
     /// Add `shape` pinned to the step on `src`, with no frame range. A
@@ -308,13 +325,19 @@ impl Editor {
         let Some(v) = self.video.as_mut() else { return };
         let steps = tour::plan_steps(&v.rec, &v.edit, &v.events);
         // Keep the shown step in line with the plan after a step is removed or restored.
+        let mut moved = false;
         if let Ok(steps) = &steps {
             v.tour_step = current_step(v, steps);
             if v.current != steps[v.tour_step].src {
                 v.current = steps[v.tour_step].src;
+                moved = true;
                 ctx.request_repaint();
             }
             load_thumbs(v, steps, &ctx);
+        }
+        // An item pinned to the step that dropped out is off the canvas now: never leave it selected.
+        if moved {
+            self.drop_hidden_selection();
         }
         let marks: Vec<StepMarks> = steps.as_ref().map(|s| s.iter().map(|st| step_marks(self.doc.items(), st.src)).collect()).unwrap_or_default();
         let can_copy = self.selected.and_then(|id| self.doc.item(id)).is_some_and(|it| it.pin.is_some());
@@ -403,6 +426,9 @@ impl Editor {
     pub(crate) fn test_tour_view(&mut self) {
         use mythicshot_editor::Bounds;
         self.set_view(VideoView::Tour);
+        if self.drawing_blocked() {
+            return;
+        }
         let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
         self.add_item(Shape::Text { at: pt(w * 0.06, h * 0.06), text: "Start here".into() });
         self.add_item(Shape::Bubble { rect: Bounds::new(pt(w * 0.6, h * 0.1), pt(w * 0.88, h * 0.24)), tail: pt(w * 0.62, h * 0.38), text: "Then click Save".into() });
@@ -457,5 +483,13 @@ mod tests {
         assert_eq!(step_for_frame(&steps, 6), 1);
         assert_eq!(step_for_frame(&steps, 8), 1);
         assert_eq!(step_for_frame(&steps, 50), 2);
+    }
+
+    #[test]
+    fn drawing_needs_a_step_on_the_current_frame() {
+        let steps: Result<Vec<StepPlan>, String> = Ok(vec![StepPlan { src: 2, click: Some((1.0, 1.0)), t_ms: 0 }, StepPlan { src: 9, click: None, t_ms: 0 }]);
+        assert_eq!(step_src(&steps, 2), Some(2));
+        assert_eq!(step_src(&steps, 5), None, "a frame that is not a step");
+        assert_eq!(step_src(&Err("no clicks".into()), 2), None, "no plan, no step");
     }
 }

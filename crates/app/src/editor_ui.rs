@@ -206,6 +206,8 @@ struct TextEdit {
     at: Pt,
     buffer: String,
     focused: bool,
+    /// For new text in the Tour view: the step it was started on, which it is pinned to.
+    step: Option<usize>,
 }
 
 /// What a paste brought from the system clipboard.
@@ -727,6 +729,14 @@ impl Editor {
     /// Add `shape` moved `n` steps down and right, and select it so it can be
     /// dragged into place.
     fn add_copy(&mut self, mut shape: Shape, style: Style, n: u32) {
+        // Spotlights belong to recordings; one copied there can reach a screenshot editor through the shared clipboard.
+        if matches!(shape, Shape::Spotlight { .. }) && self.video.is_none() {
+            self.notify("Spotlights are for recordings only");
+            return;
+        }
+        if self.drawing_blocked() {
+            return;
+        }
         let step = PASTE_OFFSET * n as f32;
         shape.translate(step, step);
         let previous = self.style;
@@ -1021,18 +1031,14 @@ impl Editor {
                     (Some(_), true) => "Unsaved changes",
                     (Some(_), false) => "Saved",
                 };
-                if self.tour_src().is_some() {
+                if self.in_tour_view() {
                     ui.label(egui::RichText::new(crate::tour_view::STATUS).color(muted));
-                    if let Some((msg, clock)) = &self.status {
-                        ui.separator();
-                        ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted));
-                    }
-                } else {
-                    match &self.status {
-                        Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
-                        None => ui.label(egui::RichText::new(dirty).color(muted)),
-                    };
+                    ui.separator();
                 }
+                match &self.status {
+                    Some((msg, clock)) => ui.label(egui::RichText::new(format!("{clock} – {msg}")).color(muted)),
+                    None => ui.label(egui::RichText::new(dirty).color(muted)),
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let z = self.zoom.unwrap_or(self.last_canvas.zoom);
@@ -1195,8 +1201,10 @@ impl Editor {
             match self.tool {
                 Tool::Text => match self.hit(p, tol).filter(|id| matches!(self.doc.item(*id).map(|i| &i.shape), Some(Shape::Text { .. }))) {
                     Some(id) => self.edit_text(id),
-                    None => self.text = Some(TextEdit { item: None, at: p, buffer: String::new(), focused: false }),
+                    None if self.drawing_blocked() => {}
+                    None => self.text = Some(TextEdit { item: None, at: p, buffer: String::new(), focused: false, step: self.tour_src() }),
                 },
+                Tool::Step if self.drawing_blocked() => {}
                 Tool::Step => {
                     let n = self.doc.next_step_number();
                     let id = self.add_item(Shape::Step { center: p, number: n });
@@ -1238,6 +1246,8 @@ impl Editor {
                 }
             }
             Tool::Crop => self.drag = Some(Drag::Crop { start: p, now: p }),
+            // Tour view without a step on this frame: nothing to pin a new item to.
+            _ if self.drawing_blocked() => {}
             Tool::Freehand => {
                 self.drag = Some(Drag::Freehand(vec![p]));
                 self.build_cache(None);
@@ -1359,7 +1369,7 @@ impl Editor {
                 Shape::Bubble { rect, .. } => pt(rect.norm().x0, rect.norm().y0),
                 _ => return,
             };
-            self.text = Some(TextEdit { item: Some(id), at, buffer: it.shape.text().unwrap_or_default().to_string(), focused: false });
+            self.text = Some(TextEdit { item: Some(id), at, buffer: it.shape.text().unwrap_or_default().to_string(), focused: false, step: None });
         }
     }
 
@@ -1373,7 +1383,13 @@ impl Editor {
                 }
             }
             None if !t.buffer.trim().is_empty() => {
-                let id = self.add_item(Shape::Text { at: t.at, text: t.buffer });
+                let shape = Shape::Text { at: t.at, text: t.buffer };
+                let id = match t.step {
+                    // Pinned to the step it was typed on, even if another step is shown now.
+                    Some(src) => self.add_pinned(shape, src),
+                    None if self.drawing_blocked() => return,
+                    None => self.add_item(shape),
+                };
                 self.selected = Some(id);
             }
             None => {}
@@ -1975,6 +1991,34 @@ mod tests {
         let mut cache = to_pixmap(&base);
         render_items_onto(&mut cache, &items);
         assert!(drag_frame(&base, &cache, Some(new), || items.clone()).data() == with_new.data());
+    }
+
+    /// A spotlight copied in a recording editor can reach the screenshot
+    /// editor through the shared clipboard; it has no spotlights, so pasting or duplicating one adds nothing.
+    #[test]
+    fn the_screenshot_editor_refuses_pasted_spotlights() {
+        let mut ed = editor(EditorPrefs::default());
+        let spot = Shape::Spotlight { rect: Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }, dim: 60 };
+        ed.add_copy(spot.clone(), Style::default(), 1);
+        assert!(ed.doc.items().is_empty(), "a pasted spotlight is refused");
+        let id = ed.doc.add(spot, Style::default());
+        ed.select(Some(id));
+        ed.duplicate();
+        assert_eq!(ed.doc.items().len(), 1, "nor is it duplicated");
+        // Everything else still pastes.
+        ed.add_copy(Shape::Rect(Bounds { x0: 1.0, y0: 1.0, x1: 9.0, y1: 9.0 }), Style::default(), 0);
+        assert_eq!(ed.doc.items().len(), 2);
+    }
+
+    /// Text typed on one tour step stays on that step even when the shown step changes before it is committed.
+    #[test]
+    fn new_text_is_pinned_to_the_step_it_was_started_on() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: Some(4) });
+        ed.commit_text();
+        let it = ed.doc.items().last().expect("the text was added");
+        assert_eq!((it.pin, it.frames), (Some(4), None));
+        assert_eq!(ed.selected, Some(it.id));
     }
 
     #[test]
