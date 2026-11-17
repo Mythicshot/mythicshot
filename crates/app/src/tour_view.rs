@@ -6,17 +6,19 @@
 //! The canvas, tools and undo are the editor's own. Guide cards and Tour settings
 //! are tour data, not items; see `tour_cards`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::{self, Color32, ColorImage, FontId, Key, Modifiers, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2};
 use image::RgbaImage;
-use mythicshot_editor::{Item, Pt, Shape, pt};
+use mythicshot_editor::{Bounds, Item, Pt, Shape, pt};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::tour::{self, StepPlan, TourDoc};
 use crate::tour_cards::{CardUi, SettingsUi, card_has_text};
-use crate::video::crop_px;
+use crate::video::{Edit, crop_px};
 use crate::video_editor::{VideoState, VideoView};
 
 pub const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
@@ -28,9 +30,37 @@ const THUMB_W: u32 = 96;
 /// Thumbnails read per frame, so a long tour does not hold up the window.
 const THUMBS_PER_FRAME: usize = 4;
 
+/// What the step plan depends on besides the recording and its input events, which never change.
+#[derive(Clone, PartialEq)]
+struct PlanKey {
+    trim: (usize, usize),
+    deleted: BTreeSet<usize>,
+    crop: Option<Bounds>,
+    removed: BTreeSet<usize>,
+}
+
+impl PlanKey {
+    fn of(edit: &Edit) -> Self {
+        Self { trim: edit.trim, deleted: edit.deleted.clone(), crop: edit.crop, removed: edit.tour_removed.clone() }
+    }
+
+    fn matches(&self, edit: &Edit) -> bool {
+        self.trim == edit.trim && self.crop == edit.crop && self.deleted == edit.deleted && self.removed == edit.tour_removed
+    }
+}
+
+/// A step plan, or why there is none.
+type StepsOrError = Result<Vec<StepPlan>, String>;
+
+/// Tells one editor window's card and panel widgets from another's, so they never share text or undo.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 /// The Tour view's own state, kept with the recording.
-#[derive(Default)]
 pub struct TourState {
+    /// This editor's number, for widget ids.
+    pub(crate) instance: u64,
+    /// The step plan, worked out once and kept until the trim, deleted frames, crop or removed steps change.
+    plan: RefCell<Option<(PlanKey, StepsOrError)>>,
     /// Plain frame thumbnails by source frame; `None` when the frame could not be read.
     thumbs: HashMap<usize, Option<TextureHandle>>,
     /// The strength slider is being dragged, so the drag is one undo step.
@@ -39,6 +69,25 @@ pub struct TourState {
     pub(crate) card: CardUi,
     /// The Tour settings panel.
     pub(crate) settings: SettingsUi,
+}
+
+impl Default for TourState {
+    fn default() -> Self {
+        Self { instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed), plan: RefCell::new(None), thumbs: HashMap::new(), dim_dragging: false, card: CardUi::default(), settings: SettingsUi::default() }
+    }
+}
+
+/// The tour's steps for `v`: worked out once, then reused until something they depend on changes.
+pub(crate) fn planned_steps(v: &VideoState) -> Result<Vec<StepPlan>, String> {
+    let mut plan = v.tour.plan.borrow_mut();
+    match plan.as_ref() {
+        Some((key, steps)) if key.matches(&v.edit) => steps.clone(),
+        _ => {
+            let steps = tour::plan_steps(&v.rec, &v.edit, &v.events);
+            *plan = Some((PlanKey::of(&v.edit), steps.clone()));
+            steps
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,7 +147,7 @@ pub(crate) fn click_point(v: &VideoState) -> Option<Pt> {
     if v.view != VideoView::Tour {
         return None;
     }
-    let steps = tour::plan_steps(&v.rec, &v.edit, &v.events).ok()?;
+    let steps = planned_steps(v).ok()?;
     let step = steps.get(current_step(v, &steps)).filter(|s| s.src == v.current)?;
     let (px, py) = step.click?;
     let (cx, cy, cw, ch) = crop_px(&v.rec, &v.edit);
@@ -216,7 +265,7 @@ impl Editor {
     /// The source frame of the step shown, while the Tour view is open and shows a step.
     pub(crate) fn tour_src(&self) -> Option<usize> {
         let v = self.video.as_ref().filter(|v| v.view == VideoView::Tour)?;
-        step_src(&tour::plan_steps(&v.rec, &v.edit, &v.events), v.current)
+        step_src(&planned_steps(v), v.current)
     }
 
     /// The Tour view is open without a step to pin to: nothing new may be drawn.
@@ -265,8 +314,16 @@ impl Editor {
         }
         v.view = view;
         v.playing = None;
+        if view != VideoView::Tour {
+            // Nothing of a guide card stays selected, typed or half-picked off screen, and its tool goes with it.
+            self.forget_card_ui();
+            if self.tool_is_card() {
+                self.use_select_tool();
+            }
+        }
+        let Some(v) = self.video.as_mut() else { return };
         if view == VideoView::Tour
-            && let Ok(steps) = tour::plan_steps(&v.rec, &v.edit, &v.events)
+            && let Ok(steps) = planned_steps(v)
         {
             v.tour_step = step_for_frame(&steps, v.current);
             v.current = steps[v.tour_step].src;
@@ -305,7 +362,7 @@ impl Editor {
             return;
         }
         let Some(v) = self.video.as_ref() else { return };
-        let Ok(steps) = tour::plan_steps(&v.rec, &v.edit, &v.events) else { return };
+        let Ok(steps) = planned_steps(v) else { return };
         let i = current_step(v, &steps);
         let next = if right { (i + 1).min(steps.len() - 1) } else { i.saturating_sub(1) };
         self.show_step(&steps, next);
@@ -342,7 +399,7 @@ impl Editor {
     pub(crate) fn tour_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(v) = self.video.as_mut() else { return };
-        let steps = tour::plan_steps(&v.rec, &v.edit, &v.events);
+        let steps = planned_steps(v);
         // Keep the shown step in line with the plan after a step is removed or restored.
         let mut moved = false;
         if let Ok(steps) = &steps {

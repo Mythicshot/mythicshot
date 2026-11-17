@@ -421,6 +421,11 @@ impl Editor {
         self.tool == Tool::Card
     }
 
+    /// Back to the Select tool, for when the Guide card tool cannot be used.
+    pub(crate) fn use_select_tool(&mut self) {
+        self.set_tool(Tool::Select);
+    }
+
     pub(crate) fn text_editing(&self) -> bool {
         self.text.is_some()
     }

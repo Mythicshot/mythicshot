@@ -4,6 +4,9 @@
 //! egui overlay above the canvas, where the shared placement rule puts it, so it can
 //! never reach a step image, a GIF or a video. Its counter and Back are filled in, never typed.
 
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 use mythicshot_editor::{Bounds, MAX_DIM, MIN_DIM, Pt, Shape, pt};
@@ -15,7 +18,7 @@ use crate::tour::{
     self, Advance, Anchor, BUTTON_LABEL_MAX, CARD_BODY_MAX, CARD_TITLE_MAX, COVER_BODY_MAX, COVER_BUTTON_MAX, COVER_TITLE_MAX, Card, CardStyle, Cover, DEFAULT_ACCENT, END_TEXT_MAX, EndCard, HotspotStyle, LINK_MAX, Link, NEXT_LABEL_MAX, Placed, Placement, Point, Side, TourDoc, ZOOM_MAX,
     ZOOM_MIN, AUTOPLAY_MAX, AUTOPLAY_MIN, parse_bold, place_card, safe_url,
 };
-use crate::tour_view::{AMBER, click_point};
+use crate::tour_view::{AMBER, click_point, planned_steps};
 use crate::video::crop_px;
 
 /// The card's width on screen, the same as the players draw it.
@@ -137,7 +140,7 @@ pub fn card_has_text(c: &Card) -> bool {
 }
 
 /// Which of a card's texts is being typed in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Field {
     Title,
     Body,
@@ -173,10 +176,64 @@ pub struct SettingsUi {
     primary_url: String,
     secondary_url: String,
     logo_error: Option<String>,
+    /// A chosen logo being checked off the UI thread.
+    logo_job: Option<Receiver<Result<PathBuf, String>>>,
     /// What a switched-off section held, so switching it on again brings it back.
     stash_cover: Option<Cover>,
     stash_cta: Option<Link>,
     stash_end: Option<EndCard>,
+}
+
+/// Give step `src` a new card when it has none. A removed card on that step is forgotten then,
+/// so "Undo" can never overwrite the new one. True when a card was added.
+fn add_card(doc: &mut TourDoc, ui: &mut CardUi, src: usize, has_click: bool) -> bool {
+    let extras = doc.steps.entry(src).or_default();
+    if extras.card.is_some() {
+        return false;
+    }
+    extras.card = Some(new_card(has_click));
+    if ui.removed.as_ref().is_some_and(|(s, _)| *s == src) {
+        ui.removed = None;
+    }
+    true
+}
+
+/// Take step `src`'s card away and remember it for "Undo", in place of any card removed before.
+fn take_card(doc: &mut TourDoc, ui: &mut CardUi, src: usize) -> bool {
+    let Some(card) = doc.steps.get_mut(&src).and_then(|s| s.card.take()) else { return false };
+    *ui = CardUi { removed: Some((src, card)), height: ui.height, ..Default::default() };
+    true
+}
+
+/// "Undo": the removed card comes back on step `shown`, only if it is that card's step and the step has no card now.
+fn undo_removal(doc: &mut TourDoc, ui: &mut CardUi, shown: usize) -> bool {
+    let free = doc.steps.get(&shown).is_none_or(|s| s.card.is_none());
+    if !free || ui.removed.as_ref().is_none_or(|(s, _)| *s != shown) {
+        return false;
+    }
+    let Some((_, card)) = ui.removed.take() else { return false };
+    doc.steps.entry(shown).or_default().card = Some(card);
+    ui.selected = true;
+    true
+}
+
+/// "Undo" is offered only while it would bring back a card without replacing one.
+fn can_undo_removal(doc: &TourDoc, ui: &CardUi, shown: usize) -> bool {
+    ui.removed.as_ref().is_some_and(|(s, _)| *s == shown) && doc.steps.get(&shown).is_none_or(|s| s.card.is_none())
+}
+
+/// The theme to remember after the panel ran: only a change the panel made, never the shared one compared again.
+fn changed_theme(before: &SavedTheme, after: SavedTheme) -> Option<SavedTheme> {
+    (*before != after).then_some(after)
+}
+
+/// Check a chosen logo off the UI thread: decoding and shrinking a large picture takes a moment.
+fn start_logo_check(path: PathBuf) -> Receiver<Result<PathBuf, String>> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(tour::load_logo(&path).map(|_| path));
+    });
+    rx
 }
 
 /// A link field's text written to the tour: the link when it is safe, else nothing.
@@ -201,8 +258,17 @@ fn text_job(pieces: &[(String, bool)], font: &FontId, color: Color32, width: f32
     job
 }
 
+/// The id of one of a card's text boxes: its own per editor window, step and text, so no two
+/// share what is typed or its undo history.
+fn field_id(instance: u64, src: usize, field: Field) -> egui::Id {
+    egui::Id::unique(("tour-card-text", instance, src, field))
+}
+
 /// What a card's texts share while they are drawn.
 struct FieldCtx {
+    /// The editor window and the step's source frame, for the text boxes' ids.
+    instance: u64,
+    src: usize,
     editing: Option<Field>,
     focus: bool,
     clicked: Option<Field>,
@@ -214,7 +280,7 @@ struct FieldCtx {
 fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut String, cap: usize, font: FontId, color: Color32, hint: (&str, Color32), width: f32, multiline: bool, all_bold: bool) {
     if fc.editing == Some(which) {
         let edit = if multiline { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
-        let resp = ui.add(edit.frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
+        let resp = ui.add(edit.id(field_id(fc.instance, fc.src, which)).frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
         if fc.focus {
             resp.request_focus();
             fc.focus = false;
@@ -300,8 +366,7 @@ impl Editor {
     /// The shown step's source frame, its index, the step count and whether it has a click.
     fn card_step(&self) -> Option<(usize, usize, usize, bool)> {
         let src = self.tour_src()?;
-        let v = self.video.as_ref()?;
-        let steps = tour::plan_steps(&v.rec, &v.edit, &v.events).ok()?;
+        let steps = planned_steps(self.video.as_ref()?).ok()?;
         let i = steps.iter().position(|s| s.src == src)?;
         Some((src, i, steps.len(), steps[i].click.is_some()))
     }
@@ -347,6 +412,9 @@ impl Editor {
 
     /// Esc: stop typing on the card, else unselect it. True when the card took the key.
     pub(crate) fn card_escape(&mut self) -> bool {
+        if !self.in_tour_view() || self.shown_card().is_none() {
+            return false;
+        }
         let Some(v) = self.video.as_mut() else { return false };
         let c = &mut v.tour.card;
         if c.editing.is_some() || c.picking {
@@ -368,10 +436,10 @@ impl Editor {
         let card_tool = self.tool_is_card();
         let Some(v) = self.video.as_mut() else { return false };
         let ui = &mut v.tour.card;
-        let extras = v.edit.tour_doc.steps.entry(src).or_default();
+        let doc = &mut v.edit.tour_doc;
         if ui.picking {
             ui.picking = false;
-            if let Some(c) = extras.card.as_mut() {
+            if let Some(c) = doc.steps.get_mut(&src).and_then(|s| s.card.as_mut()) {
                 c.anchor = Anchor::Point;
                 c.point = Some(Point { x: p.x, y: p.y });
             }
@@ -382,8 +450,7 @@ impl Editor {
             (ui.selected, ui.editing) = (false, None);
             return false;
         }
-        if extras.card.is_none() {
-            extras.card = Some(new_card(has_click));
+        if add_card(doc, ui, src, has_click) {
             // The new card's title is ready for typing.
             (ui.editing, ui.focus) = (Some(Field::Title), true);
         }
@@ -395,22 +462,19 @@ impl Editor {
     pub(crate) fn remove_card(&mut self) {
         let Some(src) = self.tour_src() else { return };
         let Some(v) = self.video.as_mut() else { return };
-        let Some(card) = v.edit.tour_doc.steps.get_mut(&src).and_then(|s| s.card.take()) else { return };
-        v.tour.card = CardUi { removed: Some((src, card)), height: v.tour.card.height, ..Default::default() };
+        take_card(&mut v.edit.tour_doc, &mut v.tour.card, src);
     }
 
     /// "Card removed · Undo" in the status bar while the removed card's step is shown.
     pub(crate) fn card_undo_status(&mut self, ui: &mut egui::Ui) {
-        let src = self.tour_src();
+        let Some(src) = self.tour_src() else { return };
         let Some(v) = self.video.as_mut() else { return };
-        let Some((from, _)) = v.tour.card.removed.as_ref().filter(|(s, _)| Some(*s) == src) else { return };
-        let from = *from;
+        if !can_undo_removal(&v.edit.tour_doc, &v.tour.card, src) {
+            return;
+        }
         ui.label(RichText::new("Card removed ·").color(MUTED));
-        if ui.link("Undo").on_hover_text("Bring the guide card back").clicked()
-            && let Some((_, card)) = v.tour.card.removed.take()
-        {
-            v.edit.tour_doc.steps.entry(from).or_default().card = Some(card);
-            v.tour.card.selected = true;
+        if ui.link("Undo").on_hover_text("Bring the guide card back").clicked() {
+            undo_removal(&mut v.edit.tour_doc, &mut v.tour.card, src);
         }
         ui.separator();
     }
@@ -511,12 +575,13 @@ impl Editor {
             if placed.side == Side::Docked { (pos2(crop.left(), crop.bottom() + 8.0), crop.width().max(CARD_W)) } else { (to_scr(pt(cx + placed.x, cy + placed.y)), CARD_W) }
         };
         let selected = state.selected;
-        let mut fc = FieldCtx { editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None };
+        let instance = v.tour.instance;
+        let mut fc = FieldCtx { instance, src, editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None };
         let before = card.clone();
         let next_fill = accent;
         let next_ink = on_accent(accent);
         let clip = ui.clip_rect();
-        let shown = egui::Area::new(egui::Id::unique("tour-guide-card")).fixed_pos(pos).order(egui::Order::Middle).constrain_to(clip).show(ui.ctx(), |ui| {
+        let shown = egui::Area::new(egui::Id::unique(("tour-guide-card", instance))).fixed_pos(pos).order(egui::Order::Middle).constrain_to(clip).show(ui.ctx(), |ui| {
             let frame = egui::Frame::new()
                 .fill(bg)
                 .corner_radius(CornerRadius::same(if compact { 8 } else { CARD_RADIUS }))
@@ -587,13 +652,32 @@ impl Editor {
         let step = self.card_step();
         let dim = self.prefs.spotlight_dim.clamp(MIN_DIM, MAX_DIM);
         let Some(v) = self.video.as_mut() else { return };
+        // A logo being checked lands even while the panel is closed.
+        let s = &mut v.tour.settings;
+        let mut loading = false;
+        if let Some(rx) = &s.logo_job {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    v.edit.tour_doc.logo_path = Some(path);
+                    (s.logo_error, s.logo_job) = (None, None);
+                }
+                Ok(Err(e)) => (s.logo_error, s.logo_job) = (Some(e), None),
+                Err(TryRecvError::Disconnected) => (s.logo_error, s.logo_job) = (Some("Could not check the cover logo.".into()), None),
+                Err(TryRecvError::Empty) => {
+                    loading = true;
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
         if !v.tour.settings.open {
             return;
         }
+        let theme_before = saved_theme(&v.edit.tour_doc);
+        let instance = v.tour.instance;
         let mut new_dim: Option<(u8, bool)> = None;
         let mut close = false;
         let frame = egui::Frame::new().fill(PANEL_BG).inner_margin(Margin::symmetric(12, 10));
-        egui::Panel::right("tour-settings").resizable(false).exact_size(304.0).frame(frame).show(ui, |ui| {
+        egui::Panel::right(("tour-settings", instance)).resizable(false).exact_size(304.0).frame(frame).show(ui, |ui| {
             let (doc, s) = (&mut v.edit.tour_doc, &mut v.tour.settings);
             if !s.loaded {
                 s.loaded = true;
@@ -633,12 +717,16 @@ impl Editor {
                 ui.horizontal(|ui| {
                     for (name, hex) in ACCENTS {
                         let c = parse_hex(hex).unwrap_or(DEFAULT_GREEN);
-                        let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                        let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
                         ui.painter().circle_filled(r.center(), 9.0, c);
                         if t.accent.eq_ignore_ascii_case(hex) {
                             ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, Color32::WHITE));
                         } else if resp.hovered() {
                             ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, MUTED));
+                        }
+                        // Reached with Tab: a ring in the selection colour, outside the others.
+                        if resp.has_focus() {
+                            ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(2.0, SELECT));
                         }
                         if resp.on_hover_text(name).clicked() {
                             t.accent = hex.to_string();
@@ -730,22 +818,21 @@ impl Editor {
                         grid_label(ui, "Logo");
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                if ui.button("Add logo…").on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
+                                if ui.add_enabled(!loading, egui::Button::new("Add logo…")).on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
                                     && let Some(path) = rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]).pick_file()
                                 {
-                                    // Checked now, so a file that is not a usable logo never reaches the tour.
-                                    match tour::load_logo(&path) {
-                                        Ok(_) => {
-                                            doc.logo_path = Some(path);
-                                            s.logo_error = None;
-                                        }
-                                        Err(e) => s.logo_error = Some(e),
-                                    }
+                                    // Checked first, so a file that is not a usable logo never reaches the tour.
+                                    s.logo_job = Some(start_logo_check(path));
+                                    s.logo_error = None;
                                 }
-                                if doc.logo_path.is_some() && ui.button("Remove logo").clicked() {
+                                if doc.logo_path.is_some() && !loading && ui.button("Remove logo").clicked() {
                                     doc.logo_path = None;
+                                    s.logo_error = None;
                                 }
                             });
+                            if loading {
+                                ui.label(RichText::new("Loading logo…").color(MUTED).size(12.0));
+                            }
                             if let Some(name) = doc.logo_path.as_ref().and_then(|p| p.file_name()) {
                                 ui.label(RichText::new(name.to_string_lossy()).color(MUTED).size(12.0));
                             }
@@ -825,19 +912,14 @@ impl Editor {
         if close {
             v.tour.settings.open = false;
         }
-        if let Some((d, checkpoint)) = new_dim {
-            self.apply_spotlight_dim(d, checkpoint);
-        }
-        self.remember_theme();
-    }
-
-    /// The theme and zoom become the next recording's, like the other remembered choices.
-    pub(crate) fn remember_theme(&mut self) {
-        let Some(v) = self.video.as_ref() else { return };
-        let saved = saved_theme(&v.edit.tour_doc);
-        if self.prefs.tour_theme != saved {
+        // The theme and zoom become the next recording's, but only when this panel changed them:
+        // another open recording's theme is never overwritten by this one's.
+        if let Some(saved) = changed_theme(&theme_before, saved_theme(&v.edit.tour_doc)) {
             self.prefs.tour_theme = saved;
             self.prefs_changed = true;
+        }
+        if let Some((d, checkpoint)) = new_dim {
+            self.apply_spotlight_dim(d, checkpoint);
         }
     }
 
@@ -845,7 +927,7 @@ impl Editor {
     #[cfg(debug_assertions)]
     pub(crate) fn test_guide_cards(&mut self) {
         let Some(v) = self.video.as_mut() else { return };
-        let Ok(steps) = tour::plan_steps(&v.rec, &v.edit, &v.events) else { return };
+        let Ok(steps) = planned_steps(v) else { return };
         let texts = [("Start here", "Open the **Invoices** page."), ("Then save", "Click Save to keep your changes.")];
         for (s, (title, body)) in steps.iter().zip(texts) {
             let mut c = new_card(s.click.is_some());
@@ -942,5 +1024,59 @@ mod tests {
         assert!(!card_has_text(&c));
         c.body = "Click Save".into();
         assert!(card_has_text(&c));
+    }
+
+    /// Every step's text boxes, in every editor window, have their own typing and undo history.
+    #[test]
+    fn each_text_box_has_its_own_id_per_window_step_and_field() {
+        let id = field_id(1, 3, Field::Title);
+        assert_eq!(id, field_id(1, 3, Field::Title), "the same box keeps its id from frame to frame");
+        for other in [field_id(1, 4, Field::Title), field_id(1, 3, Field::Body), field_id(1, 3, Field::Next), field_id(2, 3, Field::Title)] {
+            assert_ne!(id, other);
+        }
+    }
+
+    #[test]
+    fn undo_never_replaces_a_card_added_after_the_removal() {
+        let (mut doc, mut ui) = (TourDoc::default(), CardUi::default());
+        assert!(add_card(&mut doc, &mut ui, 3, true));
+        doc.steps.get_mut(&3).unwrap().card.as_mut().unwrap().title = "Old".into();
+        assert!(take_card(&mut doc, &mut ui, 3));
+        assert!(can_undo_removal(&doc, &ui, 3) && !can_undo_removal(&doc, &ui, 4), "offered on its own step only");
+        // A new card on that step: Undo is no longer offered and does nothing.
+        assert!(add_card(&mut doc, &mut ui, 3, true));
+        assert!(ui.removed.is_none(), "the removed card is forgotten once the step has a new one");
+        doc.steps.get_mut(&3).unwrap().card.as_mut().unwrap().title = "New".into();
+        assert!(!can_undo_removal(&doc, &ui, 3));
+        assert!(!undo_removal(&mut doc, &mut ui, 3));
+        assert_eq!(doc.steps[&3].card.as_ref().unwrap().title, "New");
+        // Without a new card, Undo brings the old one back once.
+        assert!(take_card(&mut doc, &mut ui, 3));
+        assert!(undo_removal(&mut doc, &mut ui, 3));
+        assert_eq!(doc.steps[&3].card.as_ref().unwrap().title, "New");
+        assert!(!can_undo_removal(&doc, &ui, 3));
+        // A card added on another step leaves the remembered one alone.
+        assert!(take_card(&mut doc, &mut ui, 3));
+        assert!(add_card(&mut doc, &mut ui, 5, false));
+        assert!(can_undo_removal(&doc, &ui, 3));
+    }
+
+    #[test]
+    fn the_theme_is_remembered_only_when_the_panel_changed_it() {
+        let before = SavedTheme::default();
+        assert_eq!(changed_theme(&before, SavedTheme::default()), None, "an open panel that changed nothing writes nothing");
+        let after = SavedTheme { accent: "#6aa8f0".into(), ..SavedTheme::default() };
+        assert_eq!(changed_theme(&before, after.clone()), Some(after));
+    }
+
+    #[test]
+    fn a_logo_is_checked_off_the_ui_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let html = tmp.path().join("logo.png");
+        std::fs::write(&html, b"<html>").unwrap();
+        assert!(start_logo_check(html).recv().unwrap().unwrap_err().contains("PNG or JPEG"));
+        let good = tmp.path().join("good.png");
+        image::RgbaImage::from_pixel(40, 20, image::Rgba([10, 20, 30, 255])).save(&good).unwrap();
+        assert_eq!(start_logo_check(good.clone()).recv().unwrap(), Ok(good));
     }
 }
