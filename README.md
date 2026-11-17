@@ -48,6 +48,17 @@ Button links must be plain `https://` addresses; anything else shows a warning b
 
 Guide cards, the cover, the end card, the buttons, the hotspot and the progress bar are tour data saved in `tour.json`: none of it is drawn into the step images or appears in GIF, APNG, MP4 or WebM exports.
 
+## Publish tour
+
+"Publish tour…", beside "Export tour…" in the export panel, uploads the tour to your own tour platform as a private draft. Nothing goes public from Mythicshot; you publish the draft on the platform.
+
+First set it up in Settings › Output › Tour publishing: enter the server address (`https://`, or `http://` for `localhost` only), paste the API token from the server's setup page and press Save, then "Test connection", which shows the workspace's name or what went wrong. "Forget" removes the token.
+
+> [!WARNING]
+> The API token is a password for your whole workspace: it is kept in Windows Credential Manager, never in `settings.toml`, and is never shown again after you save it.
+
+In the "Publish tour" dialog, upload it as a new tour (the title starts as the recording's) or add it as a new chapter to one of the workspace's tours, then press "Upload draft". The status bar shows the progress; "Cancel publishing" in the export panel stops the upload once the request in flight finishes, and a cancelled or failed upload is withdrawn from the server. Closing the editor or quitting Mythicshot cancels a publish still running. The bundle is written to a temporary folder for the upload and removed afterwards (a folder left behind by a crash is removed at the next start after a day); the tour export's limits apply unchanged.
+
 ## Build
 
 Built with Rust 1.97 (the oldest working version has not been checked). On Windows, the Visual Studio C++ Build Tools (for the linker and the resource compiler).
@@ -89,7 +100,7 @@ The wizard's banner images come from `installer/make_images.py`. The MSI is not 
 
 ## Privacy
 
-Mythicshot sends nothing anywhere. Key presses are only logged while you record with Keys turned on, stay in memory, and are deleted with the recording. Recordings are kept in the temp folder until you export or discard them.
+Mythicshot sends nothing anywhere, unless you publish a tour: then that tour goes to the server you set in Settings, and nothing else. Key presses are only logged while you record with Keys turned on, stay in memory, and are deleted with the recording. Recordings are kept in the temp folder until you export or discard them.
 
 ## Licence
 

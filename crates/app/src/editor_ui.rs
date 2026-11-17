@@ -491,9 +491,16 @@ impl Editor {
         // A press off the guide card ends typing on it before anything else sees the press.
         let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
         self.end_card_typing_on_press(&ctx, press);
-        self.video_keys(&ctx);
-        self.shortcuts(&ctx);
+        // While the "Publish tour" dialog is open it gets the keys, and the editor behind it is inert.
+        let modal = self.publish_picker_open();
+        if !modal {
+            self.video_keys(&ctx);
+            self.shortcuts(&ctx);
+        }
         self.video_tick(&ctx);
+        if modal {
+            ui.disable();
+        }
         self.toolbar(ui);
         self.status_bar(ui);
         self.timeline(ui);
@@ -1173,7 +1180,7 @@ impl Editor {
             let avail = ui.available_size();
             let fit = ((avail.x - 32.0) / w).min((avail.y - 32.0) / h).clamp(0.05, 1.0);
             // Ctrl + wheel zooms.
-            let wheel = ui.input(|i| if i.modifiers.command { i.smooth_scroll_delta.y } else { 0.0 });
+            let wheel = ui.input(|i| if i.modifiers.command && ui.is_enabled() { i.smooth_scroll_delta.y } else { 0.0 });
             if wheel != 0.0 {
                 let z = self.zoom.unwrap_or(fit);
                 self.zoom = Some((z * (1.0 + wheel * 0.002)).clamp(0.05, 8.0));
