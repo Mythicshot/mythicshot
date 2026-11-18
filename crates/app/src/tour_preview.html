@@ -150,6 +150,7 @@
   <button id="autoplay" type="button" aria-label="Pause autoplay" hidden>Pause</button>
 </footer>
 <div id="status" class="sr" aria-live="polite"></div>
+<!--TOUR_IMAGES-->
 <script>/*TOUR_CORE*/</script>
 <script>
 const TOUR = /*TOUR_JSON*/;
@@ -170,6 +171,13 @@ const TOUR = /*TOUR_JSON*/;
   }
   // Only the bundle's own step images are loaded: step-001.png, step-002.jpg and so on.
   function stepImage(s) { return typeof s.image === "string" && /^step-[0-9]{3,}\.(png|jpg)$/.test(s.image) ? s.image : null; }
+  // A single-file export carries its pictures as data URLs under the same names; a bundle loads the files.
+  var EMBEDDED = typeof TOUR_IMAGES === "object" && TOUR_IMAGES !== null ? TOUR_IMAGES : null;
+  function source(name) {
+    if (!name || !EMBEDDED) return name;
+    var url = Object.prototype.hasOwnProperty.call(EMBEDDED, name) ? EMBEDDED[name] : null;
+    return typeof url === "string" && (url.indexOf("data:image/png;base64,") === 0 || url.indexOf("data:image/jpeg;base64,") === 0) ? url : null;
+  }
   var SVG = "http://www.w3.org/2000/svg";
   // Layer values come from the manifest: numbers must be finite and colours plain #rrggbb.
   function num(v) { return typeof v === "number" && isFinite(v) ? Math.min(100, Math.max(0, v)) : null; }
@@ -252,7 +260,7 @@ const TOUR = /*TOUR_JSON*/;
     // Versions 1 and 2: the plain step-through, exactly as before.
     var show = function () {
       var s = steps[i], last = i === steps.length - 1, img = stepImage(s);
-      if (img) $("shot").src = img; else $("shot").removeAttribute("src");
+      if (source(img)) $("shot").src = source(img); else $("shot").removeAttribute("src");
       // Only a new step redraws the layer, so the end panel or a repeated key does not replay the fade.
       if (i !== drawn) { drawn = i; drawSpotlight(s); drawNotes(s); }
       var finished = done || (last && !s.click);
@@ -506,11 +514,11 @@ const TOUR = /*TOUR_JSON*/;
     var s = steps[i], first = null, kids = [];
     if (phase === "cover") {
       cardKind = "panel";
-      if (cover.logo) {
+      if (source(cover.logo)) {
         var logo = el("img", "p-logo");
         logo.alt = "";
         logo.onerror = function () { logo.remove(); };
-        logo.src = cover.logo;
+        logo.src = source(cover.logo);
         kids.push(logo);
       }
       kids.push(el("div", "p-title", cover.title));
@@ -675,7 +683,7 @@ const TOUR = /*TOUR_JSON*/;
 
   function render() {
     var s = steps[i], fin = finished(), onStep = phase === "step" && !fin;
-    setImage(stepImage(s));
+    setImage(source(stepImage(s)));
     if (phase === "cover") {
       drawn = -1;
       clearSpot();
@@ -713,7 +721,7 @@ const TOUR = /*TOUR_JSON*/;
     var keep = {};
     (phase === "cover" ? [steps[1]] : [steps[i + 1], steps[i - 1]]).forEach(function (t) {
       var src = t && stepImage(t);
-      if (src) keep[src] = preloaded[src] || Object.assign(new Image(), { src: src });
+      if (src && source(src)) keep[src] = preloaded[src] || Object.assign(new Image(), { src: source(src) });
     });
     preloaded = keep;
     refocus();

@@ -106,31 +106,38 @@ fn item_label(it: &mythicshot_editor::Item) -> String {
     }
 }
 
-/// The export running in the editor: a file (GIF, APNG, MP4, WebM), a tour bundle,
-/// or a tour being published, with the flag that cancels it.
+/// Where "Export tour" writes: a folder with the page and its pictures beside it, or one HTML file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TourOutput {
+    Folder,
+    File,
+}
+
+/// The export running in the editor: a file (GIF, APNG, MP4, WebM), a tour bundle or single
+/// file, or a tour being published, with the flag that cancels it.
 enum ExportJob {
     File(EncodeJob),
-    Tour(EncodeJob<TourSummary>),
+    Tour(EncodeJob<TourSummary>, TourOutput),
     Publish(EncodeJob<Published>, Arc<Run>),
 }
 
 /// What a finished export made.
 enum Exported {
     File(PathBuf, u64),
-    Tour(TourSummary),
+    Tour(TourSummary, TourOutput),
     Published(Published),
 }
 
 impl ExportJob {
     /// A tour export or a publish: either one hands "Export and close" over to the file export.
     fn is_tour(&self) -> bool {
-        matches!(self, ExportJob::Tour(_) | ExportJob::Publish(..))
+        matches!(self, ExportJob::Tour(..) | ExportJob::Publish(..))
     }
 
     fn progress(&self) -> f32 {
         match self {
             ExportJob::File(j) => j.progress(),
-            ExportJob::Tour(j) => j.progress(),
+            ExportJob::Tour(j, _) => j.progress(),
             ExportJob::Publish(j, _) => j.progress(),
         }
     }
@@ -139,7 +146,7 @@ impl ExportJob {
     fn take_result(&self) -> Option<Result<Exported, String>> {
         match self {
             ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
-            ExportJob::Tour(j) => j.take_result().map(|r| r.map(Exported::Tour)),
+            ExportJob::Tour(j, out) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
             ExportJob::Publish(j, _) => j.take_result().map(|r| r.map(Exported::Published)),
         }
     }
@@ -217,6 +224,24 @@ fn after_export(was_tour: bool, succeeded: bool, close_after_export: bool) -> Af
         (true, false, true) => AfterExport::Close,
         (true, false, false) => AfterExport::Nothing,
     }
+}
+
+/// The save dialog's suggested name for a single-file tour: the folder export's name as a file.
+fn tour_file_name(stem: &str) -> String {
+    format!("{stem}-tour.html")
+}
+
+/// The status message after a single-file tour export; the status bar adds "· Show in folder".
+fn tour_file_message(steps: usize, bytes: u64) -> String {
+    format!("Tour exported as one file: {} · {:.1} MB", step_count(steps), bytes as f64 / 1_048_576.0)
+}
+
+/// One item of the "Export tour" menu: what it does, with a quieter line saying what you get.
+fn menu_item(ui: &mut egui::Ui, label: &str, hint: &str) -> egui::Response {
+    let mut job = egui::text::LayoutJob::default();
+    RichText::new(label).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Min);
+    RichText::new(format!("\n{hint}")).color(MUTED).size(12.0).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Min);
+    ui.add(egui::Button::new(job))
 }
 
 fn step_count(n: usize) -> String {
@@ -416,6 +441,14 @@ impl Editor {
                 }
             }
         }
+        // Test hook: export the tour once as a single file to the given path, with no dialog.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("MYTHICSHOT_TEST_TOUR_FILE") {
+            static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if self.video.as_ref().is_some_and(|v| v.job.is_none()) && !STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.start_tour_file(PathBuf::from(path));
+            }
+        }
         let Some(v) = self.video.as_mut() else { return };
         // Overlay style changes become the default for the next recording.
         if v.edit.overlays != v.last_overlays {
@@ -478,14 +511,22 @@ impl Editor {
                             eprintln!("{msg}");
                             self.notify(msg);
                         }
-                        Exported::Tour(tour) => {
+                        Exported::Tour(tour, TourOutput::Folder) => {
                             let mut msg = format!("Tour exported: {}", step_count(tour.steps));
                             if let Some(note) = tour.squeezed_note() {
                                 msg = format!("{msg} · {note}");
                             }
-                            eprintln!("{msg} ({:.1} MB) in {}", tour.bytes as f64 / 1_048_576.0, tour.dir.display());
+                            eprintln!("{msg} ({:.1} MB) in {}", tour.bytes as f64 / 1_048_576.0, tour.path.display());
                             self.notify(msg);
-                            crate::platform::open_path(&tour.dir.join("index.html"));
+                            crate::platform::open_path(&tour.path.join("index.html"));
+                        }
+                        // A single file is for sending on: it is not opened, and the status bar offers to show it.
+                        Exported::Tour(tour, TourOutput::File) => {
+                            let msg = tour_file_message(tour.steps, tour.bytes);
+                            let note = tour.squeezed_note().map(|n| format!(" ({n})")).unwrap_or_default();
+                            eprintln!("{msg}{note} at {}", tour.path.display());
+                            self.notify(msg);
+                            self.status_reveal = Some(tour.path);
                         }
                         Exported::Published(p) => {
                             let msg = format!("Tour uploaded as a draft: {}", step_count(p.steps));
@@ -569,7 +610,37 @@ impl Editor {
             })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Tour(job));
+            v.job = Some(ExportJob::Tour(job, TourOutput::Folder));
+        }
+        self.notify("Exporting tour… 0%");
+    }
+
+    /// Ask where to save, then export the tour as one HTML file. The save dialog asks before
+    /// replacing a file that exists.
+    fn export_tour_file(&mut self) {
+        let name = tour_file_name(&tour_stem(&self.dest, chrono::Local::now()));
+        if let Some(path) = rfd::FileDialog::new().set_directory(&self.dest.output_dir).set_file_name(&name).add_filter("Web page", &["html"]).save_file() {
+            self.start_tour_file(path);
+        }
+    }
+
+    /// Export the tour as one self-contained HTML file at `path`, replacing it only once finished.
+    fn start_tour_file(&mut self, path: PathBuf) {
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
+        let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
+        let job = EncodeJob::spawn(move |progress| {
+            // The editor's reader stays on the UI thread; this one belongs to the export.
+            let mut reader = FrameReader::new(rec.clone())?;
+            tour::write_single_file(&rec, &items, &events, &edit, &title, &path, |i| reader.get(i), |f| {
+                progress(f);
+                true
+            })
+        });
+        if let Some(v) = self.video.as_mut() {
+            v.job = Some(ExportJob::Tour(job, TourOutput::File));
         }
         self.notify("Exporting tour… 0%");
     }
@@ -723,17 +794,35 @@ impl Editor {
         ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
         let publishing = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.cancelling());
         let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status());
+        let mut chosen = None;
         ui.horizontal(|ui| {
-            if ui.add_enabled(tour_ok && !exporting, egui::Button::new("Export tour…")).clicked() {
-                self.export_tour();
-                ui.close();
-            }
+            // A menu with both choices every time; neither is remembered. It opens with Enter, Space
+            // or the right arrow, and the arrows move between its items.
+            ui.add_enabled_ui(tour_ok && !exporting, |ui| {
+                ui.menu_button("Export tour", |ui| {
+                    if menu_item(ui, "As a folder…", "A web page with its pictures beside it").clicked() {
+                        chosen = Some(TourOutput::Folder);
+                        ui.close();
+                    }
+                    if menu_item(ui, "As a single file…", "One .html file to send to someone").clicked() {
+                        chosen = Some(TourOutput::File);
+                        ui.close();
+                    }
+                });
+            });
             let publish = egui::Button::new(RichText::new("Publish tour…").strong()).fill(Color32::from_rgb(47, 111, 235));
             if ui.add_enabled(blocked.is_none(), publish).on_hover_text("Upload this tour to your server as a private draft").clicked() {
                 self.open_publish_picker();
                 ui.close();
             }
         });
+        if let Some(out) = chosen {
+            ui.close();
+            match out {
+                TourOutput::Folder => self.export_tour(),
+                TourOutput::File => self.export_tour_file(),
+            }
+        }
         if let Some(reason) = blocked.and_then(|b| b.reason()) {
             ui.add(egui::Label::new(RichText::new(reason).color(MUTED).size(12.0)).wrap());
         }
@@ -1114,6 +1203,20 @@ mod tests {
         let missing = Context { output_dir: tmp.path().join("gone"), ..ctx("a/${title}") };
         assert_eq!(tour_stem(&missing, now), "Demo");
         assert!(!missing.output_dir.exists());
+    }
+
+    #[test]
+    fn a_single_file_tour_is_named_like_the_folder_and_reported_with_its_size() {
+        assert_eq!(tour_file_name("shot-01"), "shot-01-tour.html");
+        assert_eq!(tour_file_message(3, 2_516_582), "Tour exported as one file: 3 steps · 2.4 MB");
+        assert_eq!(tour_file_message(1, 50_000), "Tour exported as one file: 1 step · 0.0 MB");
+    }
+
+    #[test]
+    fn a_single_file_tour_never_closes_the_editor() {
+        // It is a tour like the folder export: "Export and close" hands over to the file export.
+        assert_eq!(after_export(true, true, true), AfterExport::StartFileExport);
+        assert_eq!(after_export(true, false, false), AfterExport::Nothing);
     }
 
     #[test]
