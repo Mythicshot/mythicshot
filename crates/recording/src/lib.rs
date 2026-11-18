@@ -14,7 +14,7 @@ mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
-pub use saved::OpenError;
+pub use saved::{OpenError, SaveError, SaveStep};
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};

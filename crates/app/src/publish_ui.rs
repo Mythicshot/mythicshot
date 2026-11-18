@@ -545,26 +545,52 @@ pub struct PublishDone {
     pub kept: Kept,
 }
 
-/// Before the reason a recording could not be kept.
-pub const NOT_KEPT: &str = "The recording could not be saved on this computer, so this tour can't be edited later: ";
+/// Before the reason a recording could not be kept; true for a new tour and for a chapter
+/// added to one. The wording is proposed and waits for the owner's approval.
+pub const NOT_KEPT: &str = "The recording could not be saved on this computer, so it can't be edited later: ";
 /// Before the list of what a kept recording was saved without. The wording is proposed and waits for the owner's approval.
-pub const KEPT_WITHOUT: &str = "Kept for later editing, without: ";
+pub const KEPT_WITHOUT: &str = "The recording was kept for later editing, but without ";
 /// The reason when this computer has no folder for saved recordings: keeping is simply off.
 /// The wording is proposed and waits for the owner's approval.
 pub const NO_FOLDER_FOR_RECORDINGS: &str = "the folder for saved recordings could not be found on this computer.";
 /// The reason when saving broke off for no reason the store could name.
 /// The wording is proposed and waits for the owner's approval.
-pub const KEEPING_BROKE_OFF: &str = "saving it failed because of an internal error.";
+pub const KEEPING_BROKE_OFF: &str = "saving failed because of an internal error.";
 
-/// "the cover logo, a pasted picture.": each thing once, in the order it came up.
+/// What the project format calls a thing that could not be saved or restored, and what
+/// several of them are called after their number. The wording is proposed and waits for the
+/// owner's approval.
+const SEVERAL: [(&str, &str); 5] = [
+    ("a pasted picture", "pasted pictures"),
+    ("an annotation on a frame the recording does not have", "annotations on frames the recording does not have"),
+    ("an annotation that could not be read", "annotations that could not be read"),
+    ("an annotation of a kind this version does not know", "annotations of a kind this version does not know"),
+    ("an annotation far outside the picture", "annotations far outside the picture"),
+];
+
+/// The end of a sentence that lists `things`: "the cover logo and 2 pasted pictures.". Each
+/// kind is named once, in the order it came up, with its number when there are several.
 pub fn listed(things: &[String]) -> String {
-    let mut once: Vec<&str> = Vec::new();
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
     for thing in things.iter().map(|t| t.as_str()) {
-        if !once.contains(&thing) {
-            once.push(thing);
+        match kinds.iter_mut().find(|(kind, _)| *kind == thing) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((thing, 1)),
         }
     }
-    format!("{}.", once.join(", "))
+    let named: Vec<String> = kinds
+        .iter()
+        .map(|(kind, n)| match (n, SEVERAL.iter().find(|(one, _)| one == kind)) {
+            (1, _) => kind.to_string(),
+            (n, Some((_, several))) => format!("{n} {several}"),
+            (n, None) => format!("{kind} ({n} times)"),
+        })
+        .collect();
+    match named.split_last() {
+        None => ".".to_string(),
+        Some((last, [])) => format!("{last}."),
+        Some((last, rest)) => format!("{} and {last}.", rest.join(", ")),
+    }
 }
 
 /// The result screen's sentence about the recording, when there is something to say: it could
@@ -1037,7 +1063,7 @@ impl Picker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `publish_blocked` with the token saved for the very address that is asked about.
@@ -1501,18 +1527,21 @@ mod tests {
         assert_eq!(screen(Kept::Saved(vec![])).kept_line(), None);
         assert_eq!(screen(Kept::Off).kept_line(), None);
         // Not kept: one sentence with the store's reason after the colon.
-        let failed_to_keep = screen(Kept::Failed("the folder for saved recordings could not be written: the disk is full.".into()));
-        assert_eq!(failed_to_keep.kept_line().as_deref(), Some("The recording could not be saved on this computer, so this tour can't be edited later: the folder for saved recordings could not be written: the disk is full."));
+        let failed_to_keep = screen(Kept::Failed(project::DISK_FULL.into()));
+        assert_eq!(failed_to_keep.kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the disk is full."));
         // The upload itself is reported as it went: a kept recording is no part of that.
         assert_eq!(result_heading(&failed_to_keep.done.outcome), "Tour published");
         assert!(!failed_to_keep.can_retry());
         // No folder on this computer: the same sentence, with that reason.
-        assert_eq!(screen(Kept::Failed(NO_FOLDER_FOR_RECORDINGS.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so this tour can't be edited later: the folder for saved recordings could not be found on this computer."));
+        assert_eq!(screen(Kept::Failed(NO_FOLDER_FOR_RECORDINGS.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the folder for saved recordings could not be found on this computer."));
+        assert_eq!(screen(Kept::Failed(project::SAVING_CANCELLED.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
+        assert_eq!(screen(Kept::Failed(KEEPING_BROKE_OFF.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
         // The one reason that is a sentence of its own is shown on its own.
         assert_eq!(screen(Kept::Failed(project::NOT_PUT_BACK.into())).kept_line().as_deref(), Some(project::NOT_PUT_BACK));
-        // Kept, but without something: each thing named once.
+        // Kept, but without something: a full sentence that says how many of a kind.
         let without = screen(Kept::Saved(vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()]));
-        assert_eq!(without.kept_line().as_deref(), Some("Kept for later editing, without: the cover logo, a pasted picture."));
+        assert_eq!(without.kept_line().as_deref(), Some("The recording was kept for later editing, but without the cover logo and 2 pasted pictures."));
+        assert_eq!(screen(Kept::Saved(vec!["a pasted picture".into()])).kept_line().as_deref(), Some("The recording was kept for later editing, but without a pasted picture."));
         // Every case draws, with and without a link, and after a publish that failed.
         let ctx = egui::Context::default();
         for kept in [Kept::Off, Kept::Saved(vec!["the cover logo".into()]), Kept::Failed("the disk is full.".into())] {
@@ -1526,8 +1555,37 @@ mod tests {
     }
 
     #[test]
+    fn a_list_names_each_kind_once_and_says_how_many() {
+        let list = |things: &[&str]| listed(&things.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        assert_eq!(list(&["the cover logo"]), "the cover logo.");
+        assert_eq!(list(&["the cover logo", "a pasted picture"]), "the cover logo and a pasted picture.");
+        assert_eq!(list(&["a pasted picture", "the cover logo", "a pasted picture", "an annotation that could not be read"]), "2 pasted pictures, the cover logo and an annotation that could not be read.");
+        assert_eq!(list(&["an annotation on a frame the recording does not have"; 3]), "3 annotations on frames the recording does not have.");
+        assert_eq!(list(&["an annotation of a kind this version does not know"; 2]), "2 annotations of a kind this version does not know.");
+        assert_eq!(list(&["an annotation far outside the picture"; 2]), "2 annotations far outside the picture.");
+        assert_eq!(list(&["an annotation that could not be read"; 12]), "12 annotations that could not be read.");
+        // A kind this list has no word for is still counted.
+        assert_eq!(list(&["a thing", "a thing"]), "a thing (2 times).");
+        // Every kind the project format can name is known here by exactly its words.
+        let format = include_str!("project/state.rs");
+        for (one, _) in SEVERAL {
+            assert!(format.contains(&format!("\"{one}\"")), "the project format no longer says: {one}");
+        }
+        let mut said: Vec<&str> = format.split("dropped.push(\"").skip(1).filter_map(|rest| rest.split('"').next()).collect();
+        said.sort();
+        said.dedup();
+        let mut known: Vec<&str> = SEVERAL.iter().map(|(one, _)| *one).chain(["the cover logo"]).collect();
+        known.sort();
+        assert_eq!(said, known, "a new kind needs its word for several (the cover logo is only ever one)");
+    }
+
+    /// Tests that change the shared switch take this first, so they do not cross.
+    pub(crate) static SWITCH: Mutex<()> = Mutex::new(());
+
+    #[test]
     fn keeping_recordings_is_on_until_the_setting_says_otherwise() {
-        // The one test that touches the shared switch; it leaves it as it found it.
+        // It leaves the shared switch as it found it.
+        let _alone = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
         let was = keeps_recordings();
         set_keep_recordings(false);
         assert!(!keeps_recordings());

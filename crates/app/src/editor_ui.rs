@@ -285,6 +285,17 @@ static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// How far each paste lands from the last, in image pixels.
 const PASTE_OFFSET: f32 = 16.0;
 
+/// How long a held status message stays when the user does nothing in the editor.
+const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A status message that stays in front of later ones.
+struct Held {
+    text: String,
+    clock: String,
+    /// When the status bar first drew it; None until it has.
+    since: Option<Instant>,
+}
+
 pub struct Editor {
     pub(crate) doc: Document,
     title: String,
@@ -308,6 +319,8 @@ pub struct Editor {
     saved: Option<PathBuf>,
     /// Last action and the time it happened, shown in the status bar.
     status: Option<(String, String)>,
+    /// A message the status bar keeps showing whatever else is reported: see [`Editor::notify_held`].
+    held: Option<Held>,
     /// A file the status message offers to show in the file manager ("Show in folder"); cleared by the next message.
     pub(crate) status_reveal: Option<PathBuf>,
     /// Sentences shown after "Show in folder" (a warning about the file); cleared by the next message.
@@ -360,6 +373,7 @@ impl Editor {
             status_open: None,
             closed: false,
             confirm_close: false,
+            held: None,
             menu_at: None,
             hover: None,
             shift: false,
@@ -499,7 +513,32 @@ impl Editor {
     /// The status bar's message.
     #[cfg(test)]
     pub(crate) fn status_text(&self) -> Option<&str> {
-        self.status.as_ref().map(|(text, _)| text.as_str())
+        self.held.as_ref().map(|h| h.text.as_str()).or(self.status.as_ref().map(|(text, _)| text.as_str()))
+    }
+
+    /// Report something the user must get to see: it stays in the status bar, in front of
+    /// anything reported after it, until the user's first click or key press in this editor,
+    /// or until it has been on screen for [`HELD_FOR`]. After that it is an ordinary message.
+    pub(crate) fn notify_held(&mut self, msg: impl Into<String>) {
+        let text: String = msg.into();
+        self.notify(text.clone());
+        let clock = self.status.as_ref().map(|(_, clock)| clock.clone()).unwrap_or_default();
+        self.held = Some(Held { text, clock, since: None });
+    }
+
+    /// What the status bar shows at `now`: the held message while it is held, else the last
+    /// one reported. `acted` is whether the user clicked or pressed a key in this frame.
+    fn status_now(&mut self, now: Instant, acted: bool) -> Option<(String, String)> {
+        if let Some(held) = self.held.as_mut() {
+            let since = *held.since.get_or_insert(now);
+            if acted || now.saturating_duration_since(since) >= HELD_FOR {
+                self.held = None;
+            }
+        }
+        match &self.held {
+            Some(held) => Some((held.text.clone(), held.clock.clone())),
+            None => self.status.clone(),
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -1123,13 +1162,17 @@ impl Editor {
                     self.card_undo_status(ui);
                 }
                 // A long message (an export path) is cut with an ellipsis before the zoom controls and shown whole on hover.
-                let text = match &self.status {
+                let acted = ui.ctx().input(|i| i.pointer.any_pressed() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_) | egui::Event::Paste(_))));
+                let shown = self.status_now(Instant::now(), acted);
+                let text = match &shown {
                     Some((msg, clock)) => format!("{clock} – {msg}"),
                     None => dirty.to_string(),
                 };
-                let reveal = self.status.as_ref().and(self.status_reveal.clone());
-                let more = self.status.as_ref().and(self.status_more.clone());
-                let open = self.status.as_ref().and(self.status_open.clone());
+                // The links and the sentences after them belong to the last message, not to a held one.
+                let last = shown.as_ref().filter(|_| self.held.is_none());
+                let reveal = last.and(self.status_reveal.clone());
+                let more = last.and(self.status_more.clone());
+                let open = last.and(self.status_open.clone());
                 // Hovering any part of the message shows all of it.
                 let whole = match &more {
                     Some(m) => format!("{text} · Show in folder. {m}"),
@@ -2037,6 +2080,46 @@ mod tests {
         let mut input = egui::RawInput::default();
         input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
         ctx.run_ui(input, |ui| ed.ui(ui)).textures_delta.clear();
+    }
+
+    #[test]
+    fn a_held_message_stays_until_the_first_action_or_half_a_minute() {
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let shown = |ed: &mut Editor, secs: u64, acted: bool| ed.status_now(at(secs), acted).map(|(text, _)| text);
+        // Nothing the editor reports afterwards takes its place while the user does nothing.
+        let mut ed = editor(EditorPrefs::default());
+        ed.notify_held("This recording was opened without the cover logo.");
+        ed.notify("Exporting… 40%");
+        assert_eq!(ed.status_text(), Some("This recording was opened without the cover logo."));
+        // The half minute counts from when it was first on screen, not from when it was reported.
+        assert_eq!(shown(&mut ed, 100, false).as_deref(), Some("This recording was opened without the cover logo."));
+        assert_eq!(shown(&mut ed, 129, false).as_deref(), Some("This recording was opened without the cover logo."));
+        assert_eq!(shown(&mut ed, 130, false).as_deref(), Some("Exporting… 40%"));
+        assert_eq!(shown(&mut ed, 131, false).as_deref(), Some("Exporting… 40%"));
+        // The user's first click or key press lets the next message through at once.
+        let mut ed = editor(EditorPrefs::default());
+        ed.notify_held("This recording was opened without the cover logo.");
+        assert_eq!(shown(&mut ed, 0, false).as_deref(), Some("This recording was opened without the cover logo."));
+        ed.notify("Copied this frame to the clipboard");
+        assert_eq!(shown(&mut ed, 1, false).as_deref(), Some("This recording was opened without the cover logo."));
+        assert_eq!(shown(&mut ed, 2, true).as_deref(), Some("Copied this frame to the clipboard"));
+        // With nothing reported after it, it simply stays, as any message does.
+        let mut ed = editor(EditorPrefs::default());
+        ed.notify_held("This recording was opened without the cover logo.");
+        assert_eq!(shown(&mut ed, 0, true).as_deref(), Some("This recording was opened without the cover logo."));
+        assert_eq!(shown(&mut ed, 500, false).as_deref(), Some("This recording was opened without the cover logo."));
+        // The status bar draws it, and a key press in the window is the first action.
+        let ctx = egui::Context::default();
+        let mut ed = editor(EditorPrefs::default());
+        ed.notify_held("This recording was opened without the cover logo.");
+        ed.notify("Saved");
+        ctx.run_ui(egui::RawInput::default(), |ui| ed.ui(ui)).textures_delta.clear();
+        assert!(ed.held.as_ref().is_some_and(|h| h.since.is_some()));
+        let key = egui::Event::Key { key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        ctx.run_ui(egui::RawInput { events: vec![key], ..Default::default() }, |ui| ed.ui(ui)).textures_delta.clear();
+        assert!(ed.held.is_none());
+        assert_eq!(ed.status_text(), Some("Saved"));
     }
 
     #[test]

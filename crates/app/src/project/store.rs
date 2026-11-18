@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use mythicshot_recording::{OpenError, Recording};
+use mythicshot_recording::{OpenError, Recording, SaveError, SaveStep};
 use sha2::Digest;
 
 use super::state::{self, Blob, MAX_PROJECT_JSON_BYTES, ParseError, ProjectFile, ProjectKey, Restored, Snapshot};
@@ -52,6 +52,13 @@ const BUSY_WAIT: Duration = Duration::from_millis(120);
 /// The error of a save that could not put the project it was replacing back in place. The
 /// wording is proposed and waits for the owner's approval.
 pub const NOT_PUT_BACK: &str = "The earlier saved recording could not be put back in place. It is kept on this computer and is restored the next time Mythicshot starts.";
+
+/// The reason of a save that was told to stop while the frames were being copied. The wording
+/// is proposed and waits for the owner's approval.
+pub const SAVING_CANCELLED: &str = "saving was cancelled.";
+/// The reason of a save or a removal the disk had no room for. The wording is proposed and
+/// waits for the owner's approval.
+pub const DISK_FULL: &str = "the disk is full.";
 
 /// The projects folder of this computer's user.
 #[derive(Debug, Clone)]
@@ -136,7 +143,7 @@ pub struct OpenGuard {
 /// The steps of a save that a test makes fail.
 struct Steps<'a> {
     /// Puts the recording's frames file and index into a folder; the frames file's size.
-    keep_frames: &'a dyn Fn(&Recording, &Path) -> Result<u64, String>,
+    keep_frames: &'a dyn Fn(&Recording, &Path) -> Result<u64, SaveError>,
     /// Every rename of a save: a staging folder into place, the project it replaces out of the
     /// way and back, and the new `project.json` over the old one.
     rename: &'a dyn Fn(&Path, &Path) -> io::Result<()>,
@@ -179,9 +186,19 @@ impl Store {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Save the project for `key`. The error is a sentence that names no folder.
+    /// Save the project for `key`. The error is the reason in words that follow "…: " in a
+    /// sentence for the user (or [`NOT_PUT_BACK`], a sentence of its own): lower-case, with one
+    /// full stop, and without a folder's name or the system's own text.
     pub fn save(&self, key: &ProjectKey, snap: &Snapshot<'_>) -> Result<Saved, String> {
-        self.save_with(key, snap, &Steps { keep_frames: &|rec, dir| rec.save_into(dir), rename: &|from, to| patiently(|| std::fs::rename(from, to)) })
+        self.save_while(key, snap, &|| true)
+    }
+
+    /// [`Store::save`] for a job that can be cancelled: when the frames have to be copied
+    /// (they are linked when that can be done, which takes no time), `keep_going` is asked
+    /// before every megabyte, and a no ends the save with [`SAVING_CANCELLED`] and nothing
+    /// left behind. Nothing else of a save is cut short by it.
+    pub fn save_while(&self, key: &ProjectKey, snap: &Snapshot<'_>, keep_going: &dyn Fn() -> bool) -> Result<Saved, String> {
+        self.save_with(key, snap, &Steps { keep_frames: &|rec, dir| rec.save_into_with(dir, keep_going), rename: &|from, to| patiently(|| std::fs::rename(from, to)) })
     }
 
     fn save_with(&self, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Saved, String> {
@@ -208,9 +225,9 @@ impl Store {
         if matches!(read_project(dir), Err(Unreadable::Newer)) {
             return Err("a newer version of Mythicshot saved this tour's recording, so it is left as it is.".into());
         }
-        std::fs::create_dir_all(&self.root).map_err(|e| sentence("the folder for saved recordings could not be made", e))?;
+        std::fs::create_dir_all(&self.root).map_err(|e| reason("the folder for saved recordings could not be made", &e))?;
         let staging = self.root.join(format!("{STAGING}{}-{}", now_ms().max(0), random_name()));
-        std::fs::create_dir(&staging).map_err(|e| sentence("the folder for saved recordings could not be written", e))?;
+        std::fs::create_dir(&staging).map_err(|e| reason("the folder for saved recordings could not be written", &e))?;
         // The frames may have to be copied, which can take long: nothing else waits for that.
         let result = fill(&staging, key, snap, steps).and_then(|saved| {
             let _changing = changing();
@@ -231,12 +248,12 @@ impl Store {
         }
         let parents: Vec<&Path> = dir.ancestors().skip(1).take(2).collect();
         if let Some(parent) = parents.first() {
-            std::fs::create_dir_all(parent).map_err(|e| sentence("the folder for saved recordings could not be written", e))?;
+            std::fs::create_dir_all(parent).map_err(|e| reason("the folder for saved recordings could not be written", &e))?;
         }
         let aside = match std::fs::symlink_metadata(dir) {
             Ok(_) => {
                 let aside = self.root.join(format!("{REPLACED}{}", random_name()));
-                (steps.rename)(dir, &aside).map_err(|e| sentence("this tour's saved recording is in use and could not be replaced", e))?;
+                (steps.rename)(dir, &aside).map_err(|e| reason("this tour's saved recording is in use and could not be replaced", &e))?;
                 Some(aside)
             }
             Err(_) => None,
@@ -251,7 +268,7 @@ impl Store {
                     let _ = std::fs::remove_dir(parent);
                 }),
             }
-            return Err(sentence("the recording could not be put into the folder for saved recordings", e));
+            return Err(reason("the recording could not be put into the folder for saved recordings", &e));
         }
         if let Some(aside) = &aside {
             retire(aside, dir);
@@ -422,7 +439,7 @@ impl Store {
             self.bump();
         }
         match failed {
-            Some(e) => Err(sentence("a saved recording of this tour could not be removed", e)),
+            Some(e) => Err(reason("a saved recording of this tour could not be removed", &e)),
             None => Ok(removed),
         }
     }
@@ -523,7 +540,7 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
     if !kept.same_frames(snap.rec) {
         return Err("this tour's saved recording is open in an editor and belongs to another recording.".into());
     }
-    let frames_bytes = std::fs::metadata(dir.join(FRAMES_FILE)).map_err(|e| sentence("the saved recording's frames can no longer be read", e))?.len();
+    let frames_bytes = std::fs::metadata(dir.join(FRAMES_FILE)).map_err(|e| reason("the saved recording's frames can no longer be read", &e))?.len();
     let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
     let text = project_text(&file)?;
 
@@ -552,7 +569,7 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
         let tmp = temp_beside(&path);
         write_whole(&tmp, text.as_bytes()).and_then(|()| (steps.rename)(&tmp, &path)).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            sentence("the project file could not be written", e)
+            reason("the project file could not be written", &e)
         })
     });
     match written {
@@ -574,13 +591,13 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
 
 /// Put everything a project holds into the new folder `staging`, the project file last.
 fn fill(staging: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<(ProjectFile, Vec<String>), String> {
-    let frames_bytes = (steps.keep_frames)(snap.rec, staging).map_err(|e| one_sentence(&e))?;
+    let frames_bytes = (steps.keep_frames)(snap.rec, staging).map_err(frames_reason)?;
     let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
     let text = project_text(&file)?;
     for blob in &blobs {
         write_blob(staging, blob)?;
     }
-    write_whole(&staging.join(PROJECT_FILE), text.as_bytes()).map_err(|e| sentence("the project file could not be written", e))?;
+    write_whole(&staging.join(PROJECT_FILE), text.as_bytes()).map_err(|e| reason("the project file could not be written", &e))?;
     Ok((file, left_out))
 }
 
@@ -610,7 +627,7 @@ fn named_key(dir: &Path) -> Option<(ProjectKey, i64)> {
 }
 
 fn project_text(file: &ProjectFile) -> Result<String, String> {
-    let text = state::to_text(file).map_err(|e| sentence("the project could not be written down", e))?;
+    let text = state::to_text(file).map_err(|_| "the project could not be written down.".to_string())?;
     if text.len() > MAX_PROJECT_JSON_BYTES {
         return Err("the project is too large to be saved.".into());
     }
@@ -621,7 +638,7 @@ fn project_text(file: &ProjectFile) -> Result<String, String> {
 /// name is trusted only when it has the right size; one cut short by an earlier save is replaced.
 /// Returns the file's path when there was no file of that name before.
 fn write_blob(dir: &Path, blob: &Blob) -> Result<Option<PathBuf>, String> {
-    let failed = |e: io::Error| sentence("a picture of the project could not be written", e);
+    let failed = |e: io::Error| reason("a picture of the project could not be written", &e);
     let path = match blob.name.strip_prefix("pictures/") {
         Some(file) if state::is_picture_name(&blob.name) => {
             let pictures = dir.join(PICTURES);
@@ -891,8 +908,22 @@ fn now_ms() -> i64 {
 }
 
 /// "what: why." as one sentence, whatever `why` ends with.
-fn sentence(what: &str, why: impl std::fmt::Display) -> String {
-    one_sentence(&format!("{what}: {why}"))
+/// The reason for the user's sentence when the system refused a step: `what` could not be
+/// done, or, when the disk had no room, that. The system's own text never goes into it, and
+/// only the kind of error is logged: its text can hold a folder's name.
+fn reason(what: &str, e: &io::Error) -> String {
+    eprintln!("Saved recordings: {what} ({:?}).", e.kind());
+    if matches!(e.kind(), io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded) { DISK_FULL.to_string() } else { format!("{what}.") }
+}
+
+/// The reason when the recording's frames and index could not be put into a project.
+fn frames_reason(e: SaveError) -> String {
+    match e {
+        SaveError::Cancelled => SAVING_CANCELLED.to_string(),
+        SaveError::Unusable(why) => one_sentence(why),
+        SaveError::Io { step: SaveStep::Frames, error, .. } => reason("the recording's files could not be copied", &error),
+        SaveError::Io { step: SaveStep::Index, error, .. } => reason("the recording's files could not be written", &error),
+    }
 }
 
 /// The text with exactly one full stop at its end.
@@ -1004,6 +1035,72 @@ mod tests {
         }
     }
 
+    /// The error the system gives when the disk has no room.
+    fn no_room() -> io::Error {
+        io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 })
+    }
+
+    /// Whether a reason fits after "…: " in the user's sentence: it starts lower-case, is one
+    /// sentence with one full stop, has no second colon, and holds no system text or folder.
+    fn reads_as_a_reason(reason: &str, root: &Path) -> bool {
+        reason.starts_with(|c: char| c.is_lowercase()) && reason.ends_with('.') && reason.matches('.').count() == 1 && !reason.contains(':') && !reason.contains("os error") && !reason.contains(&*root.to_string_lossy()) && !reason.contains('\\')
+    }
+
+    #[test]
+    fn what_the_system_refuses_becomes_a_reason_without_the_systems_own_words() {
+        let w = World::new();
+        // The system's own error for a full disk, wherever in a save it comes up.
+        assert_eq!(no_room().kind(), io::ErrorKind::StorageFull);
+        assert_eq!(reason("the project file could not be written", &no_room()), "the disk is full.");
+        assert_eq!(frames_reason(SaveError::Io { step: SaveStep::Index, context: "could not write the recording's index", error: no_room() }), "the disk is full.");
+        let full = |_: &Path, _: &Path| -> io::Result<()> { Err(no_room()) };
+        assert_eq!(w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &real_frames, rename: &full }).unwrap_err(), "the disk is full.");
+        assert_eq!(tree(w.store.root()), Vec::<String>::new());
+
+        // The recording's own files are gone: neither a link nor a copy can be made.
+        let gone = recorded(w.tmp.path(), "gone", 4);
+        std::fs::remove_file(w.tmp.path().join("gone").join(FRAMES_FILE)).unwrap();
+        let edit = Edit::new(&gone, Default::default());
+        let snap = Snapshot { rec: &gone, title: "Gone", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let err = w.store.save(&key_1(), &snap).unwrap_err();
+        assert_eq!(err, "the recording's files could not be copied.");
+        assert_eq!(tree(w.store.root()), Vec::<String>::new());
+
+        // Where the folder for saved recordings should be, there is a file.
+        let blocked = own_store(w.tmp.path().join("in-the-way"));
+        std::fs::write(blocked.root(), b"mine").unwrap();
+        let err = blocked.save(&key_1(), &w.snap()).unwrap_err();
+        assert_eq!(err, "the folder for saved recordings could not be made.");
+        assert_eq!(std::fs::read(blocked.root()).unwrap(), b"mine");
+
+        // A recording that cannot be kept at all says so in its own words.
+        let empty = Recording::timing_only(100, 80, &[], 0);
+        let edit = Edit::new(&empty, Default::default());
+        let snap = Snapshot { rec: &empty, title: "Empty", tour_title: "Customer onboarding", steps: 0, edit: &edit, events: &[], items: &[] };
+        assert_eq!(w.store.save(&key_1(), &snap).unwrap_err(), "the recording has no frames to keep.");
+        // Every one of them fits after the colon of the user's sentence.
+        for said in ["the disk is full.", "the recording's files could not be copied.", "the folder for saved recordings could not be made.", "the recording has no frames to keep.", SAVING_CANCELLED] {
+            assert!(reads_as_a_reason(said, w.tmp.path()), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_save_stopped_while_the_frames_are_copied_is_cancelled_and_leaves_nothing() {
+        let w = World::new();
+        // The copy was told to stop after it had written part of the frames file.
+        let stopped = |_: &Recording, dir: &Path| -> Result<u64, SaveError> {
+            assert!(dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with(STAGING)));
+            Err(SaveError::Cancelled)
+        };
+        let err = w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &stopped, rename: &real_rename }).unwrap_err();
+        assert_eq!(err, "saving was cancelled.");
+        assert_eq!(tree(w.store.root()), Vec::<String>::new(), "no staging folder is left");
+        assert_eq!((w.store.list(), changes(&w.store)), (vec![], 0));
+        // Told to stop when the frames can be linked: nothing is copied, so the save is whole.
+        let saved = w.store.save_while(&key_1(), &w.snap(), &|| false).unwrap();
+        assert_eq!(w.store.list(), vec![saved.info]);
+    }
+
     /// A store with a change counter of its own, so that what another test saves is not counted.
     fn own_store(root: PathBuf) -> Store {
         Store { root, epoch: Box::leak(Box::new(AtomicU64::new(0))) }
@@ -1033,8 +1130,8 @@ mod tests {
         std::fs::rename(from, to)
     }
 
-    fn real_frames(rec: &Recording, dir: &Path) -> Result<u64, String> {
-        rec.save_into(dir)
+    fn real_frames(rec: &Recording, dir: &Path) -> Result<u64, SaveError> {
+        rec.save_into_with(dir, &|| true)
     }
 
     /// Every file and folder below `dir`, with `/`, sorted; folders end with `/`.
@@ -1147,12 +1244,12 @@ mod tests {
     fn a_save_that_fails_while_the_frames_are_copied_leaves_no_project_and_no_staging_folder() {
         let w = World::new();
         // The disk fills: half a frames file is written, then the copy stops.
-        let full_disk = |_: &Recording, dir: &Path| -> Result<u64, String> {
+        let full_disk = |_: &Recording, dir: &Path| -> Result<u64, SaveError> {
             std::fs::write(dir.join("frames.zst.1-2.tmp"), [1u8; 40]).unwrap();
-            Err("could not keep the frames: There is not enough space on the disk. (os error 112)".to_string())
+            Err(SaveError::Io { step: SaveStep::Frames, context: "could not keep the frames", error: no_room() })
         };
         let err = w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &full_disk, rename: &real_rename }).unwrap_err();
-        assert!(err.contains("not enough space"), "{err}");
+        assert_eq!(err, "the disk is full.");
         assert_eq!(changes(&w.store), 0, "a save that failed is no change");
         assert!(err.ends_with('.') && !err.contains(&*w.tmp.path().to_string_lossy()) && !err.contains(STAGING), "{err}");
         assert_eq!(tree(w.store.root()), Vec::<String>::new());
@@ -1168,7 +1265,7 @@ mod tests {
         let w = World::new();
         let refuse = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("the rename was refused")) };
         let err = w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
-        assert!(err.contains("the rename was refused"), "{err}");
+        assert_eq!(err, "the recording could not be put into the folder for saved recordings.");
         assert_eq!(w.store.list(), vec![]);
         assert_eq!(tree(w.store.root()), Vec::<String>::new(), "not even the folders made for it are left");
     }
@@ -1259,7 +1356,7 @@ mod tests {
             Err(io::Error::other("the rename was refused"))
         };
         let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
-        assert!(err.contains("the rename was refused") && !err.contains(&*w.tmp.path().to_string_lossy()), "{err}");
+        assert_eq!(err, "the project file could not be written.");
         assert_eq!(contents(&dir), whole, "the files this save made are gone, and no other file is touched");
         assert_eq!(changes(&w.store), 1);
         drop(l);
@@ -1288,7 +1385,7 @@ mod tests {
         // The old one moves out of the way, the new one cannot move in, and the old one is put back.
         let no_way_in = |from: &Path, to: &Path| if named(from, STAGING) { Err(io::Error::other("the rename was refused")) } else { std::fs::rename(from, to) };
         let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &no_way_in }).unwrap_err();
-        assert!(err.contains("the rename was refused") && err != NOT_PUT_BACK, "{err}");
+        assert_eq!(err, "the recording could not be put into the folder for saved recordings.");
         assert_eq!(contents(&dir), whole);
         assert_eq!((in_root(&w.store, STAGING), in_root(&w.store, REPLACED)), (vec![], vec![]));
         assert_eq!(changes(&w.store), 1);
@@ -1315,7 +1412,7 @@ mod tests {
         let opened = std::cell::RefCell::new(None);
         let slow = |rec: &Recording, to: &Path| {
             *opened.borrow_mut() = Some(loaded(&w.store, &key_1()));
-            rec.save_into(to)
+            rec.save_into_with(to, &|| true)
         };
         let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &slow, rename: &real_rename }).unwrap_err();
         assert!(err.contains("open in an editor"), "{err}");
@@ -1752,7 +1849,7 @@ mod tests {
         let seen = std::cell::RefCell::new(None);
         let look = |rec: &Recording, to: &Path| {
             *seen.borrow_mut() = to.file_name().and_then(|n| n.to_str()).map(str::to_string);
-            rec.save_into(to)
+            rec.save_into_with(to, &|| true)
         };
         let before = since_1970(SystemTime::now());
         w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &look, rename: &real_rename }).unwrap();
@@ -1942,7 +2039,7 @@ mod tests {
         // The new project arrives with a file of that name already in it.
         let with_a_note = |rec: &Recording, to: &Path| {
             std::fs::write(to.join("notes.txt"), b"new note").unwrap();
-            rec.save_into(to)
+            rec.save_into_with(to, &|| true)
         };
         w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &with_a_note, rename: &real_rename }).unwrap();
         assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"new note");

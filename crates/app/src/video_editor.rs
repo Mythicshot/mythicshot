@@ -16,7 +16,7 @@ use mythicshot_recording::{FrameReader, Recording};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Snapshot, Store};
+use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store};
 use crate::publish::{Published, Target};
 use crate::publish_ui::{self, Before, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
@@ -275,6 +275,20 @@ pub(crate) fn keeping(on: bool, root: Option<PathBuf>) -> Keeping {
     }
 }
 
+/// Where an upload started now keeps its recording: as the setting says, in this user's folder
+/// for saved recordings. Nothing on the disk is looked at.
+pub(crate) fn keeping_now() -> Keeping {
+    keeping(publish_ui::keeps_recordings(), Store::default_root())
+}
+
+/// How a project is saved: the store, the key, the state, and the check that says whether to go on.
+type SaveFn<'a> = dyn Fn(&Store, &ProjectKey, &Snapshot<'_>, &dyn Fn() -> bool) -> Result<Saved, String> + 'a;
+
+/// The save a publish uses: the store's own, which stops a copy of the frames when told to.
+fn store_save(store: &Store, key: &ProjectKey, snap: &Snapshot<'_>, keep_going: &dyn Fn() -> bool) -> Result<Saved, String> {
+    store.save_while(key, snap, keep_going)
+}
+
 /// The editor's state as it was when a publish started: what is uploaded, and what is kept.
 pub(crate) struct PublishState {
     pub(crate) rec: Arc<Recording>,
@@ -285,8 +299,10 @@ pub(crate) struct PublishState {
 
 /// Keep the recording of an upload the site has just committed, as the project of exactly the
 /// address the upload went to, the tour and the chapter. Whatever goes wrong here, a panic
-/// included, is a reason in the answer and never an error of the upload.
-fn keep_recording(keeping: &Keeping, server: &str, up: &Published, state: &PublishState, title: &str, tour_title: &str) -> Kept {
+/// included, is a reason in the answer and never an error of the upload; so is a cancel that
+/// stops a copy of the frames (`keep_going` says no).
+#[allow(clippy::too_many_arguments)]
+fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, keep_going: &dyn Fn() -> bool, server: &str, up: &Published, state: &PublishState, title: &str, tour_title: &str) -> Kept {
     let store = match keeping {
         Keeping::Off => return Kept::Off,
         Keeping::NoFolder => return Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.to_string()),
@@ -297,7 +313,7 @@ fn keep_recording(keeping: &Keeping, server: &str, up: &Published, state: &Publi
         let server = crate::publish::check_server(server).map_err(|_| publish_ui::KEEPING_BROKE_OFF.to_string())?;
         let key = ProjectKey { server, tour_id: up.tour_id.clone(), chapter_id: up.chapter_id.clone() };
         let snap = Snapshot { rec: &state.rec, title, tour_title, steps: u32::try_from(up.steps).unwrap_or(u32::MAX), edit: &state.edit, events: &state.events, items: &state.items };
-        store.save(&key, &snap)
+        save(store, &key, &snap, keep_going)
     }));
     match saved {
         Ok(Ok(saved)) => Kept::Saved(saved.left_out),
@@ -325,6 +341,24 @@ fn publish_job(
     worker: &Arc<Run>,
     progress: &dyn Fn(f32),
 ) -> Result<PublishDone, String> {
+    publish_job_with(state, title, tour_title, server, token, target, publish_now, keeping, worker, progress, &store_save)
+}
+
+/// [`publish_job`] with the save handed in, so a test can make it fail, panic or wait.
+#[allow(clippy::too_many_arguments)]
+fn publish_job_with(
+    state: &PublishState,
+    title: &str,
+    tour_title: &str,
+    server: &str,
+    token: impl FnOnce() -> Result<String, String>,
+    target: &Target,
+    publish_now: bool,
+    keeping: &Keeping,
+    worker: &Arc<Run>,
+    progress: &dyn Fn(f32),
+    save: &SaveFn<'_>,
+) -> Result<PublishDone, String> {
     let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
     worker.set_dir(Some(tmp.path().to_path_buf()));
     let result = (|| {
@@ -351,8 +385,9 @@ fn publish_job(
                 !worker.is_cancelled()
             },
             // The commit has answered: the project is saved now, before the publish step, so
-            // that it matches the site's draft whatever becomes of the publish.
-            |up| kept = keep_recording(keeping, server, up, state, title, tour_title),
+            // that it matches the site's draft whatever becomes of the publish. A cancel stops
+            // a copy of the frames, so it never holds the publish step up.
+            |up| kept = keep_recording(keeping, save, &|| !worker.is_cancelled(), server, up, state, title, tour_title),
             |images| {
                 worker.set_publishing(images);
                 !worker.is_cancelled()
@@ -388,7 +423,7 @@ pub struct Origin {
 /// Before the list of what a saved project was opened without. The wording is proposed and waits for the owner's approval.
 // Not used until the Tours page opens a saved project.
 #[allow(dead_code)]
-pub const OPENED_WITHOUT: &str = "Opened without: ";
+pub const OPENED_WITHOUT: &str = "This recording was opened without ";
 
 /// The status line when a saved project opens without something it was saved with.
 // Not used until the Tours page opens a saved project.
@@ -639,7 +674,8 @@ impl Editor {
     /// the annotations it was saved with (a saved project holds no key presses). The editor
     /// knows where it came from ([`VideoState::origin`]) and keeps the project registered as
     /// open until it closes. Closing it never asks to export, and deletes nothing: the
-    /// recording stays saved. What could not be restored is named in the status bar.
+    /// recording stays saved. What could not be restored is named in the status bar. When the
+    /// recording cannot be read after all, the project is let go of again.
     // Not used until the Tours page opens a saved project.
     #[allow(dead_code)]
     pub fn open_project(loaded: Loaded, keys: std::collections::BTreeMap<crate::hotkeys::EditorAction, String>, dest: Context, overlays: OverlayStyle, prefs: crate::settings::EditorPrefs) -> Result<Editor, String> {
@@ -657,8 +693,9 @@ impl Editor {
             v.exported = true;
             v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, open: Arc::new(open) });
         }
+        // Kept in front of whatever the editor reports next, until the user has had the time to read it.
         if let Some(note) = opened_note(&dropped) {
-            editor.notify(note);
+            editor.notify_held(note);
         }
         Ok(editor)
     }
@@ -1083,7 +1120,7 @@ impl Editor {
         let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
         // A recording opened from a saved project is read from that project's folder.
         let open = v.origin.as_ref().map(|o| o.open.clone());
-        let keeping = keeping(publish_ui::keeps_recordings(), Store::default_root());
+        let keeping = keeping_now();
         let run = Run::begin();
         let worker = run.clone();
         let kept_as = tour_title.clone();
@@ -1970,9 +2007,9 @@ mod tests {
         let done = publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the tour is published all the same: {done:?}");
         let Kept::Failed(reason) = &done.kept else { panic!("{:?}", done.kept) };
-        assert!(reason.starts_with(|c: char| c.is_lowercase()) && reason.ends_with('.') && !reason.contains(TOKEN), "{reason}");
+        assert_eq!(reason, "the folder for saved recordings could not be made.");
         let note = publish_ui::kept_note(&done.kept).unwrap();
-        assert_eq!(note, format!("The recording could not be saved on this computer, so this tour can't be edited later: {reason}"));
+        assert_eq!(note, "The recording could not be saved on this computer, so it can't be edited later: the folder for saved recordings could not be made.");
         assert_eq!(std::fs::read(store.root()).unwrap(), b"in the way");
         // No folder for saved recordings on this computer: keeping is off, and the result says so once.
         let keep = keeping(true, None);
@@ -2066,8 +2103,12 @@ mod tests {
         // What could not be restored is said once, in the status bar.
         loaded.restored.dropped = vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()];
         let ed = Editor::open_project(loaded, Default::default(), settings.dest_context(TITLE), other, settings.editor.clone()).unwrap();
-        assert_eq!(ed.status_text(), Some("Opened without: the cover logo, a pasted picture."));
+        assert_eq!(ed.status_text(), Some("This recording was opened without the cover logo and 2 pasted pictures."));
         assert_eq!(opened_note(&[]), None);
+        // It stays in front of what the editor reports next.
+        let mut ed = ed;
+        ed.notify("Exporting… 0%");
+        assert_eq!(ed.status_text(), Some("This recording was opened without the cover logo and 2 pasted pictures."));
     }
 
     #[test]
@@ -2105,5 +2146,182 @@ mod tests {
         assert_eq!(store.list(), [info]);
         let again = reopened(&store, &key);
         assert_eq!(again.doc.items().len(), 2, "the change that was not sent is gone");
+    }
+
+    /// Wait until `done` holds, for at most ten seconds.
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A publish job that waits to be told, then does `work`, as a job that is still saving.
+    fn waiting_job(work: impl FnOnce() -> Kept + Send + 'static) -> (ExportJob, std::sync::mpsc::Sender<()>, Arc<Run>) {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let run = Arc::new(Run::default());
+        let job = EncodeJob::spawn(move |_| {
+            let _ = wait.recv();
+            let kept = work();
+            Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft }, kept })
+        });
+        (ExportJob::Publish(job, run.clone(), TOUR_TITLE.into(), Before::new_tour()), go, run)
+    }
+
+    #[test]
+    fn a_new_recording_closed_while_its_job_still_saves_keeps_its_files_until_the_job_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let temporary = tmp.path().join("rec");
+        let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        let mut ed = editor_of(&state);
+        // The job saves the recording once it is told to; until then it is "still saving".
+        let (saving, to_key) = (store.clone(), key.clone());
+        let (job, go, run) = waiting_job(move || {
+            let snap = Snapshot { rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
+            match saving.save(&to_key, &snap) {
+                Ok(saved) => Kept::Saved(saved.left_out),
+                Err(why) => Kept::Failed(why),
+            }
+        });
+        ed.video.as_mut().unwrap().job = Some(job);
+        drop(ed);
+        assert!(run.is_cancelled(), "the publish is told to stop: nobody would see its result");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(temporary.join("frames.zst").exists(), "the job still reads the recording");
+        // The job ends: its save found the frames, and only then the temporary folder goes.
+        go.send(()).unwrap();
+        eventually("the temporary recording is deleted once the job has ended", || !temporary.exists());
+        let loaded = store.load(&key).unwrap();
+        loaded.rec.frame(5).unwrap();
+    }
+
+    #[test]
+    fn a_reopened_project_closed_while_a_job_runs_stays_open_until_the_job_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        publish_to(&s, &state, false, &Keeping::In(store.clone())).unwrap();
+        drop(state);
+        let key = key_at(&s);
+        let info = store.list().remove(0);
+
+        let mut ed = reopened(&store, &key);
+        let (job, go, _run) = waiting_job(|| Kept::Off);
+        ed.video.as_mut().unwrap().job = Some(job);
+        drop(ed);
+        // The editor is gone and the job is not: the project is still registered as open.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        go.send(()).unwrap();
+        eventually("the project is let go of once the job has ended", || !matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        // Nothing of it was removed, and it opens again.
+        assert_eq!(store.list(), [info]);
+        drop(reopened(&store, &key));
+    }
+
+    #[test]
+    fn a_project_whose_recording_cannot_be_read_after_all_is_let_go_of_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        publish_to(&s, &state, false, &Keeping::In(store.clone())).unwrap();
+        let key = key_at(&s);
+        // Loaded, and then the frames cannot be opened: a recording with no file behind it.
+        let mut loaded = store.load(&key).unwrap();
+        loaded.rec = Arc::new(Recording::timing_only(200, 160, &[0, 500], 1000));
+        let settings = Settings::default();
+        let opened = Editor::open_project(loaded, Default::default(), settings.dest_context(TITLE), OverlayStyle::default(), settings.editor.clone());
+        assert!(opened.is_err());
+        // Not left registered as open: it can be opened, and it is all there.
+        let again = store.load(&key).unwrap();
+        assert_eq!(again.restored.title, TITLE);
+    }
+
+    /// The platform, with a commit that presses Cancel on `run` just before it answers.
+    fn cancelling_at_the_commit(run: &Arc<Run>) -> Stub {
+        let pressed = run.clone();
+        crate::publish::tests::publish_stub_over(
+            move |req, seen| {
+                if req.line.ends_with("/commit") {
+                    pressed.cancel();
+                }
+                platform(req, seen)
+            },
+            |_| reply(200, LIVE),
+        )
+    }
+
+    #[test]
+    fn cancel_pressed_after_the_commit_keeps_the_project_and_reports_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let run = Arc::new(Run::default());
+        let s = cancelling_at_the_commit(&run);
+        let done = publish_job(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &run, &|_| {}).unwrap();
+        assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
+        assert!(!s.lines().iter().any(|l| l == PUBLISH), "nothing was published");
+        // The upload is on the site, so its recording is kept: the frames are linked, which a cancel never stops.
+        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(store.list().iter().map(|p| (p.key.clone(), p.problem)).collect::<Vec<_>>(), [(key_at(&s), None)]);
+        assert_eq!(publish_ui::result_status(&done.finished, &Before::new_tour()), "Publishing cancelled: the draft is uploaded, but not public");
+        assert_eq!(publish_ui::result_note(&done.finished.outcome, &Before::new_tour()), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
+        assert_eq!(publish_ui::kept_note(&done.kept), None);
+    }
+
+    #[test]
+    fn a_cancel_while_the_frames_are_copied_is_a_recording_not_kept_and_never_a_failed_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let run = Arc::new(Run::default());
+        let s = cancelling_at_the_commit(&run);
+        // A save that has to copy: it asks the job whether to go on, as the store's copy does, and stops on a no.
+        let asked = std::cell::Cell::new(0);
+        let copying: &SaveFn<'_> = &|store, key, snap, keep_going| {
+            asked.set(asked.get() + 1);
+            if keep_going() { store.save(key, snap) } else { Err(crate::project::SAVING_CANCELLED.to_string()) }
+        };
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &run, &|_| {}, copying).unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() }, "the upload is in, and the publish was cancelled");
+        assert_eq!(done.kept, Kept::Failed("saving was cancelled.".into()));
+        assert_eq!(publish_ui::kept_note(&done.kept).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
+        assert!(store.list().is_empty() && !store.root().exists(), "nothing is left of the save");
+    }
+
+    #[test]
+    fn a_save_that_panics_is_an_internal_error_reason_and_the_upload_stays_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let broken: &SaveFn<'_> = &|_, _, _, _| panic!("the save broke");
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, broken).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the publish step ran all the same: {done:?}");
+        assert_eq!(done.kept, Kept::Failed(publish_ui::KEEPING_BROKE_OFF.into()));
+        assert_eq!(publish_ui::kept_note(&done.kept).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
+    }
+
+    #[test]
+    fn a_publish_keeps_its_recording_where_the_setting_and_this_users_folder_say() {
+        let _alone = publish_ui::tests::SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        let was = publish_ui::keeps_recordings();
+        // Only the folder's name is worked out here: nothing in it is read or written.
+        let root = Store::default_root();
+        publish_ui::set_keep_recordings(true);
+        match (keeping_now(), &root) {
+            (Keeping::In(store), Some(root)) => assert_eq!(store.root(), root),
+            (Keeping::NoFolder, None) => {}
+            _ => panic!("the switch is on, and the folder is not the user's"),
+        }
+        publish_ui::set_keep_recordings(false);
+        assert!(matches!(keeping_now(), Keeping::Off));
+        publish_ui::set_keep_recordings(was);
     }
 }
