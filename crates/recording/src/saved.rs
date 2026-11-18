@@ -23,6 +23,13 @@ const INDEX_FILE: &str = "recording.json";
 const MAX_SIDE: u32 = 16_384;
 const MAX_PIXELS: u64 = 64 << 20;
 
+/// The longest recording an index may name, in ms (about 49 days), so time arithmetic on a
+/// damaged index cannot overflow.
+const MAX_MS: u64 = u32::MAX as u64;
+
+/// How far left of or above the recorded area the recorder still notes the pointer.
+const POINTER_MARGIN: i32 = 32;
+
 /// How often a rename is tried while another program (a scanner, a sync) has the file open.
 const RENAME_TRIES: u32 = 5;
 const RENAME_WAIT: std::time::Duration = std::time::Duration::from_millis(120);
@@ -82,31 +89,46 @@ impl Recording {
             return Ok(size);
         }
 
+        let staged = self.stage(dir, expected, link, copy)?;
+        if let Err(e) = staged.swap_frames() {
+            staged.undo(false);
+            return Err(format!("could not keep the frames: {e}"));
+        }
+        if let Err(e) = staged.swap_index() {
+            staged.undo(true);
+            return Err(format!("could not write the recording's index: {e}"));
+        }
+        Ok(expected)
+    }
+
+    /// The first half of a save: the frames file and the index, each whole and on the disk
+    /// under a temporary name in `dir`. Nothing that was in the folder has been touched yet,
+    /// and a failure removes both temporary files.
+    fn stage(&self, dir: &Path, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<Staged, String> {
         let src = self.dir.join(FRAMES_FILE);
-        // Frames of an earlier save stay whole until the new file is complete beside them.
-        let existed = dest.exists();
-        let tmp = temp_beside(&dest);
-        let placed = link(&src, &tmp)
+        let (frames, index) = (dir.join(FRAMES_FILE), dir.join(INDEX_FILE));
+        let staged = Staged { frames_tmp: temp_beside(&frames), index_tmp: temp_beside(&index), replaces: frames.exists(), frames, index };
+        let tmp = &staged.frames_tmp;
+        // A link is the same data under a second name: make sure that data is on the disk.
+        let result = link(&src, tmp)
+            .and_then(|()| sync(tmp))
             .or_else(|_| {
-                let _ = std::fs::remove_file(&tmp);
-                copy(&src, &tmp)
+                let _ = std::fs::remove_file(tmp);
+                copy(&src, tmp)
             })
-            .and_then(|()| match std::fs::metadata(&tmp)?.len() {
+            .and_then(|()| match std::fs::metadata(tmp)?.len() {
                 size if size == expected => Ok(()),
                 _ => Err(io::Error::other("the frames file is not complete")),
             })
-            .and_then(|()| rename_patiently(&tmp, &dest));
-        if let Err(e) = placed {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("could not keep the frames: {e}"));
-        }
-        if let Err(e) = self.write_index(dir) {
-            if !existed {
-                let _ = std::fs::remove_file(&dest);
+            .map_err(|e| format!("could not keep the frames: {e}"))
+            .and_then(|()| self.write_index_to(&staged.index_tmp).map_err(|e| format!("could not write the recording's index: {e}")));
+        match result {
+            Ok(()) => Ok(staged),
+            Err(e) => {
+                staged.undo(false);
+                Err(e)
             }
-            return Err(e);
         }
-        Ok(expected)
     }
 
     /// Where the frames file ends by the index: the last frame's offset plus its length.
@@ -114,9 +136,8 @@ impl Recording {
         self.frames.last().and_then(|m| m.offset.checked_add(m.len as u64))
     }
 
-    /// Write `recording.json` through a temporary file and one rename, so the folder never
-    /// holds half an index.
-    fn write_index(&self, dir: &Path) -> Result<(), String> {
+    /// Write the index, whole and on the disk, to the new file `to`.
+    fn write_index_to(&self, to: &Path) -> io::Result<()> {
         let index = Index {
             format: FORMAT,
             width: self.width,
@@ -124,16 +145,18 @@ impl Recording {
             end_ms: self.end_ms,
             frames: self.frames.iter().map(|m| (m.offset, m.len, m.key, m.t_ms, m.cursor.map(|c| c.0), m.cursor.map(|c| c.1))).collect(),
         };
+        let bytes = serde_json::to_vec(&index).map_err(io::Error::other)?;
+        let mut f = File::create(to)?;
+        f.write_all(&bytes)?;
+        f.sync_all()
+    }
+
+    /// Write `recording.json` through a temporary file and one rename, so the folder never
+    /// holds half an index.
+    fn write_index(&self, dir: &Path) -> Result<(), String> {
         let path = dir.join(INDEX_FILE);
         let tmp = temp_beside(&path);
-        let written = serde_json::to_vec(&index).map_err(io::Error::other).and_then(|bytes| {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            drop(f);
-            rename_patiently(&tmp, &path)
-        });
-        written.map_err(|e| {
+        self.write_index_to(&tmp).and_then(|()| patiently(|| std::fs::rename(&tmp, &path))).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("could not write the recording's index: {e}")
         })
@@ -175,6 +198,11 @@ impl Recording {
             last_ms = t_ms;
             frames.push(FrameMeta { offset, len, key, t_ms, cursor: x.zip(y) });
         }
+        // No pointer position but those the recorder writes: a little outside the top-left, or inside.
+        let pointer_fits = |c: &(i32, i32)| (-POINTER_MARGIN..index.width as i32).contains(&c.0) && (-POINTER_MARGIN..index.height as i32).contains(&c.1);
+        if index.end_ms > MAX_MS || !frames.iter().filter_map(|m| m.cursor.as_ref()).all(pointer_fits) {
+            return Err(damaged("the index does not describe a recording"));
+        }
         if end != meta.len() {
             return Err(damaged("the frames file is not as long as the index says"));
         }
@@ -212,11 +240,55 @@ fn temp_beside(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Rename, trying again for half a second while another program has either file open.
-fn rename_patiently(from: &Path, to: &Path) -> io::Result<()> {
+/// Make sure what was written to the file at `path` is on the disk.
+fn sync(path: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
+/// A save whose new files are whole under temporary names, ready to take their places.
+struct Staged {
+    frames_tmp: PathBuf,
+    frames: PathBuf,
+    index_tmp: PathBuf,
+    index: PathBuf,
+    /// The folder already held a frames file, which the new one replaces.
+    replaces: bool,
+}
+
+impl Staged {
+    /// Put the new frames in place. An index that described the frames being replaced goes
+    /// first, so if the save stops right here the folder holds frames without an index and
+    /// never an index beside frames it does not describe.
+    fn swap_frames(&self) -> io::Result<()> {
+        if self.replaces {
+            match patiently(|| std::fs::remove_file(&self.index)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        patiently(|| std::fs::rename(&self.frames_tmp, &self.frames))
+    }
+
+    fn swap_index(&self) -> io::Result<()> {
+        patiently(|| std::fs::rename(&self.index_tmp, &self.index))
+    }
+
+    /// Remove what this save wrote: its temporary files, and the frames file if it put one
+    /// where there was none.
+    fn undo(&self, frames_placed: bool) {
+        let _ = std::fs::remove_file(&self.frames_tmp);
+        let _ = std::fs::remove_file(&self.index_tmp);
+        if frames_placed && !self.replaces {
+            let _ = std::fs::remove_file(&self.frames);
+        }
+    }
+}
+
+/// Try a rename or a removal again for half a second while another program has the file open.
+fn patiently(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut tried = 1;
     loop {
-        match std::fs::rename(from, to) {
+        match step() {
             Err(e) if tried < RENAME_TRIES && (e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32))) => {
                 tried += 1;
                 std::thread::sleep(RENAME_WAIT);
@@ -248,13 +320,18 @@ mod tests {
 
     /// A real recording of `N` frames in `<root>/rec`, as the recorder leaves one.
     fn recorded(root: &Path) -> Recording {
-        let dir = root.join("rec");
+        recorded_as(root, "rec", N)
+    }
+
+    /// A real recording of the first `n` of those frames in `<root>/<name>`.
+    fn recorded_as(root: &Path, name: &str, n: usize) -> Recording {
+        let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let mut writer = FrameWriter::create(&dir, W, H).unwrap();
-        for i in 0..N {
+        for i in 0..n {
             writer.push(&synthetic(i, W, H), i as u64 * 66, (i % 3 != 0).then_some((i as i32 - 5, 7))).unwrap();
         }
-        writer.finish(dir, N as u64 * 66).unwrap()
+        writer.finish(dir, n as u64 * 66).unwrap()
     }
 
     fn folder(root: &Path, name: &str) -> PathBuf {
@@ -464,6 +541,13 @@ mod tests {
             ("an empty frame", one(48, 32, 10, &format!("[[0,{size},true,0,null,null],[{size},0,false,5,null,null]]"))),
             ("time running backwards", one(48, 32, 10, &format!("[[0,{len0},true,7,null,null],[{len0},{rest},false,5,null,null]]"))),
             ("an end before the last frame", one(48, 32, 4, &format!("[[0,{len0},true,0,null,null],[{len0},{rest},false,5,null,null]]"))),
+            ("an end later than any recording", one(48, 32, u32::MAX as u64 + 1, &format!("[[0,{size},true,0,null,null]]"))),
+            ("a frame later than any recording", one(48, 32, u64::MAX, &format!("[[0,{size},true,{},null,null]]", u32::MAX as u64 + 1))),
+            ("a pointer right of the picture", one(48, 32, 10, &format!("[[0,{size},true,0,48,4]]"))),
+            ("a pointer below the picture", one(48, 32, 10, &format!("[[0,{size},true,0,3,32]]"))),
+            ("a pointer too far left", one(48, 32, 10, &format!("[[0,{size},true,0,-33,4]]"))),
+            ("a pointer too far up", one(48, 32, 10, &format!("[[0,{size},true,0,3,-33]]"))),
+            ("a pointer far outside", one(48, 32, 10, &format!("[[0,{size},true,0,{},{}]]", i32::MAX, i32::MIN))),
         ];
         for (what, text) in cases {
             std::fs::write(kept.join(INDEX_FILE), text).unwrap();
@@ -472,7 +556,91 @@ mod tests {
         // The same checks pass an index that does fit.
         std::fs::write(kept.join(INDEX_FILE), one(48, 32, 10, &format!("[[0,{len0},true,0,null,null],[{len0},{rest},false,5,3,4]]"))).unwrap();
         assert_eq!(opened(&kept).frames.len(), 2);
+        // The longest time and the outermost pointer positions the recorder writes are fine.
+        let edge = one(48, 32, u32::MAX as u64, &format!("[[0,{len0},true,0,-32,-32],[{len0},{rest},false,{},47,31]]", u32::MAX));
+        std::fs::write(kept.join(INDEX_FILE), edge).unwrap();
+        let rec = opened(&kept);
+        assert_eq!((rec.frames[0].cursor, rec.frames[1].cursor, rec.end_ms), (Some((-32, -32)), Some((47, 31)), u32::MAX as u64));
         assert_eq!(names(&kept), [FRAMES_FILE, INDEX_FILE]);
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_put_in_a_new_folder_takes_the_new_frames_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorded(tmp.path());
+        let kept = folder(tmp.path(), "kept");
+        // Something that is not a file has the index's name, so the rename onto it fails.
+        std::fs::create_dir(kept.join(INDEX_FILE)).unwrap();
+        let err = rec.save_into(&kept).unwrap_err();
+        assert!(err.contains("index"), "{err}");
+        assert_eq!(names(&kept), [INDEX_FILE]);
+        assert!(kept.join(INDEX_FILE).is_dir());
+        assert_every_frame(&rec);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_index_that_cannot_be_replaced_leaves_the_recording_that_was_there_whole() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let first = recorded(tmp.path());
+        let other = recorded_as(tmp.path(), "other", 5);
+        let kept = folder(tmp.path(), "kept");
+        first.save_into(&kept).unwrap();
+        let (frames, index) = (std::fs::read(kept.join(FRAMES_FILE)).unwrap(), std::fs::read(kept.join(INDEX_FILE)).unwrap());
+        // Another program holds the index and shares it with nobody.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(kept.join(INDEX_FILE)).unwrap();
+        assert!(other.save_into(&kept).is_err());
+        drop(held);
+        assert_eq!(names(&kept), [FRAMES_FILE, INDEX_FILE]);
+        assert_eq!(std::fs::read(kept.join(FRAMES_FILE)).unwrap(), frames);
+        assert_eq!(std::fs::read(kept.join(INDEX_FILE)).unwrap(), index);
+        assert_every_frame(&opened(&kept));
+        // Once the index is free the other recording takes the folder.
+        other.save_into(&kept).unwrap();
+        assert_eq!(opened(&kept).frames.len(), 5);
+    }
+
+    #[test]
+    fn a_save_cut_off_between_the_frames_and_the_index_is_never_taken_for_a_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = recorded(tmp.path());
+        let other = recorded_as(tmp.path(), "other", 5);
+        let kept = folder(tmp.path(), "kept");
+        first.save_into(&kept).unwrap();
+        // The save of another recording gets as far as its frames, and stops there.
+        let expected = other.frames_end().unwrap();
+        let staged = other.stage(&kept, expected, no_link, copy_whole).unwrap();
+        assert_every_frame(&opened(&kept));
+        staged.swap_frames().unwrap();
+        // The first recording's index is not left beside frames it does not describe,
+        // whatever their size: there is no index at all.
+        assert!(!kept.join(INDEX_FILE).exists());
+        assert_eq!(refused(&kept), OpenError::Missing);
+        // The second half makes it the other recording, whole.
+        staged.swap_index().unwrap();
+        assert_eq!(names(&kept), [FRAMES_FILE, INDEX_FILE]);
+        let again = opened(&kept);
+        assert_eq!(again.frames.len(), 5);
+        assert_eq!(again.frame(4).unwrap().into_raw(), synthetic(4, W, H));
+    }
+
+    #[test]
+    fn a_recording_open_in_a_reader_is_kept_and_outlives_its_temp_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Arc::new(recorded(tmp.path()));
+        // The editor holds the frames file open the whole time.
+        let mut reader = FrameReader::new(rec.clone()).unwrap();
+        assert_eq!(reader.get(3).unwrap().into_raw(), synthetic(3, W, H));
+        let kept = folder(tmp.path(), "kept");
+        rec.save_with(&kept, |from, to| std::fs::hard_link(from, to), no_copy).unwrap();
+        // The editor closes: the temp files go while the reader still has its handle.
+        rec.delete_files();
+        let again = opened(&kept);
+        assert_eq!(again.frame(N - 1).unwrap().into_raw(), synthetic(N - 1, W, H));
+        assert_every_frame(&again);
+        // The reader's own handle still reads what it had open.
+        assert_eq!(reader.get(4).unwrap().into_raw(), synthetic(4, W, H));
     }
 
     #[test]
