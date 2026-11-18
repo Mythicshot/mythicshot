@@ -19,6 +19,8 @@ use crate::icons::{self, Icon};
 use crate::publish::{Published, Target};
 use crate::publish_ui::{self, Picker, PickerOutcome, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
+use crate::site::{self, SiteSummary};
+use crate::site_ui::{SiteDialog, SiteOutcome};
 use crate::settings_ui::{click_style_label, key_style_label};
 use crate::tour::{self, StepPlan, TourSummary};
 use crate::video::{self, Edit};
@@ -114,11 +116,13 @@ enum TourOutput {
 }
 
 /// The export running in the editor: a file (GIF, APNG, MP4, WebM), a tour bundle or single
-/// file, or a tour being published, with the flag that cancels it.
+/// file, a tour added to a site, or a tour being published, with the flag that cancels it.
 enum ExportJob {
     File(EncodeJob),
     /// A tour export, with the run that cancels it and that quitting waits for.
     Tour(EncodeJob<TourSummary>, TourOutput, Arc<Run>),
+    /// A tour added to a site, cancelled like a tour export, with the site title to remember once it worked.
+    Site(EncodeJob<SiteSummary>, Arc<Run>, String),
     Publish(EncodeJob<Published>, Arc<Run>),
 }
 
@@ -126,19 +130,25 @@ enum ExportJob {
 enum Exported {
     File(PathBuf, u64),
     Tour(TourSummary, TourOutput),
+    Site(SiteSummary, String),
     Published(Published),
 }
 
 impl ExportJob {
     /// A tour export or a publish: either one hands "Export and close" over to the file export.
     fn is_tour(&self) -> bool {
-        matches!(self, ExportJob::Tour(..) | ExportJob::Publish(..))
+        matches!(self, ExportJob::Tour(..) | ExportJob::Site(..) | ExportJob::Publish(..))
+    }
+
+    fn is_site(&self) -> bool {
+        matches!(self, ExportJob::Site(..))
     }
 
     fn progress(&self) -> f32 {
         match self {
             ExportJob::File(j) => j.progress(),
             ExportJob::Tour(j, ..) => j.progress(),
+            ExportJob::Site(j, ..) => j.progress(),
             ExportJob::Publish(j, _) => j.progress(),
         }
     }
@@ -148,6 +158,7 @@ impl ExportJob {
         match self {
             ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
             ExportJob::Tour(j, out, _) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
+            ExportJob::Site(j, _, title) => j.take_result().map(|r| r.map(|s| Exported::Site(s, title.clone()))),
             ExportJob::Publish(j, _) => j.take_result().map(|r| r.map(Exported::Published)),
         }
     }
@@ -160,10 +171,10 @@ impl ExportJob {
         }
     }
 
-    /// For a tour export: whether cancel was asked for (None for any other export).
+    /// For a tour export or an add to a site: whether cancel was asked for (None for any other export).
     fn tour_cancelling(&self) -> Option<bool> {
         match self {
-            ExportJob::Tour(_, _, run) => Some(run.is_cancelled()),
+            ExportJob::Tour(_, _, run) | ExportJob::Site(_, run, _) => Some(run.is_cancelled()),
             _ => None,
         }
     }
@@ -179,6 +190,34 @@ fn progress_message(is_tour: bool, cancelling: Option<bool>, tour_cancelling: bo
         None if is_tour => format!("Exporting tour… {:.0}%", progress * 100.0),
         None => format!("Exporting… {:.0}%", progress * 100.0),
     }
+}
+
+/// The notification while a tour is being added to a site.
+fn site_progress_message(cancelling: bool, progress: f32) -> String {
+    if cancelling { "Cancelling…".to_string() } else { format!("Adding to site… {:.0}%", progress * 100.0) }
+}
+
+/// The status message once a tour is in its site; the status bar adds "· Show in folder · Open site".
+fn site_message(s: &SiteSummary) -> String {
+    format!("{} site: {}", if s.replaced { "Replaced in" } else { "Added to" }, step_count(s.tour.steps))
+}
+
+/// The sentences after a site add's message: pictures saved at lower quality, and an old copy left behind.
+fn site_more(s: &SiteSummary) -> Option<String> {
+    let parts: Vec<String> = s.tour.squeezed_note().into_iter().chain(s.note.clone()).collect();
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+}
+
+/// The site folder to remember after an add, or None to keep the remembered one: the test hook's folder
+/// stays in memory only.
+fn remembered_folder(dir: &Path, hook: Option<&str>) -> Option<String> {
+    let folder = dir.to_string_lossy().into_owned();
+    if hook.is_some_and(|h| Path::new(h.trim()) == dir) { None } else { Some(folder) }
+}
+
+/// The time a site's list records for a tour: UTC to the second.
+fn utc_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Share of a publish's progress spent writing the bundle; the upload takes the rest.
@@ -312,6 +351,8 @@ pub struct VideoState {
     job: Option<ExportJob>,
     /// The "Publish tour" dialog, while it is open.
     picker: Option<Picker>,
+    /// The "Add to site" dialog, while it is open.
+    site_dialog: Option<SiteDialog>,
     pub exported: bool,
     pub close_after_export: bool,
     drag: Option<TimelineDrag>,
@@ -391,6 +432,7 @@ impl Editor {
             last_overlays: overlays,
             job: None,
             picker: None,
+            site_dialog: None,
             exported: false,
             close_after_export: false,
             drag: None,
@@ -522,10 +564,35 @@ impl Editor {
                 }
             }
         }
+        // The "Add to site" dialog. "Add to site" either starts the job or keeps the dialog open with the reason.
+        let Some(v) = self.video.as_mut() else { return };
+        match v.site_dialog.as_mut().and_then(|d| d.show(ctx)) {
+            None => {}
+            Some(SiteOutcome::Cancel) => v.site_dialog = None,
+            Some(SiteOutcome::Add { folder, title, slug }) => {
+                let refusal = if v.job.is_some() {
+                    Some("Wait for the running export to finish, then add the tour.".to_string())
+                } else {
+                    tour::plan_steps(&v.rec, &v.edit, &v.events).err()
+                };
+                match refusal {
+                    Some(why) => {
+                        if let Some(d) = v.site_dialog.as_mut() {
+                            d.refuse(why);
+                        }
+                    }
+                    None => {
+                        v.site_dialog = None;
+                        self.start_site(folder, title, slug);
+                    }
+                }
+            }
+        }
         let Some(v) = self.video.as_mut() else { return };
         let finished = v.job.as_ref().and_then(|j| j.take_result());
         let progress = v.job.as_ref().map(|j| j.progress());
         let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
+        let is_site = v.job.as_ref().is_some_and(|j| j.is_site());
         let cancelling = v.job.as_ref().and_then(|j| j.cancelling());
         let tour_cancelling = v.job.as_ref().and_then(|j| j.tour_cancelling()) == Some(true);
         if let Some(r) = finished {
@@ -560,6 +627,27 @@ impl Editor {
                             self.status_reveal = Some(tour.path);
                             self.status_more = more;
                         }
+                        // The site's index opens in the browser, and the status bar offers the folder and the site again.
+                        Exported::Site(s, title) => {
+                            let msg = site_message(&s);
+                            eprintln!("{msg} at {} in {}", site::address(&s.slug), s.dir.display());
+                            self.notify(msg);
+                            let index = s.dir.join("index.html");
+                            crate::platform::open_path(&index);
+                            self.status_reveal = Some(index.clone());
+                            self.status_open = Some(index);
+                            self.status_more = site_more(&s);
+                            #[cfg(debug_assertions)]
+                            let hook = std::env::var("MYTHICSHOT_TEST_SITE").ok();
+                            #[cfg(not(debug_assertions))]
+                            let hook: Option<String> = None;
+                            let folder = remembered_folder(&s.dir, hook.as_deref()).unwrap_or_else(|| self.prefs.site_folder.clone());
+                            if self.prefs.site_folder != folder || self.prefs.site_title != title {
+                                self.prefs.site_folder = folder;
+                                self.prefs.site_title = title;
+                                self.prefs_changed = true;
+                            }
+                        }
                         Exported::Published(p) => {
                             let msg = format!("Tour uploaded as a draft: {}", step_count(p.steps));
                             eprintln!("{msg}");
@@ -570,6 +658,11 @@ impl Editor {
                 Err(e) if cancelling.is_some() => {
                     let msg = if e == crate::publish::CANCELLED { "Publishing cancelled".to_string() } else { e };
                     eprintln!("Publish tour: {msg}");
+                    self.notify(msg);
+                }
+                Err(e) if is_site => {
+                    let msg = if e == "cancelled" { "Adding to site cancelled".to_string() } else { e };
+                    eprintln!("Add to site: {msg}");
                     self.notify(msg);
                 }
                 Err(e) if is_tour => {
@@ -588,7 +681,8 @@ impl Editor {
                 AfterExport::Close => self.closed = true,
             }
         } else if let Some(p) = progress {
-            self.notify(progress_message(is_tour, cancelling, tour_cancelling, p));
+            let msg = if is_site { site_progress_message(tour_cancelling, p) } else { progress_message(is_tour, cancelling, tour_cancelling, p) };
+            self.notify(msg);
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         self.sync_frame();
@@ -667,10 +761,11 @@ impl Editor {
         self.notify("Exporting tour… 0%");
     }
 
-    /// Ask a running tour export to stop; it stops before its next picture.
+    /// Ask a running tour export or add to a site to stop; it stops before its next picture, and an add
+    /// leaves the site as it was.
     pub(crate) fn cancel_tour_export(&mut self) {
         let Some(v) = self.video.as_ref() else { return };
-        if let Some(ExportJob::Tour(_, _, run)) = &v.job {
+        if let Some(ExportJob::Tour(_, _, run) | ExportJob::Site(_, run, _)) = &v.job {
             run.cancel();
             self.notify("Cancelling…");
         }
@@ -690,7 +785,52 @@ impl Editor {
         self.spawn_tour(TourOutput::File, move |rec, items, events, edit, title, frame, progress| tour::write_single_file(rec, items, events, edit, title, &path, frame, progress));
     }
 
-    /// Open the "Publish tour" dialog, unless an export is running.
+    /// The "Add to site" dialog is open: the editor takes no shortcuts or canvas input.
+    pub(crate) fn site_dialog_open(&self) -> bool {
+        self.video.as_ref().is_some_and(|v| v.site_dialog.is_some())
+    }
+
+    /// Open the "Add to site" dialog with the remembered folder and title, unless an export is running.
+    fn open_site_dialog(&mut self) {
+        let title = self.title().to_string();
+        let (folder, site_title) = (self.prefs.site_folder.clone(), self.prefs.site_title.clone());
+        let Some(v) = self.video.as_mut() else { return };
+        if v.job.is_some() || v.picker.is_some() || v.site_dialog.is_some() {
+            return;
+        }
+        v.site_dialog = Some(SiteDialog::open(&folder, &site_title, &title));
+    }
+
+    /// Add the tour to the site in `folder` at `slug`, in the background: the tour export writes it as a
+    /// site tour, with its limits and clean-up, and it is swapped into the site once complete.
+    /// "Cancel export" and quitting stop it, and the site is left as it was.
+    fn start_site(&mut self, folder: PathBuf, site_title: String, slug: String) {
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
+        let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
+        let run = Run::begin();
+        let worker = run.clone();
+        let (now, remembered) = (utc_now(), site_title.clone());
+        let job = EncodeJob::spawn(move |progress| {
+            guarded_as(&worker, "Adding to site failed because of an internal error.", || {
+                // The editor's reader stays on the UI thread; this one belongs to the job.
+                let mut reader = FrameReader::new(rec.clone())?;
+                site::add_tour(&folder, &site_title, &slug, &title, &now, |dir, assets| {
+                    tour::write_tour(&rec, &items, &events, &edit, &title, dir, |i| reader.get(i), |f| {
+                        progress(f);
+                        !worker.is_cancelled()
+                    }, tour::Page::Site(assets))
+                })
+            })
+        });
+        if let Some(v) = self.video.as_mut() {
+            v.job = Some(ExportJob::Site(job, run, remembered));
+        }
+        self.notify("Adding to site… 0%");
+    }
+
     /// The "Publish tour" dialog is open: the editor takes no shortcuts or canvas input.
     pub(crate) fn publish_picker_open(&self) -> bool {
         self.video.as_ref().is_some_and(|v| v.picker.is_some())
@@ -699,7 +839,7 @@ impl Editor {
     fn open_publish_picker(&mut self) {
         let title = self.title().to_string();
         let Some(v) = self.video.as_mut() else { return };
-        if v.job.is_some() || v.picker.is_some() {
+        if v.job.is_some() || v.picker.is_some() || v.site_dialog.is_some() {
             return;
         }
         v.picker = Some(Picker::open(publish_ui::server(), title));
@@ -841,6 +981,7 @@ impl Editor {
         let tour_running = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.tour_cancelling());
         let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status());
         let mut chosen = None;
+        let mut add_to_site = false;
         ui.horizontal(|ui| {
             // A menu with both choices every time; neither is remembered. It opens with Enter, Space
             // or the right arrow, and the arrows move between its items.
@@ -856,12 +997,19 @@ impl Editor {
                     }
                 });
             });
+            if ui.add_enabled(tour_ok && !exporting, egui::Button::new("Add to site…")).on_hover_text("Write this tour into a folder of plain web files").clicked() {
+                add_to_site = true;
+                ui.close();
+            }
             let publish = egui::Button::new(RichText::new("Publish tour…").strong()).fill(Color32::from_rgb(47, 111, 235));
             if ui.add_enabled(blocked.is_none(), publish).on_hover_text("Upload this tour to your server as a private draft").clicked() {
                 self.open_publish_picker();
                 ui.close();
             }
         });
+        if add_to_site {
+            self.open_site_dialog();
+        }
         if let Some(out) = chosen {
             ui.close();
             match out {
@@ -1240,6 +1388,28 @@ mod tests {
         assert_eq!(progress_message(true, None, false, 0.25), "Exporting tour… 25%");
         assert_eq!(progress_message(true, None, true, 0.25), "Cancelling…", "a tour export being cancelled");
         assert_eq!(progress_message(false, None, false, 0.5), "Exporting… 50%");
+    }
+
+    #[test]
+    fn adding_to_a_site_shows_its_progress_and_says_what_was_written() {
+        assert_eq!(site_progress_message(false, 0.4), "Adding to site… 40%");
+        assert_eq!(site_progress_message(true, 0.4), "Cancelling…");
+        let tour = TourSummary { path: PathBuf::from("site/tours/a"), steps: 3, bytes: 10, squeezed: 0 };
+        let mut s = SiteSummary { dir: PathBuf::from("site"), slug: "a".into(), replaced: false, tours: 1, tour, note: None };
+        assert_eq!(site_message(&s), "Added to site: 3 steps");
+        assert_eq!(site_more(&s), None);
+        s.replaced = true;
+        s.tour.steps = 1;
+        s.tour.squeezed = 1;
+        s.note = Some("The previous version of tours/a/ could not be removed.".into());
+        assert_eq!(site_message(&s), "Replaced in site: 1 step");
+        assert_eq!(site_more(&s).unwrap(), "1 picture was saved at lower quality to fit. The previous version of tours/a/ could not be removed.");
+        // The test hook's folder is never saved.
+        assert_eq!(remembered_folder(Path::new("sites/guides"), None).as_deref(), Some("sites/guides"));
+        assert_eq!(remembered_folder(Path::new("sites/guides"), Some("sites/guides")), None);
+        assert_eq!(remembered_folder(Path::new("sites/guides"), Some("other")).as_deref(), Some("sites/guides"));
+        let now = utc_now();
+        assert!(now.len() == 20 && now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
     }
 
     #[test]

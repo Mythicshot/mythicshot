@@ -177,6 +177,11 @@ pub fn tour_title(title: &str) -> String {
     if t.is_empty() { "Untitled tour".to_string() } else { t }
 }
 
+/// One line of text cleaned like the tour's title and capped at `max` code points; empty when nothing is left.
+pub fn clean_line(text: &str, max: usize) -> String {
+    doc::clean(text, max, false)
+}
+
 /// Refuse a tour with more steps, or a step with more notes, than the server takes.
 fn check_counts(steps: &[ManifestStep]) -> Result<(), String> {
     if steps.len() > MAX_STEPS {
@@ -251,12 +256,61 @@ const FOLDER_IMG_SRC: &str = "img-src 'self';";
 /// A single file loads them only from the `data:` URLs it carries, and nothing else.
 const SINGLE_IMG_SRC: &str = "img-src data:;";
 
+// Markers around the player's parts in the preview template, so a site's tour page and its shared files
+// are cut from the same page and can never drift from it. The preview and the single file drop the
+// markers, so their bytes are exactly what they were without them.
+const CSS_BEGIN: &str = "/*PLAYER_CSS_BEGIN*/";
+const CSS_END: &str = "/*PLAYER_CSS_END*/";
+const HTML_BEGIN: &str = "<!--PLAYER_HTML_BEGIN-->";
+const HTML_END: &str = "<!--PLAYER_HTML_END-->";
+const JS_BEGIN: &str = "/*PLAYER_JS_BEGIN*/";
+const JS_END: &str = "/*PLAYER_JS_END*/";
+/// Around the one line only the local preview has (its window title); a site's page names itself.
+const PREVIEW_ONLY_BEGIN: &str = "/*PREVIEW_ONLY_BEGIN*/";
+const PREVIEW_ONLY_END: &str = "/*PREVIEW_ONLY_END*/";
+const MARKERS: [&str; 8] = [CSS_BEGIN, CSS_END, HTML_BEGIN, HTML_END, JS_BEGIN, JS_END, PREVIEW_ONLY_BEGIN, PREVIEW_ONLY_END];
+
+/// Template text with the player markers taken out.
+fn strip_markers(s: &str) -> String {
+    MARKERS.iter().fold(s.to_string(), |s, m| s.replacen(m, "", 1))
+}
+
+/// The template text between two markers.
+fn between(begin: &str, end: &str) -> &'static str {
+    let (_, rest) = PREVIEW_TEMPLATE.split_once(begin).expect("the preview template has the player's begin marker");
+    rest.split_once(end).expect("the preview template has the player's end marker").0
+}
+
+/// The preview's style rules, as a site's shared stylesheet holds them.
+pub fn player_css() -> &'static str {
+    between(CSS_BEGIN, CSS_END)
+}
+
+/// The preview's page body from the image area to its status line, which the player script fills in.
+pub fn player_html() -> &'static str {
+    between(HTML_BEGIN, HTML_END)
+}
+
+/// The preview's player script, a function call that reads `TOUR`, without the preview's own window title.
+pub fn player_js() -> String {
+    let js = between(JS_BEGIN, JS_END);
+    let (before, rest) = js.split_once(PREVIEW_ONLY_BEGIN).expect("the player has a preview-only part");
+    let (_, after) = rest.split_once(PREVIEW_ONLY_END).expect("the preview-only part ends");
+    format!("{before}{after}")
+}
+
+/// The shared rules every player uses.
+pub fn tour_core_js() -> &'static str {
+    TOUR_CORE_JS
+}
+
 /// The preview page in two parts, split where a single file's pictures go. The rules go in first, from
-/// the template, so text in the manifest can never be taken for a placeholder. `single` swaps the image
-/// rule of the Content-Security-Policy for the single-file one; nothing else differs.
+/// the template, so text in the manifest can never be taken for a placeholder or a marker. `single` swaps
+/// the image rule of the Content-Security-Policy for the single-file one; nothing else differs.
 fn page_parts(compact_json: &str, single: bool) -> (String, String) {
     let (head, tail) = PREVIEW_TEMPLATE.split_once(IMAGES_PLACEHOLDER).expect("the preview template has an images placeholder");
-    let head = if single { head.replacen(FOLDER_IMG_SRC, SINGLE_IMG_SRC, 1) } else { head.to_string() };
+    let (head, tail) = (strip_markers(head), strip_markers(tail));
+    let head = if single { head.replacen(FOLDER_IMG_SRC, SINGLE_IMG_SRC, 1) } else { head };
     (head, tail.replacen(CORE_PLACEHOLDER, TOUR_CORE_JS, 1).replacen(JSON_PLACEHOLDER, compact_json, 1))
 }
 
@@ -317,6 +371,40 @@ pub fn write_bundle(
     frame: impl FnMut(usize) -> Result<RgbaImage, String>,
     progress: impl FnMut(f32) -> bool,
 ) -> Result<TourSummary, String> {
+    write_tour(rec, items, events, edit, title, dir, frame, progress, Page::Preview)
+}
+
+/// Which page a tour folder gets.
+#[derive(Debug, Clone, Copy)]
+pub enum Page<'a> {
+    /// The local preview, with everything inline: what "Export tour" writes.
+    Preview,
+    /// A tour page in a site, using the site's shared player files, with a `thumb.jpg` for the index.
+    Site(&'a crate::site::Assets),
+}
+
+/// A site's thumbnail is always this wide and [`THUMB_HEIGHT`] high: the index's 16:10 box.
+pub const THUMB_WIDTH: u32 = 480;
+/// The height of a site's thumbnail.
+pub const THUMB_HEIGHT: u32 = 300;
+/// The JPEG quality of a site's thumbnail.
+const THUMB_QUALITY: u8 = 80;
+
+/// [`write_bundle`] with the page chosen. [`Page::Site`] writes the site's tour page and a `thumb.jpg` (the
+/// first step's picture as a [`THUMB_WIDTH`] by [`THUMB_HEIGHT`] JPEG, quality 80) in place of the preview page.
+/// Everything else, the refusals, the clean-up and the messages, is the same.
+#[allow(clippy::too_many_arguments)]
+pub fn write_tour(
+    rec: &Recording,
+    items: &[Item],
+    events: &[InputEvent],
+    edit: &Edit,
+    title: &str,
+    dir: &Path,
+    frame: impl FnMut(usize) -> Result<RgbaImage, String>,
+    progress: impl FnMut(f32) -> bool,
+    page: Page<'_>,
+) -> Result<TourSummary, String> {
     let plan = plan_steps(rec, edit, events)?;
     if dir.symlink_metadata().is_ok() {
         return Err(format!("{} already exists", dir.display()));
@@ -327,7 +415,7 @@ pub fn write_bundle(
     std::fs::create_dir(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{} already exists", dir.display()) } else { format!("Could not create {}: {e}", dir.display()) }
     })?;
-    match write_into(rec, items, events, edit, prepared, &mut FolderSink { dir }, frame, progress) {
+    match write_into(rec, items, events, edit, prepared, &mut FolderSink { dir, page, thumb: false }, frame, progress) {
         Ok((steps, bytes, squeezed)) => Ok(TourSummary { path: dir.to_path_buf(), steps, bytes, squeezed }),
         Err(e) => match std::fs::remove_dir_all(dir) {
             Ok(()) => Err(e),
@@ -445,22 +533,57 @@ trait Sink {
     fn finish(&mut self, manifest: &Manifest) -> Result<(), String>;
 }
 
-/// A bundle: each picture as a file, then `tour.json` and `index.html`.
+/// A bundle: each picture as a file, then `tour.json` and `index.html`. A site's tour also gets
+/// `thumb.jpg`, made from its first step.
 struct FolderSink<'a> {
     dir: &'a Path,
+    page: Page<'a>,
+    /// Whether `thumb.jpg` has been written.
+    thumb: bool,
 }
 
 impl Sink for FolderSink<'_> {
     fn image(&mut self, name: &str, _ext: &str, bytes: &[u8]) -> Result<(), String> {
-        std::fs::write(self.dir.join(name), bytes).map_err(|e| format!("Could not write {name}: {e}"))
+        std::fs::write(self.dir.join(name), bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
+        if matches!(self.page, Page::Site(_)) && !self.thumb && name.starts_with("step-") {
+            let thumb = thumbnail(bytes).map_err(|e| format!("Could not write {}: {e}", crate::site::THUMB))?;
+            std::fs::write(self.dir.join(crate::site::THUMB), thumb).map_err(|e| format!("Could not write {}: {e}", crate::site::THUMB))?;
+            self.thumb = true;
+        }
+        Ok(())
     }
 
     fn finish(&mut self, manifest: &Manifest) -> Result<(), String> {
         let pretty = serde_json::to_string_pretty(manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
         std::fs::write(self.dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
-        let html = preview_page(&compact_json(manifest, "index.html")?);
+        let json = compact_json(manifest, "index.html")?;
+        let html = match self.page {
+            Page::Preview => preview_page(&json),
+            Page::Site(assets) => crate::site::tour_page(&json, &manifest.title, assets),
+        };
         std::fs::write(self.dir.join("index.html"), html).map_err(|e| format!("Could not write index.html: {e}"))
     }
+}
+
+/// A step picture as the index's thumbnail, a [`THUMB_WIDTH`] by [`THUMB_HEIGHT`] JPEG: scaled until it
+/// covers the box, then cut from the top (a step's heading is usually there) and evenly at both sides.
+/// Transparent parts are laid on white first, as a page shows them.
+fn thumbnail(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let rgba = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8();
+    let flat = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let on_white = |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255) as u8;
+        image::Rgb([on_white(r), on_white(g), on_white(b)])
+    });
+    let (w, h) = (u64::from(flat.width().max(1)), u64::from(flat.height().max(1)));
+    let (tw, th) = (u64::from(THUMB_WIDTH), u64::from(THUMB_HEIGHT));
+    // The smallest size at least as wide and as high as the box, keeping the picture's shape.
+    let (sw, sh) = if w * th >= h * tw { ((w * th).div_ceil(h).max(tw), th) } else { (tw, (h * tw).div_ceil(w).max(th)) };
+    let scaled = image::imageops::resize(&flat, sw as u32, sh as u32, image::imageops::FilterType::Triangle);
+    let img = image::imageops::crop_imm(&scaled, ((sw - tw) / 2) as u32, 0, THUMB_WIDTH, THUMB_HEIGHT).to_image();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, THUMB_QUALITY).encode_image(&img).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// A single page: its head, then one block per picture, written as each picture is made, then the rest
@@ -1853,6 +1976,104 @@ mod tests {
         assert!(seen.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(sum.bytes, std::fs::metadata(&file).unwrap().len());
         assert_eq!(single_parts(&std::fs::read_to_string(&file).unwrap()).0.len(), 200);
+    }
+
+    // Site export.
+
+    #[test]
+    fn the_preview_page_is_unchanged_by_the_markers() {
+        // The preview still carries the label and inline code, and none of the site's parts or markers.
+        let html = preview_page("{}");
+        assert!(html.contains("Local preview") && html.contains(r#"document.title = TOUR.title + " (local preview)";"#));
+        assert!(!html.contains("tour-data") && !html.contains("../../assets/"));
+        for m in MARKERS {
+            assert!(PREVIEW_TEMPLATE.matches(m).count() == 1, "{m} is in the template once");
+            assert!(!html.contains(m) && !TOUR_CORE_JS.contains(m), "{m}");
+        }
+        // Byte for byte the page written before the markers existed. Change this only together with a
+        // reviewed change to the preview page or the shared rules.
+        use sha2::Digest;
+        let hash: String = sha2::Sha256::digest(html.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash, "048d477819f6d38db7fc90ee146eb5042cb6730aaa0d0727bbe582f770a970cd");
+        // Text in a manifest that looks like a marker stays as it is.
+        let page = preview_page(r#"{"title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->"}"#);
+        assert!(page.contains(r#""title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->""#));
+    }
+
+    #[test]
+    fn the_site_player_is_cut_from_the_preview_page() {
+        // Every part a site's page uses is, word for word, in the preview page, so the two cannot drift.
+        let html = preview_page("{}");
+        assert!(html.contains(player_css()) && player_css().contains("#card.compact {") && player_css().contains("prefers-reduced-motion"));
+        assert!(html.contains(player_html()) && player_html().starts_with("<main>") && player_html().contains(r#"<div id="status""#));
+        let js = player_js();
+        assert!(js.starts_with("(function () {") && js.trim_end().ends_with("})();"));
+        let (before, after) = js.split_once("  \n  $(\"title\")").unwrap();
+        assert!(html.contains(before) && html.contains(&format!("  $(\"title\"){after}")));
+        assert!(!js.contains("local preview") && !js.contains("Local preview") && !player_html().contains("Local preview"));
+        assert!(!player_html().contains("<header") && !player_html().contains("<script"));
+    }
+
+    #[test]
+    fn a_site_tour_writes_a_thumbnail_and_no_preview() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let a = crate::site::assets();
+        let sum = write_tour(&r, &[], &clicks(), &edit(&r), "My tour", &dir, flat, |_| true, Page::Site(&a)).unwrap();
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(html.contains("tour-data") && !html.contains("Local preview"));
+        assert!(html.contains(&format!("../../assets/{}", a.js_name)) && html.contains("<title>My tour</title>"));
+        let thumb = image::open(dir.join("thumb.jpg")).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (THUMB_WIDTH, THUMB_HEIGHT));
+        assert!(dir.join("tour.json").exists() && dir.join("step-001.png").exists());
+        // The same pictures and manifest as the folder export.
+        let folder = tmp.path().join("folder");
+        let plain = write_bundle(&r, &[], &clicks(), &edit(&r), "My tour", &folder, flat, |_| true).unwrap();
+        assert_eq!((sum.steps, sum.bytes, sum.squeezed), (plain.steps, plain.bytes, plain.squeezed));
+        assert_eq!(std::fs::read(dir.join("tour.json")).unwrap(), std::fs::read(folder.join("tour.json")).unwrap());
+        assert!(!folder.join("thumb.jpg").exists());
+        // The manifest in the page is the manifest, and nothing in it is markup.
+        let data = html.split_once(r#"<script type="application/json" id="tour-data">"#).unwrap().1.split_once("</script>").unwrap().0;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(data).unwrap(), read_json(&dir));
+    }
+
+    #[test]
+    fn a_wide_first_step_gives_a_480_pixel_thumbnail_and_a_failure_leaves_nothing() {
+        let r = Recording::timing_only(1600, 1000, &[0, 500], 1000);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        let a = crate::site::assets();
+        let wide = |_: usize| Ok(RgbaImage::from_pixel(1600, 1000, image::Rgba([10, 200, 30, 255])));
+        write_tour(&r, &[], &[left(250, 800, 500)], &edit(&r), "<b>Wide</b>", &dir, wide, |_| true, Page::Site(&a)).unwrap();
+        let thumb = image::open(dir.join("thumb.jpg")).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (480, 300));
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(html.contains("<title>&lt;b&gt;Wide&lt;/b&gt;</title>") && !html.contains("<b>Wide"));
+        // A tall picture is scaled to the width and cut from the top; a wide one is cut at both sides.
+        let png = |img: &RgbaImage| {
+            let mut out = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+            out
+        };
+        let mut tall = RgbaImage::from_pixel(200, 1000, image::Rgba([0, 0, 255, 255]));
+        for y in 0..100 {
+            for x in 0..200 {
+                tall.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let t = image::load_from_memory(&thumbnail(&png(&tall)).unwrap()).unwrap().to_rgb8();
+        assert_eq!(t.dimensions(), (480, 300));
+        assert!(t.get_pixel(240, 10)[0] > 200 && t.get_pixel(240, 290)[2] > 200, "the top is kept");
+        let broad = image::load_from_memory(&thumbnail(&png(&RgbaImage::from_pixel(3000, 300, image::Rgba([9, 9, 9, 255])))).unwrap()).unwrap();
+        assert_eq!((broad.width(), broad.height()), (480, 300));
+        // Transparency becomes white, not black.
+        let clear = image::load_from_memory(&thumbnail(&png(&RgbaImage::from_pixel(160, 100, image::Rgba([0, 0, 0, 0])))).unwrap()).unwrap().to_rgb8();
+        assert!(clear.get_pixel(240, 150).0.iter().all(|c| *c > 245), "{:?}", clear.get_pixel(240, 150));
+        // A cancel removes the folder, thumbnail and all, with the folder export's own message.
+        let gone = tmp.path().join("gone");
+        assert_eq!(write_tour(&r, &[], &[left(250, 800, 500)], &edit(&r), "t", &gone, wide, |f| f < 1.0, Page::Site(&a)).unwrap_err(), "cancelled");
+        assert!(!gone.exists());
     }
 
     #[test]

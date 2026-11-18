@@ -101,6 +101,9 @@ pub struct EditorPrefs {
     pub tour_theme: SavedTheme,
     /// The Tour view pulses the hotspot as the tour does; off draws it still.
     pub tour_animate_hotspot: bool,
+    /// "Add to site": the site folder and the site's title used last, empty until a tour is added.
+    pub site_folder: String,
+    pub site_title: String,
 }
 
 /// A tour's look as saved in the settings file: the Tour settings a new recording starts with.
@@ -129,7 +132,7 @@ impl Default for SavedTheme {
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true, site_folder: String::new(), site_title: String::new() }
     }
 }
 

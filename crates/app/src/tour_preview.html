@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Tour preview</title>
-<style>
+<style>/*PLAYER_CSS_BEGIN*/
   :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse; the editor's Tour view uses the same as PULSE_PERIOD in tour_view.rs. */ --pulse-period: 1.9s; }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -121,11 +121,11 @@
     .v3 #view, .v3 #dim, .v3 #hole.glide, #card, #scrim, #bar-fill, #cta { transition: none !important; }
     .v3 #ring.pulse::after { animation: none; display: none; }
   }
-</style>
+/*PLAYER_CSS_END*/</style>
 </head>
 <body>
 <header><h1 id="title"></h1><span class="tag">Local preview</span></header>
-<main>
+<!--PLAYER_HTML_BEGIN--><main>
   <div id="stage">
     <div id="frame">
       <div id="view">
@@ -150,16 +150,16 @@
   <button id="autoplay" type="button" aria-label="Pause autoplay" hidden>Pause</button>
 </footer>
 <div id="status" class="sr" aria-live="polite"></div>
-<!--TOUR_IMAGES-->
+<!--PLAYER_HTML_END--><!--TOUR_IMAGES-->
 <script>/*TOUR_CORE*/</script>
 <script>
 const TOUR = /*TOUR_JSON*/;
-(function () {
+/*PLAYER_JS_BEGIN*/(function () {
   // Steps that are not objects are skipped.
   var steps = (Array.isArray(TOUR.steps) ? TOUR.steps : []).filter(function (s) { return s && typeof s === "object" && !Array.isArray(s); });
   var i = 0, done = false, drawn = -1;
   var $ = function (id) { return document.getElementById(id); };
-  document.title = TOUR.title + " (local preview)";
+  /*PREVIEW_ONLY_BEGIN*/document.title = TOUR.title + " (local preview)";/*PREVIEW_ONLY_END*/
   $("title").textContent = TOUR.title;
   if (!steps.length) {
     var empty = document.createElement("p");
@@ -830,7 +830,7 @@ const TOUR = /*TOUR_JSON*/;
   playing = playable();
   showPlay();
   render();
-})();
+})();/*PLAYER_JS_END*/
 </script>
 </body>
 </html>
