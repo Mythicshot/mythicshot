@@ -2,6 +2,11 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.6 (2026-11-18)
+
+- New icon: a twenty-sided die with a camera shutter. The program, the tray, the windows, the taskbar and the installer all use it.
+- Small sizes (tray, title bar) use a simplified drawing of it so it stays readable; 48 pixels and up show the full picture.
+
 ## 0.2.5 (2026-11-18)
 
 - Settings are saved through a temporary file, so a crash or power cut during a save cannot damage the settings file.
