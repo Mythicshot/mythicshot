@@ -90,6 +90,15 @@ pub struct Settings {
     /// Keep the recording and its edit state on this computer when a tour is uploaded, so the
     /// tour can be opened and updated later. On by default, also for a file without the key.
     pub keep_published_recordings: bool,
+    /// Store kept recordings as near-lossless video in the background when ffmpeg is on this
+    /// computer, to save space. On by default, also for a file without the key. Turning it off
+    /// converts nothing back.
+    pub store_recordings_as_video: bool,
+    /// Warn when the saved recordings together take more than this many GB; 0 means no warning.
+    /// Nothing is ever removed because of it. A file may hold 0 to `LIMIT_MAX_GB`; anything else
+    /// there costs only this value.
+    #[serde(deserialize_with = "warn_gb")]
+    pub saved_recordings_warn_gb: u32,
     /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
     /// says nothing is left, so the delete can be finished after a restart.
     pub unfinished_deletes: Vec<UnfinishedDelete>,
@@ -104,6 +113,19 @@ pub struct Settings {
     save_to_file: Option<bool>,
     #[serde(skip_serializing)]
     copy_to_clipboard: Option<bool>,
+}
+
+/// The size past which saved recordings are warned about until the user sets another, in GB.
+const DEFAULT_WARN_GB: u32 = 5;
+
+/// The warning limit as the settings file holds it: a whole number no larger than the field in
+/// Preferences can hold. Anything else is refused, which costs only this value (see [`Settings::parse`]).
+fn warn_gb<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let gb = u32::deserialize(d)?;
+    if gb > crate::project::LIMIT_MAX_GB {
+        return Err(serde::de::Error::custom("the limit is larger than the largest that can be set"));
+    }
+    Ok(gb)
 }
 
 /// A delete to finish: which site, which tour, and the title to show for it. No secret is in it.
@@ -345,6 +367,8 @@ impl Default for Settings {
             publish_saved_for: None,
             publish_binding_settled: false,
             keep_published_recordings: true,
+            store_recordings_as_video: true,
+            saved_recordings_warn_gb: DEFAULT_WARN_GB,
             unfinished_deletes: Vec::new(),
             load_problem: None,
             open_editor: None,
@@ -734,6 +758,90 @@ publish_server = \"https://tours.example.com\"
         read.keep_published_recordings = true;
         read.save_to(&path).unwrap();
         assert!(load_at(&path).keep_published_recordings);
+    }
+
+    #[test]
+    fn recordings_are_stored_as_video_by_default_and_the_choice_is_remembered() {
+        assert!(Settings::default().store_recordings_as_video);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A file from before the switch existed, and an empty one: on.
+        std::fs::write(&path, "magnifier = false\nkeep_published_recordings = false\n").unwrap();
+        let old = load_at(&path);
+        assert!(old.load_problem.is_none() && old.store_recordings_as_video && !old.magnifier && !old.keep_published_recordings);
+        std::fs::write(&path, "").unwrap();
+        assert!(load_at(&path).store_recordings_as_video);
+        // Turned off, saved and read again: off, under the name the file uses. Turned on again: on.
+        let mut s = old;
+        s.store_recordings_as_video = false;
+        s.save_to(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("store_recordings_as_video = false"));
+        let mut read = load_at(&path);
+        assert!(read.load_problem.is_none() && !read.store_recordings_as_video);
+        read.store_recordings_as_video = true;
+        read.save_to(&path).unwrap();
+        assert!(load_at(&path).store_recordings_as_video);
+        // It is its own switch: keeping recordings is not touched by it.
+        assert!(!load_at(&path).keep_published_recordings);
+    }
+
+    #[test]
+    fn the_warning_is_5_gb_by_default_and_0_is_remembered_as_no_warning() {
+        assert_eq!(Settings::default().saved_recordings_warn_gb, 5);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A file from before the limit existed, and an empty one: 5 GB.
+        std::fs::write(&path, "magnifier = false\n").unwrap();
+        let old = load_at(&path);
+        assert!(old.load_problem.is_none() && old.saved_recordings_warn_gb == 5 && !old.magnifier);
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load_at(&path).saved_recordings_warn_gb, 5);
+        // No warning is a choice, and does not read as the default the next time.
+        let mut s = old;
+        s.saved_recordings_warn_gb = 0;
+        s.save_to(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("saved_recordings_warn_gb = 0"));
+        let mut read = load_at(&path);
+        assert_eq!((read.saved_recordings_warn_gb, &read.load_problem), (0, &None));
+        // Every limit that can be typed is remembered, the smallest and the largest too.
+        for gb in [1, 12, crate::project::LIMIT_MAX_GB] {
+            read.saved_recordings_warn_gb = gb;
+            read.save_to(&path).unwrap();
+            let back = load_at(&path);
+            assert_eq!((back.saved_recordings_warn_gb, &back.load_problem), (gb, &None));
+        }
+    }
+
+    #[test]
+    fn a_limit_in_the_file_that_is_not_a_whole_number_costs_only_that_value() {
+        // Text, a decimal, a negative number, a switch, a list, and numbers no field could hold.
+        for bad in ["\"lots\"", "\"5\"", "2.5", "-3", "true", "[5]", "10000", "4294967296", "99999999999"] {
+            let text = format!("saved_recordings_warn_gb = {bad}\nstore_recordings_as_video = false\npublish_server = \"https://tours.example.com\"\nmagnifier = false\n\n[hotkeys]\ncapture_region = \"control+KeyQ\"\n");
+            assert!(toml::from_str::<Settings>(&text).is_err(), "the strict parse refuses {bad}");
+            let s = Settings::parse(&text).expect("still loads").upgrade();
+            assert_eq!(s.saved_recordings_warn_gb, 5, "{bad} reads as the default");
+            assert!(!s.store_recordings_as_video && !s.magnifier, "{bad}");
+            assert_eq!((s.publish_server.as_str(), s.binding(Action::CaptureRegion)), ("https://tours.example.com", "control+KeyQ"), "{bad}");
+        }
+        // The same for the switch: a word where on or off belongs costs the switch, not the limit.
+        let s = Settings::parse("store_recordings_as_video = \"yes\"\nsaved_recordings_warn_gb = 12\nkeep_published_recordings = false\n").unwrap();
+        assert!(s.store_recordings_as_video && !s.keep_published_recordings);
+        assert_eq!(s.saved_recordings_warn_gb, 12);
+        // Through a real load: the file is copied aside as it was, and the rest of it is in use.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "saved_recordings_warn_gb = 2.5\nstore_recordings_as_video = false\nmagnifier = false\n";
+        std::fs::write(&path, mine).unwrap();
+        let s = load_at(&path);
+        let copy = tmp.path().join("settings.unreadable-20261118-093000.toml");
+        assert_eq!(s.load_problem, Some(LoadProblem { path: path.clone(), backup: Some(copy.clone()), partly_read: true }));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), mine);
+        assert_eq!((s.saved_recordings_warn_gb, s.store_recordings_as_video, s.magnifier), (5, false, false));
+        // The largest limit and no limit are whole numbers the file may hold.
+        for (good, gb) in [("9999", 9999), ("0", 0), ("1", 1)] {
+            let s: Settings = toml::from_str(&format!("saved_recordings_warn_gb = {good}\n")).unwrap();
+            assert_eq!(s.saved_recordings_warn_gb, gb);
+        }
     }
 
     #[test]
