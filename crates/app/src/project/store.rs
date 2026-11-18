@@ -511,6 +511,7 @@ impl Store {
             }
         }
         // And where the folder really is, is that place in this store's folder.
+        // Failing closed is deliberate: a place that cannot be resolved, or is spelled otherwise on the disk, is refused.
         match (std::fs::canonicalize(&self.root), std::fs::canonicalize(&dir)) {
             (Ok(root), Ok(real)) if real == root.join(site).join(tour).join(chapter) => {}
             _ => return refused(),
@@ -670,6 +671,8 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
     match written {
         Ok(()) => {
             tidy(dir, &blobs.iter().map(|b| b.name.clone()).collect());
+            // Saved again after it was removed while open: the save is the later word, so it is kept.
+            let _ = std::fs::remove_file(dir.join(REMOVING_FILE));
             Ok(Some((file, left_out)))
         }
         Err(e) => {
@@ -1782,12 +1785,6 @@ mod tests {
         assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(0));
         w.store.finish_removals();
         assert!(open.info.dir.join(FRAMES_FILE).is_file());
-        // Its editor can still save; the save is reported from what was written, and stays unlisted.
-        let snap = Snapshot { rec: &open.rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
-        let saved = w.store.save(&key(SITE_A, TOUR_1, CH_1), &snap).unwrap();
-        assert_eq!((saved.info.title.as_str(), saved.info.key.clone(), saved.info.problem), ("Late", key(SITE_A, TOUR_1, CH_1), None));
-        assert!(saved.info.bytes > frames_and_index(FRAMES).0.len() as u64);
-        assert_eq!(w.store.list(), vec![]);
         let before = changes(&w.store);
         drop(open);
         assert_eq!(changes(&w.store), before + 1);
@@ -2251,7 +2248,9 @@ mod tests {
             assert_eq!(contents(&dir).into_iter().filter(|(name, _)| name != REMOVING_FILE).collect::<Vec<_>>(), whole);
             assert_eq!(load_err(&w.store, &open_key), LoadError::AlreadyOpen);
             // Asked again, the answer is the same and nothing more happens; housekeeping leaves it too.
+            let marked = changes(&w.store);
             assert_eq!(w.store.remove_project(&dir), Ok(Removed::WhenItsEditorCloses));
+            assert_eq!(changes(&w.store), marked, "nothing changed, so no page reads the list again");
             w.store.finish_removals();
             assert_eq!(std::fs::read(dir.join(FRAMES_FILE)).unwrap(), frames_and_index(FRAMES).0);
             let before = changes(&w.store);
@@ -2387,7 +2386,17 @@ mod tests {
                 PathBuf::from(site_of(SITE_A)).join(TOUR_1).join(CH_1),
                 PathBuf::from(CH_1),
                 PathBuf::new(),
+                // Spellings the system would take for the real folder, or for something of its own.
+                tour_dir.join(format!("{CH_1}.")),
+                tour_dir.join(format!("{CH_1} ")),
+                tour_dir.join(format!("{CH_1}::$DATA")),
+                tour_dir.join("con"),
+                site_dir.join("con").join(CH_1),
             ];
+            // The real folder with the prefix for a path taken as it is, when the store's own is not spelled so.
+            if !root.to_string_lossy().starts_with(VERBATIM) {
+                refused.push(PathBuf::from(format!("{VERBATIM}{}", dir.display())));
+            }
             // The real project through another store's eyes: it is not inside that store.
             let elsewhere = own_store(other_store.clone());
             // A chapter and a tour that are links to folders outside the store.
@@ -2414,6 +2423,128 @@ mod tests {
             assert_eq!(keys(&w.store.list()), vec![key_1()]);
             // The same folder, named as the store names it, is removed.
             assert_eq!(w.store.remove_project(&dir), Ok(Removed::Now));
+        }
+
+        /// The start of a path that the system takes as it is spelled.
+        const VERBATIM: &str = r"\\?\";
+
+        /// Everything a saved project holds, written again into the new folder `to`.
+        fn copy_project(project: &[(String, Vec<u8>)], to: &Path) {
+            std::fs::create_dir_all(to.join(PICTURES)).unwrap();
+            for (name, bytes) in project {
+                std::fs::write(to.join(name), bytes).unwrap();
+            }
+            assert!(is_project(to));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_folder_spelled_otherwise_on_the_disk_than_it_is_asked_for_is_refused() {
+            let w = World::new();
+            w.save(&key_1());
+            let project = contents(&w.dir(&key_1()));
+            // By hand, under a name the store never gives; the system finds it under the store's spelling too.
+            let site_dir = w.store.root().join(site_of(SITE_A));
+            let on_disk = site_dir.join("tour_1").join("CH_1");
+            copy_project(&project, &on_disk);
+            let asked = site_dir.join("tour_1").join("ch_1");
+            assert!(is_project(&asked) && is_folder_id("tour_1") && is_folder_id("ch_1"), "every other check lets it through");
+            let (whole, before) = (contents(w.tmp.path()), changes(&w.store));
+            assert_eq!(w.store.remove_project(&asked).unwrap_err(), "this saved recording could not be removed.");
+            assert!(w.store.remove_project(&on_disk).is_err());
+            assert_eq!((contents(w.tmp.path()), changes(&w.store)), (whole, before), "nothing was touched");
+        }
+
+        #[test]
+        fn a_file_where_a_folder_should_be_is_refused() {
+            let w = World::new();
+            w.save(&key_1());
+            let root = w.store.root().to_path_buf();
+            let (site_dir, tour_dir) = (root.join(site_of(SITE_A)), root.join(site_of(SITE_A)).join(TOUR_1));
+            // A file with a chapter's name, one with a tour's, and one with a site's.
+            for file in [tour_dir.join(CH_2), site_dir.join(TOUR_2), root.join(site_of(SITE_B))] {
+                std::fs::write(file, b"mine").unwrap();
+            }
+            let (whole, before) = (contents(w.tmp.path()), changes(&w.store));
+            for asked in [tour_dir.join(CH_2), site_dir.join(TOUR_2).join(CH_1), root.join(site_of(SITE_B)).join(TOUR_1).join(CH_1)] {
+                let err = w.store.remove_project(&asked).expect_err(&format!("{asked:?} was not refused"));
+                assert_eq!(err, "this saved recording could not be removed.");
+            }
+            assert_eq!((contents(w.tmp.path()), changes(&w.store)), (whole, before), "nothing was touched");
+            assert_eq!(keys(&w.store.list()), vec![key_1()]);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_link_at_any_level_is_refused_whether_a_folder_link_or_a_junction() {
+            fn junction(outside: &Path, link: &Path) -> bool {
+                std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(outside).output().is_ok_and(|o| o.status.success())
+            }
+            fn folder_link(outside: &Path, link: &Path) -> bool {
+                std::os::windows::fs::symlink_dir(outside, link).is_ok()
+            }
+            let kinds: [(&str, fn(&Path, &Path) -> bool); 2] = [("junction", junction), ("folder link", folder_link)];
+            let mut ran = Vec::new();
+            for (kind, make) in kinds {
+                let w = World::new();
+                w.save(&key_1());
+                let project = contents(&w.dir(&key_1()));
+                let root = w.store.root().to_path_buf();
+                let (site_dir, tour_dir) = (root.join(site_of(SITE_A)), root.join(site_of(SITE_A)).join(TOUR_1));
+                // Outside the store: a chapter's folder, a tour's and a site's, each with a whole project in it.
+                let (chapter, tour, site) = (w.tmp.path().join("outside-chapter"), w.tmp.path().join("outside-tour"), w.tmp.path().join("outside-site"));
+                copy_project(&project, &chapter);
+                copy_project(&project, &tour.join(CH_1));
+                copy_project(&project, &site.join(TOUR_1).join(CH_1));
+                let links = [(&chapter, tour_dir.join(CH_2)), (&tour, site_dir.join(TOUR_2)), (&site, root.join(site_of(SITE_B)))];
+                if !links.iter().all(|(outside, link)| make(outside, link)) {
+                    println!("skipped: a {kind} could not be made on this computer");
+                    continue;
+                }
+                let asked = [tour_dir.join(CH_2), site_dir.join(TOUR_2).join(CH_1), root.join(site_of(SITE_B)).join(TOUR_1).join(CH_1)];
+                for path in &asked {
+                    assert!(is_project(path), "the {kind} leads to a project");
+                }
+                let (whole, before) = (contents(w.tmp.path()), changes(&w.store));
+                for path in &asked {
+                    let err = w.store.remove_project(path).expect_err(&format!("{path:?} behind a {kind} was not refused"));
+                    assert_eq!(err, "this saved recording could not be removed.");
+                }
+                assert_eq!((contents(w.tmp.path()), changes(&w.store)), (whole, before), "nothing behind a {kind} was touched");
+                assert_eq!(keys(&w.store.list()), vec![key_1()]);
+                println!("ran: {kind}");
+                ran.push(kind);
+            }
+            assert!(ran.contains(&"junction"), "a junction needs no privilege and could not be made");
+        }
+
+        #[test]
+        fn a_project_marked_for_removal_and_then_saved_again_is_kept() {
+            let w = World::new();
+            w.save(&key_1());
+            let open = loaded(&w.store, &key_1());
+            let dir = open.info.dir.clone();
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::WhenItsEditorCloses));
+            assert_eq!(w.store.list(), vec![]);
+            let (edit, items) = edited(&w);
+            let snap = Snapshot { rec: &open.rec, title: "Late", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &open.restored.events, items: &items };
+            // A save that fails changes nothing: the removal still stands.
+            let refuse = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("the rename was refused")) };
+            w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
+            assert!(dir.join(REMOVING_FILE).is_file());
+            assert_eq!(w.store.list(), vec![]);
+            // The editor saves the recording again: that is the user's last word, and it is kept.
+            let before = changes(&w.store);
+            let saved = w.store.save(&key_1(), &snap).unwrap();
+            assert_eq!(changes(&w.store), before + 1);
+            assert_eq!((saved.info.title.as_str(), saved.info.key.clone(), saved.info.problem), ("Late", key_1(), None));
+            assert!(!dir.join(REMOVING_FILE).exists());
+            assert_eq!(w.store.list(), vec![saved.info.clone()]);
+            drop(open);
+            w.store.finish_removals();
+            assert_eq!(changes(&w.store), before + 1, "closing the editor removed nothing");
+            assert_eq!(w.store.list(), vec![saved.info]);
+            assert_eq!(loaded(&w.store, &key_1()).restored.title, "Late");
         }
 
         #[test]
