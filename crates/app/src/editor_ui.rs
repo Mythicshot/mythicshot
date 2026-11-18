@@ -308,6 +308,10 @@ pub struct Editor {
     saved: Option<PathBuf>,
     /// Last action and the time it happened, shown in the status bar.
     status: Option<(String, String)>,
+    /// A file the status message offers to show in the file manager ("Show in folder"); cleared by the next message.
+    pub(crate) status_reveal: Option<PathBuf>,
+    /// Sentences shown after "Show in folder" (a warning about the file); cleared by the next message.
+    pub(crate) status_more: Option<String>,
     pub closed: bool,
     confirm_close: bool,
     /// Where the canvas was right-clicked, for the menu's Paste here.
@@ -349,6 +353,8 @@ impl Editor {
             dest,
             saved: None,
             status: None,
+            status_reveal: None,
+            status_more: None,
             closed: false,
             confirm_close: false,
             menu_at: None,
@@ -414,6 +420,8 @@ impl Editor {
 
     pub(crate) fn notify(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), chrono::Local::now().format("%H:%M:%S").to_string()));
+        self.status_reveal = None;
+        self.status_more = None;
     }
 
     /// The Guide card tool is the current tool.
@@ -1098,11 +1106,37 @@ impl Editor {
                     Some((msg, clock)) => format!("{clock} – {msg}"),
                     None => dirty.to_string(),
                 };
+                let reveal = self.status.as_ref().and(self.status_reveal.clone());
+                let more = self.status.as_ref().and(self.status_more.clone());
+                // Hovering any part of the message shows all of it.
+                let whole = match &more {
+                    Some(m) => format!("{text} · Show in folder. {m}"),
+                    None => text.clone(),
+                };
                 ui.scope(|ui| {
-                    ui.set_max_width(status_width(ui.available_width()));
-                    // A cut label shows its whole text as a tooltip by itself.
-                    ui.add(egui::Label::new(egui::RichText::new(&text).color(muted)).truncate());
+                    // Room is kept for "· Show in folder" when the message offers it, and half of what is left
+                    // for the sentences after it.
+                    let link_w = if reveal.is_some() { STATUS_REVEAL_W } else { 0.0 };
+                    let room = (status_width(ui.available_width()) - link_w).max(0.0);
+                    ui.set_max_width(if more.is_some() { room / 2.0 } else { room });
+                    let label = ui.add(egui::Label::new(egui::RichText::new(&text).color(muted)).truncate());
+                    if more.is_some() {
+                        label.on_hover_text(&whole);
+                    }
                 });
+                if let Some(path) = reveal {
+                    ui.label(egui::RichText::new("·").color(muted));
+                    // A link is a focusable widget, so Tab reaches it and Enter or Space follows it.
+                    if ui.link("Show in folder").on_hover_text(path.display().to_string()).clicked() {
+                        crate::platform::reveal(&path);
+                    }
+                }
+                if let Some(m) = &more {
+                    ui.scope(|ui| {
+                        ui.set_max_width(status_width(ui.available_width()));
+                        ui.add(egui::Label::new(egui::RichText::new(m).color(Color32::from_rgb(245, 165, 36))).truncate()).on_hover_text(&whole);
+                    });
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let z = self.zoom.unwrap_or(self.last_canvas.zoom);
@@ -1829,6 +1863,9 @@ const STATUS_ZOOM_W: f32 = 150.0;
 
 /// The width the status message may use when `available` is left in the status bar, so it never
 /// runs under the zoom controls.
+/// Width kept beside the status message for "· Show in folder".
+const STATUS_REVEAL_W: f32 = 112.0;
+
 fn status_width(available: f32) -> f32 {
     (available - STATUS_ZOOM_W).max(0.0)
 }

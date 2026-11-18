@@ -141,21 +141,23 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TourSummary {
-    pub dir: PathBuf,
+    /// Where the tour was written: the bundle's folder, or the single file.
+    pub path: PathBuf,
     pub steps: usize,
+    /// For a bundle, the step images and logo together; for a single file, its size on disk.
     pub bytes: u64,
     /// Step images re-encoded at a lower quality (or shrunk) to fit [`MAX_STEP_BYTES`].
     pub squeezed: usize,
 }
 
 impl TourSummary {
-    /// What the export summary adds when step images had to be made smaller, else None.
+    /// The sentence the export's status adds when step images had to be made smaller to fit
+    /// [`MAX_STEP_BYTES`], else None.
     pub fn squeezed_note(&self) -> Option<String> {
-        let mb = MAX_STEP_BYTES as f64 / 1_000_000.0;
         match self.squeezed {
             0 => None,
-            1 => Some(format!("1 step image was saved at a lower quality to stay under {mb} MB")),
-            n => Some(format!("{n} step images were saved at a lower quality to stay under {mb} MB")),
+            1 => Some("1 picture was saved at lower quality to fit.".to_string()),
+            n => Some(format!("{n} pictures were saved at lower quality to fit.")),
         }
     }
 }
@@ -242,11 +244,62 @@ const JSON_PLACEHOLDER: &str = "/*TOUR_JSON*/";
 /// The shared rules every player uses, inlined into the preview's first script block.
 const TOUR_CORE_JS: &str = include_str!("tour_core.js");
 const CORE_PLACEHOLDER: &str = "/*TOUR_CORE*/";
+/// Where a single-file export puts its embedded pictures, before the page's scripts; a bundle's page drops it.
+const IMAGES_PLACEHOLDER: &str = "<!--TOUR_IMAGES-->\n";
+/// The page's image rule: a bundle's page loads its pictures from its own folder.
+const FOLDER_IMG_SRC: &str = "img-src 'self';";
+/// A single file loads them only from the `data:` URLs it carries, and nothing else.
+const SINGLE_IMG_SRC: &str = "img-src data:;";
 
-/// The preview page for an already escaped compact manifest. The rules go in first, from the
-/// template, so text in the manifest can never be taken for a placeholder.
+/// The preview page in two parts, split where a single file's pictures go. The rules go in first, from
+/// the template, so text in the manifest can never be taken for a placeholder. `single` swaps the image
+/// rule of the Content-Security-Policy for the single-file one; nothing else differs.
+fn page_parts(compact_json: &str, single: bool) -> (String, String) {
+    let (head, tail) = PREVIEW_TEMPLATE.split_once(IMAGES_PLACEHOLDER).expect("the preview template has an images placeholder");
+    let head = if single { head.replacen(FOLDER_IMG_SRC, SINGLE_IMG_SRC, 1) } else { head.to_string() };
+    (head, tail.replacen(CORE_PLACEHOLDER, TOUR_CORE_JS, 1).replacen(JSON_PLACEHOLDER, compact_json, 1))
+}
+
+/// The preview page for an already escaped compact manifest.
 fn preview_page(compact_json: &str) -> String {
-    PREVIEW_TEMPLATE.replacen(CORE_PLACEHOLDER, TOUR_CORE_JS, 1).replacen(JSON_PLACEHOLDER, compact_json, 1)
+    let (head, tail) = page_parts(compact_json, false);
+    head + &tail
+}
+
+/// The manifest as compact JSON for a script block: `<` becomes a JSON escape so no text can close it.
+fn compact_json(manifest: &Manifest, file: &str) -> Result<String, String> {
+    Ok(serde_json::to_string(manifest).map_err(|e| format!("Could not write {file}: {e}"))?.replace('<', r"\u003c"))
+}
+
+/// Everything a tour export knows before its first image: the steps, the draft manifest (images at their
+/// largest) and the logo. Refusals happen here, so a refused tour writes nothing.
+struct Prepared {
+    plan: Vec<StepPlan>,
+    draft: Manifest,
+    logo: Option<(Vec<u8>, &'static str)>,
+}
+
+fn prepare(rec: &Recording, items: &[Item], edit: &Edit, title: &str, plan: Vec<StepPlan>) -> Result<Prepared, String> {
+    // The settings are sanitised and the logo loaded before anything is written, so a bad logo writes nothing.
+    // A logo travels only with a cover.
+    let mut doc = sanitize(&edit.tour_doc);
+    let logo = match (&doc.cover, &doc.logo_path) {
+        (Some(_), Some(path)) => Some(load_logo(path)?),
+        _ => None,
+    };
+    if let (Some(c), Some((_, ext))) = (doc.cover.as_mut(), &logo) {
+        c.logo = Some(format!("logo.{ext}"));
+    }
+    // Everything but the images is known now, so a tour the server would refuse writes nothing.
+    // The size check here counts every image at its largest, so a tour that is too big is refused before
+    // any image is encoded; the exact check before the manifest is written can then never fail on its own.
+    let steps = step_entries(rec, edit, items, &plan, &doc);
+    check_counts(&steps)?;
+    let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
+    let spotlight_dim = tour_dim(rec, edit, items, &srcs);
+    let draft = manifest(tour_title(title), steps, spotlight_dim, doc);
+    check_size(&draft)?;
+    Ok(Prepared { plan, draft, logo })
 }
 
 /// Write a tour bundle into `dir`, which must not exist yet; its parent folder must.
@@ -268,37 +321,226 @@ pub fn write_bundle(
     if dir.symlink_metadata().is_ok() {
         return Err(format!("{} already exists", dir.display()));
     }
-    // The settings are sanitised and the logo loaded before the folder exists, so a bad logo writes nothing.
-    // A logo travels only with a cover.
-    let mut doc = sanitize(&edit.tour_doc);
-    let logo = match (&doc.cover, &doc.logo_path) {
-        (Some(_), Some(path)) => Some(load_logo(path)?),
-        _ => None,
-    };
-    if let (Some(c), Some((_, ext))) = (doc.cover.as_mut(), &logo) {
-        c.logo = Some(format!("logo.{ext}"));
-    }
-    // Everything but the images is known now, so a tour the server would refuse writes nothing.
-    // The size check here counts every image at its largest, so a tour that is too big is refused before
-    // any image is encoded; the exact check before tour.json is written can then never fail on its own.
-    let steps = step_entries(rec, edit, items, &plan, &doc);
-    check_counts(&steps)?;
-    let srcs: Vec<usize> = plan.iter().map(|s| s.src).collect();
-    let spotlight_dim = tour_dim(rec, edit, items, &srcs);
-    let draft = manifest(tour_title(title), steps, spotlight_dim, doc);
-    check_size(&draft)?;
+    let prepared = prepare(rec, items, edit, title, plan)?;
     // Not create_dir_all: a missing parent is an error, and a folder that appears
     // between the check above and here makes this call fail instead of being reused.
     std::fs::create_dir(dir).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{} already exists", dir.display()) } else { format!("Could not create {}: {e}", dir.display()) }
     })?;
-    match write_into(rec, items, events, edit, dir, &plan, draft, logo, frame, progress) {
-        Ok(summary) => Ok(summary),
+    match write_into(rec, items, events, edit, prepared, &mut FolderSink { dir }, frame, progress) {
+        Ok((steps, bytes, squeezed)) => Ok(TourSummary { path: dir.to_path_buf(), steps, bytes, squeezed }),
         Err(e) => match std::fs::remove_dir_all(dir) {
             Ok(()) => Err(e),
             Err(_) => Err(format!("{e} (the partly written folder {} could not be removed)", dir.display())),
         },
     }
+}
+
+/// A single file over this is still written, and the status says it is large.
+pub const LARGE_FILE_BYTES: u64 = 25 * 1_048_576;
+/// A single file over this is refused: a browser may not open it, and it is too big to send.
+pub const MAX_FILE_BYTES: u64 = 200 * 1_048_576;
+
+/// Write the tour as one self-contained HTML file at `path`: the same page as a bundle's `index.html`,
+/// with every step image and the logo embedded, each in its own block the page decodes only when its
+/// step is shown or about to be. Built by the same steps as [`write_bundle`], so the two never differ in
+/// anything but where the pictures live.
+///
+/// The page is streamed into a temporary file beside `path` one image at a time (only one encoded
+/// image is held at once), then renamed over `path`. Replacing an existing file is the caller's
+/// decision (the save dialog asks); a refusal, failure or cancel removes the temporary file and leaves
+/// `path` and everything else untouched. A file over [`MAX_FILE_BYTES`] is refused with its size, and
+/// `path` is not written. The summary's `bytes` is the file's size on disk.
+#[allow(clippy::too_many_arguments)]
+pub fn write_single_file(
+    rec: &Recording,
+    items: &[Item],
+    events: &[InputEvent],
+    edit: &Edit,
+    title: &str,
+    path: &Path,
+    frame: impl FnMut(usize) -> Result<RgbaImage, String>,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<TourSummary, String> {
+    write_single_file_within(rec, items, events, edit, title, path, frame, progress, MAX_FILE_BYTES)
+}
+
+/// The refusal for a single file over `cap` bytes.
+fn too_big(size: u64, cap: u64) -> String {
+    format!("As one file this tour would be {:.1} MB, and a single file can be at most {} MB. Export it as a folder instead.", size as f64 / 1_048_576.0, cap / 1_048_576)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_single_file_within(
+    rec: &Recording,
+    items: &[Item],
+    events: &[InputEvent],
+    edit: &Edit,
+    title: &str,
+    path: &Path,
+    frame: impl FnMut(usize) -> Result<RgbaImage, String>,
+    progress: impl FnMut(f32) -> bool,
+    cap: u64,
+) -> Result<TourSummary, String> {
+    let plan = plan_steps(rec, edit, events)?;
+    let prepared = prepare(rec, items, edit, title, plan)?;
+    let shown = path.display();
+    if path.is_dir() {
+        return Err(format!("{shown} is a folder"));
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = tempfile::Builder::new().prefix(".mythicshot-tour-").suffix(".tmp").tempfile_in(parent).map_err(|e| format!("Could not write {shown}: {e}"))?;
+    let (steps, squeezed) = {
+        let mut sink = PageSink { out: Capped { inner: std::io::BufWriter::new(tmp.as_file()), written: 0, cap }, images: 0 };
+        let (steps, _, squeezed) = write_into(rec, items, events, edit, prepared, &mut sink, frame, progress)?;
+        if sink.out.written > cap {
+            return Err(too_big(sink.out.written, cap));
+        }
+        let file = sink.out.inner.into_inner().map_err(|e| format!("Could not write {shown}: {}", e.error()))?;
+        file.sync_all().map_err(|e| format!("Could not write {shown}: {e}"))?;
+        (steps, squeezed)
+    };
+    // The temporary file is created readable by its owner only; the tour is a file to share.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).map_err(|e| format!("Could not write {shown}: {e}"))?;
+    }
+    // Dropping the temporary file on any error above removes it; a failed rename hands it back and drops it too.
+    tmp.persist(path).map_err(|e| format!("Could not save {shown}: {}", e.error))?;
+    let bytes = std::fs::metadata(path).map_err(|e| format!("Could not read the size of {shown}: {e}"))?.len();
+    Ok(TourSummary { path: path.to_path_buf(), steps, bytes, squeezed })
+}
+
+/// A writer that counts every byte but stops passing them on past `cap`, so a file that turns out too
+/// big is measured to the end without filling the disk.
+struct Capped<W: std::io::Write> {
+    inner: W,
+    written: u64,
+    cap: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for Capped<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len() as u64;
+        if self.written <= self.cap {
+            self.inner.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Where an export's pictures and manifest go. Everything before these calls is shared.
+trait Sink {
+    /// One picture, `ext` "png" or "jpg", under the name the manifest gives it.
+    fn image(&mut self, name: &str, ext: &str, bytes: &[u8]) -> Result<(), String>;
+    /// The finished manifest, after every picture.
+    fn finish(&mut self, manifest: &Manifest) -> Result<(), String>;
+}
+
+/// A bundle: each picture as a file, then `tour.json` and `index.html`.
+struct FolderSink<'a> {
+    dir: &'a Path,
+}
+
+impl Sink for FolderSink<'_> {
+    fn image(&mut self, name: &str, _ext: &str, bytes: &[u8]) -> Result<(), String> {
+        std::fs::write(self.dir.join(name), bytes).map_err(|e| format!("Could not write {name}: {e}"))
+    }
+
+    fn finish(&mut self, manifest: &Manifest) -> Result<(), String> {
+        let pretty = serde_json::to_string_pretty(manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
+        std::fs::write(self.dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
+        let html = preview_page(&compact_json(manifest, "index.html")?);
+        std::fs::write(self.dir.join("index.html"), html).map_err(|e| format!("Could not write index.html: {e}"))
+    }
+}
+
+/// A single page: its head, then one block per picture, written as each picture is made, then the rest
+/// of the page with the manifest.
+struct PageSink<W: std::io::Write> {
+    out: W,
+    images: usize,
+}
+
+impl<W: std::io::Write> PageSink<W> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.out.write_all(bytes).map_err(|e| format!("Could not write the tour file: {e}"))
+    }
+}
+
+/// The start of one picture's block. Its type is one the browser never runs: the block is plain base64
+/// text, kept out of every script, so no single string in the page holds more than one picture.
+fn image_block_open(name: &str, mime: &str) -> String {
+    format!("<script type=\"application/octet-stream\" data-tour-image=\"{name}\" data-type=\"{mime}\">")
+}
+const IMAGE_BLOCK_CLOSE: &str = "</script>\n";
+
+/// A picture name the page can carry in an attribute as it is: letters, digits, `-` and `.` only.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+impl<W: std::io::Write> Sink for PageSink<W> {
+    fn image(&mut self, name: &str, ext: &str, bytes: &[u8]) -> Result<(), String> {
+        if !plain_name(name) {
+            return Err(format!("A tour picture cannot be named {name:?}."));
+        }
+        let mime = image_mime(ext)?;
+        if self.images == 0 {
+            // The head depends on nothing in the manifest, so it can go first.
+            let (head, _) = page_parts("", true);
+            self.write(head.as_bytes())?;
+        }
+        self.images += 1;
+        self.write(image_block_open(name, mime).as_bytes())?;
+        base64_into(&mut self.out, bytes).map_err(|e| format!("Could not write the tour file: {e}"))?;
+        self.write(IMAGE_BLOCK_CLOSE.as_bytes())
+    }
+
+    fn finish(&mut self, manifest: &Manifest) -> Result<(), String> {
+        if self.images == 0 {
+            return Err("A tour file needs at least one picture.".to_string());
+        }
+        let (_, tail) = page_parts(&compact_json(manifest, "the tour file")?, true);
+        self.write(tail.as_bytes())?;
+        self.out.flush().map_err(|e| format!("Could not write the tour file: {e}"))
+    }
+}
+
+/// The picture type for an encoder's choice.
+fn image_mime(ext: &str) -> Result<&'static str, String> {
+    match ext {
+        "png" => Ok("image/png"),
+        "jpg" => Ok("image/jpeg"),
+        other => Err(format!("A tour picture cannot be a .{other} file.")),
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding, written in pieces of about 8 KB. Its alphabet has no `<`, `"` or `\`,
+/// so whatever the bytes hold can never end a string or a script block.
+fn base64_into(out: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(8192);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for k in 0..4 {
+            buf.push(if k <= chunk.len() { BASE64[((n >> (18 - 6 * k)) & 63) as usize] } else { b'=' });
+        }
+        if buf.len() >= 8188 {
+            out.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    out.write_all(&buf)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -307,13 +549,12 @@ fn write_into(
     items: &[Item],
     events: &[InputEvent],
     edit: &Edit,
-    dir: &Path,
-    plan: &[StepPlan],
-    mut manifest: Manifest,
-    logo: Option<(Vec<u8>, &'static str)>,
+    prepared: Prepared,
+    sink: &mut impl Sink,
     mut frame: impl FnMut(usize) -> Result<RgbaImage, String>,
     mut progress: impl FnMut(f32) -> bool,
-) -> Result<TourSummary, String> {
+) -> Result<(usize, u64, usize), String> {
+    let Prepared { plan, draft: mut manifest, logo } = prepared;
     // Same crop and annotations as every export, but no scale and no pointer, ripple, halo or keys.
     let mut tour_edit = edit.clone();
     tour_edit.scale = 100;
@@ -333,26 +574,21 @@ fn write_into(
         let (bytes, ext, img, smaller) = encode_within(fit_image(img), MAX_STEP_BYTES)?;
         squeezed += usize::from(smaller);
         let name = format!("step-{:03}.{ext}", i + 1);
-        std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
+        sink.image(&name, ext, &bytes)?;
         total += bytes.len() as u64;
         (entry.image, entry.width, entry.height, entry.bytes) = (name, img.width(), img.height(), bytes.len() as u64);
     }
-    if let (Some(name), Some((bytes, _))) = (manifest.cover.as_ref().and_then(|c| c.logo.clone()), &logo) {
-        std::fs::write(dir.join(&name), bytes).map_err(|e| format!("Could not write {name}: {e}"))?;
+    if let (Some(name), Some((bytes, ext))) = (manifest.cover.as_ref().and_then(|c| c.logo.clone()), &logo) {
+        sink.image(&name, ext, bytes)?;
         total += bytes.len() as u64;
     }
     check_size(&manifest)?;
-
-    let pretty = serde_json::to_string_pretty(&manifest).map_err(|e| format!("Could not write tour.json: {e}"))?;
-    std::fs::write(dir.join("tour.json"), pretty).map_err(|e| format!("Could not write tour.json: {e}"))?;
-
-    // `<` becomes a JSON escape so no title can close the page's script block.
-    let compact = serde_json::to_string(&manifest).map_err(|e| format!("Could not write index.html: {e}"))?.replace('<', r"\u003c");
-    let html = preview_page(&compact);
-    std::fs::write(dir.join("index.html"), html).map_err(|e| format!("Could not write index.html: {e}"))?;
-
-    progress(1.0);
-    Ok(TourSummary { dir: dir.to_path_buf(), steps: n, bytes: total, squeezed })
+    sink.finish(&manifest)?;
+    // A cancel that came after the last picture still stops the export before it is kept.
+    if !progress(1.0) {
+        return Err("cancelled".to_string());
+    }
+    Ok((n, total, squeezed))
 }
 
 #[cfg(test)]
@@ -1178,7 +1414,8 @@ mod tests {
         assert_eq!(img.height(), 4096);
         assert_eq!((sum.squeezed, sum.squeezed_note()), (0, None));
         let two = TourSummary { squeezed: 2, ..sum };
-        assert!(two.squeezed_note().unwrap().contains("2 step images") && two.squeezed_note().unwrap().contains("2 MB"));
+        assert_eq!(two.squeezed_note().unwrap(), "2 pictures were saved at lower quality to fit.");
+        assert_eq!(TourSummary { squeezed: 1, ..two }.squeezed_note().unwrap(), "1 picture was saved at lower quality to fit.");
     }
 
     /// The server's caps, copied from `LIMITS` in the server's manifest rules (`src/manifest.ts` in the
@@ -1348,6 +1585,274 @@ mod tests {
             assert_eq!(s["advance"], "anywhere");
         }
         assert_eq!(steps[0]["notes"].as_array().unwrap().len(), 20, "the flat bubble was dropped");
+    }
+
+    // Single-file export.
+
+    fn unbase64(s: &str) -> Vec<u8> {
+        let val = |c: u8| BASE64.iter().position(|&b| b == c).unwrap_or_else(|| panic!("{:?} is not base64", c as char)) as u32;
+        let s = s.as_bytes();
+        assert_eq!(s.len() % 4, 0, "base64 length");
+        let mut out = Vec::new();
+        for q in s.chunks(4) {
+            let pad = q.iter().filter(|&&c| c == b'=').count();
+            let n = q.iter().take(4 - pad).enumerate().fold(0u32, |n, (i, &c)| n | (val(c) << (18 - 6 * i)));
+            out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8][..3 - pad]);
+        }
+        out
+    }
+
+    const BLOCK_START: &str = "<script type=\"application/octet-stream\"";
+
+    /// The single file's picture blocks as (name, type, base64), and the page without them.
+    fn image_blocks(html: &str) -> (Vec<(String, String, String)>, String) {
+        let (mut blocks, mut page, mut rest) = (Vec::new(), String::new(), html);
+        while let Some(i) = rest.find(BLOCK_START) {
+            page.push_str(&rest[..i]);
+            let (open, more) = rest[i..].split_once('>').unwrap();
+            let attr = |k: &str| open.split(&format!("{k}=\"")).nth(1).unwrap().split('"').next().unwrap().to_string();
+            let (body, more) = more.split_once(IMAGE_BLOCK_CLOSE).expect("a closed block");
+            blocks.push((attr("data-tour-image"), attr("data-type"), body.to_string()));
+            rest = more;
+        }
+        page.push_str(rest);
+        (blocks, page)
+    }
+
+    /// The single file's pictures as `data:` URLs by name, and its manifest, read back as data.
+    fn single_parts(html: &str) -> (serde_json::Map<String, serde_json::Value>, serde_json::Value) {
+        let images = image_blocks(html).0.into_iter().map(|(name, mime, b64)| (name, serde_json::Value::String(format!("data:{mime};base64,{b64}")))).collect();
+        let manifest = html.split_once("const TOUR = ").unwrap().1.split_once(";\n(function").unwrap().0;
+        (images, serde_json::from_str(manifest).unwrap())
+    }
+
+    fn csp(html: &str) -> &str {
+        html.split("Content-Security-Policy\" content=\"").nth(1).unwrap().split('"').next().unwrap()
+    }
+
+    fn noise(w: u32, h: u32) -> RgbaImage {
+        let mut s = 3u32;
+        RgbaImage::from_fn(w, h, |_, _| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            image::Rgba([(s >> 24) as u8, (s >> 16) as u8, (s >> 8) as u8, 255])
+        })
+    }
+
+    /// A tour with everything a page can show: cards, a note, a spotlight, a cover with a logo, an end
+    /// card, and one busy step that the encoder saves as JPEG.
+    fn full_tour(tmp: &Path) -> (Recording, Vec<Item>, Vec<InputEvent>, Edit, impl FnMut(usize) -> Result<RgbaImage, String>) {
+        let r = Recording::timing_only(640, 400, &[0, 500, 1000, 1500, 2000], 2500);
+        let ev = vec![left(750, 320, 200), left(1750, 64, 100)];
+        let items = vec![text(40.0, 40.0, "Unpaid invoices", 1), spot(Bounds { x0: 200.0, y0: 100.0, x1: 440.0, y1: 300.0 }, 1)];
+        let mut e = edit(&r);
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Open invoices", "One click **away**.")), ..Default::default() });
+        e.tour_doc.steps.insert(3, StepExtras { card: Some(card("Then this", "")), advance: Advance::Anywhere, zoom: Some(false) });
+        let logo = tmp.join("logo-src.png");
+        RgbaImage::from_pixel(64, 32, image::Rgba([20, 120, 220, 255])).save(&logo).unwrap();
+        e.tour_doc.cover = Some(Cover { title: "Billing tour".into(), body: "Three steps.".into(), button: "Start".into(), logo: None });
+        e.tour_doc.logo_path = Some(logo);
+        e.tour_doc.end = Some(EndCard { text: "All done".into(), primary: Some(Link { label: "Book a call".into(), url: "https://tours.example.com".into() }), secondary: None, replay: true });
+        let frames = |i: usize| Ok::<_, String>(if i == 3 { noise(640, 400) } else { RgbaImage::from_pixel(640, 400, image::Rgba([230, 232, 236, 255])) });
+        (r, items, ev, e, frames)
+    }
+
+    #[test]
+    fn a_single_file_holds_exactly_the_folder_exports_pictures_and_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, items, ev, e, mut frames) = full_tour(tmp.path());
+        let dir = tmp.path().join("folder");
+        let folder = write_bundle(&r, &items, &ev, &e, "Billing", &dir, &mut frames, |_| true).unwrap();
+        let file = tmp.path().join("billing-tour.html");
+        let single = write_single_file(&r, &items, &ev, &e, "Billing", &file, &mut frames, |_| true).unwrap();
+        assert_eq!((single.steps, single.squeezed, single.path.as_path()), (folder.steps, folder.squeezed, file.as_path()));
+        assert_eq!(single.bytes, std::fs::metadata(&file).unwrap().len(), "the size reported is the size on disk");
+
+        let html = std::fs::read_to_string(&file).unwrap();
+        let (images, manifest) = single_parts(&html);
+        let json = read_json(&dir);
+        assert_eq!(manifest, json, "the embedded manifest is tour.json");
+        let mut names: Vec<String> = json["steps"].as_array().unwrap().iter().map(|s| s["image"].as_str().unwrap().to_string()).collect();
+        names.push(json["cover"]["logo"].as_str().expect("the logo is in the manifest").to_string());
+        assert!(names.iter().any(|n| n.ends_with(".jpg")) && names.iter().any(|n| n.ends_with(".png")), "{names:?}");
+        assert_eq!(images.len(), names.len(), "one embedded picture per file, and no others");
+        for name in &names {
+            let url = images[name].as_str().unwrap();
+            let mime = if name.ends_with(".png") { "data:image/png;base64," } else { "data:image/jpeg;base64," };
+            let b64 = url.strip_prefix(mime).unwrap_or_else(|| panic!("{name} is not {mime}"));
+            assert_eq!(unbase64(b64), std::fs::read(dir.join(name)).unwrap(), "{name}");
+        }
+        // It is the folder's page: take the pictures out and the image rule back, and the two are the same.
+        let (blocks, page) = image_blocks(&html);
+        let same = page.replacen(SINGLE_IMG_SRC, FOLDER_IMG_SRC, 1);
+        assert_eq!(same, std::fs::read_to_string(dir.join("index.html")).unwrap());
+        // Each picture is its own block, so no string in the page holds more than one picture, and the
+        // blocks all come before the page's scripts.
+        assert_eq!(blocks.len(), names.len());
+        let last_block = html.rfind(BLOCK_START).unwrap();
+        assert!(last_block < html.find("<script>").unwrap(), "pictures come before the scripts that read them");
+        assert!(html.contains("Local preview"));
+        // Only the file was written.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 3, "folder, logo source and the tour file");
+    }
+
+    #[test]
+    fn only_the_single_file_allows_data_images_and_neither_allows_the_network() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t");
+        write_bundle(&r, &[], &clicks(), &edit(&r), "t", &dir, flat, |_| true).unwrap();
+        let file = tmp.path().join("t.html");
+        write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| true).unwrap();
+        let folder_html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        let single_html = std::fs::read_to_string(&file).unwrap();
+        let (folder, single) = (csp(&folder_html), csp(&single_html));
+        assert!(folder.contains("img-src 'self';") && !folder.contains("data:"), "{folder}");
+        assert!(single.contains("img-src data:;") && !single.contains("'self'"), "{single}");
+        assert_eq!(single.replacen("img-src data:;", "img-src 'self';", 1), folder, "nothing else differs");
+        for part in ["default-src 'none'", "script-src 'unsafe-inline'", "base-uri 'none'", "form-action 'none'"] {
+            assert!(single.contains(part), "{part}");
+        }
+        assert!(!single.contains("http") && !single.contains('*') && !single.contains("connect-src") && !single.contains("blob:"), "{single}");
+        assert!(single_html.find("Content-Security-Policy").unwrap() < single_html.find("<script").unwrap());
+    }
+
+    #[test]
+    fn nothing_in_a_single_file_can_close_its_script_blocks() {
+        // Base64 never holds `<`, `"` or `\`, whatever the bytes are.
+        let hostile = b"</script><script>alert(1)</script>\"\\";
+        let mut out = Vec::new();
+        base64_into(&mut out, hostile).unwrap();
+        let text64 = String::from_utf8(out).unwrap();
+        assert!(text64.bytes().all(|b| BASE64.contains(&b) || b == b'='), "{text64}");
+        assert_eq!(unbase64(&text64), hostile);
+        for n in 0..=7 {
+            let mut out = Vec::new();
+            base64_into(&mut out, &hostile[..n]).unwrap();
+            assert_eq!(unbase64(std::str::from_utf8(&out).unwrap()), &hostile[..n], "{n} bytes");
+        }
+        // A picture holding that text after decoding, and a manifest with a hostile title, stay data.
+        let mut sink = PageSink { out: Vec::new(), images: 0 };
+        sink.image("step-001.png", "png", hostile).unwrap();
+        sink.finish(&manifest(HOSTILE.into(), vec![], None, TourDoc::default())).unwrap();
+        let html = String::from_utf8(sink.out).unwrap();
+        assert_eq!(html.matches("</script").count(), PREVIEW_TEMPLATE.matches("</script").count() + 1, "only the page's own blocks close");
+        assert!(!html.contains("</script><img") && !html.contains("alert(1)</script>"));
+        let (images, parsed) = single_parts(&html);
+        assert_eq!(unbase64(images["step-001.png"].as_str().unwrap().strip_prefix("data:image/png;base64,").unwrap()), hostile);
+        assert_eq!(parsed["title"], HOSTILE);
+        // A whole export with a hostile title and note.
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        write_single_file(&r, &[text(10.0, 20.0, HOSTILE, 1)], &clicks(), &edit(&r), "</script><b>x", &file, flat, |_| true).unwrap();
+        let html = std::fs::read_to_string(&file).unwrap();
+        assert!(!html.contains("</script><b>x") && !html.contains("</script><img"));
+        assert_eq!(html.matches("</script").count(), PREVIEW_TEMPLATE.matches("</script").count() + 3, "one block per picture and the page's own");
+        let (_, parsed) = single_parts(&html);
+        assert_eq!((parsed["title"].as_str(), parsed["steps"][0]["notes"][0]["text"].as_str()), (Some("</script><b>x"), Some(HOSTILE)));
+        // The picture types follow the encoder; anything else is refused.
+        assert_eq!(image_mime("jpg").unwrap(), "image/jpeg");
+        assert!(image_mime("gif").is_err());
+        // A name that is not plain cannot reach an attribute.
+        let mut sink = PageSink { out: Vec::new(), images: 0 };
+        assert!(sink.image("step\" onload=\"x.png", "png", b"x").is_err());
+        assert!(sink.image("", "png", b"x").is_err());
+        assert!(sink.out.is_empty());
+    }
+
+    #[test]
+    fn a_single_file_over_the_size_cap_is_refused_with_its_size_and_writes_nothing() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        std::fs::write(&file, "old").unwrap();
+        let err = write_single_file_within(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| true, 10_000).unwrap_err();
+        assert!(err.starts_with("As one file this tour would be ") && err.contains(" MB, and a single file can be at most "), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old", "the target is not touched");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "no temporary file is left");
+        // The size named is the size the file would have had.
+        let ok = write_single_file_within(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| true, MAX_FILE_BYTES).unwrap();
+        assert!(err.contains(&format!("{:.1} MB", ok.bytes as f64 / 1_048_576.0)), "{err} vs {}", ok.bytes);
+        assert_eq!(too_big(300 * 1_048_576, MAX_FILE_BYTES), "As one file this tour would be 300.0 MB, and a single file can be at most 200 MB. Export it as a folder instead.");
+        assert!(LARGE_FILE_BYTES < MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn a_cancel_after_the_last_picture_still_keeps_the_target_unchanged() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        std::fs::write(&file, "old").unwrap();
+        assert_eq!(write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |f| f < 1.0).unwrap_err(), "cancelled");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        let dir = tmp.path().join("folder");
+        assert_eq!(write_bundle(&r, &[], &clicks(), &edit(&r), "t", &dir, flat, |f| f < 1.0).unwrap_err(), "cancelled");
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_single_file_is_readable_by_others_like_any_saved_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| true).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn a_failed_cancelled_or_refused_single_file_leaves_nothing_and_keeps_what_was_there() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        // Cancel and a frame error: no file, no temporary file.
+        assert_eq!(write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| false).unwrap_err(), "cancelled");
+        let mut n = 0;
+        let failing = |_: usize| { n += 1; if n == 2 { Err("disk read failed".to_string()) } else { flat(0) } };
+        assert_eq!(write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, failing, |_| true).unwrap_err(), "disk read failed");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing was left behind");
+        // An existing file survives a cancel untouched, and is replaced whole by a finished export.
+        std::fs::write(&file, "old").unwrap();
+        write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| false).unwrap_err();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+        let sum = write_single_file(&r, &[], &clicks(), &edit(&r), "t", &file, flat, |_| true).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("<!doctype html>"));
+        assert_eq!(sum.bytes, std::fs::metadata(&file).unwrap().len());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        // The limits refuse with the folder export's own message and write nothing.
+        let (big, ev) = many(201);
+        let other = tmp.path().join("big.html");
+        let folder_err = write_bundle(&big, &[], &ev, &edit(&big), "t", &tmp.path().join("big"), flat, |_| true).unwrap_err();
+        assert_eq!(write_single_file(&big, &[], &ev, &edit(&big), "t", &other, flat, |_| true).unwrap_err(), folder_err);
+        let mut e = edit(&r);
+        e.tour_removed.extend([1, 3, 4]);
+        assert_eq!(write_single_file(&r, &[], &clicks(), &e, "t", &other, flat, |_| true).unwrap_err(), ALL_REMOVED);
+        assert_eq!(write_single_file(&r, &[], &[], &edit(&r), "t", &other, flat, |_| true).unwrap_err(), NO_CLICKS);
+        // A folder in the way, or a missing parent folder, is an error and is left alone.
+        let folder = tmp.path().join("taken.html");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(write_single_file(&r, &[], &clicks(), &edit(&r), "t", &folder, flat, |_| true).is_err());
+        assert!(folder.is_dir() && std::fs::read_dir(&folder).unwrap().count() == 0);
+        assert!(write_single_file(&r, &[], &clicks(), &edit(&r), "t", &tmp.path().join("missing").join("t.html"), flat, |_| true).is_err());
+        let mut left: Vec<String> = std::fs::read_dir(tmp.path()).unwrap().map(|d| d.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["t.html", "taken.html"]);
+    }
+
+    #[test]
+    fn a_200_step_single_file_reports_progress_and_its_size() {
+        let (r, ev) = many(200);
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("t.html");
+        let mut seen = Vec::new();
+        let sum = write_single_file(&r, &[], &ev, &edit(&r), "t", &file, flat, |f| { seen.push(f); true }).unwrap();
+        assert_eq!(sum.steps, 200);
+        assert_eq!((seen.first(), seen.last(), seen.len()), (Some(&0.0), Some(&1.0), 201));
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(sum.bytes, std::fs::metadata(&file).unwrap().len());
+        assert_eq!(single_parts(&std::fs::read_to_string(&file).unwrap()).0.len(), 200);
     }
 
     #[test]

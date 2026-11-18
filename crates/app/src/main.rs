@@ -907,7 +907,9 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// A publish still running is cancelled; its temporary folder goes if it has not ended in time.
+    /// A publish or tour export still running is cancelled and given a few seconds to remove what it
+    /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
+    /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         publish_ui::shutdown(std::time::Duration::from_secs(5));
     }

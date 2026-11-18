@@ -262,10 +262,21 @@ pub fn open_path(path: &Path) {
     }
 }
 
+/// Explorer's argument to open a folder with `path` selected. The path is quoted, so commas, spaces and
+/// any other characters in it stay part of the name (a Windows path cannot hold a quote). It must reach
+/// Explorer as it is, not re-quoted as a whole.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn select_arg(path: &Path) -> String {
+    format!("/select,\"{}\"", path.display())
+}
+
 /// Show a file selected in the file manager.
 pub fn reveal(path: &Path) {
     #[cfg(windows)]
-    let result = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    let result = {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer").raw_arg(select_arg(path)).spawn()
+    };
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg("-R").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -285,5 +296,16 @@ pub fn open_folder(path: &Path) {
     let cmd = "xdg-open";
     if let Err(e) = std::process::Command::new(cmd).arg(path).spawn() {
         eprintln!("could not open {}: {e}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_file_to_select_is_quoted_whole() {
+        assert_eq!(select_arg(Path::new(r"C:\Users\me\Tours\Billing, v2 tour.html")), r#"/select,"C:\Users\me\Tours\Billing, v2 tour.html""#);
+        assert_eq!(select_arg(Path::new(r"D:\Führung\演示.html")), r#"/select,"D:\Führung\演示.html""#);
     }
 }
