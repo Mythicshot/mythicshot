@@ -220,10 +220,10 @@ fn sweep(tours: &Path, slug: &str, list: &SiteList) {
         if !leftover_of(&name, slug) || list.tours.iter().any(|t| t.slug == name) {
             continue;
         }
-        if e.path().symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            if let Err(err) = retry(|| std::fs::remove_dir_all(e.path())) {
-                eprintln!("Add to site: could not remove the leftover folder tours/{name}: {err}");
-            }
+        if e.path().symlink_metadata().is_ok_and(|m| m.is_dir())
+            && let Err(err) = retry(|| std::fs::remove_dir_all(e.path()))
+        {
+            eprintln!("Add to site: could not remove the leftover folder tours/{name}: {err}");
         }
     }
 }
@@ -371,15 +371,15 @@ fn add_checked(
     // Put the site's tours back as they were before the swap.
     let unswap = |tours_dir: &Path| {
         let aside = temp_name("tmp", slug, tours_dir);
-        if target.symlink_metadata().is_ok() {
-            if let Err(e) = retry(|| std::fs::rename(&target, &aside)) {
-                eprintln!("Add to site: could not move the new {} aside: {e}", address(slug));
-            }
+        if target.symlink_metadata().is_ok()
+            && let Err(e) = retry(|| std::fs::rename(&target, &aside))
+        {
+            eprintln!("Add to site: could not move the new {} aside: {e}", address(slug));
         }
-        if let Some(old) = &old {
-            if let Err(e) = retry(|| std::fs::rename(old, &target)) {
-                eprintln!("Add to site: could not put the previous {} back: {e}", address(slug));
-            }
+        if let Some(old) = &old
+            && let Err(e) = retry(|| std::fs::rename(old, &target))
+        {
+            eprintln!("Add to site: could not put the previous {} back: {e}", address(slug));
         }
         for dir in [&aside, &new] {
             if let Err(e) = remove_ours(dir) {

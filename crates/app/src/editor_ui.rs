@@ -312,6 +312,8 @@ pub struct Editor {
     pub(crate) status_reveal: Option<PathBuf>,
     /// Sentences shown after "Show in folder" (a warning about the file); cleared by the next message.
     pub(crate) status_more: Option<String>,
+    /// A page the status message offers to open in the browser ("Open site"); cleared by the next message.
+    pub(crate) status_open: Option<PathBuf>,
     pub closed: bool,
     confirm_close: bool,
     /// Where the canvas was right-clicked, for the menu's Paste here.
@@ -355,6 +357,7 @@ impl Editor {
             status: None,
             status_reveal: None,
             status_more: None,
+            status_open: None,
             closed: false,
             confirm_close: false,
             menu_at: None,
@@ -422,6 +425,7 @@ impl Editor {
         self.status = Some((msg.into(), chrono::Local::now().format("%H:%M:%S").to_string()));
         self.status_reveal = None;
         self.status_more = None;
+        self.status_open = None;
     }
 
     /// The Guide card tool is the current tool.
@@ -499,8 +503,8 @@ impl Editor {
         }
         // A press off the guide card ends typing on it; noted now, done once this frame's keys reached the card.
         let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
-        // While the "Publish tour" dialog is open it gets the keys, and the editor behind it is inert.
-        let modal = self.publish_picker_open();
+        // While the "Publish tour" or "Add to site" dialog is open it gets the keys, and the editor behind it is inert.
+        let modal = self.publish_picker_open() || self.site_dialog_open();
         if !modal {
             self.video_keys(&ctx);
             self.shortcuts(&ctx);
@@ -1108,6 +1112,7 @@ impl Editor {
                 };
                 let reveal = self.status.as_ref().and(self.status_reveal.clone());
                 let more = self.status.as_ref().and(self.status_more.clone());
+                let open = self.status.as_ref().and(self.status_open.clone());
                 // Hovering any part of the message shows all of it.
                 let whole = match &more {
                     Some(m) => format!("{text} · Show in folder. {m}"),
@@ -1116,7 +1121,7 @@ impl Editor {
                 ui.scope(|ui| {
                     // Room is kept for "· Show in folder" when the message offers it, and half of what is left
                     // for the sentences after it.
-                    let link_w = if reveal.is_some() { STATUS_REVEAL_W } else { 0.0 };
+                    let link_w = (if reveal.is_some() { STATUS_REVEAL_W } else { 0.0 }) + (if open.is_some() { STATUS_OPEN_W } else { 0.0 });
                     let room = (status_width(ui.available_width()) - link_w).max(0.0);
                     ui.set_max_width(if more.is_some() { room / 2.0 } else { room });
                     let label = ui.add(egui::Label::new(egui::RichText::new(&text).color(muted)).truncate());
@@ -1129,6 +1134,12 @@ impl Editor {
                     // A link is a focusable widget, so Tab reaches it and Enter or Space follows it.
                     if ui.link("Show in folder").on_hover_text(path.display().to_string()).clicked() {
                         crate::platform::reveal(&path);
+                    }
+                }
+                if let Some(page) = open {
+                    ui.label(egui::RichText::new("·").color(muted));
+                    if ui.link("Open site").on_hover_text("Open the site's index page in the browser").clicked() {
+                        crate::platform::open_path(&page);
                     }
                 }
                 if let Some(m) = &more {
@@ -1865,6 +1876,8 @@ const STATUS_ZOOM_W: f32 = 150.0;
 /// runs under the zoom controls.
 /// Width kept beside the status message for "· Show in folder".
 const STATUS_REVEAL_W: f32 = 112.0;
+/// Width kept beside the status message for "· Open site".
+const STATUS_OPEN_W: f32 = 84.0;
 
 fn status_width(available: f32) -> f32 {
     (available - STATUS_ZOOM_W).max(0.0)

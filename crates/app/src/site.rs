@@ -1,15 +1,13 @@
 //! A site: a folder of plain web files holding many tours and an index page listing them.
 //!
 //! A folder is a site only when its own `tours.json` says so. This module decides what a tour's
-//! address is and whether a folder may be used; nothing here writes to disk.
-
-#![cfg_attr(not(test), expect(dead_code, reason = "used by the Add to site dialog, which is not built yet"))]
+//! address is and whether a folder may be used; `pages` makes its pages and `write` is the only part that
+//! writes to disk.
 
 mod pages;
 mod write;
 
 pub use pages::*;
-#[allow(unused_imports, reason = "used by the Add to site dialog, which is not built yet")]
 pub use write::*;
 
 use std::path::Path;

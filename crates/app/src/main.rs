@@ -23,6 +23,7 @@ mod recorder_ui;
 mod settings;
 mod settings_ui;
 mod site;
+mod site_ui;
 mod tray;
 mod tour;
 mod tour_cards;

@@ -178,7 +178,6 @@ pub fn tour_title(title: &str) -> String {
 }
 
 /// One line of text cleaned like the tour's title and capped at `max` code points; empty when nothing is left.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the site export, whose dialog is not built yet"))]
 pub fn clean_line(text: &str, max: usize) -> String {
     doc::clean(text, max, false)
 }
@@ -381,7 +380,6 @@ pub enum Page<'a> {
     /// The local preview, with everything inline: what "Export tour" writes.
     Preview,
     /// A tour page in a site, using the site's shared player files, with a `thumb.jpg` for the index.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the site export, whose dialog is not built yet"))]
     Site(&'a crate::site::Assets),
 }
 
