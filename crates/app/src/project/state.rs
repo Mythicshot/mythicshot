@@ -1,7 +1,12 @@
-//! The on-disk format of a saved project: `project.json`, `format: 1`.
+//! The on-disk format of a saved project: `project.json`.
+//!
+//! A project whose recording is kept as frames is `format: 1`, exactly as 0.2.7 writes it, and
+//! 0.2.7 still opens it. A project whose recording is kept as a video is `format: 2` and says so in
+//! its `store` section; 0.2.7 reports such a file as written by a newer version.
 //!
 //! The file has its own types, so a change to the editor's types cannot change saved files
-//! unnoticed; `golden-v1.json` pins the exact text. Pasted pictures and the cover logo are files
+//! unnoticed; `golden-v1.json` pins the exact text of the frames form and `golden-v2.json` that of
+//! the video form. Pasted pictures and the cover logo are files
 //! beside the JSON, named by their content. Only mouse events are saved: key presses stay in
 //! memory and go with the recording, as Preferences promises. The token is not part of any type
 //! here, so it cannot reach a project.
@@ -20,8 +25,11 @@ use sha2::Digest;
 use crate::tour::{Advance, Anchor, Autoplay, Card, CardStyle, Cover, EndCard, HotspotStyle, Link, Placement, Point, StepExtras, Theme, TourDoc, Zoom};
 use crate::video::Edit;
 
-/// The format this build writes. A file with a higher number was written by a newer Mythicshot.
-pub const FORMAT: u32 = 1;
+/// The highest format this build reads, and what it writes for a project kept as a video. A file
+/// with a higher number was written by a newer Mythicshot.
+pub const FORMAT: u32 = 2;
+/// The format of a project kept as frames: what 0.2.7 writes and reads.
+pub const FORMAT_FRAMES: u32 = 1;
 
 /// A cover logo larger than this is not copied into a project; the tour export refuses it too.
 const LOGO_MAX_FILE_BYTES: u64 = 30_000_000;
@@ -78,6 +86,10 @@ pub struct ProjectFile {
     /// The size of `frames.zst` when the project was saved.
     #[serde(default)]
     pub frames_bytes: u64,
+    /// Which form the recording is kept in and how a conversion ended. Left out of the file when
+    /// it is the default, so a frames-form project without a mark is the text 0.2.7 writes.
+    #[serde(default, skip_serializing_if = "StoreInfo::is_default")]
+    pub store: StoreInfo,
     #[serde(default)]
     pub edit: SavedEdit,
     /// Mouse events only.
@@ -85,6 +97,53 @@ pub struct ProjectFile {
     pub events: Vec<SavedEvent>,
     #[serde(default)]
     pub items: Vec<ItemEntry>,
+}
+
+/// The form a project's recording is kept in. A word this build does not know makes the file
+/// damaged: the form decides which files the project needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedForm {
+    /// `frames.zst`, lossless.
+    #[default]
+    Frames,
+    /// `frames.mkv`.
+    Video,
+}
+
+/// The `store` section of the file.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoreInfo {
+    pub form: SavedForm,
+    /// The size of the video when the project was converted; 0 in the frames form.
+    pub video_bytes: u64,
+    /// The size the frames had before they were replaced by the video; 0 in the frames form.
+    pub lossless_bytes: u64,
+    /// How the last conversion that did not replace the frames ended, so it is not tried forever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub convert: Option<ConvertMark>,
+}
+
+impl StoreInfo {
+    /// The frames form with no mark: what every project of 0.2.7 is.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A conversion that ended without a video. It is tried again only when `codec` or `app` differs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConvertMark {
+    /// "failed" or "not_smaller".
+    pub state: String,
+    /// The codec's own name for its settings.
+    pub codec: String,
+    /// The Mythicshot version that tried.
+    pub app: String,
+    /// Milliseconds since 1970.
+    pub at: i64,
 }
 
 /// One entry of `items`. An entry that does not have an item's shape is kept as it was read, so
@@ -791,8 +850,9 @@ fn load_step(s: SavedStep) -> StepExtras {
 /// The file for `snap`, the files that go beside it (the pasted pictures as PNG and the cover
 /// logo's source file), and what could not be saved: an item whose picture cannot be encoded
 /// ("a pasted picture") and a logo that cannot be read or is too large ("the cover logo") are
-/// left out of the file and named in the third value.
-pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes: u64) -> (ProjectFile, Vec<Blob>, Vec<String>) {
+/// left out of the file and named in the third value. `store` says which form the recording is
+/// kept in: the frames form is written as format 1, the video form as format 2.
+pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes: u64, store: StoreInfo) -> (ProjectFile, Vec<Blob>, Vec<String>) {
     let mut blobs = Blobs::default();
     let e = snap.edit;
     let edit = SavedEdit {
@@ -808,7 +868,10 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
     };
     let items = snap.items.iter().filter_map(|it| Some(ItemEntry::Item(SavedItem { shape: save_shape(&it.shape, &mut blobs)?, style: save_style(&it.style), frames: it.frames, pin: it.pin }))).collect();
     let file = ProjectFile {
-        format: FORMAT,
+        format: match store.form {
+            SavedForm::Frames => FORMAT_FRAMES,
+            SavedForm::Video => FORMAT,
+        },
         app: env!("CARGO_PKG_VERSION").to_string(),
         saved_at: now_ms,
         server: key.server.clone(),
@@ -818,6 +881,7 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
         title: snap.title.to_string(),
         steps: snap.steps,
         frames_bytes,
+        store,
         edit,
         events: snap.events.iter().filter_map(save_event).collect(),
         items,
@@ -825,7 +889,7 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
     (file, blobs.list, blobs.dropped)
 }
 
-/// The text of `project.json`: the form `golden-v1.json` pins.
+/// The text of `project.json`: the form `golden-v1.json` and `golden-v2.json` pin.
 pub fn to_text(file: &ProjectFile) -> Result<String, String> {
     let mut text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     text.push('\n');
@@ -861,7 +925,8 @@ fn from_file_within(file: ProjectFile, dir: &Path, rec: &Recording, limits: Limi
 }
 
 /// Reads `project.json`. The format number is looked at first, so a file from a newer Mythicshot
-/// is reported as newer whatever else it holds.
+/// is reported as newer whatever else it holds. The format and the form must agree: format 1 is
+/// the frames form and format 2 the video form, and a file that says otherwise is damaged.
 pub fn parse(text: &str) -> Result<ProjectFile, ParseError> {
     if text.len() > MAX_PROJECT_JSON_BYTES {
         return Err(ParseError::Damaged(format!("the file is larger than {} MB", MAX_PROJECT_JSON_BYTES / 1_048_576)));
@@ -874,7 +939,12 @@ pub fn parse(text: &str) -> Result<ProjectFile, ParseError> {
     if format == 0 {
         return Err(ParseError::Damaged("the format number is 0".to_string()));
     }
-    serde_json::from_value(value).map_err(|e| ParseError::Damaged(e.to_string()))
+    let file: ProjectFile = serde_json::from_value(value).map_err(|e| ParseError::Damaged(e.to_string()))?;
+    match (file.format, file.store.form) {
+        (FORMAT_FRAMES, SavedForm::Frames) | (FORMAT, SavedForm::Video) => Ok(file),
+        (FORMAT_FRAMES, SavedForm::Video) => Err(ParseError::Damaged("the file is format 1 and says its recording is kept as a video".to_string())),
+        _ => Err(ParseError::Damaged(format!("the file is format {} and does not say its recording is kept as a video", file.format))),
+    }
 }
 
 #[cfg(test)]
@@ -885,11 +955,16 @@ pub(super) mod tests {
     use mythicshot_editor::pt;
 
     const GOLDEN: &str = include_str!("golden-v1.json");
+    /// The same state kept as a video: `format: 2` and the `store` section.
+    const GOLDEN_VIDEO: &str = include_str!("golden-v2.json");
     /// The picture's name in the golden file. A real name is the hash of the PNG bytes, which a
     /// new version of the PNG encoder may change; the format does not depend on it.
     const GOLDEN_PICTURE: &str = "pictures/00112233aabbccdd.png";
     /// The golden file's `app`: the real one moves with every release.
     const GOLDEN_APP: &str = "0.2.5";
+    /// The second golden file's `app`: the first version that writes the video form.
+    const GOLDEN_VIDEO_APP: &str = "0.2.8";
+    const VIDEO_BYTES: u64 = 23_456;
     const LOGO: &[u8] = b"\x89PNG\r\n\x1a\nnot really a logo";
     const SAVED_AT: i64 = 1_763_460_000_000;
     const FRAMES_BYTES: u64 = 123_456;
@@ -1000,10 +1075,23 @@ pub(super) mod tests {
     }
 
     fn build(rec: &Recording, edit: &Edit, events: &[InputEvent], items: &[Item]) -> (ProjectFile, Vec<Blob>) {
+        build_as(rec, edit, events, items, StoreInfo::default())
+    }
+
+    fn build_as(rec: &Recording, edit: &Edit, events: &[InputEvent], items: &[Item], store: StoreInfo) -> (ProjectFile, Vec<Blob>) {
         let snap = Snapshot { rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit, events, items };
-        let (file, blobs, dropped) = to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES);
+        let (file, blobs, dropped) = to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES, store);
         assert_eq!(dropped, Vec::<String>::new());
         (file, blobs)
+    }
+
+    /// What the store section of a project kept as a video holds.
+    fn video_store() -> StoreInfo {
+        StoreInfo { form: SavedForm::Video, video_bytes: VIDEO_BYTES, lossless_bytes: FRAMES_BYTES, convert: None }
+    }
+
+    fn mark(state: &str) -> ConvertMark {
+        ConvertMark { state: state.into(), codec: "x264-444-crf10-medium-g30".into(), app: "0.2.8".into(), at: SAVED_AT + 60_000 }
     }
 
     fn saved(entry: &ItemEntry) -> &SavedItem {
@@ -1067,7 +1155,7 @@ pub(super) mod tests {
         let (_keep, logo) = logo_source();
         let (edit, events, items) = (edit(&rec, Some(&logo)), events(), items());
         let (file, blobs) = build(&rec, &edit, &events, &items);
-        assert_eq!((file.format, file.app.as_str(), file.saved_at, file.frames_bytes, file.steps), (FORMAT, env!("CARGO_PKG_VERSION"), SAVED_AT, FRAMES_BYTES, 3));
+        assert_eq!((file.format, file.app.as_str(), file.saved_at, file.frames_bytes, file.steps), (FORMAT_FRAMES, env!("CARGO_PKG_VERSION"), SAVED_AT, FRAMES_BYTES, 3));
         assert_eq!((file.server.as_str(), file.tour_id.as_str(), file.chapter_id.as_str()), ("https://tours.example.com", "tour_0123456789abcdef01234567", "ch_0123456789abcdef01234567"));
         assert_eq!((file.tour_title.as_str(), file.title.as_str()), ("Customer onboarding", "Chapter one"));
         // One picture and the logo, each named by its content.
@@ -1113,46 +1201,136 @@ pub(super) mod tests {
     }
 
     /// The golden state as a file, with the two values that are not part of the format pinned.
-    fn golden_text() -> String {
+    fn golden_text(store: StoreInfo, app: &str) -> String {
         let rec = rec();
         let (_keep, logo) = logo_source();
-        let (mut file, blobs) = build(&rec, &edit(&rec, Some(&logo)), &events(), &items());
-        file.app = GOLDEN_APP.to_string();
+        let (mut file, blobs) = build_as(&rec, &edit(&rec, Some(&logo)), &events(), &items(), store);
+        file.app = app.to_string();
         let picture = blobs.iter().find(|b| b.name.starts_with("pictures/")).unwrap();
         to_text(&file).unwrap().replace(&picture.name, GOLDEN_PICTURE)
     }
 
     #[test]
-    fn the_saved_file_matches_the_golden_file() {
-        assert_eq!(golden_text(), GOLDEN.replace("\r\n", "\n"));
+    fn a_frames_form_project_is_still_written_as_format_1_and_matches_the_first_golden_file() {
+        let text = golden_text(StoreInfo::default(), GOLDEN_APP);
+        assert_eq!(text, GOLDEN.replace("\r\n", "\n"));
+        assert!(text.starts_with("{\n  \"format\": 1,\n"));
+        // The new section is not in a frames-form file at all, so 0.2.7 reads what it always read.
+        assert!(!text.contains("\"store\"") && !text.contains("video") && !text.contains("lossless"));
+        assert_eq!((FORMAT_FRAMES, FORMAT), (1, 2));
     }
 
     #[test]
-    fn the_golden_file_of_format_1_still_loads() {
+    fn a_video_form_project_is_format_2_and_matches_the_second_golden_file() {
+        let text = golden_text(video_store(), GOLDEN_VIDEO_APP);
+        assert_eq!(text, GOLDEN_VIDEO.replace("\r\n", "\n"));
+        assert!(text.starts_with("{\n  \"format\": 2,\n"));
+        // The two golden files differ in the format number, the version and the store section only.
+        let section = "  \"store\": {\n    \"form\": \"video\",\n    \"video_bytes\": 23456,\n    \"lossless_bytes\": 123456\n  },\n";
+        assert_eq!(text.matches(section).count(), 1);
+        let as_frames = text.replacen(section, "", 1).replacen("\"format\": 2", "\"format\": 1", 1).replacen("\"app\": \"0.2.8\"", "\"app\": \"0.2.5\"", 1);
+        assert_eq!(as_frames, GOLDEN.replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn both_golden_files_still_load() {
         let rec = rec();
         let project = tempfile::tempdir().unwrap();
         write_blobs(project.path(), &[Blob { name: GOLDEN_PICTURE.into(), bytes: png(&picture()).unwrap() }, Blob { name: logo_name(), bytes: LOGO.to_vec() }]);
-        let file = parse(GOLDEN).unwrap();
-        assert_eq!((file.format, file.app.as_str(), file.saved_at, file.frames_bytes, file.steps), (1, GOLDEN_APP, SAVED_AT, FRAMES_BYTES, 3));
-        assert_eq!(ProjectKey { server: file.server.clone(), tour_id: file.tour_id.clone(), chapter_id: file.chapter_id.clone() }, key());
-        assert_eq!(file.tour_title, "Customer onboarding");
-        let back = from_file(file, project.path(), &rec);
-        assert_eq!(back.dropped, Vec::<String>::new());
-        assert_eq!(back.title, "Chapter one");
-        assert_same_items(&back.items, &items());
-        assert_eq!(back.events, mouse_only(&events()));
-        assert_same_edit(&back.edit, &edit(&rec, Some(&project.path().join(logo_name()))));
+        for (golden, format, app, store) in [(GOLDEN, 1, GOLDEN_APP, StoreInfo::default()), (GOLDEN_VIDEO, 2, GOLDEN_VIDEO_APP, video_store())] {
+            let file = parse(golden).unwrap();
+            assert_eq!((file.format, file.app.as_str(), file.saved_at, file.frames_bytes, file.steps), (format, app, SAVED_AT, FRAMES_BYTES, 3));
+            assert_eq!(file.store, store);
+            assert_eq!(ProjectKey { server: file.server.clone(), tour_id: file.tour_id.clone(), chapter_id: file.chapter_id.clone() }, key());
+            assert_eq!(file.tour_title, "Customer onboarding");
+            // Read and written again, each file is the text it was.
+            assert_eq!(to_text(&file).unwrap(), golden.replace("\r\n", "\n"));
+            let back = from_file(file, project.path(), &rec);
+            assert_eq!(back.dropped, Vec::<String>::new());
+            assert_eq!(back.title, "Chapter one");
+            assert_same_items(&back.items, &items());
+            assert_eq!(back.events, mouse_only(&events()));
+            assert_same_edit(&back.edit, &edit(&rec, Some(&project.path().join(logo_name()))));
+        }
     }
 
     #[test]
-    fn a_file_with_a_higher_format_is_reported_as_newer_and_not_as_damaged() {
+    fn a_conversion_mark_on_a_format_1_file_round_trips_and_is_left_out_when_there_is_none() {
+        let rec = rec();
+        let edit = Edit::new(&rec, OverlayStyle::default());
+        // No mark and the frames form: no section, and the file is format 1.
+        let (plain, _) = build(&rec, &edit, &[], &[]);
+        assert!(plain.store.is_default() && plain.store == StoreInfo::default());
+        assert_eq!((plain.format, plain.store.form, plain.store.convert.clone()), (1, SavedForm::Frames, None));
+        assert!(!to_text(&plain).unwrap().contains("store"));
+        assert_eq!(parse(&to_text(&plain).unwrap()).unwrap(), plain);
+
+        for state in ["failed", "not_smaller"] {
+            let store = StoreInfo { convert: Some(mark(state)), ..StoreInfo::default() };
+            assert!(!store.is_default());
+            let (file, _) = build_as(&rec, &edit, &[], &[], store.clone());
+            // A mark alone does not make the file one that 0.2.7 refuses.
+            assert_eq!((file.format, &file.store), (1, &store));
+            let text = to_text(&file).unwrap();
+            let section = format!("  \"store\": {{\n    \"form\": \"frames\",\n    \"video_bytes\": 0,\n    \"lossless_bytes\": 0,\n    \"convert\": {{\n      \"state\": \"{state}\",\n      \"codec\": \"x264-444-crf10-medium-g30\",\n      \"app\": \"0.2.8\",\n      \"at\": 1763460060000\n    }}\n  }},\n");
+            assert_eq!(text.matches(&section).count(), 1, "{text}");
+            assert!(text.starts_with("{\n  \"format\": 1,\n"));
+            let back = parse(&text).unwrap();
+            assert_eq!(back, file);
+            assert_eq!(back.store.convert, Some(mark(state)));
+            // Without the section the text is the unmarked file's: the mark changes nothing else.
+            assert_eq!(text.replacen(&section, "", 1), to_text(&plain).unwrap());
+        }
+
+        // A mark is kept on a video-form file too, and a state this build does not know is kept as read.
+        let (file, _) = build_as(&rec, &edit, &[], &[], StoreInfo { convert: Some(mark("later_word")), ..video_store() });
+        assert_eq!(file.format, 2);
+        assert_eq!(parse(&to_text(&file).unwrap()).unwrap(), file);
+        // A section written by hand with fields missing takes the defaults.
+        let file = parse(r#"{"format": 1, "store": {"convert": {"state": "failed"}}}"#).unwrap();
+        assert_eq!(file.store, StoreInfo { convert: Some(ConvertMark { state: "failed".into(), codec: String::new(), app: String::new(), at: 0 }), ..StoreInfo::default() });
+        assert_eq!(parse(r#"{"format": 1, "store": {}}"#).unwrap().store, StoreInfo::default());
+        assert_eq!(parse(r#"{"format": 1, "store": {"convert": null}}"#).unwrap().store, StoreInfo::default());
+    }
+
+    #[test]
+    fn a_format_3_file_is_newer_and_not_damaged() {
         // Everything but the format number is of a shape this build has never seen.
-        assert_eq!(parse(r#"{"format": 2, "edit": "elsewhere", "items": {"a": 1}, "events": 7}"#), Err(ParseError::Newer(2)));
+        assert_eq!(parse(r#"{"format": 3, "edit": "elsewhere", "items": {"a": 1}, "events": 7, "store": "somewhere"}"#), Err(ParseError::Newer(3)));
         assert_eq!(parse(r#"{"items": [1, 2], "format": 4000000000}"#), Err(ParseError::Newer(4_000_000_000)));
         assert_eq!(parse(r#"{"format": 99999999999999}"#), Err(ParseError::Newer(u32::MAX)));
-        let newer = GOLDEN.replacen("\"format\": 1", "\"format\": 2", 1);
-        assert_ne!(newer, GOLDEN);
-        assert_eq!(parse(&newer), Err(ParseError::Newer(2)));
+        for golden in [GOLDEN, GOLDEN_VIDEO] {
+            let newer = golden.replacen("\"format\": 1", "\"format\": 3", 1).replacen("\"format\": 2", "\"format\": 3", 1);
+            assert_ne!(newer, golden);
+            assert_eq!(parse(&newer), Err(ParseError::Newer(3)));
+        }
+        // Format 2 is read by this build: a file of that format with a field of the wrong shape is damaged.
+        assert!(matches!(parse(r#"{"format": 2, "edit": "elsewhere"}"#), Err(ParseError::Damaged(_))));
+        assert_eq!(FORMAT, 2);
+    }
+
+    #[test]
+    fn a_format_1_file_that_claims_a_video_is_damaged() {
+        let damaged = |text: &str| matches!(parse(text), Err(ParseError::Damaged(why)) if !why.is_empty());
+        assert!(damaged(r#"{"format": 1, "store": {"form": "video", "video_bytes": 5}}"#));
+        let golden = GOLDEN_VIDEO.replace("\r\n", "\n");
+        let claims = golden.replacen("\"format\": 2", "\"format\": 1", 1);
+        assert_ne!(claims, golden);
+        assert!(damaged(&claims));
+        assert!(parse(&golden).is_ok());
+        // The other way round: format 2 is written only for a video, so one without is damaged too.
+        assert!(damaged(r#"{"format": 2}"#));
+        assert!(damaged(r#"{"format": 2, "store": {"form": "frames"}}"#));
+        assert!(damaged(&GOLDEN.replacen("\"format\": 1", "\"format\": 2", 1)));
+        assert!(parse(r#"{"format": 2, "store": {"form": "video"}}"#).is_ok());
+        // A form this build does not know, and a section of the wrong shape, in either format.
+        for format in [1, 2] {
+            for store in [r#"{"form": "hologram"}"#, r#"{"form": "Video"}"#, r#"{"form": 1}"#, r#"{"form": null}"#, r#""video""#, "7", r#"{"form": "video", "video_bytes": -1}"#, r#"{"form": "video", "convert": "failed"}"#] {
+                assert!(damaged(&format!(r#"{{"format": {format}, "store": {store}}}"#)), "{format} {store}");
+            }
+        }
+        // The frames form said in so many words is the frames form.
+        assert_eq!(parse(r#"{"format": 1, "store": {"form": "frames"}}"#).unwrap().store, StoreInfo::default());
     }
 
     #[test]
@@ -1482,7 +1660,7 @@ pub(super) mod tests {
         let build = |logo: &Path| {
             let edit = edit(&rec, Some(logo));
             let snap = Snapshot { rec: &rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &events, items: &items };
-            to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES)
+            to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES, StoreInfo::default())
         };
         // A logo file that is gone.
         let (file, blobs, dropped) = build(&dir.path().join("gone.png"));
@@ -1510,6 +1688,20 @@ pub(super) mod tests {
         assert!(!text.contains(token) && !text.contains(&token[3..]));
         assert!(!text.to_ascii_lowercase().contains("token"));
         assert!(blobs.iter().all(|b| !b.bytes.windows(token.len()).any(|w| w == token.as_bytes())));
+        // The store section, in the video form and with a conversion mark, holds none either.
+        let store = StoreInfo { convert: Some(mark("failed")), ..video_store() };
+        let (file, blobs) = build_as(&rec, &edit(&rec, Some(&logo)), &events(), &items(), store);
+        let text = to_text(&file).unwrap();
+        assert!(text.contains("\"store\"") && text.contains("\"convert\"") && text.contains("\"video_bytes\""));
+        assert!(!text.contains(token) && !text.contains(&token[3..]));
+        assert!(!text.to_ascii_lowercase().contains("token"));
+        assert!(blobs.iter().all(|b| !b.bytes.windows(token.len()).any(|w| w == token.as_bytes())));
+        // The section's own types have no field a token could be put in: every word in it is named here.
+        let section = serde_json::to_value(&file.store).unwrap();
+        let mut keys: Vec<&str> = section.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.extend(section["convert"].as_object().unwrap().keys().map(String::as_str));
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["app", "at", "codec", "convert", "form", "lossless_bytes", "state", "video_bytes"]);
     }
 
     #[test]

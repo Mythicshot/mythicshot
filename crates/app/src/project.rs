@@ -6,9 +6,16 @@
 
 mod state;
 mod store;
+mod usage;
 
 pub use state::{COVER_LOGO, ProjectKey, Restored, Snapshot};
 pub use store::{LoadError, Loaded, NOT_PUT_BACK, OpenGuard, Problem, ProjectInfo, Saved, Store, Totals, epoch};
+// The settings name the largest limit; the rest is for Preferences and the publish result screen.
+#[allow(unused_imports)]
+pub use usage::{ConvertState, Form, LIMIT_MAX_GB, form_text, over_limit, over_limit_sentence, parse_limit, pushed_over, remove_question, row_title, usage_fraction, usage_line};
+// What removing one saved recording answers; nothing outside this module asks for one yet.
+#[allow(unused_imports)]
+pub use store::Removed;
 
 // Named outside this module by tests only: the format's number, and two of the store's reasons.
 #[cfg(test)]
