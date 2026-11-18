@@ -18,7 +18,7 @@ use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store};
 use crate::publish::{Published, Target};
-use crate::publish_ui::{self, Before, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
+use crate::publish_ui::{self, Before, EditTarget, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
 use crate::site_ui::{SiteDialog, SiteOutcome};
@@ -125,8 +125,9 @@ enum ExportJob {
     /// A tour added to a site, cancelled like a tour export, with the site title to remember once it worked.
     Site(EncodeJob<SiteSummary>, Arc<Run>, String),
     /// An upload (then a publish, when asked), or a publish alone, with the tour's title and
-    /// what the tour was before, for the result screen.
-    Publish(EncodeJob<PublishDone>, Arc<Run>, String, Before),
+    /// what the tour was before, for the result screen, and whether it is an update of a
+    /// chapter over the same link ("Update tour", and "Try again" after one).
+    Publish(EncodeJob<PublishDone>, Arc<Run>, String, Before, bool),
 }
 
 /// What a finished export made.
@@ -134,7 +135,8 @@ enum Exported {
     File(PathBuf, u64),
     Tour(TourSummary, TourOutput),
     Site(SiteSummary, String),
-    Published(PublishDone, String, Before),
+    /// With whether it was an update.
+    Published(PublishDone, String, Before, bool),
 }
 
 impl ExportJob {
@@ -162,7 +164,7 @@ impl ExportJob {
             ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
             ExportJob::Tour(j, out, _) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
             ExportJob::Site(j, _, title) => j.take_result().map(|r| r.map(|s| Exported::Site(s, title.clone()))),
-            ExportJob::Publish(j, _, title, before) => j.take_result().map(|r| r.map(|done| Exported::Published(done, title.clone(), before.clone()))),
+            ExportJob::Publish(j, _, title, before, update) => j.take_result().map(|r| r.map(|done| Exported::Published(done, title.clone(), before.clone(), *update))),
         }
     }
 
@@ -182,10 +184,19 @@ impl ExportJob {
         }
     }
 
+    /// Whether this is an update of a chapter over the same link, or the publish of one.
+    fn is_update(&self) -> bool {
+        matches!(self, ExportJob::Publish(_, _, _, _, true))
+    }
+
     /// The editor is going away: a publish is cancelled, since nobody would see its result.
-    /// It stops calling the server; any other export runs on to its end.
+    /// It stops calling the server; any other export runs on to its end. So does an update:
+    /// it changes a tour that is already on the site, and stopping it half-way without a word
+    /// would leave that tour, its public page and the saved recording at three different
+    /// points. It runs to its end in the background, and the saved recording stays registered
+    /// as open until then ([`VideoState`]'s drop).
     fn abandon(&self) {
-        if let ExportJob::Publish(_, run, ..) = self {
+        if let ExportJob::Publish(_, run, _, _, false) = self {
             run.cancel();
         }
     }
@@ -200,12 +211,14 @@ impl ExportJob {
 }
 
 /// The notification while an export runs. `cancelling` is a publish's cancel state, `tour_cancelling`
-/// whether a tour export was asked to stop, `publishing` a publish's step after its upload.
-fn progress_message(is_tour: bool, cancelling: Option<bool>, tour_cancelling: bool, publishing: Option<Option<crate::publish::Images>>, progress: f32) -> String {
+/// whether a tour export was asked to stop, `publishing` a publish's step after its upload,
+/// `updating` whether the publish is an update of a chapter.
+fn progress_message(is_tour: bool, cancelling: Option<bool>, tour_cancelling: bool, publishing: Option<Option<crate::publish::Images>>, updating: bool, progress: f32) -> String {
     match cancelling {
         Some(true) => "Cancelling…".to_string(),
         Some(false) if publishing.is_some() => publish_ui::publishing_message(publishing.flatten()),
         None if tour_cancelling => "Cancelling…".to_string(),
+        Some(false) if updating => format!("Updating tour… {:.0}%", progress * 100.0),
         Some(false) => format!("Publishing tour… {:.0}%", progress * 100.0),
         None if is_tour => format!("Exporting tour… {:.0}%", progress * 100.0),
         None => format!("Exporting… {:.0}%", progress * 100.0),
@@ -359,25 +372,13 @@ fn publish_job_with(
     progress: &dyn Fn(f32),
     save: &SaveFn<'_>,
 ) -> Result<PublishDone, String> {
-    let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
-    worker.set_dir(Some(tmp.path().to_path_buf()));
-    let result = (|| {
-        let dir = tmp.path().join("tour");
-        // The editor's reader stays on the UI thread; this one belongs to the publish.
-        let mut reader = FrameReader::new(state.rec.clone())?;
-        tour::write_bundle(&state.rec, &state.items, &state.events, &state.edit, title, &dir, |i| reader.get(i), |f| {
-            progress(f * PUBLISH_WRITE_SHARE);
-            !worker.is_cancelled()
-        })?;
-        if worker.is_cancelled() {
-            return Err(crate::publish::CANCELLED.to_string());
-        }
+    with_bundle(state, title, worker, progress, |dir| {
         let token = token()?;
         let mut kept = Kept::Off;
         let finished = crate::publish::upload_and_publish(
             server,
             &token,
-            &dir,
+            dir,
             target,
             publish_now,
             |f| {
@@ -394,6 +395,27 @@ fn publish_job_with(
             },
         )?;
         Ok(PublishDone { finished, kept })
+    })
+}
+
+/// Write the tour's bundle into a fresh temporary folder, as the publish `worker` stands for,
+/// and hand the folder to `then`; the folder is removed afterwards whether it worked or not.
+/// The first [`PUBLISH_WRITE_SHARE`] of `progress` is the writing.
+fn with_bundle<T>(state: &PublishState, title: &str, worker: &Arc<Run>, progress: &dyn Fn(f32), then: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+    let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
+    worker.set_dir(Some(tmp.path().to_path_buf()));
+    let result = (|| {
+        let dir = tmp.path().join("tour");
+        // The editor's reader stays on the UI thread; this one belongs to the publish.
+        let mut reader = FrameReader::new(state.rec.clone())?;
+        tour::write_bundle(&state.rec, &state.items, &state.events, &state.edit, title, &dir, |i| reader.get(i), |f| {
+            progress(f * PUBLISH_WRITE_SHARE);
+            !worker.is_cancelled()
+        })?;
+        if worker.is_cancelled() {
+            return Err(crate::publish::CANCELLED.to_string());
+        }
+        then(&dir)
     })();
     let shown = tmp.path().display().to_string();
     if let Err(e) = tmp.close() {
@@ -402,18 +424,89 @@ fn publish_job_with(
     result
 }
 
+/// The work of "Update tour", on the job's own thread and with the state the editor had when
+/// it started: write the bundle, replace the chapter `target` names on the site (only the
+/// pictures the site lacks are sent), save the project over the one the editor was opened
+/// from, then publish when the site says that is safe. `keeping` is the store that project
+/// lives in. An error means the project on this computer was not touched; and the site's
+/// chapter is as it was, unless the error itself says to check the tour list.
+///
+/// The save runs once, when the commit has answered and before anything is published, so the
+/// saved project matches the site's draft whatever becomes of the publish. It is not stopped
+/// by a cancel: the site already has the changes. A save that fails never fails the update;
+/// the result says that the saved recording no longer matches.
+#[allow(clippy::too_many_arguments)]
+fn update_job(state: &PublishState, title: &str, target: &EditTarget, server: &str, token: impl FnOnce() -> Result<String, String>, keeping: &Keeping, worker: &Arc<Run>, progress: &dyn Fn(f32)) -> Result<PublishDone, String> {
+    update_job_with(state, title, target, server, token, keeping, worker, progress, &store_save)
+}
+
+/// [`update_job`] with the save handed in, so a test can make it fail or panic.
+#[allow(clippy::too_many_arguments)]
+fn update_job_with(
+    state: &PublishState,
+    title: &str,
+    target: &EditTarget,
+    server: &str,
+    token: impl FnOnce() -> Result<String, String>,
+    keeping: &Keeping,
+    worker: &Arc<Run>,
+    progress: &dyn Fn(f32),
+    save: &SaveFn<'_>,
+) -> Result<PublishDone, String> {
+    with_bundle(state, title, worker, progress, |dir| {
+        let token = token()?;
+        // Until the save has answered, the saved project is not known to match the site.
+        let mut kept = Kept::Failed(publish_ui::KEEPING_BROKE_OFF.to_string());
+        let finished = crate::publish::update_tour(
+            server,
+            &token,
+            dir,
+            &target.tour_id,
+            &target.chapter_id,
+            |f| {
+                progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
+                !worker.is_cancelled()
+            },
+            |up| kept = keep_recording(keeping, save, &|| true, server, up, state, title, &target.tour_title),
+            |images| {
+                worker.set_publishing(images);
+                !worker.is_cancelled()
+            },
+        )?;
+        Ok(PublishDone { finished, kept })
+    })
+}
+
+/// What "Update tour" replaces for an editor opened from the project `origin`.
+fn edit_target(origin: &Origin) -> EditTarget {
+    EditTarget { tour_id: origin.key.tour_id.clone(), chapter_id: origin.key.chapter_id.clone(), tour_title: origin.tour_title.clone() }
+}
+
+/// Whether the project `key` belongs to the site at `server`: projects are tied to the exact
+/// address the address rule writes, so a tour of another address is never updated from here.
+fn on_this_site(key: &ProjectKey, server: &str) -> bool {
+    crate::publish::check_server(server).is_ok_and(|s| s == key.server)
+}
+
 /// "Try again": the publish step alone, for the upload `retry` names. Nothing is written,
 /// uploaded or saved again; what the first result said about the recording is said again.
 fn retry_done(retry: &publish_ui::Retry, result: Result<crate::publish::Live, String>) -> PublishDone {
     PublishDone { finished: crate::publish::after_publish(&retry.tour_id, &retry.chapter_id, retry.steps, result), kept: retry.kept.clone() }
 }
 
+/// The status-bar message when a publish or an update ended without uploading: "cancelled" in
+/// words, else the error as it is.
+fn failed_publish_message(error: &str, updating: bool) -> String {
+    match (error == crate::publish::CANCELLED, updating) {
+        (true, true) => "Update cancelled".to_string(),
+        (true, false) => "Publishing cancelled".to_string(),
+        (false, _) => error.to_string(),
+    }
+}
+
 /// The saved project an editor was opened from.
 pub struct Origin {
-    // Not read until the publish dialog offers Update.
-    #[allow(dead_code)]
     pub key: ProjectKey,
-    #[allow(dead_code)]
     pub tour_title: String,
     /// Keeps the project registered as open, for as long as this editor or a job it started
     /// reads the recording. Shared, so that whichever of them ends last lets go of it.
@@ -564,6 +657,7 @@ pub struct VideoState {
 impl Drop for VideoState {
     /// The recording's temp files go with the editor; an export still running
     /// keeps them until it finishes. A publish is cancelled: nobody would see its result.
+    /// An update is not: it runs to its end ([`ExportJob::abandon`] says why).
     fn drop(&mut self) {
         if let Some(job) = &self.job {
             job.abandon();
@@ -577,9 +671,20 @@ impl Drop for VideoState {
             None => rec.delete_files(),
             Some(job) => {
                 std::thread::spawn(move || {
-                    while job.take_result().is_none() {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    let result = loop {
+                        match job.take_result() {
+                            Some(result) => break result,
+                            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+                        }
+                    };
+                    // An update ran on without its editor: how it ended goes to the log, the
+                    // one place left to say it. Never the link, and an error never holds the token.
+                    match &result {
+                        Ok(Exported::Published(done, _, before, true)) => eprintln!("Update tour, after its editor was closed: {}", publish_ui::result_status(&done.finished, before, true)),
+                        Err(e) if job.is_update() => eprintln!("Update tour, after its editor was closed: {}", failed_publish_message(e, true)),
+                        _ => {}
                     }
+                    drop(result);
                     rec.delete_files();
                     drop(rec);
                     drop(open);
@@ -802,6 +907,20 @@ impl Editor {
                     }
                 }
             }
+            Some(PickerOutcome::Update { title, target, before }) => {
+                let has_steps = tour::plan_steps(&v.rec, &v.edit, &v.events).is_ok();
+                match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref()) {
+                    Some(blocked) => {
+                        if let Some(p) = v.picker.as_mut() {
+                            p.refuse(blocked.refusal());
+                        }
+                    }
+                    None => {
+                        v.picker = None;
+                        self.start_update(title, target, before);
+                    }
+                }
+            }
         }
         // The screen after a publish: "Done" closes it, "Try again" publishes the uploaded draft.
         let Some(v) = self.video.as_mut() else { return };
@@ -853,6 +972,7 @@ impl Editor {
         let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
         let is_site = v.job.as_ref().is_some_and(|j| j.is_site());
         let cancelling = v.job.as_ref().and_then(|j| j.cancelling());
+        let updating = v.job.as_ref().is_some_and(|j| j.is_update());
         let publishing = v.job.as_ref().and_then(|j| j.publishing());
         let tour_cancelling = v.job.as_ref().and_then(|j| j.tour_cancelling()) == Some(true);
         if let Some(r) = finished {
@@ -908,21 +1028,26 @@ impl Editor {
                                 self.prefs_changed = true;
                             }
                         }
-                        Exported::Published(done, title, before) => {
+                        Exported::Published(done, title, before, update) => {
                             // Never the link itself in the log: the result screen shows it.
-                            let msg = publish_ui::result_status(&done.finished, &before);
+                            let msg = publish_ui::result_status(&done.finished, &before, update);
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {
-                                v.publish_result = Some(ResultDialog::new(title, before, done));
+                                v.publish_result = Some(if update { ResultDialog::after_update(title, before, done) } else { ResultDialog::new(title, before, done) });
                             }
                         }
                     }
                 }
                 Err(e) if cancelling.is_some() => {
-                    let msg = if e == crate::publish::CANCELLED { "Publishing cancelled".to_string() } else { e };
+                    let msg = failed_publish_message(&e, updating);
                     eprintln!("Publish tour: {msg}");
                     self.notify(msg);
+                    // An update that failed: the dialog comes back with the reason, and still
+                    // offers a new tour. A cancel is the user's own doing and brings nothing back.
+                    if updating && e != crate::publish::CANCELLED {
+                        self.offer_update_again(e);
+                    }
                 }
                 Err(e) if is_site => {
                     let msg = if e == "cancelled" { "Adding to site cancelled".to_string() } else { e };
@@ -945,7 +1070,7 @@ impl Editor {
                 AfterExport::Close => self.closed = true,
             }
         } else if let Some(p) = progress {
-            let msg = if is_site { site_progress_message(tour_cancelling, p) } else { progress_message(is_tour, cancelling, tour_cancelling, publishing, p) };
+            let msg = if is_site { site_progress_message(tour_cancelling, p) } else { progress_message(is_tour, cancelling, tour_cancelling, publishing, updating, p) };
             self.notify(msg);
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -1106,7 +1231,63 @@ impl Editor {
         if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
             return;
         }
-        v.picker = Some(Picker::open(publish_ui::server(), title));
+        let server = publish_ui::server();
+        v.picker = Some(match &v.origin {
+            // A new recording: a new tour, or a new chapter of one.
+            None => Picker::open(server, title),
+            // Opened through Edit: update the tour it was saved for, or publish a new one.
+            Some(origin) if on_this_site(&origin.key, &server) => Picker::open_for_edit(server, title, edit_target(origin)),
+            // The address was changed since: that tour is not on the site that is configured now.
+            Some(origin) => Picker::open_for_edit_elsewhere(server, title, edit_target(origin)),
+        });
+    }
+
+    /// The dialog again after an update failed, with the reason.
+    fn offer_update_again(&mut self, error: String) {
+        let title = self.title().to_string();
+        let Some(v) = self.video.as_mut() else { return };
+        let Some(origin) = &v.origin else { return };
+        if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
+            return;
+        }
+        v.picker = Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error));
+    }
+
+    /// "Update tour": replace the chapter this editor's recording was saved for, save the
+    /// project over the saved one, then publish when the site says that is safe: see
+    /// [`update_job`]. Only for an editor opened through Edit, only for its own tour and
+    /// chapter on its own site, and never while another export runs. The project the editor
+    /// was opened from stays its origin.
+    fn start_update(&mut self, title: String, target: EditTarget, before: Before) {
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
+        let Some(origin) = v.origin.as_ref() else { return };
+        let server = publish_ui::server();
+        if !on_this_site(&origin.key, &server) || target != edit_target(origin) {
+            return;
+        }
+        let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
+        // The job reads the recording from the project's folder and saves over that project
+        // in place: it holds the project open for as long as it runs, also past this editor.
+        let open = origin.open.clone();
+        // The project is rewritten whatever the keep setting says: it exists already, and
+        // left as it is it would no longer match the tour.
+        let keeping = keeping(true, Store::default_root());
+        let run = Run::begin();
+        let worker = run.clone();
+        let tour_title = target.tour_title.clone();
+        let job = EncodeJob::spawn(move |progress| {
+            let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || publish_ui::token_for(&server), &keeping, &worker, progress));
+            drop(state);
+            drop(open);
+            result
+        });
+        if let Some(v) = self.video.as_mut() {
+            v.job = Some(ExportJob::Publish(job, run, tour_title, before, true));
+        }
+        self.notify("Updating tour… 0%");
     }
 
     /// Upload the tour, keep its recording on this computer when the setting says so, then
@@ -1132,19 +1313,20 @@ impl Editor {
             result
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Publish(job, run, tour_title, before));
+            v.job = Some(ExportJob::Publish(job, run, tour_title, before, false));
         }
         self.notify("Publishing tour… 0%");
     }
 
     /// "Try again" after a publish that failed: publish the tour that is already uploaded.
-    /// Nothing is written, uploaded or saved again.
+    /// Nothing is written, uploaded or saved again, also after an update: the update is on
+    /// the site and the project was saved when its commit answered.
     fn start_publish_only(&mut self, retry: publish_ui::Retry) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
-        let (tour_title, before) = (retry.title.clone(), retry.before.clone());
+        let (tour_title, before, update) = (retry.title.clone(), retry.before.clone(), retry.update);
         let server = publish_ui::server();
         let run = Run::begin();
         let worker = run.clone();
@@ -1162,7 +1344,7 @@ impl Editor {
             })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Publish(job, run, tour_title, before));
+            v.job = Some(ExportJob::Publish(job, run, tour_title, before, update));
         }
         self.notify(publish_ui::publishing_message(None));
     }
@@ -1664,7 +1846,7 @@ mod tests {
         let done = || Ok(PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 1, outcome: crate::publish::Outcome::Draft }, kept: Kept::Off });
         // Runs of their own, not in the shared list that quitting cancels.
         let run = Arc::new(Run::default());
-        let publish = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), "Demo".into(), Before::new_tour());
+        let publish = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), "Demo".into(), Before::new_tour(), false);
         assert_eq!(publish.cancelling(), Some(false));
         publish.abandon();
         assert!(run.is_cancelled());
@@ -1682,7 +1864,7 @@ mod tests {
         let was = Before { public: true, link: None, steps: Some(14) };
         let done = PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, kept: Kept::Saved(vec!["the cover logo".into()]) };
         let sent = done.clone();
-        let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone());
+        let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone(), false);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let mut result = None;
         while result.is_none() && Instant::now() < deadline {
@@ -1690,9 +1872,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         match result {
-            Some(Ok(Exported::Published(got, title, before))) => {
+            Some(Ok(Exported::Published(got, title, before, false))) => {
                 assert_eq!((got, title.as_str(), &before), (done, "Customer onboarding", &was));
-                assert_eq!(publish_ui::result_status(&Finished { tour_id: String::new(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, &before), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
+                assert_eq!(publish_ui::result_status(&Finished { tour_id: String::new(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, &before, false), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
             }
             _ => panic!("the publish did not finish as a published result"),
         }
@@ -1700,15 +1882,15 @@ mod tests {
 
     #[test]
     fn publishing_shows_its_progress_and_then_cancelling() {
-        assert_eq!(progress_message(true, Some(false), false, None, 0.4), "Publishing tour… 40%");
-        assert_eq!(progress_message(true, Some(true), false, None, 0.4), "Cancelling…");
-        assert_eq!(progress_message(true, None, false, None, 0.25), "Exporting tour… 25%");
-        assert_eq!(progress_message(true, None, true, None, 0.25), "Cancelling…", "a tour export being cancelled");
-        assert_eq!(progress_message(false, None, false, None, 0.5), "Exporting… 50%");
+        assert_eq!(progress_message(true, Some(false), false, None, false, 0.4), "Publishing tour… 40%");
+        assert_eq!(progress_message(true, Some(true), false, None, false, 0.4), "Cancelling…");
+        assert_eq!(progress_message(true, None, false, None, false, 0.25), "Exporting tour… 25%");
+        assert_eq!(progress_message(true, None, true, None, false, 0.25), "Cancelling…", "a tour export being cancelled");
+        assert_eq!(progress_message(false, None, false, None, false, 0.5), "Exporting… 50%");
         // After the upload, the publish step shows the server's count instead of a percentage.
-        assert_eq!(progress_message(true, Some(false), false, Some(None), 1.0), "Publishing…");
-        assert_eq!(progress_message(true, Some(false), false, Some(Some((12, 22))), 1.0), "Publishing… 12 of 22 images");
-        assert_eq!(progress_message(true, Some(true), false, Some(Some((12, 22))), 1.0), "Cancelling…");
+        assert_eq!(progress_message(true, Some(false), false, Some(None), false, 1.0), "Publishing…");
+        assert_eq!(progress_message(true, Some(false), false, Some(Some((12, 22))), false, 1.0), "Publishing… 12 of 22 images");
+        assert_eq!(progress_message(true, Some(true), false, Some(Some((12, 22))), false, 1.0), "Cancelling…");
     }
 
     #[test]
@@ -1990,7 +2172,7 @@ mod tests {
         let done = publish_to(&s, &state, true, &keep).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }));
         assert_eq!(done.kept, Kept::Off);
-        assert_eq!(publish_ui::kept_note(&done.kept), None);
+        assert_eq!(publish_ui::kept_note(&done.kept, false), None);
         assert!(!store.root().exists());
         // Off stays off without a folder too.
         assert!(matches!(keeping(false, None), Keeping::Off));
@@ -2008,7 +2190,7 @@ mod tests {
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the tour is published all the same: {done:?}");
         let Kept::Failed(reason) = &done.kept else { panic!("{:?}", done.kept) };
         assert_eq!(reason, "the folder for saved recordings could not be made.");
-        let note = publish_ui::kept_note(&done.kept).unwrap();
+        let note = publish_ui::kept_note(&done.kept, false).unwrap();
         assert_eq!(note, "The recording could not be saved on this computer, so it can't be edited later: the folder for saved recordings could not be made.");
         assert_eq!(std::fs::read(store.root()).unwrap(), b"in the way");
         // No folder for saved recordings on this computer: keeping is off, and the result says so once.
@@ -2166,7 +2348,7 @@ mod tests {
             let kept = work();
             Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft }, kept })
         });
-        (ExportJob::Publish(job, run.clone(), TOUR_TITLE.into(), Before::new_tour()), go, run)
+        (ExportJob::Publish(job, run.clone(), TOUR_TITLE.into(), Before::new_tour(), false), go, run)
     }
 
     #[test]
@@ -2269,9 +2451,9 @@ mod tests {
         // The upload is on the site, so its recording is kept: the frames are linked, which a cancel never stops.
         assert_eq!(done.kept, Kept::Saved(vec![]));
         assert_eq!(store.list().iter().map(|p| (p.key.clone(), p.problem)).collect::<Vec<_>>(), [(key_at(&s), None)]);
-        assert_eq!(publish_ui::result_status(&done.finished, &Before::new_tour()), "Publishing cancelled: the draft is uploaded, but not public");
-        assert_eq!(publish_ui::result_note(&done.finished.outcome, &Before::new_tour()), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
-        assert_eq!(publish_ui::kept_note(&done.kept), None);
+        assert_eq!(publish_ui::result_status(&done.finished, &Before::new_tour(), false), "Publishing cancelled: the draft is uploaded, but not public");
+        assert_eq!(publish_ui::result_note(&done.finished.outcome, &Before::new_tour(), false), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
+        assert_eq!(publish_ui::kept_note(&done.kept, false), None);
     }
 
     #[test]
@@ -2291,7 +2473,7 @@ mod tests {
         assert_eq!(asked.get(), 1);
         assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() }, "the upload is in, and the publish was cancelled");
         assert_eq!(done.kept, Kept::Failed("saving was cancelled.".into()));
-        assert_eq!(publish_ui::kept_note(&done.kept).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
+        assert_eq!(publish_ui::kept_note(&done.kept, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
         assert!(store.list().is_empty() && !store.root().exists(), "nothing is left of the save");
     }
 
@@ -2305,7 +2487,7 @@ mod tests {
         let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, broken).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the publish step ran all the same: {done:?}");
         assert_eq!(done.kept, Kept::Failed(publish_ui::KEEPING_BROKE_OFF.into()));
-        assert_eq!(publish_ui::kept_note(&done.kept).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
+        assert_eq!(publish_ui::kept_note(&done.kept, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
     }
 
     #[test]
@@ -2323,5 +2505,495 @@ mod tests {
         publish_ui::set_keep_recordings(false);
         assert!(matches!(keeping_now(), Keeping::Off));
         publish_ui::set_keep_recordings(was);
+    }
+
+    // ---- Update tour ----
+
+    use crate::publish::tests::{Answer, committed, created, publish_stub_over};
+    use std::sync::Mutex;
+
+    /// What the test site does with a replace.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Replace {
+        /// It works, and the commit says this about publishing.
+        Works(&'static str),
+        TourGone,
+        ChapterGone,
+        OldSite,
+        /// Another upload replaced the chapter meanwhile.
+        Changed,
+        /// The commit gets no answer, twice.
+        AnswerLost,
+    }
+
+    /// One site for a whole story: a new upload answers as the platform does (tour TOUR,
+    /// chapter CH), and a replace of that chapter answers as `how` says at that moment, with
+    /// step 1 already there. `at_commit` runs before every commit is answered, and `publish`
+    /// answers the publish route.
+    fn site(how: Arc<Mutex<Replace>>, at_commit: impl Fn() + Send + 'static, publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+        let replacing = std::sync::atomic::AtomicBool::new(false);
+        publish_stub_over(
+            move |req, seen| {
+                use std::sync::atomic::Ordering::SeqCst;
+                let how = *how.lock().unwrap();
+                if req.line == "POST /api/v1/uploads" {
+                    let replace = serde_json::from_slice::<serde_json::Value>(&req.body).ok().is_some_and(|v| v["target"]["kind"] == "replace");
+                    replacing.store(replace, SeqCst);
+                    if replace {
+                        return match how {
+                            Replace::TourGone => reply(404, r#"{"error":"not_found","detail":"no such tour"}"#),
+                            Replace::ChapterGone => reply(404, r#"{"error":"not_found","detail":"no such chapter"}"#),
+                            Replace::OldSite => reply(400, r#"{"error":"bad_target","detail":"target.kind must be \"new\" or \"chapter\""}"#),
+                            Replace::Works(_) | Replace::Changed | Replace::AnswerLost => reply(201, &created("[1]", false)),
+                        };
+                    }
+                } else if req.line.starts_with("PUT ") {
+                    return reply(204, "");
+                } else if req.line.ends_with("/commit") {
+                    at_commit();
+                    if replacing.load(SeqCst) {
+                        return match how {
+                            Replace::Works(advice) => reply(201, &committed(advice)),
+                            Replace::AnswerLost => Answer::Drop,
+                            _ => reply(409, r#"{"error":"chapter_changed","detail":"the chapter was changed by another upload since this one started; start again"}"#),
+                        };
+                    }
+                }
+                platform(req, seen)
+            },
+            publish,
+        )
+    }
+
+    fn working_site(advice: &'static str) -> Stub {
+        site(Arc::new(Mutex::new(Replace::Works(advice))), || {}, |_| reply(200, LIVE))
+    }
+
+    fn target() -> EditTarget {
+        EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() }
+    }
+
+    /// What an update started now in `ed` would send and save, as `start_update` takes it.
+    fn state_of(ed: &Editor) -> PublishState {
+        let v = ed.video.as_ref().unwrap();
+        PublishState { rec: v.rec.clone(), items: ed.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() }
+    }
+
+    /// Run the update job against `stub`, as the editor's job thread does, with the test token.
+    fn update_to(stub: &Stub, state: &PublishState, store: &Store, run: &Arc<Run>) -> Result<PublishDone, String> {
+        update_job(state, TITLE, &target(), &stub.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), run, &|_| {})
+    }
+
+    const NOTE: &str = "Added after it was published";
+
+    /// A tour published to `stub` from a new recording and saved; then its project reopened
+    /// and changed: a note that the saved project does not have.
+    fn reopened_and_changed(root: &Path, stub: &Stub) -> (Store, ProjectKey, ProjectInfo, Editor) {
+        let first = state(root);
+        let store = store_in(root);
+        assert_eq!(publish_to(stub, &first, false, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved(vec![]));
+        drop(first);
+        let key = key_at(stub);
+        let info = store.list().remove(0);
+        assert!(!project_text(&info).contains(NOTE));
+        let mut ed = reopened(&store, &key);
+        ed.add_item(Shape::Text { at: pt(60.0, 100.0), text: NOTE.into() });
+        (store, key, info, ed)
+    }
+
+    /// Every file of a project with its bytes.
+    fn files_of(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            for e in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+                if e.file_type().unwrap().is_dir() {
+                    walk(&e.path(), base, out);
+                } else {
+                    out.push((e.path().strip_prefix(base).unwrap().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_successful_update_rewrites_the_saved_project() {
+        for (advice, uploads_before_publish) in [("ready", true), ("draft", false), ("other_changes", false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            // The publish route notes whether the saved project already had the change when it was called.
+            let saved_at_publish = Arc::new(Mutex::new(Vec::new()));
+            let (log, root) = (saved_at_publish.clone(), tmp.path().join("projects"));
+            let s = site(Arc::new(Mutex::new(Replace::Works(advice))), || {}, move |_| {
+                let text: Vec<String> = Store::at(root.clone()).list().iter().map(project_text).collect();
+                log.lock().unwrap().push(text.len() == 1 && text[0].contains(NOTE));
+                reply(200, LIVE)
+            });
+            let (store, key, info, ed) = reopened_and_changed(tmp.path(), &s);
+            let requests = s.lines().len();
+
+            let done = update_to(&s, &state_of(&ed), &store, &Arc::new(Run::default())).unwrap();
+            assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str()), (TOUR, CH));
+            match advice {
+                "ready" => assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "{done:?}"),
+                "draft" => assert_eq!(done.finished.outcome, Outcome::Draft),
+                _ => assert_eq!(done.finished.outcome, Outcome::Held),
+            }
+            // The site got a replace of exactly that chapter, and only the pictures it lacked.
+            let reqs = s.requests();
+            let create: serde_json::Value = serde_json::from_slice(&reqs[requests].body).unwrap();
+            assert_eq!(create["target"], serde_json::json!({ "kind": "replace", "tour_id": TOUR, "chapter_id": CH }));
+            let sent: Vec<&str> = reqs[requests..].iter().map(|r| r.line.as_str()).filter(|l| l.starts_with("PUT ")).collect();
+            assert_eq!(sent.len(), 2, "step 1 is on the site already: {sent:?}");
+            assert!(sent[0].ends_with("/steps/2") && sent[1].ends_with("/steps/3"));
+            // The project is rewritten, for every outcome, and before anything was published.
+            assert_eq!(done.kept, Kept::Saved(vec![]), "{advice}");
+            assert_eq!(*saved_at_publish.lock().unwrap(), if uploads_before_publish { vec![true] } else { vec![] }, "{advice}");
+            let list = store.list();
+            assert_eq!(list.len(), 1, "the same project, not a second one");
+            assert_eq!((&list[0].key, &list[0].dir, list[0].problem), (&key, &info.dir, None));
+            let text = project_text(&list[0]);
+            assert!(text.contains(NOTE) && !text.contains(TOKEN), "{text}");
+            // It stays the editor's origin, open in it; closed and opened again, the change is there.
+            assert_eq!(ed.video.as_ref().unwrap().origin.as_ref().unwrap().key, key);
+            assert!(matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+            drop(ed);
+            let again = reopened(&store, &key);
+            assert_eq!(again.doc.items().len(), 3);
+            assert!(again.doc.items().iter().any(|it| matches!(&it.shape, Shape::Text { text, .. } if text == NOTE)));
+        }
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_update_leaves_the_saved_project_byte_for_byte_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let how = Arc::new(Mutex::new(Replace::Works("ready")));
+        let s = site(how.clone(), || {}, |_| reply(200, LIVE));
+        let (store, key, info, ed) = reopened_and_changed(tmp.path(), &s);
+        let state = state_of(&ed);
+        let before = files_of(&info.dir);
+        let unchanged = |what: &str| {
+            assert_eq!(files_of(&info.dir), before, "{what}");
+            assert_eq!(store.list(), std::slice::from_ref(&info), "{what}");
+        };
+
+        // Cancelled before anything is sent, and cancelled while the pictures go up.
+        let run = Arc::new(Run::default());
+        run.cancel();
+        assert_eq!(update_to(&s, &state, &store, &run), Err(CANCELLED.to_string()));
+        unchanged("cancelled at once");
+        let run = Arc::new(Run::default());
+        let commits = s.lines().iter().filter(|l| l.ends_with("/commit")).count();
+        let cancelled = update_job(&state, TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &run, &|f| {
+            if f > PUBLISH_WRITE_SHARE {
+                run.cancel();
+            }
+        });
+        assert_eq!(cancelled, Err(CANCELLED.to_string()));
+        assert_eq!(s.lines().iter().filter(|l| l.ends_with("/commit")).count(), commits, "it never reached the commit");
+        assert_eq!(failed_publish_message(CANCELLED, true), "Update cancelled");
+        unchanged("cancelled mid-upload");
+
+        // No token: nothing is sent.
+        let sent = s.lines().len();
+        let no_token = update_job(&state, TITLE, &target(), &s.base, || Err("Add the server and token first.".to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {});
+        assert_eq!(no_token, Err("Add the server and token first.".to_string()));
+        assert_eq!(s.lines().len(), sent);
+        unchanged("no token");
+
+        // The site refuses, each with its own sentence; the dialog then offers Update again or not.
+        let refusals = [
+            (Replace::TourGone, "Could not start the upload: that tour no longer exists.", false),
+            (Replace::ChapterGone, "Could not start the upload: that chapter is no longer part of the tour.", false),
+            (Replace::OldSite, "Could not start the upload: the site needs an update to version 0.1.4 or newer.", false),
+            (Replace::Changed, "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.", true),
+        ];
+        for (refusal, sentence, again) in refusals {
+            *how.lock().unwrap() = refusal;
+            let e = update_to(&s, &state, &store, &Arc::new(Run::default())).unwrap_err();
+            assert_eq!(e, sentence);
+            assert_eq!(failed_publish_message(&e, true), sentence, "the status bar says the sentence");
+            assert_eq!(publish_ui::update_can_be_tried_again(&e), again, "{sentence}");
+            assert!(!e.contains(TOKEN));
+            unchanged(sentence);
+        }
+
+        // The commit's answer is lost: the site may hold the update or not, so the saved
+        // project is not rewritten on a guess.
+        *how.lock().unwrap() = Replace::AnswerLost;
+        let e = update_to(&s, &state, &store, &Arc::new(Run::default())).unwrap_err();
+        assert!(e.starts_with("Could not finish the upload: ") && e.ends_with(" Check the tour list before uploading again."), "{e}");
+        assert!(publish_ui::update_can_be_tried_again(&e));
+        unchanged("the commit answer was lost");
+        assert!(!s.lines().iter().any(|l| l == PUBLISH), "nothing was ever published");
+
+        // The project is still this editor's, still opens, and still lacks the change that was never sent.
+        assert_eq!(ed.video.as_ref().unwrap().origin.as_ref().unwrap().key, key);
+        drop(state);
+        drop(ed);
+        assert_eq!(reopened(&store, &key).doc.items().len(), 2);
+    }
+
+    #[test]
+    fn a_saved_recording_that_cannot_be_rewritten_never_fails_the_update() {
+        for advice in ["ready", "draft", "other_changes"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = working_site(advice);
+            let (store, _key, info, ed) = reopened_and_changed(tmp.path(), &s);
+            let state = state_of(&ed);
+            let before = files_of(&info.dir);
+            // The save fails with the store's reason.
+            let asked = std::cell::Cell::new(0);
+            let failing: &SaveFn<'_> = &|_, _, _, _| {
+                asked.set(asked.get() + 1);
+                Err("the project file could not be written.".to_string())
+            };
+            let done = update_job_with(&state, TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, failing).unwrap();
+            assert_eq!(asked.get(), 1, "one save, whatever the site says about publishing");
+            let published = s.lines().iter().filter(|l| *l == PUBLISH).count();
+            match advice {
+                "ready" => assert!(matches!(done.finished.outcome, Outcome::Public { .. }) && published == 1, "{done:?}"),
+                "draft" => assert!(done.finished.outcome == Outcome::Draft && published == 0),
+                _ => assert!(done.finished.outcome == Outcome::Held && published == 0),
+            }
+            assert_eq!(done.kept, Kept::Failed("the project file could not be written.".into()));
+            assert_eq!(
+                publish_ui::kept_note(&done.kept, true).as_deref(),
+                Some("The changes were uploaded, but the recording saved on this computer could not be updated, so it no longer matches the tour: the project file could not be written.")
+            );
+            assert_eq!(files_of(&info.dir), before);
+
+            // A save that panics: the same, with the internal-error reason, and the publish step still ran.
+            let broken: &SaveFn<'_> = &|_, _, _, _| panic!("the save broke");
+            let done = update_job_with(&state, TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, broken).unwrap();
+            assert_eq!(done.kept, Kept::Failed(publish_ui::KEEPING_BROKE_OFF.into()));
+            assert_eq!(s.lines().iter().filter(|l| *l == PUBLISH).count(), if advice == "ready" { 2 } else { 0 });
+            assert!(publish_ui::kept_note(&done.kept, true).is_some_and(|n| n.starts_with(publish_ui::UPDATE_NOT_SAVED)));
+
+            // No folder for saved recordings: said as a recording that no longer matches, too.
+            let done = update_job(&state, TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::NoFolder, &Arc::new(Run::default()), &|_| {}).unwrap();
+            assert_eq!(done.kept, Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.into()));
+            assert_eq!(files_of(&info.dir), before);
+        }
+    }
+
+    #[test]
+    fn cancel_pressed_at_the_commit_of_an_update_still_saves_the_project_and_publishes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, _info, ed) = reopened_and_changed(tmp.path(), &s);
+        let run = Arc::new(Run::default());
+        let pressed = run.clone();
+        // Cancel is pressed when the commit has answered and the save begins. The save is asked
+        // whether to go on, as a copy of frames would ask: the answer is yes.
+        let go_on = std::cell::Cell::new(None);
+        let asking: &SaveFn<'_> = &|store, key, snap, keep_going| {
+            pressed.cancel();
+            go_on.set(Some(keep_going()));
+            store.save(key, snap)
+        };
+        let done = update_job_with(&state_of(&ed), TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &run, &|_| {}, asking).unwrap();
+        assert_eq!(go_on.get(), Some(true), "the site has the changes: the save is not cut short");
+        assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
+        assert!(!s.lines().iter().any(|l| l == PUBLISH));
+        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert!(project_text(&store.list()[0]).contains(NOTE));
+        assert_eq!(store.list()[0].key, key);
+        let was = Before { public: true, link: None, steps: Some(2) };
+        assert_eq!(publish_ui::result_status(&done.finished, &was, true), "Update uploaded: the public page still shows the previous version");
+        assert_eq!(publish_ui::result_note(&done.finished.outcome, &was, true), Some(("Publishing was cancelled. The update is uploaded, but the public page still shows the previous version.".to_string(), false)));
+    }
+
+    #[test]
+    fn try_again_after_an_update_publishes_only_and_neither_uploads_nor_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = site(Arc::new(Mutex::new(Replace::Works("ready"))), || {}, |calls| if calls == 0 { reply(500, r#"{"error":"publish_failed","detail":"the tour could not be published"}"#) } else { reply(200, LIVE) });
+        let (store, _key, info, ed) = reopened_and_changed(tmp.path(), &s);
+        let done = update_to(&s, &state_of(&ed), &store, &Arc::new(Run::default())).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: false, .. }), "{done:?}");
+        let saved = files_of(&info.dir);
+        let was = Before { public: true, link: None, steps: Some(2) };
+        let mut screen = Some(ResultDialog::after_update(TOUR_TITLE.into(), was, done));
+        let retry = publish_ui::take_retry(&mut screen, false).unwrap();
+        assert_eq!((retry.tour_id.as_str(), retry.chapter_id.as_str(), retry.update), (TOUR, CH, true));
+        let sent = s.lines().len();
+        let again = retry_done(&retry, crate::publish::publish_tour(&s.base, TOKEN, &retry.tour_id, |_| true));
+        assert!(matches!(again.finished.outcome, Outcome::Public { .. }), "{again:?}");
+        assert_eq!((again.finished.chapter_id.as_str(), &again.kept), (CH, &Kept::Saved(vec![])));
+        assert_eq!(&s.lines()[sent..], [PUBLISH], "one publish call, and nothing else");
+        assert_eq!(files_of(&info.dir), saved, "the project was not written a second time");
+    }
+
+    #[test]
+    fn publish_as_a_new_tour_from_an_edit_leaves_the_first_tours_project_alone_and_saves_a_second() {
+        const OTHER_TOUR: &str = "tour_bbbbbbbbbbbbbbbbbbbbbbbb";
+        const OTHER_CH: &str = "ch_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let tmp = tempfile::tempdir().unwrap();
+        // The site's first commit makes TOUR; every later one makes another tour.
+        let s = stub(|req, seen| {
+            if req.line.starts_with("PUT ") {
+                reply(204, "")
+            } else if req.line.ends_with("/commit") && seen > 0 {
+                reply(201, &format!(r#"{{"tour_id":"{OTHER_TOUR}","chapter_id":"{OTHER_CH}","steps":2}}"#))
+            } else {
+                platform(req, seen)
+            }
+        });
+        let (store, key, info, ed) = reopened_and_changed(tmp.path(), &s);
+        let before = files_of(&info.dir);
+        let sent = s.lines().len();
+        // "Publish as a new tour" is the publish of any recording, with a new tour as its target.
+        let done = publish_job(&state_of(&ed), "A second tour", "A second tour", &s.base, || Ok(TOKEN.to_string()), &Target::New, false, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap();
+        assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str(), &done.kept), (OTHER_TOUR, OTHER_CH, &Kept::Saved(vec![])));
+        let create: serde_json::Value = serde_json::from_slice(&s.requests()[sent].body).unwrap();
+        assert_eq!(create["target"], serde_json::json!({ "kind": "new" }));
+        assert!(create.get("sha256").is_none());
+        // The first tour's project is as it was, and a second one holds the change.
+        assert_eq!(files_of(&info.dir), before);
+        let other = ProjectKey { server: key.server.clone(), tour_id: OTHER_TOUR.into(), chapter_id: OTHER_CH.into() };
+        let mut keys: Vec<ProjectKey> = store.list().iter().map(|p| p.key.clone()).collect();
+        keys.sort_by(|a, b| a.tour_id.cmp(&b.tour_id));
+        assert_eq!(keys, [key.clone(), other.clone()]);
+        let second = store.for_tour(&key.server, OTHER_TOUR).remove(0);
+        assert_eq!((second.title.as_str(), second.tour_title.as_str(), second.problem), ("A second tour", "A second tour", None));
+        assert!(project_text(&second).contains(NOTE));
+        // The origin does not move: the editor still edits the first tour's project.
+        assert_eq!(ed.video.as_ref().unwrap().origin.as_ref().unwrap().key, key);
+        assert_eq!(edit_target(ed.video.as_ref().unwrap().origin.as_ref().unwrap()), target());
+        assert!(matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        // The second one is a recording of its own: it opens while the first is open, and after it closed.
+        let second_ed = reopened(&store, &other);
+        assert_eq!(second_ed.doc.items().len(), 3);
+        drop(second_ed);
+        drop(ed);
+        assert_eq!(reopened(&store, &key).doc.items().len(), 2);
+        drop(reopened(&store, &other));
+    }
+
+    #[test]
+    fn updating_shows_its_progress_and_then_the_publish_count() {
+        assert_eq!(progress_message(true, Some(false), false, None, true, 0.4), "Updating tour… 40%");
+        assert_eq!(progress_message(true, Some(false), false, None, true, 0.0), "Updating tour… 0%");
+        assert_eq!(progress_message(true, Some(true), false, None, true, 0.4), "Cancelling…");
+        // After the upload, the publish step is the same one as for any tour.
+        assert_eq!(progress_message(true, Some(false), false, Some(None), true, 1.0), "Publishing…");
+        assert_eq!(progress_message(true, Some(false), false, Some(Some((12, 22))), true, 1.0), "Publishing… 12 of 22 images");
+        assert_eq!(progress_message(true, Some(true), false, Some(Some((12, 22))), true, 1.0), "Cancelling…");
+        assert_eq!(failed_publish_message(CANCELLED, true), "Update cancelled");
+        assert_eq!(failed_publish_message(CANCELLED, false), "Publishing cancelled");
+        assert_eq!(failed_publish_message("Could not start the upload: that tour no longer exists.", true), "Could not start the upload: that tour no longer exists.");
+
+        // The job itself: progress climbs through the writing and the upload, and the run
+        // then carries the site's count.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = site(Arc::new(Mutex::new(Replace::Works("ready"))), || {}, |calls| if calls == 0 { reply(202, r#"{"status":"in_progress","publish_id":"pub_0123456789abcdef01234567","done":1,"total":2}"#) } else { reply(200, LIVE) });
+        let (store, _key, _info, ed) = reopened_and_changed(tmp.path(), &s);
+        let run = Arc::new(Run::default());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let counts = std::cell::RefCell::new(Vec::new());
+        let done = update_job(&state_of(&ed), TITLE, &target(), &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &run, &|f| {
+            seen.borrow_mut().push(f);
+            counts.borrow_mut().push(run.publishing());
+        })
+        .unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }));
+        let seen = seen.into_inner();
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]) && seen.last() == Some(&1.0), "{seen:?}");
+        assert!(seen.iter().any(|f| *f > 0.0 && *f < PUBLISH_WRITE_SHARE) || seen.iter().any(|f| *f > PUBLISH_WRITE_SHARE && *f < 1.0), "{seen:?}");
+        assert!(counts.into_inner().iter().all(|c| c.is_none()), "no count while it writes and uploads");
+        assert_eq!(run.publishing(), Some(Some((1, 2))), "then the site's count");
+    }
+
+    #[test]
+    fn an_update_cannot_start_while_another_export_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, _key, _info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        let sent = s.lines().len();
+        // The dialog's own check refuses with a sentence.
+        assert_eq!(publish_ui::publish_blocked(true, true, &s.base, &publish_ui::TokenStatus::Saved, Some(&s.base)).map(|b| b.refusal()), Some("Wait for the running export to finish, then upload.".to_string()));
+        // And should it be asked all the same, the running job stays the only one.
+        let (job, go, run) = waiting_job(|| Kept::Off);
+        ed.video.as_mut().unwrap().job = Some(job);
+        ed.start_update(TITLE.into(), target(), Before::new_tour());
+        let v = ed.video.as_ref().unwrap();
+        assert!(v.job.as_ref().is_some_and(|j| !j.is_update()), "the job that was running is still the one");
+        assert_ne!(ed.status_text(), Some("Updating tour… 0%"));
+        assert!(!run.is_cancelled());
+        assert_eq!(s.lines().len(), sent, "nothing was sent");
+        go.send(()).unwrap();
+    }
+
+    #[test]
+    fn update_is_only_for_the_tour_and_site_the_recording_was_saved_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, key, _info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        // The address, exactly as the address rule writes it.
+        assert!(on_this_site(&key, &s.base));
+        assert!(on_this_site(&key, &format!(" {}/ ", s.base)));
+        for other in ["", "https://tours.example.com", "http://127.0.0.1:1", "not an address"] {
+            assert!(!on_this_site(&key, other), "{other}");
+        }
+        let origin = ed.video.as_ref().unwrap().origin.as_ref().unwrap();
+        assert_eq!(edit_target(origin), EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() });
+        // No site address is configured in a test run, so this editor's tour is "elsewhere":
+        // an update asked for all the same starts nothing.
+        if !on_this_site(&key, &publish_ui::server()) {
+            let sent = s.lines().len();
+            ed.start_update(TITLE.into(), target(), Before::new_tour());
+            assert!(!ed.exporting());
+            assert_eq!(s.lines().len(), sent);
+        }
+        // A new recording has no tour to update.
+        let fresh_state = state(&tmp.path().join("fresh"));
+        let mut fresh = editor_of(&fresh_state);
+        fresh.start_update(TITLE.into(), target(), Before::new_tour());
+        assert!(!fresh.exporting());
+    }
+
+    #[test]
+    fn closing_the_editor_does_not_cancel_a_running_update() {
+        // An update, and "Try again" after one: neither is told to stop when the editor goes.
+        let done = || Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 1, outcome: Outcome::Draft }, kept: Kept::Saved(vec![]) });
+        let run = Arc::new(Run::default());
+        let update = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), TOUR_TITLE.into(), Before::new_tour(), true);
+        assert!(update.is_update());
+        assert_eq!(update.cancelling(), Some(false));
+        update.abandon();
+        assert!(!run.is_cancelled());
+        assert_eq!(update.cancelling(), Some(false));
+
+        // In an editor: the window closes without a question, the update runs on, and the
+        // project stays registered as open until the update has ended.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let run = Arc::new(Run::default());
+        let (state, updating, to, base, worker) = (state_of(&ed), store.clone(), target(), s.base.clone(), run.clone());
+        let open = ed.video.as_ref().unwrap().origin.as_ref().unwrap().open.clone();
+        let job = EncodeJob::spawn(move |progress| {
+            let _ = wait.recv();
+            let result = update_job(&state, TITLE, &to, &base, || Ok(TOKEN.to_string()), &Keeping::In(updating), &worker, progress);
+            drop(state);
+            drop(open);
+            result
+        });
+        ed.video.as_mut().unwrap().job = Some(ExportJob::Publish(job, run.clone(), TOUR_TITLE.into(), Before::new_tour(), true));
+        request_close(&mut ed);
+        assert!(ed.closed, "no question: the existing one says the recording is deleted");
+        drop(ed);
+        assert!(!run.is_cancelled(), "the update was not cancelled behind the user's back");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        assert!(!project_text(&info).contains(NOTE));
+        // It runs to its end: the site is updated and published, and the saved project matches it.
+        go.send(()).unwrap();
+        eventually("the project is let go of once the update has ended", || !matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        assert!(s.lines().iter().any(|l| l == PUBLISH));
+        assert!(project_text(&store.list()[0]).contains(NOTE));
+        assert_eq!(reopened(&store, &key).doc.items().len(), 3);
     }
 }
