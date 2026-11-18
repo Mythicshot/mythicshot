@@ -26,7 +26,14 @@ function readTourData() {
 
 /// Rules a site's page needs beyond the preview's: the link back to the index, which sits where the
 /// preview's label does and looks like it.
-const SITE_CSS: &str = "\n  a.tag { text-decoration: none; white-space: nowrap; }\n  a.tag:hover { color: #d8dbe2; border-color: #5a6378; }\n";
+const SITE_CSS: &str = "\n  a.tag { text-decoration: none; white-space: nowrap; }\n  a.tag:hover { color: #d8dbe2; border-color: #5a6378; }\n  #needs-script { display: block; max-width: 34em; margin: 0; padding: 32px 24px; line-height: 1.5; color: #d8dbe2; white-space: normal; }\n";
+
+/// Shown inside the stage until the player starts, so a page whose script a browser blocks is not just empty.
+pub const NEEDS_SCRIPT: &str = "This tour needs scripts enabled. If you opened it from a folder and it stays empty, put the site on a web server.";
+/// Where the message goes: first thing in the player's stage.
+const STAGE_OPEN: &str = "<div id=\"stage\">";
+/// Removes that message once the shared script runs, just before the player starts.
+const DROP_MESSAGE_JS: &str = "(function () { var m = document.getElementById(\"needs-script\"); if (m) m.remove(); })();\n";
 
 /// The shared player files of a site, with the names they are served under.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +53,7 @@ fn hashed_name(content: &str, ext: &str) -> String {
 /// The shared player files: "player.<16 hex of SHA-256>.js" and ".css". The script is the shared rules,
 /// the preview's player as a function of the tour, and a last line that starts it with the page's data.
 pub fn assets() -> Assets {
-    let js = [tour::tour_core_js(), READ_DATA_JS, "function startTour(TOUR) {\n", &tour::player_js(), "\n}\nstartTour(readTourData());\n"].concat();
+    let js = [tour::tour_core_js(), READ_DATA_JS, "function startTour(TOUR) {\n", &tour::player_js(), "\n}\n", DROP_MESSAGE_JS, "startTour(readTourData());\n"].concat();
     let css = [tour::player_css(), SITE_CSS].concat();
     Assets { js_name: hashed_name(&js, "js"), js, css_name: hashed_name(&css, "css"), css }
 }
@@ -88,7 +95,8 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
 pub fn tour_page(compact_json: &str, title: &str, assets: &Assets) -> String {
     let data = compact_json.replace('<', r"\u003c");
     let title = escape_html(title);
-    fill(TOUR_TEMPLATE, &[("title", &title), ("css", &escape_html(&assets.css_name)), ("js", &escape_html(&assets.js_name)), ("player", tour::player_html()), ("data", &data)])
+    let player = tour::player_html().replacen(STAGE_OPEN, &format!("{STAGE_OPEN}\n    <p id=\"needs-script\">{NEEDS_SCRIPT}</p>"), 1);
+    fill(TOUR_TEMPLATE, &[("title", &title), ("css", &escape_html(&assets.css_name)), ("js", &escape_html(&assets.js_name)), ("player", &player), ("data", &data)])
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -155,7 +163,13 @@ mod tests {
         assert_eq!(html.matches("</script").count(), 2);
         assert!(html.contains(r#"{"title":"\u003c/script>\u003cscript>alert(1)\u003c/script>"}"#));
         // A link back to the index, by its file name, and the preview's player body.
-        assert!(html.contains(r#"href="../../index.html""#) && html.contains(tour::player_html()));
+        assert!(html.contains(r#"href="../../index.html""#));
+        // The preview's player body, with a message inside the stage that the shared script removes before it starts.
+        let stage = html.split_once(STAGE_OPEN).unwrap().1;
+        assert!(stage.trim_start().starts_with(&format!(r#"<p id="needs-script">{NEEDS_SCRIPT}</p>"#)));
+        assert_eq!(html.replacen(&format!("\n    <p id=\"needs-script\">{NEEDS_SCRIPT}</p>"), "", 1).matches(tour::player_html()).count(), 1);
+        assert!(a.js.find("needs-script").unwrap() < a.js.rfind("startTour(readTourData())").unwrap() && a.js.contains("m.remove()"));
+        assert!(!tour::player_html().contains("needs-script"), "the preview page is unchanged");
         // Text that looks like a placeholder stays text.
         let html = tour_page(r#"{"title":"{{data}}"}"#, "{{js}}", &a);
         assert!(html.contains("<title>{{js}}</title>") && html.contains(r#"{"title":"{{data}}"}"#));

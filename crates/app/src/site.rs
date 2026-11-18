@@ -20,15 +20,28 @@ pub const SLUG_MAX: usize = 60;
 /// The longest a site title may be.
 pub const SITE_TITLE_MAX: usize = 80;
 /// Names this feature writes at the top of a site folder.
-pub const OWN_NAMES: [&str; 5] = ["index.html", "tours.json", ".nojekyll", "assets", "tours"];
+pub const OWN_NAMES: [&str; 6] = ["index.html", "tours.json", ".nojekyll", "favicon.ico", "assets", "tours"];
+/// Which of [`OWN_NAMES`] are folders; the others are plain files.
+const OWN_FOLDERS: [&str; 2] = ["assets", "tours"];
+/// Starts of folder names the site export uses for its temporary folders inside `tours`, so no tour may have them.
+pub const TEMP_PREFIXES: [&str; 2] = ["tmp-", "old-"];
 /// The picture each tour has for the index.
 pub const THUMB: &str = "thumb.jpg";
 /// The largest `tours.json` read. Far more than thousands of tours need; a bigger file is not ours.
 const LIST_MAX_BYTES: u64 = 8 * 1_048_576;
 /// Names a slug may not be: the site's own folders and page, and the Windows device names.
-const RESERVED: [&str; 25] = [
-    "assets", "tours", "index", "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+/// The device names are those of "Naming Files, Paths, and Namespaces"
+/// (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file, checked 2026-11-17), plus `com0` and
+/// `lpt0`, which that page does not list but Windows can still map to a device. Its superscript-digit names
+/// (`com¹` and the like) cannot occur, since a slug is ASCII only.
+const RESERVED: [&str; 27] = [
+    "assets", "tours", "index", "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
+
+/// Whether a slug starts like one of the site export's temporary folders.
+fn temp_like(slug: &str) -> bool {
+    TEMP_PREFIXES.iter().any(|p| slug.starts_with(p))
+}
 
 /// "Setting up raid groups" -> "setting-up-raid-groups". Never empty, never reserved.
 /// ASCII letters are lowercased and digits kept; every other character becomes a hyphen, runs of
@@ -48,6 +61,10 @@ pub fn slug_from_title(title: &str) -> String {
         "tour".to_string()
     } else if RESERVED.contains(&slug) {
         format!("{slug}-tour")
+    } else if temp_like(slug) {
+        // "Old ways" -> "tour-old-ways": the temporary folders' prefixes are kept for them alone.
+        let long: String = format!("tour-{slug}").chars().take(SLUG_MAX).collect();
+        long.trim_end_matches('-').to_string()
     } else {
         slug.to_string()
     }
@@ -70,6 +87,9 @@ pub fn check_slug(slug: &str) -> Result<(), String> {
     }
     if RESERVED.contains(&slug) {
         return Err(format!("\"{slug}\" is a name the site keeps for itself; choose another address."));
+    }
+    if temp_like(slug) {
+        return Err("A tour address cannot start with tmp- or old-, which the site keeps for its temporary folders.".to_string());
     }
     Ok(())
 }
@@ -161,10 +181,15 @@ pub fn inspect(dir: &Path) -> Result<Folder, String> {
         }
         Err(e) => return Err(format!("Could not check tours.json in this folder: {e}")),
     };
-    for own in ["tours", "assets"] {
+    // Every name the site owns is the plain file or folder it should be, or absent; a link is never followed.
+    for own in OWN_NAMES {
+        let folder = OWN_FOLDERS.contains(&own);
         match exists(own) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-            Ok(_) => return Err(format!("{own} in this site is not a plain folder, so Mythicshot will not write into it.")),
+            Ok(m) if m.file_type().is_symlink() => return Err(format!("{own} in this site is a link, so Mythicshot will not write through it.")),
+            Ok(m) if folder && m.is_dir() => {}
+            Ok(m) if !folder && m.is_file() => {}
+            Ok(_) if folder => return Err(format!("{own} in this site is not a plain folder, so Mythicshot will not write into it.")),
+            Ok(_) => return Err(format!("{own} in this site is not a plain file, so Mythicshot will not replace it.")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("Could not check {own} in this site: {e}")),
         }
@@ -254,9 +279,16 @@ mod tests {
         assert_eq!(slug_from_title(&"a".repeat(100)), "a".repeat(60));
         assert_eq!(slug_from_title("CON"), "con-tour");
         assert_eq!(slug_from_title("Assets"), "assets-tour");
+        assert_eq!(slug_from_title("LPT0"), "lpt0-tour");
+        assert_eq!(slug_from_title("COM0"), "com0-tour");
+        // The temporary folders' prefixes are never a tour's.
+        assert_eq!(slug_from_title("Old ways"), "tour-old-ways");
+        assert_eq!(slug_from_title("tmp-a-1234abcd"), "tour-tmp-a-1234abcd");
+        assert_eq!(slug_from_title("Old"), "old");
+        assert_eq!(slug_from_title(&format!("old {}", "a".repeat(80))).len(), 60);
         assert_eq!(slug_from_title(&format!("{} b", "a".repeat(59))), "a".repeat(59)); // never ends with a hyphen
         // Whatever the title, the slug passes the rules.
-        for t in ["", "-", "a--b", "Tours", "index", "LPT9", "com1!", "../../etc", "a\\b/c", "\u{202E}x\u{0}", &"é".repeat(100), &"ab-".repeat(40)] {
+        for t in ["", "-", "a--b", "Tours", "index", "LPT9", "old-x", &format!("tmp {}", "b ".repeat(40)), "com1!", "../../etc", "a\\b/c", "\u{202E}x\u{0}", &"é".repeat(100), &"ab-".repeat(40)] {
             let s = slug_from_title(t);
             assert!(check_slug(&s).is_ok(), "{t:?} -> {s:?}");
         }
@@ -264,10 +296,10 @@ mod tests {
 
     #[test]
     fn only_plain_slugs_are_accepted() {
-        for ok in ["a", "setting-up-raid-groups", "v2", &"a".repeat(60)] {
+        for ok in ["a", "setting-up-raid-groups", "v2", &"a".repeat(60), "tmp", "old", "bold-a", "tmpa", "a-tmp-b"] {
             assert!(check_slug(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "A", "a b", "a_b", "-a", "a-", "a--b", "a/b", "a\\b", "..", ".a", "a.", "é", &"a".repeat(61), "assets", "tours", "index", "con", "nul", "com1", "lpt9"] {
+        for bad in ["", "A", "a b", "a_b", "-a", "a-", "a--b", "a/b", "a\\b", "..", ".a", "a.", "é", &"a".repeat(61), "assets", "tours", "index", "con", "nul", "com0", "com1", "lpt0", "lpt9", "tmp-a-1234abcd", "old-a-1234abcd", "tmp-x", "old-"] {
             assert!(check_slug(bad).is_err(), "{bad}");
         }
     }
@@ -373,6 +405,19 @@ mod tests {
         std::fs::write(d.join("tours.json"), &good).unwrap();
         std::fs::write(d.join("tours"), "x").unwrap();
         assert!(inspect(&d).unwrap_err().contains("tours"));
+        // A tour listed at a temporary folder's name in a hand-written list is refused, never taken for a leftover.
+        let d = tmp.path().join("hand");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("tours.json"), serde_json::to_string(&list(&[("old-a-1234abcd", "A")])).unwrap()).unwrap();
+        assert!(inspect(&d).unwrap_err().contains("tours.json"));
+        // Each of the site's own names must be the plain file or folder it should be.
+        for (name, wrong_folder) in [("index.html", true), (".nojekyll", true), ("favicon.ico", true), ("assets", false)] {
+            let d = tmp.path().join(format!("wrong-{}", name.trim_start_matches('.')));
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(d.join("tours.json"), &good).unwrap();
+            if wrong_folder { std::fs::create_dir(d.join(name)).unwrap() } else { std::fs::write(d.join(name), "x").unwrap() }
+            assert!(inspect(&d).unwrap_err().contains(name), "{name}");
+        }
     }
 
     #[test]
@@ -398,6 +443,19 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, site.join("assets")).unwrap();
         assert!(inspect(&site).unwrap_err().contains("assets"));
+        // A link at any of the site's own file names is refused too.
+        let target = tmp.path().join("elsewhere.html");
+        std::fs::write(&target, "theirs").unwrap();
+        for name in ["index.html", "favicon.ico", ".nojekyll"] {
+            let site = tmp.path().join(format!("site-{}", name.trim_start_matches('.')));
+            std::fs::create_dir(&site).unwrap();
+            std::fs::write(site.join("tours.json"), serde_json::to_string(&list(&[])).unwrap()).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&target, site.join(name)).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, site.join(name)).unwrap();
+            assert!(inspect(&site).unwrap_err().contains(name), "{name}");
+        }
     }
 
     #[test]

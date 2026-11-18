@@ -385,13 +385,15 @@ pub enum Page<'a> {
     Site(&'a crate::site::Assets),
 }
 
-/// The widest a site's thumbnail is.
+/// A site's thumbnail is always this wide and [`THUMB_HEIGHT`] high: the index's 16:10 box.
 pub const THUMB_WIDTH: u32 = 480;
+/// The height of a site's thumbnail.
+pub const THUMB_HEIGHT: u32 = 300;
 /// The JPEG quality of a site's thumbnail.
 const THUMB_QUALITY: u8 = 80;
 
 /// [`write_bundle`] with the page chosen. [`Page::Site`] writes the site's tour page and a `thumb.jpg` (the
-/// first step's picture at most [`THUMB_WIDTH`] wide, JPEG quality 80) in place of the preview page.
+/// first step's picture as a [`THUMB_WIDTH`] by [`THUMB_HEIGHT`] JPEG, quality 80) in place of the preview page.
 /// Everything else, the refusals, the clean-up and the messages, is the same.
 #[allow(clippy::too_many_arguments)]
 pub fn write_tour(
@@ -565,15 +567,22 @@ impl Sink for FolderSink<'_> {
     }
 }
 
-/// A step picture as the index's thumbnail: at most [`THUMB_WIDTH`] wide, as a JPEG.
+/// A step picture as the index's thumbnail, a [`THUMB_WIDTH`] by [`THUMB_HEIGHT`] JPEG: scaled until it
+/// covers the box, then cut from the top (a step's heading is usually there) and evenly at both sides.
+/// Transparent parts are laid on white first, as a page shows them.
 fn thumbnail(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgb8();
-    let img = if img.width() > THUMB_WIDTH {
-        let h = ((u64::from(img.height()) * u64::from(THUMB_WIDTH) + u64::from(img.width()) / 2) / u64::from(img.width())).max(1) as u32;
-        image::imageops::resize(&img, THUMB_WIDTH, h, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
+    let rgba = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8();
+    let flat = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let on_white = |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a)) + 127) / 255) as u8;
+        image::Rgb([on_white(r), on_white(g), on_white(b)])
+    });
+    let (w, h) = (u64::from(flat.width().max(1)), u64::from(flat.height().max(1)));
+    let (tw, th) = (u64::from(THUMB_WIDTH), u64::from(THUMB_HEIGHT));
+    // The smallest size at least as wide and as high as the box, keeping the picture's shape.
+    let (sw, sh) = if w * th >= h * tw { ((w * th).div_ceil(h).max(tw), th) } else { (tw, (h * tw).div_ceil(w).max(th)) };
+    let scaled = image::imageops::resize(&flat, sw as u32, sh as u32, image::imageops::FilterType::Triangle);
+    let img = image::imageops::crop_imm(&scaled, ((sw - tw) / 2) as u32, 0, THUMB_WIDTH, THUMB_HEIGHT).to_image();
     let mut out = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, THUMB_QUALITY).encode_image(&img).map_err(|e| e.to_string())?;
     Ok(out)
@@ -2018,7 +2027,7 @@ mod tests {
         assert!(html.contains("tour-data") && !html.contains("Local preview"));
         assert!(html.contains(&format!("../../assets/{}", a.js_name)) && html.contains("<title>My tour</title>"));
         let thumb = image::open(dir.join("thumb.jpg")).unwrap();
-        assert!(thumb.width() <= 480);
+        assert_eq!((thumb.width(), thumb.height()), (THUMB_WIDTH, THUMB_HEIGHT));
         assert!(dir.join("tour.json").exists() && dir.join("step-001.png").exists());
         // The same pictures and manifest as the folder export.
         let folder = tmp.path().join("folder");
@@ -2043,6 +2052,26 @@ mod tests {
         assert_eq!((thumb.width(), thumb.height()), (480, 300));
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
         assert!(html.contains("<title>&lt;b&gt;Wide&lt;/b&gt;</title>") && !html.contains("<b>Wide"));
+        // A tall picture is scaled to the width and cut from the top; a wide one is cut at both sides.
+        let png = |img: &RgbaImage| {
+            let mut out = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+            out
+        };
+        let mut tall = RgbaImage::from_pixel(200, 1000, image::Rgba([0, 0, 255, 255]));
+        for y in 0..100 {
+            for x in 0..200 {
+                tall.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let t = image::load_from_memory(&thumbnail(&png(&tall)).unwrap()).unwrap().to_rgb8();
+        assert_eq!(t.dimensions(), (480, 300));
+        assert!(t.get_pixel(240, 10)[0] > 200 && t.get_pixel(240, 290)[2] > 200, "the top is kept");
+        let broad = image::load_from_memory(&thumbnail(&png(&RgbaImage::from_pixel(3000, 300, image::Rgba([9, 9, 9, 255])))).unwrap()).unwrap();
+        assert_eq!((broad.width(), broad.height()), (480, 300));
+        // Transparency becomes white, not black.
+        let clear = image::load_from_memory(&thumbnail(&png(&RgbaImage::from_pixel(160, 100, image::Rgba([0, 0, 0, 0])))).unwrap()).unwrap().to_rgb8();
+        assert!(clear.get_pixel(240, 150).0.iter().all(|c| *c > 245), "{:?}", clear.get_pixel(240, 150));
         // A cancel removes the folder, thumbnail and all, with the folder export's own message.
         let gone = tmp.path().join("gone");
         assert_eq!(write_tour(&r, &[], &[left(250, 800, 500)], &edit(&r), "t", &gone, wide, |f| f < 1.0, Page::Site(&a)).unwrap_err(), "cancelled");
