@@ -350,6 +350,44 @@ impl Default for Settings {
     }
 }
 
+/// Where the settings file's new text is written before it takes the file's place: beside it,
+/// so the rename stays on one drive.
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Every write of the settings file goes through here, with [`writing`] held by the caller.
+/// The file is never written in place: the new text goes to a temporary file beside it, is
+/// flushed to the disk, and then takes the file's place in one rename. A crash or a failure
+/// at any point leaves the settings file whole, as it was or as it should be.
+fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let write = |tmp: &std::path::Path| {
+        // A temporary file left by a crash is written over from its start.
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    };
+    replace_with(path, write, |from, to| std::fs::rename(from, to))
+}
+
+/// The steps of [`write_file`]: `write` fills the temporary file, `rename` moves it over the
+/// file at `path`. When either fails the file at `path` has not been touched, the temporary
+/// file is removed if it can be, and the error is the caller's to report.
+fn replace_with(path: &std::path::Path, write: impl FnOnce(&std::path::Path) -> std::io::Result<()>, rename: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    let result = write(&tmp).and_then(|()| rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// One writer of the settings file at a time: the app's own save, and a background job's note.
 fn writing() -> std::sync::MutexGuard<'static, ()> {
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -485,10 +523,7 @@ impl Settings {
         };
         let Ok(value) = toml::Value::try_from(list.to_vec()) else { return false };
         table.insert("unfinished_deletes".to_string(), value);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        toml::to_string_pretty(&table).is_ok_and(|text| std::fs::write(path, text).is_ok())
+        toml::to_string_pretty(&table).is_ok_and(|text| write_file(path, &text).is_ok())
     }
 
     /// Write the settings to `path`, unless the file there could not be read at start-up and no
@@ -498,12 +533,9 @@ impl Settings {
             return;
         }
         let _writing = writing();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         match toml::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(path, text) {
+                if let Err(e) = write_file(path, &text) {
                     eprintln!("could not save settings: {e}");
                 }
             }
@@ -813,6 +845,114 @@ publish_server = \"https://tours.example.com\"
         );
         assert_eq!(backup_stamp("settings.unreadable-20261118-093000-2.toml"), Some(("20261118-093000".into(), 2)));
         assert_eq!(backup_stamp("settings.toml"), None);
+    }
+
+    #[test]
+    fn a_rename_takes_the_place_of_a_file_that_is_there() {
+        // What the save relies on, on this system and this toolchain.
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new) = (tmp.path().join("settings.toml"), tmp.path().join("settings.toml.tmp"));
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &old).unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "new");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        assert_eq!(temp_path(&old), new);
+    }
+
+    #[test]
+    fn a_save_writes_beside_the_file_first_and_then_takes_its_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "magnifier = true\n").unwrap();
+        // The new text is whole in the temporary file, and the old file still whole, when the rename is asked for.
+        let seen = std::cell::RefCell::new(None);
+        let write = |to: &std::path::Path| std::fs::write(to, "magnifier = false\n");
+        replace_with(&path, write, |from, to| {
+            *seen.borrow_mut() = Some((from.to_path_buf(), std::fs::read_to_string(from).unwrap(), std::fs::read_to_string(to).unwrap()));
+            std::fs::rename(from, to)
+        })
+        .unwrap();
+        assert_eq!(seen.into_inner(), Some((temp_path(&path), "magnifier = false\n".to_string(), "magnifier = true\n".to_string())));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "magnifier = false\n");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // The app's save and a job's note both go that way, and leave nothing else behind.
+        let mut s = load_at(&path);
+        s.magnifier = true;
+        s.save_to(&path);
+        assert!(Settings::patch_unfinished_deletes(&path, &[UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() }]));
+        let read = load_at(&path);
+        assert!(read.magnifier && read.unfinished_deletes.len() == 1 && read.load_problem.is_none());
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // No file yet, in a folder that is not there yet.
+        let fresh = tmp.path().join("new").join("settings.toml");
+        write_file(&fresh, "magnifier = false\n").unwrap();
+        assert_eq!(names(fresh.parent().unwrap()), ["settings.toml"]);
+    }
+
+    #[test]
+    fn a_write_or_a_rename_that_fails_leaves_the_file_as_it_was_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "publish_server = \"https://tours.example.com\"\nmagnifier = false\n";
+        std::fs::write(&path, mine).unwrap();
+        // The disk fills half-way through the new text.
+        let full = |to: &std::path::Path| {
+            std::fs::write(to, "publish_ser")?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        };
+        let e = replace_with(&path, full, |from, to| std::fs::rename(from, to)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"], "the half-written file is removed");
+        // The new text is written, but cannot take the file's place.
+        let whole = |to: &std::path::Path| std::fs::write(to, "magnifier = true\n");
+        let e = replace_with(&path, whole, |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // For real: the temporary file cannot be made, because a folder has its name.
+        std::fs::create_dir(temp_path(&path)).unwrap();
+        assert!(write_file(&path, "magnifier = true\n").is_err());
+        assert!(!Settings::patch_unfinished_deletes(&path, &[]), "a note that is not on disk is reported as not written");
+        let mut s = load_at(&path);
+        s.magnifier = true;
+        s.save_to(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert!(temp_path(&path).is_dir(), "what is not the app's own file is not removed");
+    }
+
+    #[test]
+    fn a_temporary_file_left_by_a_crash_is_written_over_and_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let note = UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() };
+        std::fs::write(&path, "magnifier = false\n").unwrap();
+        // The app stopped half-way through a save: part of a file, longer than the next one.
+        let stale = format!("magnifier = true\npublish_server = \"https://tours.exa{}", "x".repeat(4000));
+        std::fs::write(temp_path(&path), &stale).unwrap();
+        // The next start reads the settings file alone, finds nothing wrong, and copies nothing aside.
+        let mut s = load_at(&path);
+        assert_eq!((s.magnifier, &s.load_problem), (false, &None));
+        assert_eq!(names(tmp.path()), ["settings.toml", "settings.toml.tmp"]);
+        // A job's note, then the app's save: each writes over the leftover and takes it away.
+        assert!(Settings::patch_unfinished_deletes(&path, std::slice::from_ref(&note)));
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        std::fs::write(temp_path(&path), &stale).unwrap();
+        s.unfinished_deletes = vec![note.clone()];
+        s.output_dir = PathBuf::from("D:/Shots");
+        s.save_to(&path);
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        let read = load_at(&path);
+        assert_eq!((read.magnifier, read.output_dir.clone(), read.unfinished_deletes.clone(), &read.load_problem), (false, PathBuf::from("D:/Shots"), vec![note], &None));
+        // A leftover and no settings file at all is a first start.
+        let first = tmp.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(temp_path(&first.join("settings.toml")), &stale).unwrap();
+        let s = load_at(&first.join("settings.toml"));
+        assert_eq!((s.magnifier, &s.load_problem), (true, &None));
+        s.save_to(&first.join("settings.toml"));
+        assert_eq!(names(&first), ["settings.toml"]);
     }
 
     #[test]

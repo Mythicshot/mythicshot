@@ -182,7 +182,8 @@ impl App {
             let unfinished = s.tours.unfinished();
             unfinished.load(settings.unfinished_deletes.clone());
             // A delete is noted in the file before its first request, on the job's own thread.
-            // A file that could not be read at start-up is never written over, here either.
+            // A file that could not be read at start-up is never written over, here either:
+            // with no way to write its note, a new delete is refused on the Tours page.
             if !settings.load_problem.as_ref().is_some_and(settings::LoadProblem::keeps_file_untouched) {
                 unfinished.save_with(Settings::save_unfinished_deletes);
             }

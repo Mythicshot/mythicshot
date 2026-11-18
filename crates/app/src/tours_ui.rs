@@ -55,6 +55,8 @@ pub const LIST_CHANGED: &str = "The tour list changed, so nothing was deleted. C
 
 pub const FINISH_DELETING: &str = "Finish deleting";
 pub const JOB_BROKE: &str = "That did not finish because of an unexpected error in Mythicshot. The list is read again to show where the tour stands.";
+/// A delete that was not sent, because its note could not be written to the settings file.
+pub const NOTE_NOT_SAVED: &str = "Could not save a note about this delete, so nothing was deleted. Check that the settings file can be written, then try again.";
 const LOAD_BROKE: &str = "Could not list the tours: an unexpected error in Mythicshot stopped it.";
 /// Most unfinished deletes kept; the oldest go first.
 const MAX_UNFINISHED: usize = 200;
@@ -678,6 +680,17 @@ pub struct Unfinished(Arc<Mutex<UnfinishedList>>);
 /// Writes the list to the settings file at once; false when it could not.
 type SaveNow = Arc<dyn Fn(&[UnfinishedDelete]) -> bool + Send + Sync>;
 
+/// What became of the note for a delete that is about to be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Noted {
+    /// Written to the settings file just now.
+    Now,
+    /// There already: an earlier delete of this tour did not finish.
+    Before,
+    /// It could not be written to the settings file, so there is no note, and the delete must not be sent.
+    NotSaved,
+}
+
 #[derive(Default)]
 struct UnfinishedList {
     list: Vec<UnfinishedDelete>,
@@ -699,29 +712,33 @@ impl Unfinished {
     }
 
     /// How a note gets to the settings file before its request is sent. Set once by the app.
+    /// Until it is set no new note can be made, so no new delete is sent.
     pub fn save_with(&self, save_now: impl Fn(&[UnfinishedDelete]) -> bool + Send + Sync + 'static) {
         self.lock().save_now = Some(Arc::new(save_now));
     }
 
     /// Note that a delete of this tour on `server` (an address as the address rule writes it)
-    /// is about to be sent, and write the note to the settings file before returning. False
-    /// when the tour was noted already: by an earlier delete that did not finish.
-    pub fn add(&self, server: &str, tour_id: &str, title: &str) -> bool {
+    /// is about to be sent, and write the note to the settings file before returning.
+    pub fn add(&self, server: &str, tour_id: &str, title: &str) -> Noted {
         let mut l = self.lock();
         if l.list.iter().any(|e| e.server == server && e.tour_id == tour_id) {
-            return false;
+            return Noted::Before;
         }
         let title = if title.trim().is_empty() { "Untitled tour".to_string() } else { title.chars().take(TITLE_MAX).collect() };
-        l.list.push(UnfinishedDelete { server: server.to_string(), tour_id: tour_id.to_string(), title });
-        let extra = l.list.len().saturating_sub(MAX_UNFINISHED);
-        l.list.drain(..extra);
+        let mut list = l.list.clone();
+        list.push(UnfinishedDelete { server: server.to_string(), tour_id: tour_id.to_string(), title });
+        let extra = list.len().saturating_sub(MAX_UNFINISHED);
+        list.drain(..extra);
+        // Written while the list is held, so the app's own save cannot come between with an older list.
+        // A note that is not on disk is no note: the list stays as it was, and with no way to
+        // write (the settings file is not to be touched this session) there is none either.
+        if !l.save_now.clone().is_some_and(|save| save(&list)) {
+            return Noted::NotSaved;
+        }
+        l.list = list;
         // The app's copy still has to learn of it, or its next save would take the note away again.
         l.changed = true;
-        // Written while the list is held, so the app's own save cannot come between with an older list.
-        if let Some(save) = l.save_now.clone() {
-            save(&l.list);
-        }
-        true
+        Noted::Now
     }
 
     /// With the list held still: `write` gets the list if the app's copy does not have it
@@ -815,7 +832,7 @@ impl Drop for JobGuard {
 
 /// Do the job's requests. A delete is noted, in the settings file too, before its first
 /// request is sent: the answer to that request can be lost after the site has removed the
-/// tour. The note goes when the site says nothing is left (a tour that is already gone
+/// tour. A delete whose note cannot be written is not sent at all. The note goes when the site says nothing is left (a tour that is already gone
 /// included), or when it clearly refused before beginning (a publish in progress, a
 /// rejected token, a site too old to delete), unless the note is an earlier delete's. Any
 /// other end (no answer, a server error, an answer that makes no sense) leaves the note:
@@ -833,7 +850,11 @@ fn run_job(model: &Mutex<Model>, token: &TokenSource, unfinished: &Unfinished, s
         .map(|live| Done::Published(live.url))
         .map_err(failure),
         Job::Delete => {
-            let noted_here = unfinished.add(server, id, &started.title);
+            let noted_here = match unfinished.add(server, id, &started.title) {
+                Noted::Now => true,
+                Noted::Before => false,
+                Noted::NotSaved => return Err(Failure::Message(NOTE_NOT_SAVED.to_string())),
+            };
             let result = publish::delete_tour(server, &token, id, |files| lock(model).progress(id, Work::Deleting(files)));
             match result {
                 Ok(()) => {
@@ -1643,9 +1664,53 @@ mod tests {
         assert!(m.finish_delete(&here).is_some());
     }
 
+    /// A list whose notes reach the settings file.
+    fn saved_list() -> Unfinished {
+        let u = Unfinished::default();
+        u.save_with(|_| true);
+        u
+    }
+
+    #[test]
+    fn a_note_that_cannot_be_written_is_not_kept_in_memory_either() {
+        // No way to write at all (the settings file is not to be touched this session), and a write that fails.
+        let refusing = Unfinished::default();
+        refusing.save_with(|_| false);
+        for u in [Unfinished::default(), refusing] {
+            assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::NotSaved);
+            assert!(u.for_site("https://tours.example.com").is_empty() && !u.is_changed());
+            // A note read from the file at start-up is there already, and needs no write.
+            u.load(vec![entry("https://tours.example.com", A, "Earlier")]);
+            assert_eq!(u.add("https://tours.example.com", A, "Earlier"), Noted::Before);
+            assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::NotSaved);
+            assert_eq!(u.for_site("https://tours.example.com"), [entry("https://tours.example.com", A, "Earlier")]);
+            assert!(!u.is_changed(), "nothing for the app to write");
+        }
+        // A full list loses its oldest note only to a note that was written.
+        let u = saved_list();
+        let asked: Arc<Mutex<Vec<usize>>> = Arc::default();
+        for i in 0..MAX_UNFINISHED {
+            assert_eq!(u.add("https://tours.example.com", &format!("tour_{i:024x}"), "x"), Noted::Now);
+        }
+        let full = u.take_changed().unwrap();
+        let seen = asked.clone();
+        u.save_with(move |list| {
+            seen.lock().unwrap().push(list.len());
+            false
+        });
+        assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::NotSaved);
+        assert_eq!(*asked.lock().unwrap(), [MAX_UNFINISHED], "the write was tried, with the list as it would have been");
+        assert_eq!(u.for_site("https://tours.example.com"), full);
+        assert!(!u.is_changed());
+        // Once the file can be written again, the same delete is noted.
+        u.save_with(|_| true);
+        assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::Now);
+        assert_eq!((u.add("https://tours.example.com", B, "Testing"), u.is_changed()), (Noted::Before, true));
+    }
+
     #[test]
     fn the_unfinished_list_keeps_every_site_and_shows_one() {
-        let u = Unfinished::default();
+        let u = saved_list();
         assert_eq!(u.take_changed(), None);
         u.add("https://tours.example.com", B, "Testing");
         assert!(u.is_changed());
@@ -1668,7 +1733,7 @@ mod tests {
         assert!(!u.is_changed(), "what was read from the file is not a change");
         assert_eq!(u.for_site("https://tours.example.com"), [entry("https://tours.example.com", B, "Testing")]);
         // The list cannot grow without end, and a title is kept short.
-        let u = Unfinished::default();
+        let u = saved_list();
         for i in 0..MAX_UNFINISHED + 5 {
             u.add("https://tours.example.com", &format!("tour_{i:024x}"), &"x".repeat(500));
         }
@@ -1680,7 +1745,7 @@ mod tests {
 
     #[test]
     fn unfinished_deletes_survive_a_restart_through_the_settings_file() {
-        let u = Unfinished::default();
+        let u = saved_list();
         u.add("https://tours.example.com", B, "Testing \"quoted\" · café");
         u.add("https://other.example.com", C, "Elsewhere");
         // What the app does with a change: into the settings, and the settings to disk.
@@ -1766,7 +1831,15 @@ mod tests {
     const ONLY_A: &str = r#"{"tours":[{"id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","title":"Customer onboarding","status":"published","slug":"abc123","url":"/t/abc123","chapters":2,"steps":22,"updated_at":1763424000000,"published_at":1763467200000}]}"#;
     const NO_TOUR: &str = r#"{"error":"not_found","detail":"no such tour"}"#;
 
+    /// A page whose settings file can be written.
     fn page() -> ToursState {
+        let state = unsaved_page();
+        state.unfinished().save_with(|_| true);
+        state
+    }
+
+    /// A page as it is when the settings file is not to be written this session.
+    fn unsaved_page() -> ToursState {
         ToursState::with_token(|_| Ok(TOKEN.to_string()))
     }
 
@@ -2194,6 +2267,61 @@ mod tests {
             delete_b(&ctx, &mut state, &conn);
             assert!(lock(&state.model).tours().len() == 1 && store.for_site(&s.base).is_empty(), "answer {i}");
             assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 2, "answer {i}");
+        }
+    }
+
+    #[test]
+    fn a_delete_whose_note_cannot_be_saved_is_not_sent_and_the_row_says_why() {
+        // The settings file cannot be written (false), or is not to be written this session (no way to write).
+        for can_try in [true, false] {
+            let (ctx, mut state) = (egui::Context::default(), unsaved_page());
+            let store = state.unfinished();
+            if can_try {
+                store.save_with(|_| false);
+            }
+            let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(200, DELETED) });
+            let conn = stub_conn(&s);
+            until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+            let text = delete_b(&ctx, &mut state, &conn);
+            assert!(s.lines().iter().all(|l| l == "GET /api/v1/tours"), "can_try {can_try}: nothing but list requests: {:?}", s.lines());
+            assert!(store.for_site(&s.base).is_empty() && !store.is_changed(), "can_try {can_try}: no note is left in memory");
+            let m = lock(&state.model);
+            assert_eq!((m.tours().len(), m.error(B), m.notice()), (2, Some(NOTE_NOT_SAVED), None), "can_try {can_try}");
+            drop(m);
+            assert!(text.replace('\n', " ").contains("Could not save a note about this delete, so nothing was deleted. Check that the settings file can be written, then try again."), "can_try {can_try}:\n{text}");
+            assert!(!text.contains("did not finish") && !has_line(&text, FINISH_DELETING), "can_try {can_try}:\n{text}");
+            // The file can be written again: the same delete goes through, noted first.
+            let file = written_to(&store);
+            delete_b(&ctx, &mut state, &conn);
+            assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 1, "can_try {can_try}");
+            assert!(lock(&state.model).error(B).is_none() && store.for_site(&s.base).is_empty(), "can_try {can_try}");
+            assert_eq!(*file.lock().unwrap(), [entry(&s.base, B, "Testing")], "can_try {can_try}: it was written before the request");
+        }
+    }
+
+    #[test]
+    fn finish_deleting_needs_no_new_note_so_a_file_that_cannot_be_written_does_not_stop_it() {
+        for can_try in [true, false] {
+            let (ctx, mut state) = (egui::Context::default(), unsaved_page());
+            let store = state.unfinished();
+            if can_try {
+                store.save_with(|_| false);
+            }
+            let s = stub(|req, _| match req.line.as_str() {
+                "GET /api/v1/tours" => reply(200, ONLY_A),
+                DELETE_B => reply(200, DELETED),
+                _ => reply(500, r#"{"error":"unexpected"}"#),
+            });
+            let conn = stub_conn(&s);
+            let note = entry(&s.base, B, "Testing");
+            store.load(vec![note.clone()]);
+            until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+            let job = lock(&state.model).finish_delete(&note).unwrap();
+            state.spawn_job(job);
+            let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading());
+            assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 1, "can_try {can_try}");
+            assert!(store.for_site(&s.base).is_empty(), "can_try {can_try}");
+            assert!(!text.contains("Could not save a note") && !has_line(&text, FINISH_DELETING), "can_try {can_try}:\n{text}");
         }
     }
 
