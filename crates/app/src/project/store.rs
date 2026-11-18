@@ -547,7 +547,7 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
         return Err("this tour's saved recording is open in an editor and belongs to another recording.".into());
     }
     let frames_bytes = std::fs::metadata(dir.join(FRAMES_FILE)).map_err(|e| reason("the saved recording's frames can no longer be read", &e))?.len();
-    let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
+    let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes, state::StoreInfo::default());
     let text = project_text(&file)?;
 
     let _changing = changing();
@@ -598,7 +598,7 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
 /// Put everything a project holds into the new folder `staging`, the project file last.
 fn fill(staging: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<(ProjectFile, Vec<String>), String> {
     let frames_bytes = (steps.keep_frames)(snap.rec, staging).map_err(frames_reason)?;
-    let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
+    let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes, state::StoreInfo::default());
     let text = project_text(&file)?;
     for blob in &blobs {
         write_blob(staging, blob)?;
@@ -1574,7 +1574,7 @@ mod tests {
         let w = World::new();
         w.save(&key_1());
         let dir = w.dir(&key_1());
-        let newer = serde_json::json!({"format": 2, "app": "9.0.0", "saved_at": 1_800_000_000_000i64, "server": SITE_A, "tour_id": TOUR_1, "chapter_id": CH_1, "tour_title": "Customer onboarding", "title": "From later", "edit": "something new"}).to_string();
+        let newer = serde_json::json!({"format": 3, "app": "9.0.0", "saved_at": 1_800_000_000_000i64, "server": SITE_A, "tour_id": TOUR_1, "chapter_id": CH_1, "tour_title": "Customer onboarding", "title": "From later", "edit": "something new"}).to_string();
         std::fs::write(dir.join(PROJECT_FILE), &newer).unwrap();
         let whole = contents(&dir);
 
