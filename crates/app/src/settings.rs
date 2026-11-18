@@ -350,6 +350,100 @@ impl Default for Settings {
     }
 }
 
+/// Where the settings file's new text is written before it takes the file's place: beside it,
+/// so the rename stays on one drive.
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Every write of the settings file goes through here, with [`writing`] held by the caller.
+/// The file is never written in place: the new text goes to a temporary file beside it, is
+/// flushed to the disk, and then takes the file's place in one rename. A crash or a failure
+/// at any point leaves the settings file whole, as it was or as it should be.
+fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let write = |tmp: &std::path::Path| {
+        // A temporary file left by a crash is written over from its start.
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    };
+    replace_with(path, write, |from, to| std::fs::rename(from, to), RENAME_TRIES, || std::thread::sleep(RENAME_WAIT))
+}
+
+/// An error of the kind another program causes for a moment by having the file open: no
+/// permission (Windows error 5) or a sharing violation (32).
+fn is_busy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32))
+}
+
+/// How often the rename is tried, and how long is waited between two tries: half a second in all.
+const RENAME_TRIES: u32 = 5;
+const RENAME_WAIT: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// How long after a save that failed the app tries again by itself.
+pub const SAVE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the app remembers of a save of the settings file that failed: the change is still
+/// only in memory, and is written again later, and when the app closes.
+#[derive(Debug, Default)]
+pub struct SaveRetry {
+    again_at: Option<std::time::Instant>,
+}
+
+impl SaveRetry {
+    /// A save ended, well or not.
+    pub fn record(&mut self, result: &std::io::Result<()>, now: std::time::Instant) {
+        self.again_at = result.is_err().then(|| now + SAVE_RETRY_AFTER);
+    }
+
+    /// The settings file does not hold what the app has.
+    pub fn pending(&self) -> bool {
+        self.again_at.is_some()
+    }
+
+    /// Whether a save nobody asked for may run now: always, except shortly after one that failed.
+    pub fn allows(&self, now: std::time::Instant) -> bool {
+        self.again_at.is_none_or(|at| now >= at)
+    }
+}
+
+/// The steps of [`write_file`]: `write` fills the temporary file, `rename` moves it over the
+/// file at `path`, up to `tries` times with a `wait` between them while another program is in
+/// the way. When either fails the file at `path` has not been touched, the temporary
+/// file is removed if it can be, and the error is the caller's to report.
+fn replace_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    mut rename: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    tries: u32,
+    mut wait: impl FnMut(),
+) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    let result = write(&tmp).and_then(|()| {
+        // Another program (a scanner, a backup, a sync) may have either file open for a moment.
+        let mut tried = 1;
+        loop {
+            match rename(&tmp, path) {
+                Err(e) if is_busy(&e) && tried < tries => {
+                    tried += 1;
+                    wait();
+                }
+                other => return other,
+            }
+        }
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// One writer of the settings file at a time: the app's own save, and a background job's note.
 fn writing() -> std::sync::MutexGuard<'static, ()> {
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -461,8 +555,17 @@ impl Settings {
         d
     }
 
-    pub fn save(&self) {
-        self.save_to(&Self::path());
+    /// Write the settings file. An error means the file is as it was and the change is still
+    /// only in memory: the caller keeps it to be saved again.
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    /// How a job writes its note to the settings file at once; `None` when the file could not
+    /// be read at start-up and is never written over, so that no new delete is sent.
+    pub fn note_saver(&self) -> Option<fn(&[UnfinishedDelete]) -> bool> {
+        let untouched = self.load_problem.as_ref().is_some_and(LoadProblem::keeps_file_untouched);
+        (!untouched).then_some(Self::save_unfinished_deletes as fn(&[UnfinishedDelete]) -> bool)
     }
 
     /// Write `list` as the file's unfinished deletes, now, from whatever thread asks, leaving
@@ -485,30 +588,22 @@ impl Settings {
         };
         let Ok(value) = toml::Value::try_from(list.to_vec()) else { return false };
         table.insert("unfinished_deletes".to_string(), value);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        toml::to_string_pretty(&table).is_ok_and(|text| std::fs::write(path, text).is_ok())
+        toml::to_string_pretty(&table).is_ok_and(|text| write_file(path, &text).is_ok())
     }
 
     /// Write the settings to `path`, unless the file there could not be read at start-up and no
     /// copy of it could be made: then it is never written over.
-    fn save_to(&self, path: &std::path::Path) {
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        // Nothing is to be saved this session, so nothing is left unsaved either.
         if self.load_problem.as_ref().is_some_and(LoadProblem::keeps_file_untouched) {
-            return;
+            return Ok(());
         }
         let _writing = writing();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match toml::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(path, text) {
-                    eprintln!("could not save settings: {e}");
-                }
-            }
-            Err(e) => eprintln!("could not encode settings: {e}"),
-        }
+        let text = toml::to_string_pretty(self).map_err(|e| {
+            eprintln!("could not encode settings: {e}");
+            std::io::Error::other(e)
+        })?;
+        write_file(path, &text).inspect_err(|e| eprintln!("could not save settings: {e}"))
     }
 
     pub fn binding(&self, action: Action) -> &str {
@@ -712,7 +807,7 @@ publish_server = \"https://tours.example.com\"
             assert_eq!(std::fs::read(&copy).unwrap(), bytes, "the copy is the file as it was");
             assert_eq!(s.magnifier, !partly, "what could be read is kept, the rest is the default");
             // With the copy made, saving goes ahead.
-            s.save_to(&path);
+            s.save_to(&path).unwrap();
             let saved = std::fs::read_to_string(&path).unwrap();
             assert!(saved.contains("tray_left_click = \"open_app\""), "{saved}");
             assert!(!saved.contains("load_problem") && !saved.contains("unreadable"), "the problem is never written: {saved}");
@@ -732,7 +827,7 @@ publish_server = \"https://tours.example.com\"
         assert_eq!((first.tray_left_click, &first.load_problem), (TrayLeftClick::OpenApp, &None));
         assert_eq!(names(tmp.path()), ["settings.toml"]);
         // A first start saves as usual.
-        first.save_to(&tmp.path().join("none.toml"));
+        first.save_to(&tmp.path().join("none.toml")).unwrap();
         assert!(tmp.path().join("none.toml").exists());
     }
 
@@ -750,8 +845,8 @@ publish_server = \"https://tours.example.com\"
         // Changes made this session are not written, by this copy of the settings or a clone of it.
         s.magnifier = false;
         s.toggle_destination(DestId::File);
-        s.save_to(&path);
-        s.clone().save_to(&path);
+        s.save_to(&path).unwrap();
+        s.clone().save_to(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
         assert_eq!(names(tmp.path()), ["settings.toml"], "and nothing else is written either");
         let sentence = s.load_problem.as_ref().unwrap().sentence();
@@ -775,7 +870,7 @@ publish_server = \"https://tours.example.com\"
             assert_eq!(s.load_problem, Some(LoadProblem { path: path.clone(), backup: None, partly_read: partly }));
             assert_eq!(s.publish_server, if partly { "https://tours.example.com" } else { "" });
             s.magnifier = !s.magnifier;
-            s.save_to(&path);
+            s.save_to(&path).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
             assert_eq!(names(tmp.path()), ["settings.toml"]);
         }
@@ -816,6 +911,263 @@ publish_server = \"https://tours.example.com\"
     }
 
     #[test]
+    fn a_rename_takes_the_place_of_a_file_that_is_there() {
+        // What the save relies on, on this system and this toolchain.
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new) = (tmp.path().join("settings.toml"), tmp.path().join("settings.toml.tmp"));
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &old).unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "new");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        assert_eq!(temp_path(&old), new);
+    }
+
+    #[test]
+    fn a_save_writes_beside_the_file_first_and_then_takes_its_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "magnifier = true\n").unwrap();
+        // The new text is whole in the temporary file, and the old file still whole, when the rename is asked for.
+        let seen = std::cell::RefCell::new(None);
+        let write = |to: &std::path::Path| std::fs::write(to, "magnifier = false\n");
+        replace_with(&path, write, |from, to| {
+            *seen.borrow_mut() = Some((from.to_path_buf(), std::fs::read_to_string(from).unwrap(), std::fs::read_to_string(to).unwrap()));
+            std::fs::rename(from, to)
+        }, 1, || ())
+        .unwrap();
+        assert_eq!(seen.into_inner(), Some((temp_path(&path), "magnifier = false\n".to_string(), "magnifier = true\n".to_string())));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "magnifier = false\n");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // The app's save and a job's note both go that way, and leave nothing else behind.
+        let mut s = load_at(&path);
+        s.magnifier = true;
+        s.save_to(&path).unwrap();
+        assert!(Settings::patch_unfinished_deletes(&path, &[UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() }]));
+        let read = load_at(&path);
+        assert!(read.magnifier && read.unfinished_deletes.len() == 1 && read.load_problem.is_none());
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // No file yet, in a folder that is not there yet.
+        let fresh = tmp.path().join("new").join("settings.toml");
+        write_file(&fresh, "magnifier = false\n").unwrap();
+        assert_eq!(names(fresh.parent().unwrap()), ["settings.toml"]);
+    }
+
+    #[test]
+    fn a_write_or_a_rename_that_fails_leaves_the_file_as_it_was_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "publish_server = \"https://tours.example.com\"\nmagnifier = false\n";
+        std::fs::write(&path, mine).unwrap();
+        // The disk fills half-way through the new text.
+        let full = |to: &std::path::Path| {
+            std::fs::write(to, "publish_ser")?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        };
+        let e = replace_with(&path, full, |from, to| std::fs::rename(from, to), 1, || ()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"], "the half-written file is removed");
+        // The new text is written, but cannot take the file's place.
+        let whole = |to: &std::path::Path| std::fs::write(to, "magnifier = true\n");
+        let e = replace_with(&path, whole, |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)), 1, || ()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // For real: the temporary file cannot be made, because a folder has its name.
+        std::fs::create_dir(temp_path(&path)).unwrap();
+        assert!(write_file(&path, "magnifier = true\n").is_err());
+        assert!(!Settings::patch_unfinished_deletes(&path, &[]), "a note that is not on disk is reported as not written");
+        let mut s = load_at(&path);
+        s.magnifier = true;
+        assert!(s.save_to(&path).is_err(), "the app is told, so that it keeps the change to save it again");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert!(temp_path(&path).is_dir(), "what is not the app's own file is not removed");
+    }
+
+    fn os_error(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn a_rename_that_is_refused_for_a_moment_is_tried_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "magnifier = false\n";
+        std::fs::write(&path, mine).unwrap();
+        let whole = |to: &std::path::Path| std::fs::write(to, "magnifier = true\n");
+        // Another program has the file for a moment: no permission twice, a sharing violation once, then it is free.
+        let (asked, waits) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let busy_then_free = |from: &std::path::Path, to: &std::path::Path| {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                1 => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                2 => Err(os_error(5)),
+                3 => Err(os_error(32)),
+                _ => std::fs::rename(from, to),
+            }
+        };
+        replace_with(&path, whole, busy_then_free, 5, || waits.set(waits.get() + 1)).unwrap();
+        assert_eq!((asked.get(), waits.get()), (4, 3), "a wait before each further try, none after the last");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "magnifier = true\n");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // It never comes free: the tries end, the error is the last one, and the file is as it was.
+        std::fs::write(&path, mine).unwrap();
+        let (asked, waits) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let never = |_: &std::path::Path, _: &std::path::Path| {
+            asked.set(asked.get() + 1);
+            Err(os_error(32))
+        };
+        let e = replace_with(&path, whole, never, 5, || waits.set(waits.get() + 1)).unwrap_err();
+        assert_eq!((e.raw_os_error(), asked.get(), waits.get()), (Some(32), 5, 4));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // An error that waiting does not cure is not tried again.
+        let (asked, waits) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let gone = |_: &std::path::Path, _: &std::path::Path| {
+            asked.set(asked.get() + 1);
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let e = replace_with(&path, whole, gone, 5, || waits.set(waits.get() + 1)).unwrap_err();
+        assert_eq!((e.kind(), asked.get(), waits.get()), (std::io::ErrorKind::NotFound, 1, 0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        // The app's own save waits half a second at most.
+        assert_eq!(RENAME_TRIES, 5);
+        assert!(RENAME_WAIT * (RENAME_TRIES - 1) <= std::time::Duration::from_millis(500));
+    }
+
+    /// The write step of a save, as the app does it.
+    #[cfg(windows)]
+    fn whole_file(text: &'static str) -> impl FnOnce(&std::path::Path) -> std::io::Result<()> {
+        move |to| std::fs::write(to, text)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_settings_file_is_not_replaced_and_stays_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "publish_server = \"https://tours.example.com\"\n";
+        std::fs::write(&path, mine).unwrap();
+        let read_only = |on: bool| {
+            let mut p = std::fs::metadata(&path).unwrap().permissions();
+            p.set_readonly(on);
+            std::fs::set_permissions(&path, p).unwrap();
+        };
+        read_only(true);
+        // The real rename, refused by the system every time; only the waiting is left out.
+        let waits = std::cell::Cell::new(0);
+        let result = replace_with(&path, whole_file("magnifier = false\n"), |from, to| std::fs::rename(from, to), RENAME_TRIES, || waits.set(waits.get() + 1));
+        let left = (std::fs::read_to_string(&path).unwrap(), names(tmp.path()));
+        // So that the folder can be removed again.
+        read_only(false);
+        let e = result.unwrap_err();
+        assert!(is_busy(&e), "{e:?}");
+        assert_eq!(waits.get(), RENAME_TRIES - 1);
+        assert_eq!(left, (mine.to_string(), vec!["settings.toml".to_string()]), "the file is as it was, and no temporary file is left");
+        // Once it may be written again, the next save goes through.
+        write_file(&path, "magnifier = false\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "magnifier = false\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_temporary_file_that_cannot_be_removed_does_not_stop_the_next_save() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "magnifier = false\n";
+        std::fs::write(&path, mine).unwrap();
+        // Another program (a scanner) opens the fresh temporary file and lets nobody move or remove it.
+        let held = std::cell::RefCell::new(None);
+        let rename = |from: &std::path::Path, to: &std::path::Path| {
+            if held.borrow().is_none() {
+                // Shared for reading and writing, not for deleting.
+                *held.borrow_mut() = Some(std::fs::OpenOptions::new().read(true).share_mode(3).open(from)?);
+            }
+            std::fs::rename(from, to)
+        };
+        let e = replace_with(&path, whole_file("magnifier = true\npublish_server = \"https://tours.example.com\"\n"), rename, RENAME_TRIES, || ()).unwrap_err();
+        assert!(is_busy(&e), "{e:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml", "settings.toml.tmp"], "it could not be removed");
+        // The scanner is done. The leftover is longer than the next text: it is written over from its start.
+        drop(held.into_inner());
+        write_file(&path, "magnifier = true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "magnifier = true\n");
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+    }
+
+    #[test]
+    fn a_save_that_failed_is_tried_again_later_and_not_at_once() {
+        let start = std::time::Instant::now();
+        let mut retry = SaveRetry::default();
+        assert!(!retry.pending() && retry.allows(start));
+        // A save that worked leaves nothing to do.
+        retry.record(&Ok(()), start);
+        assert!(!retry.pending() && retry.allows(start));
+        // One that failed is pending, and is not tried again frame after frame.
+        retry.record(&Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)), start);
+        assert!(retry.pending());
+        assert!(!retry.allows(start) && !retry.allows(start + SAVE_RETRY_AFTER - std::time::Duration::from_millis(1)));
+        assert!(retry.allows(start + SAVE_RETRY_AFTER));
+        // It fails again: the wait starts again. Then it works.
+        let later = start + SAVE_RETRY_AFTER;
+        retry.record(&Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)), later);
+        assert!(retry.pending() && !retry.allows(later + std::time::Duration::from_secs(1)));
+        retry.record(&Ok(()), later + SAVE_RETRY_AFTER);
+        assert!(!retry.pending() && retry.allows(later + SAVE_RETRY_AFTER));
+    }
+
+    #[test]
+    fn a_job_may_write_its_note_only_to_a_file_that_may_be_saved() {
+        let path = PathBuf::from("settings.toml");
+        assert!(Settings::default().note_saver().is_some(), "a first start, or a file that read well");
+        // Copied aside before it is saved over: saving goes ahead, for a note too.
+        let copied = Settings { load_problem: Some(LoadProblem { path: path.clone(), backup: Some(PathBuf::from("settings.unreadable-20261118-093000.toml")), partly_read: true }), ..Settings::default() };
+        assert!(copied.note_saver().is_some());
+        // Unreadable, or no copy could be made: never written over, by a job either.
+        for partly_read in [false, true] {
+            let untouched = Settings { load_problem: Some(LoadProblem { path: path.clone(), backup: None, partly_read }), ..Settings::default() };
+            assert!(untouched.note_saver().is_none());
+            assert!(untouched.save_to(&PathBuf::from("no-such-folder").join("settings.toml")).is_ok(), "nothing is to be saved, so nothing is left to try again");
+        }
+    }
+
+    #[test]
+    fn a_temporary_file_left_by_a_crash_is_written_over_and_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let note = UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() };
+        std::fs::write(&path, "magnifier = false\n").unwrap();
+        // The app stopped half-way through a save: part of a file, longer than the next one.
+        let stale = format!("magnifier = true\npublish_server = \"https://tours.exa{}", "x".repeat(4000));
+        std::fs::write(temp_path(&path), &stale).unwrap();
+        // The next start reads the settings file alone, finds nothing wrong, and copies nothing aside.
+        let mut s = load_at(&path);
+        assert_eq!((s.magnifier, &s.load_problem), (false, &None));
+        assert_eq!(names(tmp.path()), ["settings.toml", "settings.toml.tmp"]);
+        // A job's note, then the app's save: each writes over the leftover and takes it away.
+        assert!(Settings::patch_unfinished_deletes(&path, std::slice::from_ref(&note)));
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        std::fs::write(temp_path(&path), &stale).unwrap();
+        s.unfinished_deletes = vec![note.clone()];
+        s.output_dir = PathBuf::from("D:/Shots");
+        s.save_to(&path).unwrap();
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        let read = load_at(&path);
+        assert_eq!((read.magnifier, read.output_dir.clone(), read.unfinished_deletes.clone(), &read.load_problem), (false, PathBuf::from("D:/Shots"), vec![note], &None));
+        // A leftover and no settings file at all is a first start.
+        let first = tmp.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(temp_path(&first.join("settings.toml")), &stale).unwrap();
+        let s = load_at(&first.join("settings.toml"));
+        assert_eq!((s.magnifier, &s.load_problem), (true, &None));
+        s.save_to(&first.join("settings.toml")).unwrap();
+        assert_eq!(names(&first), ["settings.toml"]);
+    }
+
+    #[test]
     fn toggling_keeps_menu_order() {
         let mut s = Settings { destinations: Some(vec![DestId::Clipboard]), ..Settings::default() };
         s.toggle_destination(DestId::File);
@@ -842,7 +1194,7 @@ publish_server = \"https://tours.example.com\"
         assert_eq!(read.unfinished_deletes, [note.clone()]);
         assert_eq!((read.publish_server.as_str(), read.publish_saved_for.as_deref(), read.publish_binding_settled, read.binding(Action::CaptureWindow)), ("https://tours.example.com", Some("https://tours.example.com"), true, "alt+KeyW"));
         // The app's own save afterwards, and an emptied list.
-        read.save_to(&path);
+        read.save_to(&path).unwrap();
         assert_eq!(load_at(&path).unfinished_deletes, [note.clone()]);
         assert!(Settings::patch_unfinished_deletes(&path, &[]));
         assert!(load_at(&path).unfinished_deletes.is_empty());

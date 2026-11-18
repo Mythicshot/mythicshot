@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.5 (2026-11-18)
+
+- Settings are saved through a temporary file, so a crash or power cut during a save cannot damage the settings file.
+- A save that fails because another program holds the file is tried again, also when you exit.
+- A delete is refused, with a message, when the note about it cannot be saved; nothing is deleted in that case.
+
 ## 0.2.4 (2026-11-18)
 
 - A delete is noted before it starts, so a lost answer from the site can no longer leave a tour's files behind unnoticed.
