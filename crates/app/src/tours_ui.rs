@@ -58,6 +58,8 @@ pub const EMPTY: &str = "This workspace has no tours yet. Record a tour and publ
 pub const RECORD_A_TOUR: &str = "Record a tour";
 pub const RENAME_NOTE: &str = "The link stays the same after a rename.";
 pub const LINK_COPIED: &str = "Link copied";
+/// On the detail line of a public tour whose live page is behind its draft.
+pub const CHANGES_WAITING: &str = "changes waiting to be published";
 pub const LIST_CHANGED: &str = "The tour list changed, so nothing was deleted. Check the list and choose Delete again.";
 
 /// Edit on a tour with no recording saved on this computer for it.
@@ -152,8 +154,9 @@ pub fn load_sentence(error: &LoadError) -> &'static str {
 
 /// The muted line under a title: "2 chapters · 22 steps · published 18 Nov", or for a draft
 /// "… · updated 18 Nov" (the site's date for a draft moves with every change, a rename
-/// included). A site that gives no date (an older one) gets the line without it. `saved` is
-/// what is saved on this computer for this tour; see [`saved_note`].
+/// included). A site that gives no date (an older one) gets the line without it. A public tour
+/// whose live page is behind its draft says so next: "… · changes waiting to be published".
+/// `saved` is what is saved on this computer for this tour; see [`saved_note`].
 pub fn detail_line<Tz: TimeZone>(t: &RemoteTour, saved: &[ProjectInfo], now: &DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
@@ -162,6 +165,9 @@ where
     let dated = if t.is_public() { t.published_at.map(|ms| ("published", ms)) } else { t.updated_at.map(|ms| ("updated", ms)) };
     if let Some((word, day)) = dated.and_then(|(word, ms)| Some((word, day_label(ms, now)?))) {
         line.push_str(&format!(" · {word} {day}"));
+    }
+    if t.changes_waiting() {
+        line.push_str(&format!(" · {CHANGES_WAITING}"));
     }
     if let Some(note) = saved_note(saved) {
         line.push_str(&format!(" · {note}"));
@@ -175,6 +181,8 @@ pub enum RowButton {
     CopyLink,
     Open,
     Edit,
+    /// On a public tour whose live page is behind its draft: publish what is waiting.
+    PublishChanges,
     Publish,
     Rename,
     Unpublish,
@@ -187,6 +195,7 @@ impl RowButton {
             RowButton::CopyLink => "Copy link",
             RowButton::Open => "Open",
             RowButton::Edit => "Edit",
+            RowButton::PublishChanges => "Publish changes",
             RowButton::Publish => "Publish",
             RowButton::Rename => "Rename",
             RowButton::Unpublish => "Unpublish",
@@ -198,14 +207,22 @@ impl RowButton {
 /// The buttons a tour's row shows, in order. A public tour whose link the site did not give
 /// (an older site) has no Copy link and no Open: there is nothing true to copy. Every row has
 /// Edit, after Open or first among the buttons that manage the tour; whether there is a
-/// recording to edit is said when it is pressed.
+/// recording to edit is said when it is pressed. A public tour whose live page is behind its
+/// draft ([`RemoteTour::changes_waiting`]) has Publish changes directly after Edit; a draft
+/// keeps its own Publish.
 pub fn row_buttons(t: &RemoteTour) -> Vec<RowButton> {
     use RowButton::*;
-    match (t.is_public(), t.link.is_some()) {
+    let mut buttons = match (t.is_public(), t.link.is_some()) {
         (true, true) => vec![CopyLink, Open, Edit, Rename, Unpublish, Delete],
         (true, false) => vec![Edit, Rename, Unpublish, Delete],
         (false, _) => vec![Publish, Edit, Rename, Delete],
+    };
+    if t.changes_waiting()
+        && let Some(edit) = buttons.iter().position(|b| *b == Edit)
+    {
+        buttons.insert(edit + 1, PublishChanges);
     }
+    buttons
 }
 
 /// The question the delete confirmation asks. `saved`: how many recordings of this tour are
@@ -757,6 +774,16 @@ impl Model {
         self.begin(id, Work::Publishing(None), Job::Publish)
     }
 
+    /// "Publish changes" on a public tour whose live page is behind its draft: the job a draft's
+    /// Publish runs, for the same link. It asks nothing, and starts only where the button shows
+    /// and while nothing else runs on the tour.
+    pub fn start_publish_changes(&mut self, id: &str) -> Option<Started> {
+        if !self.can_act(id) || !self.tour(id).is_some_and(RemoteTour::changes_waiting) {
+            return None;
+        }
+        self.begin(id, Work::Publishing(None), Job::Publish)
+    }
+
     /// "Unpublish" on a public tour.
     pub fn start_unpublish(&mut self, id: &str) -> Option<Started> {
         if !self.can_act(id) || !self.tour(id).is_some_and(RemoteTour::is_public) {
@@ -833,6 +860,8 @@ impl Model {
                     t.status = "published".to_string();
                     t.link = link;
                     t.published_at = None;
+                    // Everything that waited is live now.
+                    t.unpublished_changes = false;
                 }
             }
             Ok(Done::Unpublished) => {
@@ -840,6 +869,7 @@ impl Model {
                     t.status = "draft".to_string();
                     t.link = None;
                     t.published_at = None;
+                    t.unpublished_changes = false;
                 }
             }
             Ok(Done::Deleted) => removed(self),
@@ -1470,6 +1500,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                         state.spawn_job(job);
                     }
                 }
+                RowButton::PublishChanges => {
+                    if let Some(job) = m.start_publish_changes(&id) {
+                        state.spawn_job(job);
+                    }
+                }
                 RowButton::Unpublish => {
                     if let Some(job) = m.start_unpublish(&id) {
                         state.spawn_job(job);
@@ -1611,7 +1646,8 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                 }
             });
         } else if !renaming {
-            ui.horizontal(|ui| {
+            // Wrapped: with Publish changes a public row has seven buttons, more than a narrow window holds on one line.
+            ui.horizontal_wrapped(|ui| {
                 for b in row_buttons(t) {
                     let text = if b == RowButton::Delete { RichText::new(b.label()).color(DANGER) } else { RichText::new(b.label()) };
                     if ui.button(text).clicked() {
@@ -1675,6 +1711,7 @@ mod tests {
             link: public.then(|| format!("https://tours.example.com/t/{}", &id[5..11])),
             updated_at: Some(1_763_424_000_000),
             published_at: public.then_some(1_763_467_200_000),
+            unpublished_changes: false,
         }
     }
 
@@ -3866,5 +3903,271 @@ mod tests {
             assert_eq!(line(bytes), format!("recording saved on this computer ({size})"));
             assert_eq!(crate::settings_ui::saved_recordings_line(project::Totals { count: 1, bytes }), format!("1 saved recording · {size}"));
         }
+    }
+
+    // ---- Publish changes ----
+
+    /// A public tour whose live page is behind its draft.
+    fn waiting(id: &str, title: &str) -> RemoteTour {
+        RemoteTour { unpublished_changes: true, ..tour(id, title, true, 22) }
+    }
+
+    /// A draft a misbehaving site says has changes waiting.
+    fn odd_draft(id: &str, title: &str) -> RemoteTour {
+        RemoteTour { unpublished_changes: true, ..tour(id, title, false, 9) }
+    }
+
+    /// The list of a site of 0.1.6: A is public with changes waiting; B is a draft the site wrongly flags too.
+    const LIST_WAITING: &str = r#"{"tours":[
+        {"id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","title":"Customer onboarding","status":"published","slug":"abc123","url":"/t/abc123","chapters":2,"steps":22,"updated_at":1763424000000,"published_at":1763467200000,"unpublished_changes":true},
+        {"id":"tour_bbbbbbbbbbbbbbbbbbbbbbbb","title":"Testing","status":"draft","slug":"def456","url":null,"chapters":1,"steps":9,"updated_at":1763424000000,"published_at":null,"unpublished_changes":true}]}"#;
+    /// The same list once everything is published.
+    const LIST_LIVE: &str = r#"{"tours":[
+        {"id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","title":"Customer onboarding","status":"published","slug":"abc123","url":"/t/abc123","chapters":2,"steps":22,"updated_at":1763424000000,"published_at":1763467200000,"unpublished_changes":false},
+        {"id":"tour_bbbbbbbbbbbbbbbbbbbbbbbb","title":"Testing","status":"draft","slug":"def456","url":null,"chapters":1,"steps":9,"updated_at":1763424000000,"published_at":null,"unpublished_changes":false}]}"#;
+    const PUBLISH_A: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
+    const WAITING_NOTE: &str = " · changes waiting to be published";
+
+    #[test]
+    fn only_a_public_tour_with_changes_waiting_gets_publish_changes_after_edit() {
+        use RowButton::*;
+        assert_eq!(PublishChanges.label(), "Publish changes");
+        let public = waiting(A, "A");
+        assert_eq!(row_buttons(&public), [CopyLink, Open, Edit, PublishChanges, Rename, Unpublish, Delete]);
+        assert_eq!(row_buttons(&public).iter().map(|b| b.label()).collect::<Vec<_>>(), ["Copy link", "Open", "Edit", "Publish changes", "Rename", "Unpublish", "Delete"]);
+        // An older site's row without a link: still directly after Edit.
+        let unlinked = RemoteTour { link: None, ..public.clone() };
+        assert_eq!(row_buttons(&unlinked), [Edit, PublishChanges, Rename, Unpublish, Delete]);
+        // A public tour with nothing waiting is as it was.
+        assert_eq!(row_buttons(&tour(A, "A", true, 22)), [CopyLink, Open, Edit, Rename, Unpublish, Delete]);
+        // A draft keeps its own Publish and never gets the button, whatever the site says.
+        assert_eq!(row_buttons(&odd_draft(B, "B")), [Publish, Edit, Rename, Delete]);
+        assert_eq!(row_buttons(&tour(B, "B", false, 9)), [Publish, Edit, Rename, Delete]);
+    }
+
+    #[test]
+    fn the_detail_line_says_changes_are_waiting_after_the_date_and_before_the_saved_recording() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 18, 12, 0, 0).unwrap();
+        let mut t = waiting(A, "Customer onboarding");
+        t.published_at = Some(now.timestamp_millis());
+        assert_eq!(detail_line(&t, &[], &now), "2 chapters · 22 steps · published 18 Nov · changes waiting to be published");
+        let one = [info(A, CH1, "Chapter one", mb(12.4), None)];
+        assert_eq!(detail_line(&t, &one, &now), "2 chapters · 22 steps · published 18 Nov · changes waiting to be published · recording saved on this computer (12.4 MB)");
+        // A site that gives no date: after the counts.
+        t.published_at = None;
+        assert_eq!(detail_line(&t, &[], &now), "2 chapters · 22 steps · changes waiting to be published");
+        // Nothing waiting, and a draft the site flags: the line is as it always was.
+        t.unpublished_changes = false;
+        assert_eq!(detail_line(&t, &one, &now), "2 chapters · 22 steps · recording saved on this computer (12.4 MB)");
+        let mut d = odd_draft(B, "Testing");
+        d.updated_at = Some(now.timestamp_millis());
+        assert_eq!(detail_line(&d, &[], &now), "2 chapters · 9 steps · updated 18 Nov");
+    }
+
+    #[test]
+    fn publish_changes_runs_the_publish_job_once_and_only_where_the_button_shows() {
+        // Nothing to publish: a public tour without the flag, a draft with it, a tour that is not there.
+        let mut m = loaded(vec![tour(A, "Customer onboarding", true, 22), odd_draft(B, "Testing")]);
+        assert_eq!((m.start_publish_changes(A), m.start_publish_changes(B), m.start_publish_changes(C)), (None, None, None));
+        assert_eq!((m.work(A), m.work(B)), (None, None));
+        // With changes waiting: the very job a draft's Publish runs, with its progress, and once.
+        let mut m = loaded(vec![waiting(A, "Customer onboarding"), tour(B, "Testing", false, 9)]);
+        m.ask_delete(A);
+        let job = m.start_publish_changes(A).unwrap();
+        let draft_job = m.start_publish(B).unwrap();
+        assert_eq!((&job.job, &draft_job.job), (&Job::Publish, &Job::Publish));
+        assert_eq!((job.id.as_str(), job.listed), (A, true));
+        assert_eq!((m.work(A), m.work(B)), (Some(Work::Publishing(None)), Some(Work::Publishing(None))));
+        assert_eq!(m.edit(), &Edit::None, "no question is asked, and an open one on that tour closes");
+        assert_eq!(m.start_publish_changes(A), None, "a second press starts nothing");
+        m.progress(A, Work::Publishing(Some((3, 22))));
+        assert_eq!(work_message(m.work(A).unwrap()), "Publishing… 3 of 22 images");
+        // A draft's own Publish never fits a public tour, with or without changes waiting.
+        let mut m = loaded(vec![waiting(A, "Customer onboarding")]);
+        assert_eq!(m.start_publish(A), None);
+    }
+
+    #[test]
+    fn publish_changes_does_not_start_while_another_job_runs_on_that_tour() {
+        let fresh = || loaded(vec![waiting(A, "Customer onboarding"), tour(B, "Testing", false, 9)]);
+        let starts: [(&str, fn(&mut Model) -> Option<Started>); 4] = [
+            ("a rename", |m| {
+                m.start_rename(A);
+                *m.rename_text().unwrap() = "Another name".into();
+                m.save_rename()
+            }),
+            ("a delete", |m| {
+                m.ask_delete(A);
+                m.confirm_delete(A)
+            }),
+            ("an unpublish", |m| m.start_unpublish(A)),
+            ("another publish", |m| m.start_publish_changes(A)),
+        ];
+        for (what, start) in starts {
+            let mut m = fresh();
+            let running = start(&mut m).unwrap_or_else(|| panic!("{what} starts"));
+            assert_eq!(m.start_publish_changes(A), None, "while {what} runs");
+            assert_eq!(m.work(A).map(work_message), Some(work_message(match running.job {
+                Job::Rename(_) => Work::Renaming,
+                Job::Delete => Work::Deleting(None),
+                Job::Unpublish => Work::Unpublishing,
+                Job::Publish => Work::Publishing(None),
+            })), "the running job keeps its own progress");
+            // Once it ended without changing the tour, the button works again.
+            m.finish(&running, Err(Failure::Message("It did not work.".into())));
+            assert!(m.start_publish_changes(A).is_some(), "after {what}");
+        }
+    }
+
+    #[test]
+    fn a_publish_of_changes_that_worked_takes_the_flag_away_and_one_that_failed_keeps_it() {
+        let mut m = loaded(vec![waiting(A, "Customer onboarding")]);
+        let job = m.start_publish_changes(A).unwrap();
+        m.finish(&job, Err(Failure::Message("Could not publish the tour: the server answered HTTP 500.".into())));
+        assert_eq!(m.error(A), Some("Could not publish the tour: the server answered HTTP 500."));
+        assert!(m.tours()[0].unpublished_changes && row_buttons(&m.tours()[0]).contains(&RowButton::PublishChanges));
+        // Pressing again clears the error line and runs again.
+        let job = m.start_publish_changes(A).unwrap();
+        assert_eq!(m.error(A), None);
+        m.finish(&job, Ok(Done::Published(Some("https://tours.example.com/t/aaaaaa".into()))));
+        let t = &m.tours()[0];
+        assert!(t.is_public() && !t.unpublished_changes && t.link.is_some());
+        assert_eq!(row_buttons(t), [RowButton::CopyLink, RowButton::Open, RowButton::Edit, RowButton::Rename, RowButton::Unpublish, RowButton::Delete]);
+        assert_eq!(m.start_publish_changes(A), None);
+        assert!(m.wants_load(Instant::now()), "the list is read again");
+        // Unpublishing a tour with changes waiting leaves a plain draft.
+        let mut m = loaded(vec![waiting(A, "Customer onboarding")]);
+        let job = m.start_unpublish(A).unwrap();
+        m.finish(&job, Ok(Done::Unpublished));
+        assert_eq!(row_buttons(&m.tours()[0]), [RowButton::Publish, RowButton::Edit, RowButton::Rename, RowButton::Delete]);
+    }
+
+    #[test]
+    fn pressing_publish_changes_publishes_that_tour_with_progress_and_the_button_and_note_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let live = Arc::new(AtomicBool::new(false));
+        let done = live.clone();
+        let s = stub(move |req, seen| match req.line.as_str() {
+            "GET /api/v1/tours" => reply(200, if done.load(Ordering::SeqCst) { LIST_LIVE } else { LIST_WAITING }),
+            PUBLISH_A if seen == 0 => reply(202, r#"{"status":"in_progress","publish_id":"pub_0123456789abcdef01234567","done":1,"total":4}"#),
+            PUBLISH_A => {
+                // Long enough for the page to draw the count.
+                std::thread::sleep(Duration::from_millis(300));
+                done.store(true, Ordering::SeqCst);
+                reply(200, r#"{"status":"published","steps":22,"slug":"abc123","url":"/t/abc123"}"#)
+            }
+            _ => reply(500, r#"{"error":"unexpected"}"#),
+        });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
+        // The button and the note on the public tour only; the flagged draft is a plain draft.
+        assert_eq!(text.lines().filter(|l| *l == "Publish changes").count(), 1, "{text}");
+        assert_eq!(text.lines().filter(|l| *l == "Publish").count(), 1, "{text}");
+        let flat = text.replace('\n', " ");
+        assert_eq!(flat.matches(WAITING_NOTE).count(), 1, "{text}");
+        assert!(flat.contains(&format!("2 chapters · 22 steps · published {}{WAITING_NOTE}", day_label(1_763_467_200_000, &Local::now()).unwrap())), "{text}");
+        assert!(flat.contains("1 chapter · 9 steps · updated ") && !flat.contains(&format!("updated {}{WAITING_NOTE}", day_label(1_763_424_000_000, &Local::now()).unwrap())), "{text}");
+        // The row's buttons in order, on one line: Copy link, Open, Edit, Publish changes, Rename, Unpublish, Delete.
+        let at = |state: &mut ToursState, word: &str| places(&ctx, state, &conn, word)[0];
+        let row: Vec<egui::Pos2> = ["Copy link", "Open", "Edit", "Publish changes", "Rename", "Unpublish", "Delete"].iter().map(|w| at(&mut state, w)).collect();
+        assert!(row.windows(2).all(|w| w[0].x < w[1].x && (w[0].y - w[1].y).abs() < 1.0), "{row:?}");
+        assert!(row[6].x < 590.0, "the row fits the page: {row:?}");
+        assert!(s.lines().iter().all(|l| l == "GET /api/v1/tours"), "looking sends nothing: {:?}", s.lines());
+
+        // One press: no question, the job runs at once.
+        assert_eq!(click(&ctx, &mut state, &conn, row[3]), None);
+        {
+            let m = lock(&state.model);
+            assert_eq!(m.edit(), &Edit::None);
+            assert!(m.work(A).is_some() || s.lines().iter().any(|l| l == PUBLISH_A), "the publish started");
+        }
+        // The row's progress, with the site's count, in place of that row's buttons.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (text, _) = drawn(&ctx, &mut state, &conn);
+            if has_line(&text, "Publishing… 1 of 4 images") {
+                assert!(!has_line(&text, "Publish changes") && !has_line(&text, "Copy link") && !has_line(&text, "Unpublish"), "{text}");
+                assert!(has_line(&text, "Publish"), "the other row stays usable:\n{text}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the count never showed:\n{text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Done: the list is read again, and the button and the note are gone.
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(A).is_none() && !m.is_loading() && !m.wants_load(Instant::now()) && m.tours().len() == 2);
+        assert!(!text.contains("Publish changes") && !text.replace('\n', " ").contains(WAITING_NOTE), "{text}");
+        assert!(has_line(&text, "Copy link") && has_line(&text, "Unpublish") && has_line(&text, "Public") && !text.contains("Could not"), "{text}");
+        {
+            let m = lock(&state.model);
+            assert!(m.tours().iter().all(|t| !t.unpublished_changes) && m.tours()[0].is_public() && m.tours()[0].published_at == Some(1_763_467_200_000));
+            assert_eq!(m.tours()[0].link, Some(format!("{}/t/abc123", s.base)));
+        }
+        // Only publish calls for that tour were sent besides the list: no upload, nothing for the draft.
+        let reqs = s.requests();
+        let sent: Vec<&crate::publish::tests::Req> = reqs.iter().filter(|r| r.line != "GET /api/v1/tours").collect();
+        assert_eq!(sent.iter().map(|r| r.line.as_str()).collect::<Vec<_>>(), [PUBLISH_A; 2]);
+        assert!(sent[0].body.is_empty());
+        assert_eq!(String::from_utf8_lossy(&sent[1].body), r#"{"publish_id":"pub_0123456789abcdef01234567"}"#);
+        assert!(reqs.iter().all(|r| !r.line.contains("upload") && !r.line.contains("dp_")) && !text.contains("dp_"));
+        assert!(reqs.iter().filter(|r| r.line == "GET /api/v1/tours").count() >= 2, "the list was read again");
+    }
+
+    #[test]
+    fn a_publish_of_changes_shows_what_a_draft_publish_shows_while_it_runs() {
+        // The row of a draft being published offers its progress and nothing to press (there is
+        // no Cancel on a Tours row); publishing changes is the same job and shows the same.
+        let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST_WAITING) } else { reply(500, r#"{"error":"unexpected"}"#) });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
+        {
+            // Both jobs are held as running, without their threads: the page draws what the model says.
+            let mut m = lock(&state.model);
+            assert!(m.start_publish_changes(A).is_some() && m.start_publish(B).is_some());
+            m.progress(A, Work::Publishing(Some((2, 9))));
+            m.progress(B, Work::Publishing(Some((2, 9))));
+        }
+        let (text, _) = drawn(&ctx, &mut state, &conn);
+        assert_eq!(text.lines().filter(|l| *l == "Publishing… 2 of 9 images").count(), 2, "{text}");
+        for word in ["Publish changes", "Publish", "Cancel", "Edit", "Rename", "Unpublish", "Delete", "Copy link", "Open"] {
+            assert!(!has_line(&text, word), "a row that is publishing offers no {word:?}:\n{text}");
+        }
+        // The note stays on the detail line until the site says the changes are live.
+        assert_eq!(text.replace('\n', " ").matches(WAITING_NOTE).count(), 1, "{text}");
+        assert!(s.lines().iter().all(|l| l == "GET /api/v1/tours"));
+    }
+
+    #[test]
+    fn a_publish_of_changes_that_fails_leaves_the_button_with_the_error_line() {
+        let s = stub(|req, _| match req.line.as_str() {
+            "GET /api/v1/tours" => reply(200, LIST_WAITING),
+            _ => reply(500, r#"{"error":"server_error"}"#),
+        });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
+        let button = places(&ctx, &mut state, &conn, "Publish changes");
+        assert_eq!(button.len(), 1);
+        assert_eq!(click(&ctx, &mut state, &conn, button[0]), None);
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(A).is_none() && m.error(A).is_some() && !m.is_loading() && !m.wants_load(Instant::now()));
+        let error = lock(&state.model).error(A).unwrap().to_string();
+        assert!(error.starts_with("Could not publish the tour: ") && error.contains("HTTP 500"), "{error}");
+        assert!(text.replace('\n', " ").contains(&error), "{text}");
+        assert!(has_line(&text, "Publish changes") && text.replace('\n', " ").contains(WAITING_NOTE), "the button and the note are still there:\n{text}");
+        assert_eq!(s.lines().iter().filter(|l| *l == PUBLISH_A).count(), 1, "a failed call is not sent again");
+        assert!(s.lines().iter().all(|l| l == "GET /api/v1/tours" || l == PUBLISH_A), "{:?}", s.lines());
+    }
+
+    #[test]
+    fn a_site_that_does_not_say_whether_changes_wait_shows_no_publish_changes() {
+        // The list of a site of 0.1.5: no such field on any row.
+        let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(500, r#"{"error":"unexpected"}"#) });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
+        assert!(!text.contains("Publish changes") && !text.contains("changes waiting"), "{text}");
+        for (word, times) in [("Copy link", 1), ("Open", 1), ("Unpublish", 1), ("Publish", 1), ("Edit", 2), ("Rename", 2), ("Delete", 2)] {
+            assert_eq!(text.lines().filter(|l| *l == word).count(), times, "{word:?} in:\n{text}");
+        }
+        let mut m = lock(&state.model);
+        assert!(m.tours().iter().all(|t| !t.unpublished_changes));
+        assert_eq!((m.start_publish_changes(A), m.start_publish_changes(B)), (None, None));
     }
 }

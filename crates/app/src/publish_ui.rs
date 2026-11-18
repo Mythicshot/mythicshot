@@ -658,7 +658,7 @@ impl Before {
 const UPDATE_NOT_PUBLIC: &str = "The update is uploaded, but the public page still shows the previous version.";
 /// After an update the site would not publish, because that would publish more than the update.
 /// The wording is proposed and waits for the owner's approval.
-pub const UPDATE_HELD: &str = "This tour has other changes that were never published, so the update was uploaded without publishing. Publish the tour from the Tours page when all of it is ready.";
+pub const UPDATE_HELD: &str = "This tour has other changes that were never published, so the update was uploaded without publishing. Publish the changes from the Tours page when all of it is ready.";
 
 /// The result screen's heading. `update` is whether a chapter was replaced over the same link
 /// ("Update tour"), as opposed to a new tour or a new chapter.
@@ -1665,7 +1665,7 @@ pub(crate) mod tests {
     }
 
     fn tour(title: &str, chapters: u32, steps: u32, status: &str) -> RemoteTour {
-        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None, updated_at: None, published_at: None }
+        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None, updated_at: None, published_at: None, unpublished_changes: false }
     }
 
     #[test]
@@ -2536,7 +2536,7 @@ pub(crate) mod tests {
         assert_eq!(result_heading(&held, true), "Update uploaded");
         assert_eq!(
             result_note(&held, &was_public(), true),
-            Some(("This tour has other changes that were never published, so the update was uploaded without publishing. Publish the tour from the Tours page when all of it is ready.".to_string(), false))
+            Some(("This tour has other changes that were never published, so the update was uploaded without publishing. Publish the changes from the Tours page when all of it is ready.".to_string(), false))
         );
         assert_eq!(result_line("Customer onboarding", &finished(3, held.clone()), &was_public(), true), "Customer onboarding · this chapter: 3 steps · the public version is unchanged");
         assert_eq!(result_status(&finished(3, held.clone()), &was_public(), true), "Update uploaded: the public page still shows the previous version");

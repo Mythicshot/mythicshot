@@ -108,11 +108,20 @@ pub struct RemoteTour {
     pub updated_at: Option<i64>,
     /// When it went public, in milliseconds since 1970: only a published tour on a site of 0.1.1 or newer has it.
     pub published_at: Option<i64>,
+    /// The tour is public and its live page is behind its draft: only a site of 0.1.6 or newer
+    /// says. False when the list does not say (an older site), says anything but yes or no, or
+    /// says it of a draft.
+    pub unpublished_changes: bool,
 }
 
 impl RemoteTour {
     pub fn is_public(&self) -> bool {
         self.status == "published"
+    }
+
+    /// Whether changes wait to be published: a public tour the site says is behind its draft.
+    pub fn changes_waiting(&self) -> bool {
+        self.is_public() && self.unpublished_changes
     }
 }
 
@@ -721,7 +730,9 @@ impl Client {
                 // Only a published tour has a link, whatever else the row says.
                 let link = if status == "published" { public_url(&self.base, r.get("url").and_then(Value::as_str), r.get("slug").and_then(Value::as_str)) } else { None };
                 let published_at = if status == "published" { ms("published_at") } else { None };
-                Some(RemoteTour { id: s("id")?, title: s("title")?, status, chapters: n("chapters")?, steps: n("steps")?, link, updated_at: ms("updated_at"), published_at })
+                // Only a plain yes counts, and only of a published tour: there the live page can be behind.
+                let unpublished_changes = status == "published" && r.get("unpublished_changes").and_then(Value::as_bool).unwrap_or(false);
+                Some(RemoteTour { id: s("id")?, title: s("title")?, status, chapters: n("chapters")?, steps: n("steps")?, link, updated_at: ms("updated_at"), published_at, unpublished_changes })
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| not_understood(what))
@@ -2697,8 +2708,8 @@ pub(crate) mod tests {
         assert_eq!(
             tours,
             [
-                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None, updated_at: Some(1700000000000), published_at: None },
-                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None, updated_at: Some(1), published_at: None },
+                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None, updated_at: Some(1700000000000), published_at: None, unpublished_changes: false },
+                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None, updated_at: Some(1), published_at: None, unpublished_changes: false },
             ]
         );
         // A list that names a tour's slug or url gives its link, by the same rule as a publish answer.
@@ -3337,6 +3348,31 @@ pub(crate) mod tests {
         let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"t","title":"T","status":"published","chapters":1,"steps":1,"updated_at":-5,"published_at":"yesterday"}]}"#));
         let t = &list_tours(&s.base, TOKEN).unwrap()[0];
         assert_eq!((t.updated_at, t.published_at), (None, None));
+    }
+
+    #[test]
+    fn the_tour_list_says_which_public_tours_have_changes_waiting() {
+        let row = |id: &str, status: &str, extra: &str| format!(r#"{{"id":"{id}","title":"T","status":"{status}","slug":"abc123","url":"/t/abc123","chapters":1,"steps":3,"updated_at":1700000000000{extra}}}"#);
+        let rows = [
+            row("yes", "published", r#","unpublished_changes":true"#),
+            row("no", "published", r#","unpublished_changes":false"#),
+            // An older site sends no such field.
+            row("absent", "published", ""),
+            // Anything that is not a yes or a no reads as no.
+            row("null", "published", r#","unpublished_changes":null"#),
+            row("string", "published", r#","unpublished_changes":"true""#),
+            row("number", "published", r#","unpublished_changes":1"#),
+            // A draft has nothing public to be behind, whatever the row says.
+            row("draft", "draft", r#","unpublished_changes":true"#),
+        ];
+        let body = format!(r#"{{"tours":[{}]}}"#, rows.join(","));
+        let s = stub(move |_, _| reply(200, &body));
+        let tours = list_tours(&s.base, TOKEN).unwrap();
+        let read: Vec<(&str, bool)> = tours.iter().map(|t| (t.id.as_str(), t.unpublished_changes)).collect();
+        assert_eq!(read, [("yes", true), ("no", false), ("absent", false), ("null", false), ("string", false), ("number", false), ("draft", false)]);
+        // The rest of each row is read as before.
+        assert!(tours.iter().all(|t| t.title == "T" && t.steps == 3 && t.updated_at == Some(1700000000000)));
+        assert!(tours[..6].iter().all(|t| t.link.is_some()) && tours[6].link.is_none());
     }
 
     #[test]

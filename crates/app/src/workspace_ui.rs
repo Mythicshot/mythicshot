@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(tours_summary(Counts { public: 0, draft: 0 }), "0");
         assert_eq!(version_label(Some("0.1.1")), "0.1.1");
         assert_eq!(version_label(None), "unknown");
-        let t = |status: &str| RemoteTour { id: "t".into(), title: "T".into(), status: status.into(), chapters: 1, steps: 1, link: None, updated_at: None, published_at: None };
+        let t = |status: &str| RemoteTour { id: "t".into(), title: "T".into(), status: status.into(), chapters: 1, steps: 1, link: None, updated_at: None, published_at: None, unpublished_changes: false };
         assert_eq!(Counts::of(&[t("published"), t("draft"), t("draft")]), Counts { public: 1, draft: 2 });
         assert_eq!(Counts::of(&[]), Counts { public: 0, draft: 0 });
     }
