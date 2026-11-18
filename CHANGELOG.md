@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.3 (2026-11-18)
+
+- Tours page: see the tours on your site with their status, and copy the link, open, publish, unpublish, rename or delete each one. Delete asks first.
+- Workspace page: site address, token, Test connection, Open site and the site's version. These settings moved here from the Output tab.
+- The saved token is tied to the site it was saved for and is never sent to a different address without your say-so.
+- A delete that stops half-way is remembered and can be finished from the Tours page, also after a restart.
+- Needs a site running platform 0.1.1 or newer for rename, delete and links in the list.
+
 ## 0.2.2 (2026-11-18)
 
 - Main window: a left-click on the tray icon opens Mythicshot with a menu for Home, Tours, Workspace and Preferences. Tours and Workspace are placeholders until the next update.

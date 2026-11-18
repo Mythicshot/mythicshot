@@ -15,6 +15,12 @@
 //! answers 200 with the public link. Cancelling just stops calling; the server clears a
 //! publish nobody drives any more, and the public version changes only on the last call.
 //!
+//! Managing a tour that is already on the site (the Tours page) is a call or a short loop
+//! each: rename is one PATCH; unpublish and delete are called again while the server
+//! answers 202, like publish. A tour that is gone answers 404 `no such tour`: for delete
+//! that is what was asked for, for the others the error says the tour no longer exists
+//! (see [`is_gone`]). A site older than 0.1.1 has no rename or delete route, and says so.
+//!
 //! Nothing is retried blindly. Only two requests are ever sent a second time, and only
 //! after a transport failure (no answer at all): a step image, where the server answers
 //! 409 `already_sent` if the first copy did arrive, and commit, which the server treats
@@ -57,6 +63,21 @@ const MAX_PUBLISH_CALLS: u32 = 200;
 /// Longest public link shown or opened.
 const MAX_URL_CHARS: usize = 300;
 
+/// Longest site version shown.
+const MAX_VERSION_CHARS: usize = 20;
+/// The 404 detail the server gives for a tour it does not have (unknown, deleted, another
+/// workspace's). A 404 without it is a route the server does not have: an older site.
+const NO_SUCH_TOUR: &str = "no such tour";
+/// How an error ends when the tour it was about is no longer on the site; see [`is_gone`].
+const GONE: &str = "that tour no longer exists.";
+/// The sentence the Tours page shows for such an error.
+pub const TOUR_GONE: &str = "That tour no longer exists.";
+/// What a delete's error ends with when the tour is gone but files are left. The tour is no
+/// longer in the list then, so the way back is the Tours page's own block for it.
+const UNFINISHED_TRAILER: &str = " The tour itself is gone from the site, but some of its files remain. Use Finish deleting on the Tours page to remove them.";
+/// What rename and delete say to a site that does not have those routes yet.
+const NEEDS_UPDATE: &str = "the site needs an update to version 0.1.1 or newer.";
+
 pub const REJECTED_TOKEN: &str = "The server rejected the API token.";
 pub const CANCELLED: &str = "cancelled";
 
@@ -69,6 +90,38 @@ pub struct RemoteTour {
     pub steps: u32,
     /// The tour's public link, when the tour list gives one (a `url` or a `slug`) and it passes the link rule.
     pub link: Option<String>,
+    /// When it was last uploaded to, in milliseconds since 1970, when the list says.
+    pub updated_at: Option<i64>,
+    /// When it went public, in milliseconds since 1970: only a published tour on a site of 0.1.1 or newer has it.
+    pub published_at: Option<i64>,
+}
+
+impl RemoteTour {
+    pub fn is_public(&self) -> bool {
+        self.status == "published"
+    }
+}
+
+/// What `GET /api/v1/me` says: the workspace's name, and the site's version when the site is new enough to tell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Workspace {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+/// A delete that did not finish.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteFailed {
+    pub message: String,
+    /// The site has already removed the tour itself; only some of its files are left.
+    /// Deleting the same tour again carries on where this stopped.
+    pub unfinished: bool,
+}
+
+/// Whether `error` (from rename, publish or unpublish) says the tour is no longer on the site.
+/// Text from the server can never produce this ending: it is always followed by "(HTTP …)".
+pub fn is_gone(error: &str) -> bool {
+    error.ends_with(&format!(": {GONE}"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +211,22 @@ fn safe_link(url: &str) -> Option<String> {
     (url.len() <= MAX_URL_CHARS && mythicshot_destinations::is_web_link(url) && check_server(url).is_ok()).then(|| url.to_string())
 }
 
+/// The host name of a site address the address rule accepts, in lower case; an IPv6 address keeps its brackets.
+pub fn host_of(address: &str) -> Option<String> {
+    let url = check_server(address).ok()?;
+    let authority = url.split_once("://")?.1.split('/').next()?;
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => &authority[..rest.find(']')? + 2],
+        None => authority.rsplit_once(':').map_or(authority, |(host, _port)| host),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether `id` has the form of a tour id.
+pub fn is_tour_id(id: &str) -> bool {
+    is_id(id, "tour_")
+}
+
 /// Accepts https URLs, and http only for localhost and 127.0.0.1. Returns the URL without a trailing slash.
 pub fn check_server(url: &str) -> Result<String, String> {
     let url = url.trim();
@@ -222,12 +291,35 @@ fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
     Some((host, port))
 }
 
-pub fn workspace_name(server: &str, token: &str) -> Result<String, String> {
-    Client::new(server, token, Timeouts::default())?.workspace_name()
+/// The workspace's name and the site's version.
+pub fn workspace(server: &str, token: &str) -> Result<Workspace, String> {
+    Client::new(server, token, Timeouts::default())?.workspace()
 }
 
 pub fn list_tours(server: &str, token: &str) -> Result<Vec<RemoteTour>, String> {
     Client::new(server, token, Timeouts::default())?.list_tours()
+}
+
+/// Renames the tour; returns the title as the site saved it. The link stays the same.
+pub fn rename_tour(server: &str, token: &str, tour_id: &str, title: &str) -> Result<String, String> {
+    Client::new(server, token, Timeouts::default())?.rename_tour(tour_id, title)
+}
+
+/// Deletes the tour: calls the delete route until the site says nothing of it is left.
+/// `progress` is called once before every request, with the files removed so far when the
+/// site says. A second call of it therefore means the site has begun: the tour itself is
+/// gone and only files remain, which is the moment to note the delete as unfinished. A tour that is already
+/// gone is a success. There is no cancel: the first call removes the tour, the rest only
+/// its files, and stopping half-way would leave files nobody can find again. Blocks like
+/// [`publish_tour`].
+pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+    Client::new(server, token, Timeouts::default()).map_err(|message| DeleteFailed { message, unfinished: false })?.delete_tour(tour_id, PUBLISH_PAUSE, progress)
+}
+
+/// Takes the tour off the public web: calls the unpublish route until its public images
+/// are gone too. The tour stays on the site as a draft.
+pub fn unpublish_tour(server: &str, token: &str, tour_id: &str) -> Result<(), String> {
+    Client::new(server, token, Timeouts::default())?.unpublish_tour(tour_id, PUBLISH_PAUSE)
 }
 
 /// Uploads the bundle in `dir`. `progress` gets 0.0–1.0 and returns false to cancel.
@@ -421,6 +513,7 @@ enum Method {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
@@ -459,6 +552,8 @@ impl Client {
             (Method::Put, None) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
             (Method::Post, Some((ct, data))) => a.post(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
             (Method::Put, Some((ct, data))) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
+            (Method::Patch, None) => a.patch(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
+            (Method::Patch, Some((ct, data))) => a.patch(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
         };
         let mut resp = result.map_err(|e| transport(&e))?;
         let status = resp.status().as_u16();
@@ -500,10 +595,14 @@ impl Client {
         (!clean.is_empty()).then_some(clean)
     }
 
-    fn workspace_name(&self) -> Result<String, String> {
+    fn workspace(&self) -> Result<Workspace, String> {
         let what = "Could not check the server";
         let reply = self.exchange(what, Method::Get, "/api/v1/me", None)?;
-        reply.json().and_then(|v| v.get("workspace")?.as_str().map(str::to_string)).ok_or_else(|| not_understood(what))
+        let v = reply.json().ok_or_else(|| not_understood(what))?;
+        let name = v.get("workspace").and_then(Value::as_str).ok_or_else(|| not_understood(what))?.to_string();
+        // A version is shown only when it looks like one; an older site sends none.
+        let version = v.get("version").and_then(Value::as_str).filter(|s| is_version(s)).map(str::to_string);
+        Ok(Workspace { name, version })
     }
 
     fn list_tours(&self) -> Result<Vec<RemoteTour>, String> {
@@ -515,8 +614,12 @@ impl Client {
             .map(|r| {
                 let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
                 let n = |k: &str| r.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
-                let link = public_url(&self.base, r.get("url").and_then(Value::as_str), r.get("slug").and_then(Value::as_str));
-                Some(RemoteTour { id: s("id")?, title: s("title")?, status: s("status")?, chapters: n("chapters")?, steps: n("steps")?, link })
+                let ms = |k: &str| r.get(k).and_then(Value::as_i64).filter(|ms| *ms > 0);
+                let status = s("status")?;
+                // Only a published tour has a link, whatever else the row says.
+                let link = if status == "published" { public_url(&self.base, r.get("url").and_then(Value::as_str), r.get("slug").and_then(Value::as_str)) } else { None };
+                let published_at = if status == "published" { ms("published_at") } else { None };
+                Some(RemoteTour { id: s("id")?, title: s("title")?, status, chapters: n("chapters")?, steps: n("steps")?, link, updated_at: ms("updated_at"), published_at })
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| not_understood(what))
@@ -656,6 +759,9 @@ impl Client {
                     _ => {}
                 }
             }
+            if Self::says_no_such_tour(&reply) {
+                return Err(format!("{what}: {GONE}"));
+            }
             let reply = self.check(what, reply)?;
             let v = reply.json().ok_or_else(|| not_understood(what))?;
             if reply.status == 202 {
@@ -689,6 +795,164 @@ impl Client {
         }
         Err(not_understood(what))
     }
+}
+
+impl Client {
+    /// Whether a 404 says the tour is not there, as opposed to the route not being there.
+    fn says_no_such_tour(reply: &Reply) -> bool {
+        reply.status == 404 && reply.json().is_some_and(|v| v.get("error").and_then(Value::as_str) == Some("not_found") && v.get("detail").and_then(Value::as_str) == Some(NO_SUCH_TOUR))
+    }
+
+    /// Whether the answer means the site has no such route: any other 404, or a 405.
+    fn says_no_such_route(reply: &Reply) -> bool {
+        reply.status == 405 || (reply.status == 404 && !Self::says_no_such_tour(reply))
+    }
+
+    fn rename_tour(&self, tour_id: &str, title: &str) -> Result<String, String> {
+        let what = "Could not rename the tour";
+        if !is_id(tour_id, "tour_") {
+            return Err(not_understood(what));
+        }
+        let body = json!({ "title": title }).to_string().into_bytes();
+        let reply = self.send(Method::Patch, &format!("/api/v1/tours/{tour_id}"), Some(("application/json", &body))).map_err(|t| format!("{what}: {}.", t.0))?;
+        if Self::says_no_such_tour(&reply) {
+            return Err(format!("{what}: {GONE}"));
+        }
+        if Self::says_no_such_route(&reply) {
+            return Err(format!("{what}: {NEEDS_UPDATE}"));
+        }
+        let reply = self.check(what, reply)?;
+        let v = reply.json().ok_or_else(|| not_understood(what))?;
+        // The answer must be about this tour.
+        if reply.status != 200 || v.get("id").and_then(Value::as_str) != Some(tour_id) {
+            return Err(not_understood(what));
+        }
+        let saved = v.get("title").and_then(Value::as_str).ok_or_else(|| not_understood(what))?;
+        Ok(saved.to_string())
+    }
+
+    /// The delete loop: the same call, `pause` apart, until the server answers 200, or 404
+    /// for a tour that is gone. Unlike publish, a call may be sent again: the server
+    /// carries on where it stopped, so a 500 `cleanup_pending` is simply called again.
+    /// Gives up after [`MAX_STALLED_CALLS`] calls in a row that removed nothing more.
+    fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+        let what = "Could not delete the tour";
+        let failed = |message: String, unfinished: bool| {
+            let message = if unfinished { format!("{message}{UNFINISHED_TRAILER}") } else { message };
+            DeleteFailed { message, unfinished }
+        };
+        if !is_id(tour_id, "tour_") {
+            return Err(failed(not_understood(what), false));
+        }
+        let path = format!("/api/v1/tours/{tour_id}");
+        // Once the server has answered that the delete is under way, the tour itself is gone.
+        let mut unfinished = false;
+        let mut files = None;
+        let (mut last_done, mut stalled) = (-1i128, 0u32);
+        for call in 1u32.. {
+            progress(files);
+            let reply = match self.send(Method::Delete, &path, None) {
+                Ok(r) => r,
+                Err(t) => return Err(failed(format!("{what}: {}.", t.0), unfinished)),
+            };
+            // Gone: deleted by this loop's earlier call, or elsewhere. Either way it is not there.
+            if Self::says_no_such_tour(&reply) {
+                return Ok(());
+            }
+            // Never with the "files remain" ending: half-way through, a 404 that is not the
+            // site's own (a proxy's page) says nothing about the tour either way.
+            if Self::says_no_such_route(&reply) {
+                return Err(failed(format!("{what}: {NEEDS_UPDATE}"), false));
+            }
+            if reply.status == 409 && reply.error_code().as_deref() == Some("publish_busy") {
+                return Err(failed(format!("{what}: a publish of this tour is in progress. Wait for it to finish, or unpublish the tour, then delete it again."), unfinished));
+            }
+            if reply.status == 500 && reply.error_code().as_deref() == Some("cleanup_pending") {
+                // The tour is deleted; some files could not be removed yet. Calling again retries.
+                unfinished = true;
+                stalled += 1;
+                if stalled >= MAX_STALLED_CALLS {
+                    return Err(failed(format!("{what} completely: the site could not remove some of its files yet."), true));
+                }
+            } else {
+                let reply = self.check(what, reply).map_err(|m| failed(m, unfinished))?;
+                let v = reply.json().ok_or_else(|| failed(not_understood(what), unfinished))?;
+                match reply.status {
+                    200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(()),
+                    202 if v.get("status").and_then(Value::as_str) == Some("in_progress") => {}
+                    _ => return Err(failed(not_understood(what), unfinished)),
+                }
+                unfinished = true;
+                let done = v.get("done").and_then(Value::as_u64);
+                files = done.zip(v.get("total").and_then(Value::as_u64)).filter(|(d, t)| *t > 0 && d <= t);
+                let moved = done.is_some_and(|d| i128::from(d) > last_done);
+                stalled = if moved { 0 } else { stalled + 1 };
+                last_done = done.map_or(last_done, |d| last_done.max(i128::from(d)));
+                if stalled >= MAX_STALLED_CALLS {
+                    let message = match files {
+                        Some((d, t)) => format!("{what} completely: the site stopped making progress at {d} of {t} files."),
+                        None => not_understood(what),
+                    };
+                    return Err(failed(message, true));
+                }
+            }
+            if call >= MAX_PUBLISH_CALLS {
+                return Err(failed(format!("{what} completely: the site did not finish within {MAX_PUBLISH_CALLS} calls."), true));
+            }
+            std::thread::sleep(pause);
+        }
+        Err(failed(not_understood(what), unfinished))
+    }
+
+    /// The unpublish loop: the first call takes the tour off the web; while the server
+    /// answers 202 (public images still to remove) or 500 `cleanup_pending`, it is called
+    /// again, `pause` apart. The server gives no counts, so the stop is a number of calls.
+    fn unpublish_tour(&self, tour_id: &str, pause: Duration) -> Result<(), String> {
+        let what = "Could not unpublish the tour";
+        if !is_id(tour_id, "tour_") {
+            return Err(not_understood(what));
+        }
+        let path = format!("/api/v1/tours/{tour_id}/unpublish");
+        // After a 202 or a `cleanup_pending` the tour is already off the web.
+        let mut off = false;
+        let mut pending = 0u32;
+        for call in 1u32.. {
+            let reply = self.send(Method::Post, &path, None).map_err(|t| if off { UNPUBLISHED_NOT_CLEARED.to_string() } else { format!("{what}: {}.", t.0) })?;
+            if Self::says_no_such_tour(&reply) {
+                return Err(format!("{what}: {GONE}"));
+            }
+            if reply.status == 500 && reply.error_code().as_deref() == Some("cleanup_pending") {
+                off = true;
+                pending += 1;
+                if pending >= MAX_STALLED_CALLS {
+                    return Err(UNPUBLISHED_NOT_CLEARED.to_string());
+                }
+            } else {
+                let reply = self.check(what, reply).map_err(|m| if off { UNPUBLISHED_NOT_CLEARED.to_string() } else { m })?;
+                match reply.status {
+                    204 => return Ok(()),
+                    202 if reply.json().is_some_and(|v| v.get("status").and_then(Value::as_str) == Some("in_progress")) => {
+                        off = true;
+                        pending = 0;
+                    }
+                    _ => return Err(not_understood(what)),
+                }
+            }
+            if call >= MAX_PUBLISH_CALLS {
+                return Err(UNPUBLISHED_NOT_CLEARED.to_string());
+            }
+            std::thread::sleep(pause);
+        }
+        Err(not_understood(what))
+    }
+}
+
+/// What unpublish says when the tour is off the web but the loop could not see the clean-up through.
+pub const UNPUBLISHED_NOT_CLEARED: &str = "The tour is no longer public, but the site has not removed all of its public images yet. It removes the rest later.";
+
+/// A version as a site reports it: short, digits, letters, dots and hyphens, starting with a digit.
+fn is_version(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_VERSION_CHARS && s.as_bytes()[0].is_ascii_digit() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 fn not_understood(what: &str) -> String {
@@ -857,52 +1121,52 @@ fn read_bundle_file(dir: &Path, f: &BundleFile) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
-    const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
+    pub(crate) const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
     const UP: &str = "up_0123456789abcdef01234567";
 
     #[derive(Debug, Clone)]
-    struct Req {
-        line: String,
-        auth: Option<String>,
-        content_type: Option<String>,
-        body: Vec<u8>,
+    pub(crate) struct Req {
+        pub(crate) line: String,
+        pub(crate) auth: Option<String>,
+        pub(crate) content_type: Option<String>,
+        pub(crate) body: Vec<u8>,
     }
 
     /// What the stub does with a request: answer, or drop the connection without a word.
-    enum Answer {
+    pub(crate) enum Answer {
         Reply(u16, String, Vec<(&'static str, String)>),
         Drop,
         Hang,
     }
 
-    fn reply(status: u16, body: &str) -> Answer {
+    pub(crate) fn reply(status: u16, body: &str) -> Answer {
         Answer::Reply(status, body.to_string(), vec![])
     }
 
-    struct Stub {
-        base: String,
+    pub(crate) struct Stub {
+        pub(crate) base: String,
         log: Arc<Mutex<Vec<Req>>>,
     }
 
     impl Stub {
-        fn lines(&self) -> Vec<String> {
+        pub(crate) fn lines(&self) -> Vec<String> {
             self.log.lock().unwrap().iter().map(|r| r.line.clone()).collect()
         }
-        fn requests(&self) -> Vec<Req> {
+        pub(crate) fn requests(&self) -> Vec<Req> {
             self.log.lock().unwrap().clone()
         }
     }
 
     /// A one-thread HTTP server on 127.0.0.1 that records each request and answers with `handler`.
     /// `handler` gets the request and how many earlier requests had the same line.
-    fn stub(handler: impl Fn(&Req, usize) -> Answer + Send + 'static) -> Stub {
+    pub(crate) fn stub(handler: impl Fn(&Req, usize) -> Answer + Send + 'static) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1522,7 +1786,7 @@ mod tests {
     #[test]
     fn a_401_reads_as_a_token_problem_without_the_token() {
         let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
-        assert_eq!(workspace_name(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
+        assert_eq!(workspace(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
         assert_eq!(list_tours(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
         let err = upload(&s, 1, false, &Target::New).unwrap_err();
         assert_eq!(err, "The server rejected the API token.");
@@ -1543,8 +1807,8 @@ mod tests {
         assert_eq!(
             tours,
             [
-                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None },
-                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None },
+                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None, updated_at: Some(1700000000000), published_at: None },
+                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None, updated_at: Some(1), published_at: None },
             ]
         );
         // A list that names a tour's slug or url gives its link, by the same rule as a publish answer.
@@ -1552,7 +1816,7 @@ mod tests {
         let links: Vec<Option<String>> = list_tours(&s2.base, TOKEN).unwrap().into_iter().map(|t| t.link).collect();
         assert_eq!(links, [Some(format!("{}/t/abc", s2.base)), None]);
         assert_eq!(s.lines(), ["GET /api/v1/tours"]);
-        assert_eq!(workspace_name(&stub(platform).base, TOKEN).unwrap(), "Acme");
+        assert_eq!(workspace(&stub(platform).base, TOKEN).unwrap().name, "Acme");
 
         let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"t"}]}"#));
         assert_eq!(list_tours(&s.base, TOKEN).unwrap_err(), "Could not list the tours: the server's answer was not understood.");
@@ -1563,19 +1827,19 @@ mod tests {
         let echo = format!(r#"{{"error":"x","detail":"you sent {TOKEN}"}}"#);
         let mut errors = vec![
             check_server("http://example.com").unwrap_err(),
-            workspace_name("http://example.com", TOKEN).unwrap_err(),
-            workspace_name("https://x.dev", "dp_short").unwrap_err(),
+            workspace("http://example.com", TOKEN).unwrap_err(),
+            workspace("https://x.dev", "dp_short").unwrap_err(),
             store_token_in(&FakeStore::default(), &format!("{TOKEN}x")).unwrap_err(),
         ];
         let e2 = echo.clone();
         let s = stub(move |req, seen| if req.line.ends_with("/steps/1") { Answer::Reply(500, e2.clone(), vec![]) } else { platform(req, seen) });
         errors.push(upload(&s, 1, false, &Target::New).unwrap_err());
         let s = stub(move |_, _| Answer::Reply(400, echo.clone(), vec![]));
-        errors.push(workspace_name(&s.base, TOKEN).unwrap_err());
+        errors.push(workspace(&s.base, TOKEN).unwrap_err());
         errors.push(list_tours(&s.base, TOKEN).unwrap_err());
         errors.push(upload(&s, 1, false, &Target::New).unwrap_err());
         errors.push(upload(&stub(|_, _| reply(302, "")), 1, false, &Target::New).unwrap_err());
-        errors.push(workspace_name(&stub(|_, _| Answer::Drop).base, TOKEN).unwrap_err());
+        errors.push(workspace(&stub(|_, _| Answer::Drop).base, TOKEN).unwrap_err());
         for e in &errors {
             assert!(!e.contains(TOKEN) && !format!("{e:?}").contains(TOKEN), "{e}");
             assert!(!e.contains("0123456789abcdef0123"), "{e}");
@@ -1592,7 +1856,7 @@ mod tests {
         let other = stub(platform);
         let to = format!("{}/api/v1/me", other.base);
         let s = stub(move |_, _| Answer::Reply(307, String::new(), vec![("Location", to.clone())]));
-        let err = workspace_name(&s.base, TOKEN).unwrap_err();
+        let err = workspace(&s.base, TOKEN).unwrap_err();
         assert!(err.contains("redirect"), "{err}");
         assert!(other.lines().is_empty());
         let err = upload(&s, 1, false, &Target::New).unwrap_err();
@@ -1637,7 +1901,7 @@ mod tests {
         let s = stub(|_, _| Answer::Hang);
         let client = Client::new(&s.base, TOKEN, Timeouts { connect: Duration::from_millis(500), request: Duration::from_millis(300) }).unwrap();
         let start = std::time::Instant::now();
-        assert_eq!(client.workspace_name().unwrap_err(), "Could not check the server: the server did not answer in time.");
+        assert_eq!(client.workspace().unwrap_err(), "Could not check the server: the server did not answer in time.");
         assert!(start.elapsed() < Duration::from_secs(3));
     }
 
@@ -1645,7 +1909,7 @@ mod tests {
     fn a_huge_answer_is_cut_off() {
         let big = format!(r#"{{"workspace":"{}"}}"#, "x".repeat(MAX_RESPONSE_BYTES as usize + 10));
         let s = stub(move |_, _| Answer::Reply(200, big.clone(), vec![]));
-        assert_eq!(workspace_name(&s.base, TOKEN).unwrap_err(), "Could not check the server: the server's answer was too large.");
+        assert_eq!(workspace(&s.base, TOKEN).unwrap_err(), "Could not check the server: the server's answer was too large.");
     }
 
     #[test]
@@ -1782,10 +2046,402 @@ mod tests {
         let detail = format!("a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{00AD}f\u{061C}g\u{2060}h{}", "x".repeat(1000));
         let body = json!({ "error": "bad", "detail": detail }).to_string();
         let s = stub(move |_, _| Answer::Reply(400, body.clone(), vec![]));
-        let err = workspace_name(&s.base, TOKEN).unwrap_err();
+        let err = workspace(&s.base, TOKEN).unwrap_err();
         assert!(err.contains("abcdefgh"), "{err}");
         assert!(!err.chars().any(|c| is_invisible(c) || c.is_control()), "{err:?}");
         assert!(err.chars().count() < MAX_DETAIL_CHARS + 60, "{}", err.len());
+    }
+
+    // ---- Managing a tour on the site: rename, delete, unpublish ----
+
+    const RENAME: &str = "PATCH /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const DELETE: &str = "DELETE /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const UNPUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/unpublish";
+    /// The server's 404 for a tour it does not have, and its 404 for a route it does not have.
+    const NO_TOUR: &str = r#"{"error":"not_found","detail":"no such tour"}"#;
+    const NO_ROUTE: &str = r#"{"error":"not_found"}"#;
+    const CLEANUP_PENDING: &str = r#"{"error":"cleanup_pending","detail":"the tour is deleted, but some of its files could not be removed yet; delete it again to retry"}"#;
+    const GONE_TRAILER: &str = " The tour itself is gone from the site, but some of its files remain. Use Finish deleting on the Tours page to remove them.";
+
+    fn deleting(done: u32, total: u32) -> Answer {
+        reply(202, &format!(r#"{{"status":"in_progress","done":{done},"total":{total}}}"#))
+    }
+
+    /// Deletes TOUR against the stub with no pause, recording every progress report.
+    fn delete(stub: &Stub) -> (Result<(), DeleteFailed>, Vec<Option<Images>>) {
+        let mut seen = Vec::new();
+        let r = client(stub).delete_tour(TOUR, Duration::ZERO, |p| seen.push(p));
+        (r, seen)
+    }
+
+    fn unpublish(stub: &Stub) -> Result<(), String> {
+        client(stub).unpublish_tour(TOUR, Duration::ZERO)
+    }
+
+    #[test]
+    fn rename_sends_the_title_and_returns_what_the_site_saved() {
+        let s = stub(|_, _| reply(200, &format!(r#"{{"id":"{TOUR}","title":"New name"}}"#)));
+        assert_eq!(rename_tour(&s.base, TOKEN, TOUR, "  New name ").unwrap(), "New name");
+        let reqs = s.requests();
+        assert_eq!(s.lines(), [RENAME]);
+        assert_eq!(reqs[0].auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        assert_eq!(reqs[0].content_type.as_deref(), Some("application/json"));
+        assert_eq!(serde_json::from_slice::<Value>(&reqs[0].body).unwrap(), json!({ "title": "  New name " }));
+        // A title with quotes and non-ASCII letters goes through as JSON.
+        let s = stub(|req, _| {
+            let title = serde_json::from_slice::<Value>(&req.body).unwrap()["title"].clone();
+            reply(200, &json!({ "id": TOUR, "title": title }).to_string())
+        });
+        assert_eq!(rename_tour(&s.base, TOKEN, TOUR, "Say \"hi\" · café").unwrap(), "Say \"hi\" · café");
+    }
+
+    #[test]
+    fn rename_refusals_are_sentences_and_are_sent_once() {
+        let cases: [(u16, &str, &str); 9] = [
+            (400, r#"{"error":"bad_title","detail":"the title must not be empty"}"#, "Could not rename the tour: the title must not be empty (HTTP 400)."),
+            (404, NO_TOUR, "Could not rename the tour: that tour no longer exists."),
+            // A site of version 0.1.0 has no rename route.
+            (404, NO_ROUTE, "Could not rename the tour: the site needs an update to version 0.1.1 or newer."),
+            (404, "404 Not Found", "Could not rename the tour: the site needs an update to version 0.1.1 or newer."),
+            (405, "", "Could not rename the tour: the site needs an update to version 0.1.1 or newer."),
+            (429, r#"{"error":"rate_limited"}"#, "Could not rename the tour: the server is busy (HTTP 429). Try again later."),
+            (500, r#"{"error":"internal"}"#, "Could not rename the tour: internal (HTTP 500)."),
+            (503, "", "Could not rename the tour: the server answered HTTP 503."),
+            (401, r#"{"error":"unauthorized"}"#, REJECTED_TOKEN),
+        ];
+        for (status, body, message) in cases {
+            let s = stub(move |_, _| reply(status, body));
+            let e = rename_tour(&s.base, TOKEN, TOUR, "New").unwrap_err();
+            assert_eq!(e, message);
+            assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
+            assert_eq!(is_gone(&e), body == NO_TOUR);
+        }
+        // No answer at all, an answer about another tour, a web page: none is taken as a rename.
+        let s = stub(|_, _| Answer::Drop);
+        let e = rename_tour(&s.base, TOKEN, TOUR, "New").unwrap_err();
+        assert!(e.starts_with("Could not rename the tour: ") && e.ends_with('.') && !e.contains("dp_"), "{e}");
+        assert_eq!(s.lines().len(), 1);
+        for body in [r#"{"id":"tour_bbbbbbbbbbbbbbbbbbbbbbbb","title":"New"}"#, "<html>Sign in</html>", r#"{"id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa"}"#, r#"{"id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","title":7}"#] {
+            let s = stub(move |_, _| reply(200, body));
+            assert_eq!(rename_tour(&s.base, TOKEN, TOUR, "New").unwrap_err(), "Could not rename the tour: the server's answer was not understood.", "{body}");
+        }
+        // An id that is not a tour id is never sent anywhere.
+        let s = stub(platform);
+        for id in ["", "tour_1", "../uploads/x", "tour_AAAAAAAAAAAAAAAAAAAAAAAA"] {
+            assert!(rename_tour(&s.base, TOKEN, id, "New").is_err());
+            assert!(delete_tour(&s.base, TOKEN, id, |_| {}).is_err());
+            assert!(unpublish_tour(&s.base, TOKEN, id).is_err());
+        }
+        assert!(s.lines().is_empty());
+    }
+
+    #[test]
+    fn a_small_tour_is_deleted_in_one_call() {
+        let s = stub(|_, _| reply(200, r#"{"deleted":true}"#));
+        let (r, seen) = delete(&s);
+        assert_eq!(r, Ok(()));
+        assert_eq!(seen, [None]);
+        assert_eq!(s.lines(), [DELETE]);
+        let req = &s.requests()[0];
+        assert_eq!(req.auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn delete_calls_until_the_site_says_nothing_is_left() {
+        let s = stub(|_, seen| match seen {
+            0 => deleting(250, 601),
+            1 => deleting(500, 601),
+            _ => reply(200, r#"{"deleted":true}"#),
+        });
+        let (r, seen) = delete(&s);
+        assert_eq!(r, Ok(()));
+        assert_eq!(seen, [None, Some((250, 601)), Some((500, 601))]);
+        assert_eq!(s.lines(), [DELETE; 3]);
+    }
+
+    #[test]
+    fn a_tour_that_is_already_gone_counts_as_deleted() {
+        // Deleted elsewhere before the first call.
+        let s = stub(|_, _| reply(404, NO_TOUR));
+        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(s.lines().len(), 1);
+        // Or finished by someone else between two calls.
+        let s = stub(|_, seen| if seen == 0 { deleting(250, 601) } else { reply(404, NO_TOUR) });
+        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(s.lines().len(), 2);
+    }
+
+    #[test]
+    fn a_site_without_a_delete_route_is_not_mistaken_for_a_deleted_tour() {
+        for (status, body) in [(404, NO_ROUTE), (404, "404 Not Found"), (404, ""), (404, r#"{"error":"not_found","detail":"no such page"}"#), (405, "")] {
+            let s = stub(move |_, _| reply(status, body));
+            let e = delete(&s).0.unwrap_err();
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false }, "{status} {body}");
+            assert_eq!(s.lines().len(), 1);
+        }
+    }
+
+    #[test]
+    fn delete_refusals_are_sentences_and_are_not_retried() {
+        let cases: [(u16, &str, &str); 6] = [
+            (409, r#"{"error":"publish_busy","detail":"a publish of this tour is in progress; wait"}"#, "Could not delete the tour: a publish of this tour is in progress. Wait for it to finish, or unpublish the tour, then delete it again."),
+            (429, r#"{"error":"rate_limited"}"#, "Could not delete the tour: the server is busy (HTTP 429). Try again later."),
+            (500, r#"{"error":"internal"}"#, "Could not delete the tour: internal (HTTP 500)."),
+            (503, "", "Could not delete the tour: the server answered HTTP 503."),
+            (302, "", "Could not delete the tour: the server answered with a redirect (HTTP 302), which is not followed. Check the server address."),
+            (401, r#"{"error":"unauthorized"}"#, REJECTED_TOKEN),
+        ];
+        for (status, body, message) in cases {
+            let s = stub(move |_, _| reply(status, body));
+            let (r, _) = delete(&s);
+            assert_eq!(r.unwrap_err(), DeleteFailed { message: message.into(), unfinished: false });
+            assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
+        }
+        let s = stub(|_, _| Answer::Drop);
+        let e = delete(&s).0.unwrap_err();
+        assert!(e.message.starts_with("Could not delete the tour: ") && e.message.ends_with('.') && !e.message.contains("dp_") && !e.unfinished, "{e:?}");
+        assert_eq!(s.lines().len(), 1);
+    }
+
+    #[test]
+    fn a_delete_whose_files_could_not_be_removed_yet_is_called_again_and_resumes() {
+        let s = stub(|_, seen| match seen {
+            0 => deleting(250, 601),
+            1 => reply(500, CLEANUP_PENDING),
+            2 => deleting(500, 601),
+            _ => reply(200, r#"{"deleted":true}"#),
+        });
+        let (r, seen) = delete(&s);
+        assert_eq!(r, Ok(()));
+        assert_eq!(s.lines().len(), 4);
+        assert_eq!(seen, [None, Some((250, 601)), Some((250, 601)), Some((500, 601))]);
+        // On the very first call too: the tour is deleted by then, only files are left.
+        let s = stub(|_, seen| if seen == 0 { reply(500, CLEANUP_PENDING) } else { reply(200, r#"{"deleted":true}"#) });
+        assert_eq!(delete(&s).0, Ok(()));
+        // A site that keeps failing is given up, and the error says what is left.
+        let s = stub(|_, _| reply(500, CLEANUP_PENDING));
+        let e = delete(&s).0.unwrap_err();
+        assert_eq!(e.message, format!("Could not delete the tour completely: the site could not remove some of its files yet.{GONE_TRAILER}"));
+        assert!(e.unfinished);
+        assert_eq!(s.lines().len(), MAX_STALLED_CALLS as usize);
+    }
+
+    #[test]
+    fn a_delete_that_stops_making_progress_is_given_up() {
+        let s = stub(|_, _| deleting(250, 601));
+        let (r, _) = delete(&s);
+        let e = r.unwrap_err();
+        assert_eq!(e.message, format!("Could not delete the tour completely: the site stopped making progress at 250 of 601 files.{GONE_TRAILER}"));
+        assert!(e.unfinished);
+        assert_eq!(s.lines().len(), 1 + MAX_STALLED_CALLS as usize);
+        // Progress in between starts the count again.
+        let s = stub(|_, seen| match seen {
+            0 | 1 | 2 => deleting(250, 1000),
+            3 | 4 | 5 => deleting(500, 1000),
+            _ => reply(200, r#"{"deleted":true}"#),
+        });
+        assert_eq!(delete(&s).0, Ok(()));
+        // An answer without counts is not progress.
+        let s = stub(|_, _| reply(202, r#"{"status":"in_progress"}"#));
+        let (r, seen) = delete(&s);
+        assert!(r.unwrap_err().unfinished);
+        assert!(seen.iter().all(Option::is_none));
+        assert_eq!(s.lines().len(), MAX_STALLED_CALLS as usize);
+    }
+
+    #[test]
+    fn a_delete_that_never_finishes_stops_at_the_hard_limit() {
+        let s = stub(|_, seen| deleting(seen as u32 + 1, 100_000));
+        let e = delete(&s).0.unwrap_err();
+        assert_eq!(e.message, format!("Could not delete the tour completely: the site did not finish within {MAX_PUBLISH_CALLS} calls.{GONE_TRAILER}"));
+        assert!(e.unfinished);
+        assert_eq!(s.lines().len(), MAX_PUBLISH_CALLS as usize);
+    }
+
+    #[test]
+    fn a_delete_that_fails_half_way_says_the_tour_is_gone_but_files_remain() {
+        let s = stub(|_, seen| if seen == 0 { deleting(250, 601) } else { Answer::Drop });
+        let e = delete(&s).0.unwrap_err();
+        assert!(e.unfinished && e.message.starts_with("Could not delete the tour: ") && e.message.ends_with(GONE_TRAILER) && !e.message.contains("dp_"), "{e:?}");
+        assert_eq!(s.lines().len(), 2);
+        let s = stub(|_, seen| if seen == 0 { deleting(250, 601) } else { reply(503, "") });
+        let e = delete(&s).0.unwrap_err();
+        assert_eq!(e.message, format!("Could not delete the tour: the server answered HTTP 503.{GONE_TRAILER}"));
+        assert!(e.unfinished);
+        assert_eq!(s.lines().len(), 2, "a failure that is not cleanup_pending is not sent again");
+    }
+
+    #[test]
+    fn a_web_page_404_in_the_middle_of_a_delete_does_not_claim_the_tour_is_gone() {
+        for (status, body) in [(404, "<html>Not Found</html>"), (404, NO_ROUTE), (405, "")] {
+            let s = stub(move |_, seen| if seen == 0 { deleting(250, 601) } else { reply(status, body) });
+            let e = delete(&s).0.unwrap_err();
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false }, "{status} {body}");
+            assert!(!e.message.contains("gone from the site"));
+            assert_eq!(s.lines().len(), 2);
+        }
+        // The sentence for a real unfinished delete names something the user can do.
+        assert!(GONE_TRAILER.contains("Finish deleting on the Tours page") && !GONE_TRAILER.contains("delete it again"));
+    }
+
+    #[test]
+    fn the_host_of_a_site_address_is_its_name_only() {
+        assert_eq!(host_of(" https://Tours.Example.com/demo/ ").as_deref(), Some("tours.example.com"));
+        assert_eq!(host_of("http://localhost:8787").as_deref(), Some("localhost"));
+        assert_eq!(host_of("http://tours.example.com"), None);
+        assert!(is_tour_id(TOUR) && !is_tour_id("tour_1") && !is_tour_id("../x"));
+    }
+
+    #[test]
+    fn delete_answers_that_make_no_sense_are_refused() {
+        for (status, body) in [(200, "{}"), (200, r#"{"deleted":false}"#), (200, "<html>Sign in</html>"), (202, "{}"), (202, r#"{"status":"done"}"#), (204, ""), (201, r#"{"deleted":true}"#)] {
+            let s = stub(move |_, _| reply(status, body));
+            let e = delete(&s).0.unwrap_err();
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the server's answer was not understood.".into(), unfinished: false }, "{status} {body}");
+            assert_eq!(s.lines().len(), 1);
+        }
+        // Counts that make no sense are not shown, but the loop goes on.
+        let s = stub(|_, seen| match seen {
+            0 => deleting(9, 4),
+            1 => deleting(10, 0),
+            _ => reply(200, r#"{"deleted":true}"#),
+        });
+        let (r, seen) = delete(&s);
+        assert_eq!(r, Ok(()));
+        assert_eq!(seen, [None, None, None]);
+    }
+
+    #[test]
+    fn unpublish_calls_until_the_public_images_are_gone() {
+        let s = stub(|_, _| reply(204, ""));
+        assert_eq!(unpublish(&s), Ok(()));
+        assert_eq!(s.lines(), [UNPUBLISH]);
+        assert!(s.requests()[0].body.is_empty());
+        assert_eq!(s.requests()[0].auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        let more = r#"{"status":"in_progress","detail":"the tour is unpublished; some of its public images are still to be removed; unpublish again to finish"}"#;
+        let s = stub(move |_, seen| if seen < 2 { reply(202, more) } else { reply(204, "") });
+        assert_eq!(unpublish(&s), Ok(()));
+        assert_eq!(s.lines(), [UNPUBLISH; 3]);
+        // The public function is the same loop.
+        let s = stub(|_, _| reply(204, ""));
+        assert_eq!(unpublish_tour(&s.base, TOKEN, TOUR), Ok(()));
+    }
+
+    #[test]
+    fn unpublish_refusals_are_sentences_and_are_not_retried() {
+        let cases: [(u16, &str, &str); 6] = [
+            (404, NO_TOUR, "Could not unpublish the tour: that tour no longer exists."),
+            (404, NO_ROUTE, "Could not unpublish the tour: not_found (HTTP 404)."),
+            (429, r#"{"error":"rate_limited"}"#, "Could not unpublish the tour: the server is busy (HTTP 429). Try again later."),
+            (500, r#"{"error":"internal"}"#, "Could not unpublish the tour: internal (HTTP 500)."),
+            (503, "", "Could not unpublish the tour: the server answered HTTP 503."),
+            (401, r#"{"error":"unauthorized"}"#, REJECTED_TOKEN),
+        ];
+        for (status, body, message) in cases {
+            let s = stub(move |_, _| reply(status, body));
+            let e = unpublish(&s).unwrap_err();
+            assert_eq!(e, message);
+            assert_eq!(is_gone(&e), body == NO_TOUR);
+            assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
+        }
+        let s = stub(|_, _| Answer::Drop);
+        let e = unpublish(&s).unwrap_err();
+        assert!(e.starts_with("Could not unpublish the tour: ") && e.ends_with('.') && !e.contains("dp_"), "{e}");
+        for (status, body) in [(200, "{}"), (200, "<html>Sign in</html>"), (202, "{}"), (201, "")] {
+            let s = stub(move |_, _| reply(status, body));
+            assert_eq!(unpublish(&s).unwrap_err(), "Could not unpublish the tour: the server's answer was not understood.", "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn an_unpublish_whose_clean_up_does_not_finish_says_the_tour_is_no_longer_public() {
+        let pending = r#"{"error":"cleanup_pending","detail":"the tour is unpublished, but some of its public images could not be removed yet; unpublish again to retry"}"#;
+        // Called again, it resumes.
+        let s = stub(move |_, seen| if seen == 0 { reply(500, pending) } else { reply(204, "") });
+        assert_eq!(unpublish(&s), Ok(()));
+        assert_eq!(s.lines().len(), 2);
+        // A site that keeps failing.
+        let s = stub(move |_, _| reply(500, pending));
+        assert_eq!(unpublish(&s).unwrap_err(), UNPUBLISHED_NOT_CLEARED);
+        assert_eq!(s.lines().len(), MAX_STALLED_CALLS as usize);
+        // A lost connection or a failure after the tour went off the web.
+        let more = r#"{"status":"in_progress"}"#;
+        let s = stub(move |_, seen| if seen == 0 { reply(202, more) } else { Answer::Drop });
+        assert_eq!(unpublish(&s).unwrap_err(), UNPUBLISHED_NOT_CLEARED);
+        let s = stub(move |_, seen| if seen == 0 { reply(202, more) } else { reply(503, "") });
+        assert_eq!(unpublish(&s).unwrap_err(), UNPUBLISHED_NOT_CLEARED);
+        // One that never finishes stops at the hard limit.
+        let s = stub(move |_, _| reply(202, more));
+        assert_eq!(unpublish(&s).unwrap_err(), UNPUBLISHED_NOT_CLEARED);
+        assert_eq!(s.lines().len(), MAX_PUBLISH_CALLS as usize);
+        assert!(!is_gone(UNPUBLISHED_NOT_CLEARED));
+    }
+
+    #[test]
+    fn publishing_a_tour_that_is_gone_says_so() {
+        let s = publish_stub(|_| reply(404, NO_TOUR));
+        let e = publish(&s).0.unwrap_err();
+        assert_eq!(e, "Could not publish the tour: that tour no longer exists.");
+        assert!(is_gone(&e));
+        // Text from the server can never pass for it.
+        let s = publish_stub(|_| reply(500, r#"{"error":"x","detail":"Could not publish the tour: that tour no longer exists."}"#));
+        assert!(!is_gone(&publish(&s).0.unwrap_err()));
+        assert!(!is_gone(TOUR_GONE) && !is_gone("that tour no longer exists."));
+    }
+
+    #[test]
+    fn the_token_is_never_in_a_manage_error() {
+        // A server that echoes the Authorization header back in every error.
+        let s = stub(|req, _| reply(500, &format!(r#"{{"error":"internal","detail":"failed for {}"}}"#, req.auth.clone().unwrap_or_default())));
+        let errors = [rename_tour(&s.base, TOKEN, TOUR, "New").unwrap_err(), delete(&s).0.unwrap_err().message, unpublish(&s).unwrap_err(), workspace(&s.base, TOKEN).unwrap_err()];
+        for e in errors {
+            assert!(!e.contains(TOKEN) && !e.contains("dp_") && !e.contains(&TOKEN[3..]), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_workspace_answer_gives_the_name_and_the_version_when_the_site_tells() {
+        let s = stub(|_, _| reply(200, r#"{"workspace":"Acme","version":"0.1.1"}"#));
+        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: Some("0.1.1".into()) });
+        assert_eq!(s.lines(), ["GET /api/v1/me"]);
+        // A site of version 0.1.0 does not say.
+        let s = stub(platform);
+        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: None });
+        // Something that is not a version is not shown as one.
+        for odd in [r#""""#, r#""latest""#, r#""1.0 <b>""#, "7", r#""0.1.1-with-a-very-long-suffix""#, "null"] {
+            let s = stub(move |_, _| reply(200, &format!(r#"{{"workspace":"Acme","version":{odd}}}"#)));
+            assert_eq!(workspace(&s.base, TOKEN).unwrap().version, None, "{odd}");
+        }
+        let s = stub(|_, _| reply(200, r#"{"version":"0.1.1"}"#));
+        assert_eq!(workspace(&s.base, TOKEN).unwrap_err(), "Could not check the server: the server's answer was not understood.");
+    }
+
+    #[test]
+    fn the_tour_list_gives_links_and_dates_and_an_older_site_gives_neither() {
+        let s = stub(|_, _| {
+            reply(
+                200,
+                r#"{"tours":[
+                {"id":"tour_1","title":"Onboarding","status":"published","slug":"abc123","url":"/t/abc123","chapters":2,"steps":22,"updated_at":1700000000000,"published_at":1700000100000},
+                {"id":"tour_2","title":"Testing","status":"draft","slug":"def456","url":null,"chapters":1,"steps":9,"updated_at":1700000200000,"published_at":null}]}"#,
+            )
+        });
+        let tours = list_tours(&s.base, TOKEN).unwrap();
+        assert_eq!(tours[0].link, Some(format!("{}/t/abc123", s.base)));
+        assert_eq!((tours[0].updated_at, tours[0].published_at), (Some(1700000000000), Some(1700000100000)));
+        assert!(tours[0].is_public() && !tours[1].is_public());
+        // A draft has a slug but no link.
+        assert_eq!(tours[1].link, None);
+        assert_eq!((tours[1].updated_at, tours[1].published_at), (Some(1700000200000), None));
+        // Version 0.1.0: no slug, no url, no published_at.
+        let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"tour_1","title":"Onboarding","status":"published","chapters":2,"steps":22,"updated_at":1700000000000}]}"#));
+        let t = &list_tours(&s.base, TOKEN).unwrap()[0];
+        assert_eq!((t.link.clone(), t.updated_at, t.published_at), (None, Some(1700000000000), None));
+        // Dates that make no sense are left out.
+        let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"t","title":"T","status":"published","chapters":1,"steps":1,"updated_at":-5,"published_at":"yesterday"}]}"#));
+        let t = &list_tours(&s.base, TOKEN).unwrap()[0];
+        assert_eq!((t.updated_at, t.published_at), (None, None));
     }
 
     #[test]

@@ -573,7 +573,7 @@ impl Editor {
             Some(PickerOutcome::Cancel) => v.picker = None,
             Some(PickerOutcome::Upload { title, target, mode, tour_title, before }) => {
                 let has_steps = tour::plan_steps(&v.rec, &v.edit, &v.events).is_ok();
-                match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status()) {
+                match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref()) {
                     Some(blocked) => {
                         if let Some(p) = v.picker.as_mut() {
                             p.refuse(blocked.refusal());
@@ -918,7 +918,7 @@ impl Editor {
                     if worker.is_cancelled() {
                         return Err(crate::publish::CANCELLED.to_string());
                     }
-                    let token = publish_ui::token_for_job()?;
+                    let token = publish_ui::token_for(&server)?;
                     crate::publish::upload_and_publish(
                         &server,
                         &token,
@@ -963,7 +963,7 @@ impl Editor {
         let job = EncodeJob::spawn(move |progress| {
             guarded(&worker, || {
                 progress(1.0);
-                let result = publish_ui::token_for_job().and_then(|token| {
+                let result = publish_ui::token_for(&server).and_then(|token| {
                     crate::publish::publish_tour(&server, &token, &tour_id, |images| {
                         worker.set_publishing(images);
                         !worker.is_cancelled()
@@ -1067,7 +1067,7 @@ impl Editor {
         ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
         let publishing = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.cancelling());
         let tour_running = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.tour_cancelling());
-        let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status());
+        let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref());
         let mut chosen = None;
         let mut add_to_site = false;
         ui.horizontal(|ui| {

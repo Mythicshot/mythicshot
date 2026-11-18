@@ -16,6 +16,8 @@ use crate::home_ui::{self, HomeState};
 use crate::platform::{WindowId, WindowKind};
 use crate::publish_ui::{self, TokenStatus};
 use crate::settings_ui::{self, UiAction};
+use crate::tours_ui::{self, ToursState};
+use crate::workspace_ui::{self, WorkspaceState};
 use crate::tray::Command;
 
 const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
@@ -51,14 +53,6 @@ impl Page {
         }
     }
 
-    /// The one sentence a page that is not built yet shows; `None` for a page that is.
-    pub fn coming_soon(self) -> Option<&'static str> {
-        match self {
-            Page::Tours => Some("The Tours page is coming in a later update."),
-            Page::Workspace => Some("The Workspace page is coming in a later update."),
-            Page::Home | Page::Preferences => None,
-        }
-    }
 }
 
 /// A request to show the main window.
@@ -92,6 +86,7 @@ pub struct Nav {
     page: Page,
     focus: bool,
     left_preferences: bool,
+    left_workspace: bool,
 }
 
 impl Nav {
@@ -131,16 +126,16 @@ impl Nav {
 
     /// Switch page from inside the window: no focus change.
     pub fn go(&mut self, page: Page) {
-        if self.open && self.page == Page::Preferences && page != Page::Preferences {
-            self.left_preferences = true;
+        if self.open && self.page != page {
+            self.note_left();
         }
         self.page = page;
     }
 
     /// Close the window. The page stays, so the next plain open of the window is where it was left.
     pub fn close(&mut self) {
-        if self.open && self.page == Page::Preferences {
-            self.left_preferences = true;
+        if self.open {
+            self.note_left();
         }
         self.open = false;
         self.focus = false;
@@ -151,10 +146,24 @@ impl Nav {
         std::mem::take(&mut self.focus)
     }
 
+    /// The page that is up is being left, by switching page or closing the window.
+    fn note_left(&mut self) {
+        match self.page {
+            Page::Preferences => self.left_preferences = true,
+            Page::Workspace => self.left_workspace = true,
+            Page::Home | Page::Tours => {}
+        }
+    }
+
     /// Whether the Preferences page was left (by switching page or closing the window) since the
     /// last call. Its unfinished input is dropped then, see [`Shared::settle`].
     pub fn take_left_preferences(&mut self) -> bool {
         std::mem::take(&mut self.left_preferences)
+    }
+
+    /// The same for the Workspace page, where a token may have been typed and not saved.
+    pub fn take_left_workspace(&mut self) -> bool {
+        std::mem::take(&mut self.left_workspace)
     }
 }
 
@@ -173,6 +182,10 @@ pub struct Shared {
     /// The Preferences page: the settings being edited and what the page queued for the app.
     pub prefs: settings_ui::Shared,
     pub home: HomeState,
+    /// The Tours page. Its jobs hold their own handle on it, so they finish when the window is closed.
+    pub tours: ToursState,
+    /// The Workspace page: the token field and what the site said about itself.
+    pub workspace: WorkspaceState,
     /// A capture a Home tile asked for; the app hides the window, then runs it.
     pub capture: Option<Command>,
     /// A capture or recording is going on: the tiles are greyed out.
@@ -181,17 +194,19 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), capture: None, busy: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, busy: false }
     }
 
-    /// Drop the Preferences page's unfinished input once the page has been left. Settings
-    /// themselves are saved as they are changed, so the only things that can be left half done are
-    /// a token typed but not saved (wiped, exactly as when the settings window closed) and a
-    /// shortcut waiting for its keys (cancelled).
+    /// Drop a page's unfinished input once the page has been left. Settings themselves are
+    /// saved as they are changed, so the only things that can be left half done are a shortcut
+    /// waiting for its keys on Preferences (cancelled) and a token typed but not saved on
+    /// Workspace (wiped, exactly as when the settings window closed).
     pub fn settle(&mut self, ctx: &egui::Context) {
         if self.nav.take_left_preferences() {
-            self.prefs.state.publishing.clear_token_field(ctx);
             self.prefs.actions.push(UiAction::StopListening);
+        }
+        if self.nav.take_left_workspace() {
+            self.workspace.leave(ctx);
         }
     }
 }
@@ -271,18 +286,13 @@ pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
 
 /// The host name for the "Connected to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
-pub fn connected_host(server: &str, token: &TokenStatus) -> Option<String> {
-    if *token != TokenStatus::Saved {
+/// `bound` is the address the token was saved for: with another address set, the token is not
+/// used there, so that is not a connection.
+pub fn connected_host(server: &str, token: &TokenStatus, bound: Option<&str>) -> Option<String> {
+    if *token != TokenStatus::Saved || publish_ui::binding_problem(bound, server).is_some() {
         return None;
     }
-    let url = crate::publish::check_server(server).ok()?;
-    let authority = url.split_once("://")?.1.split('/').next()?;
-    let host = match authority.strip_prefix('[') {
-        // An IPv6 address keeps its brackets.
-        Some(rest) => &authority[..rest.find(']')? + 2],
-        None => authority.rsplit_once(':').map_or(authority, |(host, _port)| host),
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    crate::publish::host_of(server)
 }
 
 pub fn viewport_id() -> egui::ViewportId {
@@ -319,7 +329,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || !s.prefs.actions.is_empty() {
+        if !s.nav.is_open() || s.capture.is_some() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -351,7 +361,7 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
     if token == TokenStatus::Checking {
         ui.ctx().request_repaint_after(Duration::from_millis(200));
     }
-    let host = connected_host(&publish_ui::server(), &token);
+    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         ui.add_space(8.0);
         match host {
@@ -370,22 +380,25 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
 fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
     match s.nav.page() {
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
-        // Not built yet: Tours (`tours_ui`) and Workspace (`workspace_ui`) replace these two arms.
-        page @ (Page::Tours | Page::Workspace) => placeholder(ui, page),
+        Page::Tours => tours_ui::ui(ui, &mut s.tours, &tours_ui::Conn::current(), out),
+        Page::Workspace => {
+            // The site address is a setting like any other: the app saves it on its next frame.
+            if workspace_ui::ui(ui, &mut s.workspace, &mut s.prefs.settings.publish_server, &workspace_ui::Conn::current()) {
+                s.prefs.actions.push(UiAction::SettingsChanged);
+            }
+        }
         Page::Preferences => {
             let p = &mut s.prefs;
             let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart };
-            let actions = settings_ui::ui(ui, &mut p.state, view);
-            p.actions.extend(actions);
+            for action in settings_ui::ui(ui, &mut p.state, view) {
+                match action {
+                    // The Output tab's link: a page switch, which is the window's own business.
+                    UiAction::OpenWorkspace => out.go_to = Some(Page::Workspace),
+                    action => p.actions.push(action),
+                }
+            }
         }
     }
-}
-
-/// A page that is not built yet: its heading and one sentence.
-fn placeholder(ui: &mut egui::Ui, page: Page) {
-    ui.heading(page.label());
-    ui.add_space(12.0);
-    ui.label(RichText::new(page.coming_soon().unwrap_or_default()).color(MUTED));
 }
 
 #[cfg(test)]
@@ -506,18 +519,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
         let mut s = shared(tmp.path());
-        s.nav.request(Page::Preferences);
+        s.nav.request(Page::Workspace);
         s.nav.take_focus();
-        s.prefs.state.publishing.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
+        s.workspace.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
         s.nav.apply(Request::Open);
         s.settle(&ctx);
-        assert_eq!(s.nav.page(), Page::Preferences, "it does not jump to Home");
+        assert_eq!(s.nav.page(), Page::Workspace, "it does not jump to Home");
         assert!(s.nav.take_focus(), "it comes to the front");
-        assert!(s.prefs.state.publishing.has_unsaved_token(), "the typed token is still there");
+        assert!(s.workspace.has_unsaved_token(), "the typed token is still there");
+        assert!(!s.nav.take_left_workspace());
+        s.nav.go(Page::Preferences);
+        s.settle(&ctx);
+        s.nav.apply(Request::Open);
+        s.settle(&ctx);
+        assert_eq!(s.nav.page(), Page::Preferences);
+        assert!(s.nav.take_focus());
         assert!(s.prefs.actions.is_empty(), "a shortcut being recorded is not stopped");
         assert!(!s.nav.take_left_preferences());
         // The same on every other page.
-        for page in [Page::Home, Page::Tours, Page::Workspace] {
+        for page in [Page::Home, Page::Tours] {
             s.nav.go(page);
             s.nav.apply(Request::Open);
             assert_eq!(s.nav.page(), page);
@@ -587,7 +607,13 @@ mod tests {
 
     #[test]
     fn the_connection_line_names_the_host_only_when_a_server_and_token_are_saved() {
+        // The token saved for the very address that is asked about.
+        let connected_host = |server: &str, token: &TokenStatus| super::connected_host(server, token, crate::publish::check_server(server).ok().as_deref());
         let saved = TokenStatus::Saved;
+        // A token saved for another address, or for none, is not a connection to this one.
+        assert_eq!(super::connected_host("https://tours.example.co", &saved, Some("https://tours.example.com")), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, None), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, Some("https://tours.example.com")).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host("https://tours.example.com", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host(" https://Tours.Example.com/demo/ ", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host("http://localhost:8787", &saved).as_deref(), Some("localhost"));
@@ -603,13 +629,73 @@ mod tests {
     }
 
     #[test]
-    fn the_two_pages_not_built_yet_say_so_in_one_sentence() {
-        for page in [Page::Tours, Page::Workspace] {
-            let s = page.coming_soon().expect("a placeholder");
-            assert!(s.starts_with(&format!("The {} page", page.label())) && s.ends_with('.') && s.matches('.').count() == 1 && !s.contains('!'), "{s}");
-        }
-        assert_eq!((Page::Home.coming_soon(), Page::Preferences.coming_soon()), (None, None));
+    fn the_menu_names_the_four_pages_in_order() {
         assert_eq!(Page::ALL.map(Page::label), ["Home", "Tours", "Workspace", "Preferences"]);
+    }
+
+    #[test]
+    fn leaving_workspace_is_noticed_once_however_it_is_left() {
+        let mut nav = Nav::default();
+        nav.request(Page::Workspace);
+        assert!(!nav.take_left_workspace());
+        nav.go(Page::Tours);
+        assert!(nav.take_left_workspace() && !nav.take_left_workspace());
+        nav.request(Page::Workspace);
+        nav.close();
+        assert!(nav.take_left_workspace());
+        nav.request(Page::Workspace);
+        nav.request(Page::Preferences);
+        assert!(nav.take_left_workspace() && !nav.take_left_preferences());
+        // Staying on it is not leaving it, and leaving another page is not leaving this one.
+        nav.request(Page::Workspace);
+        nav.take_left_preferences();
+        nav.go(Page::Workspace);
+        nav.request(Page::Workspace);
+        assert!(!nav.take_left_workspace());
+        nav.go(Page::Home);
+        nav.take_left_workspace();
+        nav.go(Page::Tours);
+        nav.close();
+        assert!(!nav.take_left_workspace());
+    }
+
+    #[test]
+    fn the_output_tabs_link_switches_to_the_workspace_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Preferences);
+        s.prefs.state.tab = settings_ui::Tab::Output;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], 2000.0));
+        // Find the link where it was drawn, then click it.
+        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos + t.galley.size() / 2.0),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        let frame = |s: &mut Shared, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| window_ui(ui, s));
+            out.textures_delta.clear();
+            out
+        };
+        frame(&mut s, vec![]);
+        let out = frame(&mut s, vec![]);
+        let text: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        assert!(text.iter().any(|t| t == settings_ui::TOUR_SITE_MOVED), "{text:?}");
+        assert!(!text.iter().any(|t| t == "Test connection" || t == "API token" || t == "Server"), "the Output tab no longer holds the site settings: {text:?}");
+        let at = out.shapes.iter().find_map(|c| find(&c.shape, settings_ui::OPEN_WORKSPACE)).expect("the link is drawn");
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![]] {
+            frame(&mut s, events);
+        }
+        assert_eq!(s.nav.page(), Page::Workspace);
+        assert!(s.prefs.actions.iter().all(|a| !matches!(a, UiAction::OpenWorkspace)), "the app never sees the link");
     }
 
     fn shared(dir: &std::path::Path) -> Shared {
@@ -653,12 +739,18 @@ mod tests {
         for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
             assert!(home.lines().any(|l| l == word), "Home is missing {word:?} in:\n{home}");
         }
-        for page in [Page::Tours, Page::Workspace] {
-            s.nav.go(page);
-            let text = drawn(&ctx, &mut s);
-            assert!(text.contains(page.coming_soon().unwrap()), "{text}");
-            assert!(!text.contains("Recent"));
+        // No token is saved in a test run, so Tours says it is not connected and asks nothing of any site.
+        s.nav.go(Page::Tours);
+        let tours = drawn(&ctx, &mut s);
+        assert!(tours.lines().any(|l| l == tours_ui::RECORD_A_TOUR) && !tours.contains("Recent"), "{tours}");
+        assert!(tours.contains(tours_ui::NOT_CONNECTED) || tours.contains(tours_ui::CHECKING), "{tours}");
+        // Workspace, with nothing set up: the rows are there and no site is asked.
+        s.nav.go(Page::Workspace);
+        let workspace = drawn(&ctx, &mut s);
+        for word in ["Site address", "Token", "Site version", "Test connection", "Open site"] {
+            assert!(workspace.lines().any(|l| l == word), "Workspace is missing {word:?} in:\n{workspace}");
         }
+        assert!(!workspace.contains("Recent"));
         s.nav.go(Page::Preferences);
         let prefs = drawn(&ctx, &mut s);
         for word in ["General", "Output", "Hotkeys", "Left-click on the tray icon", "Open Mythicshot", "Capture a region"] {
@@ -673,19 +765,26 @@ mod tests {
     }
 
     #[test]
-    fn leaving_preferences_wipes_an_unsaved_token_and_stops_a_shortcut_recording() {
+    fn leaving_workspace_wipes_an_unsaved_token_and_leaving_preferences_stops_a_shortcut_recording() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
         for leave in [|n: &mut Nav| n.go(Page::Home), |n: &mut Nav| n.close(), |n: &mut Nav| n.request(Page::Tours)] {
             let mut s = shared(tmp.path());
-            s.nav.request(Page::Preferences);
-            s.prefs.state.publishing.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
+            s.nav.request(Page::Workspace);
+            s.workspace.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
             s.settle(&ctx);
-            assert!(s.prefs.state.publishing.has_unsaved_token(), "nothing is dropped while the page is up");
+            assert!(s.workspace.has_unsaved_token(), "nothing is dropped while the page is up");
+            leave(&mut s.nav);
+            s.settle(&ctx);
+            assert!(!s.workspace.has_unsaved_token());
+            assert!(s.prefs.actions.is_empty(), "no shortcut was being recorded there");
+
+            let mut s = shared(tmp.path());
+            s.nav.request(Page::Preferences);
+            s.settle(&ctx);
             assert!(s.prefs.actions.is_empty());
             leave(&mut s.nav);
             s.settle(&ctx);
-            assert!(!s.prefs.state.publishing.has_unsaved_token());
             assert!(matches!(s.prefs.actions.as_slice(), [UiAction::StopListening]));
             // Once is enough.
             s.settle(&ctx);
