@@ -742,11 +742,24 @@ impl Unfinished {
     }
 
     /// With the list held still: `write` gets the list if the app's copy does not have it
-    /// yet, and writes the settings file. No note can be added, or written, half-way through.
-    pub fn settle<R>(&self, write: impl FnOnce(Option<Vec<UnfinishedDelete>>) -> R) -> R {
+    /// yet, and writes the settings file, answering whether that worked. No note can be added,
+    /// or written, half-way through. A write that failed leaves the list to be written again.
+    pub fn settle(&self, write: impl FnOnce(Option<Vec<UnfinishedDelete>>) -> bool) -> bool {
         let mut l = self.lock();
-        let list = std::mem::take(&mut l.changed).then(|| l.list.clone());
-        write(list)
+        let saved = write(l.changed.then(|| l.list.clone()));
+        if saved {
+            l.changed = false;
+        }
+        saved
+    }
+
+    /// At start-up: the list as the settings file holds it, and how a new note gets there
+    /// (see [`crate::settings::Settings::note_saver`]). With no way to write a note, no new delete is sent.
+    pub fn start(&self, list: Vec<UnfinishedDelete>, save_now: Option<impl Fn(&[UnfinishedDelete]) -> bool + Send + Sync + 'static>) {
+        self.load(list);
+        if let Some(save_now) = save_now {
+            self.save_with(save_now);
+        }
     }
 
     /// The site said nothing of this tour is left, or that it never began to delete it.
@@ -765,7 +778,12 @@ impl Unfinished {
     /// The whole list, once, when it changed since the last call: what the settings file should hold now.
     #[cfg(test)]
     pub fn take_changed(&self) -> Option<Vec<UnfinishedDelete>> {
-        self.settle(|list| list)
+        let mut taken = None;
+        self.settle(|list| {
+            taken = list;
+            true
+        });
+        taken
     }
 
     pub fn is_changed(&self) -> bool {
@@ -1706,6 +1724,56 @@ mod tests {
         u.save_with(|_| true);
         assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::Now);
         assert_eq!((u.add("https://tours.example.com", B, "Testing"), u.is_changed()), (Noted::Before, true));
+    }
+
+    #[test]
+    fn a_change_whose_save_failed_is_handed_out_again_until_a_save_works() {
+        let u = saved_list();
+        assert!(u.settle(|list| list.is_none()), "nothing changed, and the save's own answer is passed on");
+        u.add("https://tours.example.com", B, "Testing");
+        // The settings file could not be written: the list is still to be written.
+        assert!(!u.settle(|list| {
+            assert_eq!(list, Some(vec![entry("https://tours.example.com", B, "Testing")]));
+            false
+        }));
+        assert!(u.is_changed());
+        // A delete finished meanwhile; the next save gets the list as it is now, and works.
+        u.remove("https://tours.example.com", B);
+        assert!(!u.settle(|list| list != Some(vec![])));
+        assert!(u.is_changed());
+        assert!(u.settle(|list| list == Some(vec![])));
+        assert!(!u.is_changed());
+        assert_eq!(u.take_changed(), None, "written once it worked");
+        // A save that fails with nothing new in the list leaves nothing of the list to write.
+        assert!(!u.settle(|list| list.is_some()));
+        assert!(!u.is_changed());
+    }
+
+    #[test]
+    fn a_settings_file_that_is_never_written_over_refuses_every_new_delete() {
+        use crate::settings::{LoadProblem, Settings};
+        let earlier = entry("https://tours.example.com", A, "Earlier");
+        // The file could not be read at start-up and no copy was made: the app starts the list with no way to write.
+        let mut untouched = Settings::default();
+        untouched.load_problem = Some(LoadProblem { path: "settings.toml".into(), backup: None, partly_read: false });
+        untouched.unfinished_deletes = vec![earlier.clone()];
+        let u = Unfinished::default();
+        u.start(untouched.unfinished_deletes.clone(), untouched.note_saver());
+        assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::NotSaved);
+        assert_eq!(u.add("https://tours.example.com", A, "Earlier"), Noted::Before, "what it read can still be finished");
+        assert_eq!(u.for_site("https://tours.example.com"), [earlier.clone()]);
+        assert!(!u.is_changed());
+        // A file that may be saved gets a way to write, and with it the note is made.
+        assert!(Settings::default().note_saver().is_some());
+        let u = Unfinished::default();
+        let written: Arc<Mutex<Vec<UnfinishedDelete>>> = Arc::default();
+        let disk = written.clone();
+        u.start(vec![earlier.clone()], Some(move |list: &[UnfinishedDelete]| {
+            *disk.lock().unwrap() = list.to_vec();
+            true
+        }));
+        assert_eq!(u.add("https://tours.example.com", B, "Testing"), Noted::Now);
+        assert_eq!(*written.lock().unwrap(), [earlier, entry("https://tours.example.com", B, "Testing")]);
     }
 
     #[test]

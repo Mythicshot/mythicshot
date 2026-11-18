@@ -99,6 +99,8 @@ struct App {
     tap: Arc<std::sync::Mutex<Option<input::Tap>>>,
     /// When to save editor preferences that changed.
     prefs_save_at: Option<Instant>,
+    /// A save of the settings file failed: what is to be saved is still in memory, and is saved again later.
+    save_retry: settings::SaveRetry,
     encoding: Vec<recorder_ui::EncodeJob>,
     /// The root window is kept out of screen capture once its handle is known.
     root_hidden_from_capture: bool,
@@ -145,8 +147,9 @@ impl App {
 
         let mut settings = Settings::load();
         // Once per install, and on disk before anything else can change the address.
+        let mut save_retry = settings::SaveRetry::default();
         if publish_ui::settle_first_binding(&mut settings) {
-            settings.save();
+            save_retry.record(&settings.save(), Instant::now());
         }
         publish_ui::init(&settings);
         let mut hotkeys = Hotkeys::new();
@@ -179,14 +182,10 @@ impl App {
         })));
         // Deletes a past run could not finish: the Tours page offers to carry them on.
         if let Ok(s) = window.lock() {
-            let unfinished = s.tours.unfinished();
-            unfinished.load(settings.unfinished_deletes.clone());
             // A delete is noted in the file before its first request, on the job's own thread.
             // A file that could not be read at start-up is never written over, here either:
             // with no way to write its note, a new delete is refused on the Tours page.
-            if !settings.load_problem.as_ref().is_some_and(settings::LoadProblem::keeps_file_untouched) {
-                unfinished.save_with(Settings::save_unfinished_deletes);
-            }
+            s.tours.unfinished().start(settings.unfinished_deletes.clone(), settings.note_saver());
         }
 
         let mut app = Self {
@@ -213,6 +212,7 @@ impl App {
             rec_events: Vec::new(),
             tap: Arc::new(std::sync::Mutex::new(None)),
             prefs_save_at: None,
+            save_retry,
             encoding: Vec::new(),
             root_hidden_from_capture: false,
             refocus_at: None,
@@ -724,9 +724,13 @@ impl App {
     /// Write to the settings file what the tour pages and their background jobs noted since the
     /// last look: a delete that did not finish (or one that now has), and the address the saved
     /// token belongs to. Neither is a secret, and neither is edited on the Preferences page.
-    fn save_publish_state(&mut self) {
+    ///
+    /// A save that failed earlier is tried again here too, a while after it failed; `now_or_never`
+    /// (the app is closing) does not wait for that.
+    fn save_publish_state(&mut self, now_or_never: bool) {
         let unfinished = self.window.lock().is_ok_and(|s| s.tours.unfinished().is_changed());
-        if unfinished || publish_ui::has_token_site_change() {
+        let wanted = unfinished || publish_ui::has_token_site_change() || self.save_retry.pending();
+        if wanted && (now_or_never || self.save_retry.allows(Instant::now())) {
             self.save_settings();
         }
     }
@@ -739,15 +743,22 @@ impl App {
             self.settings.publish_saved_for = Some(site);
         }
         let unfinished = self.window.lock().map(|s| s.tours.unfinished()).ok();
+        let mut result = Ok(());
         match unfinished {
-            Some(unfinished) => unfinished.settle(|list| {
-                if let Some(list) = list {
-                    self.settings.unfinished_deletes = list;
-                }
-                self.settings.save();
-            }),
-            None => self.settings.save(),
+            Some(unfinished) => {
+                unfinished.settle(|list| {
+                    if let Some(list) = list {
+                        self.settings.unfinished_deletes = list;
+                    }
+                    result = self.settings.save();
+                    result.is_ok()
+                });
+            }
+            None => result = self.settings.save(),
         }
+        // A save that failed loses nothing: the settings stay in memory, and are saved again
+        // by the next change, a while from now, or when the app closes.
+        self.save_retry.record(&result, Instant::now());
     }
 
     fn settings_changed(&mut self) {
@@ -894,7 +905,10 @@ impl App {
     /// Each frame: apply what the main window queued, start a capture it asked for once it is
     /// hidden, and keep it drawn while it is open.
     fn main_window(&mut self, ctx: &egui::Context) {
-        self.save_publish_state();
+        self.save_publish_state(false);
+        if self.save_retry.pending() {
+            ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
+        }
         // Pull what the window did since our last frame.
         let (actions, edited, tab, capture) = {
             let mut s = self.window.lock().expect("main window state");
@@ -1014,8 +1028,9 @@ impl eframe::App for App {
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         publish_ui::shutdown(std::time::Duration::from_secs(5));
-        // A delete that was noted as unfinished in the last moments is on disk before the app is gone.
-        self.save_publish_state();
+        // A delete that was noted as unfinished in the last moments is on disk before the app is gone,
+        // and so is a change whose save failed earlier, if the file can be written by now.
+        self.save_publish_state(true);
         // An add to a site was cancelled above; one already swapping its tour in finishes or rolls back first.
         site::wait_for_adds(std::time::Duration::from_secs(30));
     }
