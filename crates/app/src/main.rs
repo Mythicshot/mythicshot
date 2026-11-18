@@ -9,6 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod editor_ui;
+mod home_ui;
 mod hotkeys;
 mod hook;
 mod icons;

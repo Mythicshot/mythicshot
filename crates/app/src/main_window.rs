@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::home_ui::{self, HomeState};
 use crate::publish_ui::{self, TokenStatus};
 use crate::settings_ui::{self, UiAction};
 use crate::tray::Command;
@@ -142,6 +143,7 @@ pub struct Shared {
     pub nav: Nav,
     /// The Preferences page: the settings being edited and what the page queued for the app.
     pub prefs: settings_ui::Shared,
+    pub home: HomeState,
     /// A capture a Home tile asked for; the app hides the window, then runs it.
     pub capture: Option<Command>,
     /// A capture or recording is going on: the tiles are greyed out.
@@ -150,7 +152,7 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, capture: None, busy: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), capture: None, busy: false }
     }
 
     /// Drop the Preferences page's unfinished input once the page has been left. Settings
@@ -297,12 +299,9 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
 }
 
 /// Draw the selected page. Each page gets the part of [`Shared`] it owns and a [`PageOut`].
-fn page_ui(ui: &mut egui::Ui, s: &mut Shared, _out: &mut PageOut) {
+fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
     match s.nav.page() {
-        // The Home page comes with the next change.
-        Page::Home => {
-            ui.heading(Page::Home.label());
-        }
+        Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
         // Not built yet: Tours (`tours_ui`) and Workspace (`workspace_ui`) replace these two arms.
         page @ (Page::Tours | Page::Workspace) => placeholder(ui, page),
         Page::Preferences => {
@@ -486,13 +485,14 @@ mod tests {
         let ctx = egui::Context::default();
         s.nav.request(Page::Home);
         let home = drawn(&ctx, &mut s);
-        for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected"] {
+        for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
             assert!(home.lines().any(|l| l == word), "Home is missing {word:?} in:\n{home}");
         }
         for page in [Page::Tours, Page::Workspace] {
             s.nav.go(page);
             let text = drawn(&ctx, &mut s);
             assert!(text.contains(page.coming_soon().unwrap()), "{text}");
+            assert!(!text.contains("Recent"));
         }
         s.nav.go(Page::Preferences);
         let prefs = drawn(&ctx, &mut s);
@@ -520,5 +520,32 @@ mod tests {
             s.settle(&ctx);
             assert_eq!(s.prefs.actions.len(), 1);
         }
+    }
+
+    #[test]
+    fn a_tile_click_reaches_the_app_as_a_capture_to_run_after_hiding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Home);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], SIZE[1]));
+        // The first tile sits just right of the menu, under the "Capture" heading.
+        let at = egui::pos2(NAV_WIDTH + 60.0, 100.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        for events in [vec![], vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![]] {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| window_ui(ui, &mut s));
+            out.textures_delta.clear();
+        }
+        assert_eq!(s.capture, Some(Command::Region));
+        // While something is being captured the tiles do nothing.
+        s.capture = None;
+        s.busy = true;
+        for events in [vec![click(true)], vec![click(false)], vec![]] {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| window_ui(ui, &mut s));
+            out.textures_delta.clear();
+        }
+        assert_eq!(s.capture, None);
     }
 }

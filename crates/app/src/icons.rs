@@ -52,6 +52,11 @@ pub enum Icon {
     StepBack,
     StepForward,
     Export,
+    /// The main window's capture tiles.
+    Region,
+    Window,
+    Screen,
+    Record,
 }
 
 const FG: Color32 = Color32::from_rgb(214, 218, 226);
@@ -308,6 +313,28 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.add(line(&[(0.05, 0.55), (0.05, 0.95), (0.95, 0.95), (0.95, 0.55)]));
             p.add(line(&[(0.5, 0.7), (0.5, 0.05)]));
             p.add(line(&[(0.25, 0.3), (0.5, 0.05), (0.75, 0.3)]));
+        }
+        Icon::Region => {
+            // A selection: a dashed rectangle with a solid corner being dragged out.
+            let pts = vec![at(0.05, 0.12), at(0.95, 0.12), at(0.95, 0.88), at(0.05, 0.88), at(0.05, 0.12)];
+            p.extend(Shape::dashed_line(&pts, thin, r.width() * 0.13, r.width() * 0.09));
+            p.add(line(&[(0.62, 0.88), (0.95, 0.88), (0.95, 0.55)]));
+            p.circle_filled(at(0.95, 0.88), r.width() * 0.08, c);
+        }
+        Icon::Window => {
+            p.rect_stroke(rect(0.05, 0.12, 0.95, 0.88), 2.0, s, StrokeKind::Middle);
+            p.add(line(&[(0.05, 0.34), (0.95, 0.34)]));
+            p.circle_filled(at(0.17, 0.23), r.width() * 0.04, c);
+            p.circle_filled(at(0.29, 0.23), r.width() * 0.04, c);
+        }
+        Icon::Screen => {
+            p.rect_stroke(rect(0.04, 0.1, 0.96, 0.7), 2.0, s, StrokeKind::Middle);
+            p.add(line(&[(0.5, 0.7), (0.5, 0.9)]));
+            p.add(line(&[(0.28, 0.9), (0.72, 0.9)]));
+        }
+        Icon::Record => {
+            p.circle_stroke(r.center(), r.width() * 0.44, s);
+            p.circle_filled(r.center(), r.width() * 0.22, c);
         }
         Icon::Shadow => {
             p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, Color32::from_black_alpha(200));
