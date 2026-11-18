@@ -2,6 +2,15 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.7 (2026-11-18)
+
+- Edit a published tour: the Tours page has an Edit button that reopens the tour's recording in the editor, as you left it. Publish from there and choose "Update" to change the tour over the same link; only pictures that changed are sent.
+- The recording is kept on this computer when you publish, so it can be edited later. Preferences has a switch for this, shows how many recordings are saved and how much space they take, and opens their folder. Deleting a tour deletes its saved recording too.
+- A public tour with changes waiting gets a "Publish changes" button on its row.
+- An update is not published by itself when another chapter of the tour still has unpublished changes, and a draft stays a draft.
+- A saved recording holds mouse clicks only, never key presses. It is an unencrypted copy of what was on screen.
+- Needs a site running platform 0.1.4 or newer to update a tour, and 0.1.6 or newer for "Publish changes".
+
 ## 0.2.6 (2026-11-18)
 
 - New icon: a twenty-sided die with a camera shutter. The program, the tray, the windows, the taskbar and the installer all use it.

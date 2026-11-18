@@ -21,6 +21,7 @@ mod overlay;
 mod password;
 mod platform;
 mod popups;
+mod project;
 mod publish;
 mod publish_ui;
 mod recorder_ui;
@@ -664,6 +665,21 @@ impl App {
         }
     }
 
+    /// Open the recording saved on this computer for a tour's chapter in the editor it was
+    /// published from: Edit on the Tours page. When it cannot be opened, the Tours page says
+    /// why on that tour's row.
+    fn open_saved_project(&mut self, key: project::ProjectKey) {
+        let store = project::Store::default_root().map(project::Store::at);
+        match open_saved(store.as_ref(), &key, &self.settings) {
+            Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Err(sentence) => {
+                if let Ok(s) = self.window.lock() {
+                    s.tours.edit_failed(&key, sentence);
+                }
+            }
+        }
+    }
+
     fn open_file(&mut self) {
         let picked = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir).pick_file();
         let Some(path) = picked else { return };
@@ -723,6 +739,17 @@ impl App {
         self.toast.post(msg, None);
     }
 
+    /// How an update ended that ran on after its editor was closed: the editor's status bar is
+    /// gone, so it is said here. The job has written it to the log already.
+    fn show_background_notices(&mut self) {
+        let said = video_editor::background_notices().take();
+        if !said.is_empty() {
+            // Several that ended together share the one notification, a line each.
+            self.toast.post(said.join("
+"), None);
+        }
+    }
+
     /// Write to the settings file what the tour pages and their background jobs noted since the
     /// last look: a delete that did not finish (or one that now has), and the address the saved
     /// token belongs to. Neither is a secret, and neither is edited on the Preferences page.
@@ -766,6 +793,7 @@ impl App {
     fn settings_changed(&mut self) {
         self.save_settings();
         publish_ui::set_server(&self.settings.publish_server);
+        publish_ui::set_keep_recordings(self.settings.keep_published_recordings);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
@@ -912,12 +940,12 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture) = {
+        let (actions, edited, tab, capture, edit_project) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take())
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take())
         };
         self.settings_state.tab = tab;
         let edited = edited.unwrap_or_else(|| self.settings.clone());
@@ -977,6 +1005,10 @@ impl App {
                 // A page switch: the main window takes it and never queues it.
                 UiAction::OpenWorkspace => {}
             }
+        }
+        // Edit on the Tours page: the saved recording opens in an editor; the window stays.
+        if let Some(key) = edit_project {
+            self.open_saved_project(key);
         }
         // A Home tile: close the window so it is not in the picture, then capture. It stays
         // closed afterwards, so it never comes back over the overlay or the editor.
@@ -1087,6 +1119,7 @@ impl eframe::App for App {
         self.tick_recording(&ctx);
         self.show_editors(&ctx);
         self.show_pickers(&ctx);
+        self.show_background_notices();
         self.toast.show(&ctx);
         self.main_window(&ctx);
         // Keep the event loop ticking slowly while hidden so queued events are never stranded.
@@ -1107,6 +1140,17 @@ fn root_window(frame: &eframe::Frame) -> Option<platform::WindowId> {
 #[cfg(not(windows))]
 fn root_window(_frame: &eframe::Frame) -> Option<platform::WindowId> {
     None
+}
+
+/// Open the recording saved for `key` in an editor, as [`App::open_saved_project`] does. `store`
+/// is the folder of saved recordings, None when this user has none. The error is the sentence
+/// for the tour's row on the Tours page; a recording that is already open in an editor opens
+/// nothing new.
+fn open_saved(store: Option<&project::Store>, key: &project::ProjectKey, settings: &Settings) -> Result<editor_ui::Editor, &'static str> {
+    let loaded = store.ok_or(project::LoadError::NotSaved).and_then(|store| store.load(key)).map_err(|e| tours_ui::load_sentence(&e))?;
+    let title = loaded.restored.title.clone();
+    // A recording that cannot be read after all: the editor has let go of the project again.
+    editor_ui::Editor::open_project(loaded, settings.editor_keys.clone(), settings.dest_context(&title), settings.overlays, settings.editor.clone()).map_err(|_| tours_ui::SAVED_DAMAGED)
 }
 
 /// Write panics to `crash.log` next to the settings file; release builds have

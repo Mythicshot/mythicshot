@@ -21,6 +21,12 @@
 //! that is what was asked for, for the others the error says the tour no longer exists
 //! (see [`is_gone`]). A site older than 0.1.1 has no rename or delete route, and says so.
 //!
+//! An update replaces one chapter of a tour that is already on the site (`Target::Replace`).
+//! The create also carries a SHA-256 of every step picture, and the site answers which steps
+//! it already has (`have`): those are not sent again. The logo goes only when the site says
+//! it takes the tour's settings from this chapter (`settings`). The commit's answer says
+//! whether publishing is safe; an update is published only when it says `ready`.
+//!
 //! Nothing is retried blindly. Only two requests are ever sent a second time, and only
 //! after a transport failure (no answer at all): a step image, where the server answers
 //! 409 `already_sent` if the first copy did arrive, and commit, which the server treats
@@ -77,6 +83,14 @@ pub const TOUR_GONE: &str = "That tour no longer exists.";
 const UNFINISHED_TRAILER: &str = " The tour itself is gone from the site, but some of its files remain. Use Finish deleting on the Tours page to remove them.";
 /// What rename and delete say to a site that does not have those routes yet.
 const NEEDS_UPDATE: &str = "the site needs an update to version 0.1.1 or newer.";
+/// The 404 detail the server gives for a chapter that is not (or no longer) the tour's.
+const NO_SUCH_CHAPTER: &str = "no such chapter";
+/// What an update says when the chapter it would replace is not there.
+const CHAPTER_GONE: &str = "that chapter is no longer part of the tour.";
+/// What an update says to a site that cannot replace a chapter yet.
+const UPDATE_NEEDS_UPDATE: &str = "the site needs an update to version 0.1.4 or newer.";
+/// The first site version that can replace a chapter.
+const UPDATE_SINCE: (u32, u32, u32) = (0, 1, 4);
 
 pub const REJECTED_TOKEN: &str = "The server rejected the API token.";
 pub const CANCELLED: &str = "cancelled";
@@ -94,11 +108,20 @@ pub struct RemoteTour {
     pub updated_at: Option<i64>,
     /// When it went public, in milliseconds since 1970: only a published tour on a site of 0.1.1 or newer has it.
     pub published_at: Option<i64>,
+    /// The tour is public and its live page is behind its draft: only a site of 0.1.6 or newer
+    /// says. False when the list does not say (an older site), says anything but yes or no, or
+    /// says it of a draft.
+    pub unpublished_changes: bool,
 }
 
 impl RemoteTour {
     pub fn is_public(&self) -> bool {
         self.status == "published"
+    }
+
+    /// Whether changes wait to be published: a public tour the site says is behind its draft.
+    pub fn changes_waiting(&self) -> bool {
+        self.is_public() && self.unpublished_changes
     }
 }
 
@@ -107,6 +130,18 @@ impl RemoteTour {
 pub struct Workspace {
     pub name: String,
     pub version: Option<String>,
+}
+
+/// How a delete that ended well was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// The site answered this delete for this tour: it removed it, or had begun to before it
+    /// said nothing is left.
+    BySite,
+    /// The site's first answer was that it has no such tour. That is a tour deleted earlier or
+    /// elsewhere, and just as well a tour of another workspace than the token's: the site
+    /// answers both the same way. Nothing of the token's workspace is left to delete either way.
+    NotThere,
 }
 
 /// A delete that did not finish.
@@ -132,12 +167,29 @@ pub fn is_gone(error: &str) -> bool {
 pub enum Target {
     New,
     Chapter(String),
+    /// Replace the steps of a chapter that is already on the site; the tour's link stays.
+    Replace { tour_id: String, chapter_id: String },
+}
+
+/// What the site says about publishing after a chapter was replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishAdvice {
+    /// The tour is not public: nothing to publish.
+    Draft,
+    /// The tour is public and this update is its only unpublished change.
+    Ready,
+    /// The tour is public but holds other changes that were never published.
+    OtherChanges,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Published {
     pub tour_id: String,
+    /// The chapter the upload made, or the one it replaced.
+    pub chapter_id: String,
     pub steps: usize,
+    /// Only a replace gets one; None for a new tour or a new chapter.
+    pub publish: Option<PublishAdvice>,
 }
 
 /// A tour that went public: its step count and its link, when the server gave a usable one.
@@ -156,12 +208,16 @@ pub enum Outcome {
     Public { url: Option<String> },
     /// Uploaded, but the publish did not finish: cancelled, or failed with `error`.
     NotPublic { cancelled: bool, error: String },
+    /// An update that was uploaded and not published, because the tour has other changes that were never published.
+    Held,
 }
 
 /// An upload that worked, and what became of its publish.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
     pub tour_id: String,
+    /// The chapter the upload made or replaced. Empty when only a publish ran and the caller did not know it.
+    pub chapter_id: String,
     pub steps: usize,
     pub outcome: Outcome,
 }
@@ -171,13 +227,24 @@ pub type Images = (u64, u64);
 
 /// What a publish's result means for a tour that is already uploaded with `steps` steps.
 /// A failed or cancelled publish is not an error of the whole job: the draft is there.
-pub fn after_publish(tour_id: &str, steps: usize, result: Result<Live, String>) -> Finished {
+pub fn after_publish(tour_id: &str, chapter_id: &str, steps: usize, result: Result<Live, String>) -> Finished {
     let (steps, outcome) = match result {
         Ok(live) => (live.steps, Outcome::Public { url: live.url }),
         Err(e) if e == CANCELLED => (steps, Outcome::NotPublic { cancelled: true, error: String::new() }),
         Err(error) => (steps, Outcome::NotPublic { cancelled: false, error }),
     };
-    Finished { tour_id: tour_id.to_string(), steps, outcome }
+    Finished { tour_id: tour_id.to_string(), chapter_id: chapter_id.to_string(), steps, outcome }
+}
+
+/// Whether a site of this version can replace a chapter ([`update_tour`]): 0.1.4 and anything
+/// newer. No version (an older site tells none) and text that is not `major.minor.patch` are a no.
+pub fn supports_update(version: Option<&str>) -> bool {
+    let Some(version) = version else { return false };
+    let mut parts = version.split('.').map(|p| if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) { p.parse::<u32>().ok() } else { None });
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Some(major)), Some(Some(minor)), Some(Some(patch)), None) => (major, minor, patch) >= UPDATE_SINCE,
+        _ => false,
+    }
 }
 
 /// The public link for a published tour. `url` is what the server answered: a path is
@@ -313,10 +380,10 @@ pub fn rename_tour(server: &str, token: &str, tour_id: &str, title: &str) -> Res
 /// `progress` is called once before every request, with the files removed so far when the
 /// site says. A second call of it therefore means the site has begun: the tour itself is
 /// gone and only files remain, which is the moment to note the delete as unfinished. A tour that is already
-/// gone is a success. There is no cancel: the first call removes the tour, the rest only
+/// gone is a success, told apart as [`Deleted::NotThere`]. There is no cancel: the first call removes the tour, the rest only
 /// its files, and stopping half-way would leave files nobody can find again. Blocks like
 /// [`publish_tour`].
-pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<Deleted, DeleteFailed> {
     Client::new(server, token, Timeouts::default()).map_err(|message| DeleteFailed { message, unfinished: false, not_started: true })?.delete_tour(tour_id, PUBLISH_PAUSE, progress)
 }
 
@@ -347,7 +414,10 @@ pub fn publish_tour(server: &str, token: &str, tour_id: &str, progress: impl FnM
 
 /// Uploads the bundle and, with `publish_now`, publishes the tour it went into. An
 /// error means nothing was uploaded; once the upload is in, the answer is `Ok` and says
-/// whether the tour is public.
+/// whether the tour is public. `uploaded` is called once, when the commit has answered and
+/// before the publish step: with what the site made of the upload, and never for an upload
+/// that failed or was cancelled.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_and_publish(
     server: &str,
     token: &str,
@@ -355,9 +425,46 @@ pub fn upload_and_publish(
     target: &Target,
     publish_now: bool,
     upload_progress: impl FnMut(f32) -> bool,
+    uploaded: impl FnOnce(&Published),
     publish_progress: impl FnMut(Option<Images>) -> bool,
 ) -> Result<Finished, String> {
-    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, publish_progress)
+    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
+}
+
+/// Updates a tour over the same link: replaces the chapter `chapter_id` of `tour_id` with the
+/// bundle in `dir`, sending only the pictures the site does not have yet, and then publishes
+/// the tour when the site says that is safe. A tour that is a draft stays one
+/// (`Outcome::Draft`); a public tour with other changes that were never published is uploaded
+/// and not published (`Outcome::Held`); a publish that fails or is cancelled leaves the
+/// update uploaded (`Outcome::NotPublic`). An error means the site's chapter is as it was,
+/// with one exception the error names itself: when the commit's answer was lost ("Check the
+/// tour list before uploading again."), the site may or may not hold the update.
+/// `uploaded` is called exactly once, when the commit has answered and before anything is
+/// published, whatever the site says about publishing; never for an update that failed or was
+/// cancelled. A panic in it is caught: the update's outcome is reported all the same.
+/// Blocks like [`upload_bundle`].
+#[allow(clippy::too_many_arguments)]
+pub fn update_tour(
+    server: &str,
+    token: &str,
+    dir: &Path,
+    tour_id: &str,
+    chapter_id: &str,
+    upload_progress: impl FnMut(f32) -> bool,
+    uploaded: impl FnOnce(&Published),
+    publish_progress: impl FnMut(Option<Images>) -> bool,
+) -> Result<Finished, String> {
+    Client::new(server, token, Timeouts::default())?.update_tour(dir, tour_id, chapter_id, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
+}
+
+/// Whether `error` (from [`update_tour`]) says the chapter is no longer part of its tour.
+pub fn is_chapter_gone(error: &str) -> bool {
+    error.ends_with(&format!(": {CHAPTER_GONE}"))
+}
+
+/// Whether `error` (from [`update_tour`]) says the site is too old to replace a chapter.
+pub fn needs_newer_site(error: &str) -> bool {
+    error.ends_with(&format!(": {UPDATE_NEEDS_UPDATE}"))
 }
 
 /// The stored token: `Ok(None)` when none is stored, `Err` when the credential store
@@ -623,36 +730,65 @@ impl Client {
                 // Only a published tour has a link, whatever else the row says.
                 let link = if status == "published" { public_url(&self.base, r.get("url").and_then(Value::as_str), r.get("slug").and_then(Value::as_str)) } else { None };
                 let published_at = if status == "published" { ms("published_at") } else { None };
-                Some(RemoteTour { id: s("id")?, title: s("title")?, status, chapters: n("chapters")?, steps: n("steps")?, link, updated_at: ms("updated_at"), published_at })
+                // Only a plain yes counts, and only of a published tour: there the live page can be behind.
+                let unpublished_changes = status == "published" && r.get("unpublished_changes").and_then(Value::as_bool).unwrap_or(false);
+                Some(RemoteTour { id: s("id")?, title: s("title")?, status, chapters: n("chapters")?, steps: n("steps")?, link, updated_at: ms("updated_at"), published_at, unpublished_changes })
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| not_understood(what))
     }
 
     fn upload_bundle(&self, dir: &Path, target: &Target, mut progress: impl FnMut(f32) -> bool) -> Result<Published, String> {
-        // An upload into an existing tour keeps that tour's logo; the server refuses another (409 logo_not_used).
-        let bundle = Bundle::read(dir, matches!(target, Target::New))?;
-        let total = (bundle.steps.len() + usize::from(bundle.logo.is_some()) + 2) as f32;
+        let what = "Could not start the upload";
+        let replace = matches!(target, Target::Replace { .. });
+        let target_json = match target {
+            Target::New => json!({ "kind": "new" }),
+            Target::Chapter(id) => json!({ "kind": "chapter", "tour_id": id }),
+            Target::Replace { tour_id, chapter_id } => {
+                // Ids that are not ids never reach the network; the site would answer the same.
+                if !is_id(tour_id, "tour_") {
+                    return Err(format!("{what}: {GONE}"));
+                }
+                if !is_id(chapter_id, "ch_") {
+                    return Err(format!("{what}: {CHAPTER_GONE}"));
+                }
+                json!({ "kind": "replace", "tour_id": tour_id, "chapter_id": chapter_id })
+            }
+        };
+        // A new chapter keeps its tour's logo; the server refuses another (409 logo_not_used).
+        // A replace sends it only when the site asks for the tour's settings, which its answer says.
+        let bundle = Bundle::read(dir, !matches!(target, Target::Chapter(_)))?;
         if !progress(0.0) {
             return Err(CANCELLED.into());
         }
 
-        let target_json = match target {
-            Target::New => json!({ "kind": "new" }),
-            Target::Chapter(id) => json!({ "kind": "chapter", "tour_id": id }),
-        };
-        let body = serde_json::to_vec(&json!({ "manifest": bundle.manifest, "target": target_json })).map_err(|_| "Could not read tour.json.".to_string())?;
-        let what = "Could not start the upload";
-        let reply = self.exchange(what, Method::Post, "/api/v1/uploads", Some(("application/json", &body)))?;
-        let id = reply.json().and_then(|v| v.get("upload_id")?.as_str().map(str::to_string)).ok_or_else(|| not_understood(what))?;
-        if !is_upload_id(&id) {
-            return Err(not_understood(what));
+        let mut create = json!({ "manifest": bundle.manifest, "target": target_json });
+        if replace {
+            // One hash per step, in step order: the site answers which pictures it already has.
+            create["sha256"] = json!(bundle.steps.iter().map(|s| s.sha256.as_str()).collect::<Vec<_>>());
         }
+        let body = serde_json::to_vec(&create).map_err(|_| "Could not read tour.json.".to_string())?;
+        let reply = self.send(Method::Post, "/api/v1/uploads", Some(("application/json", &body))).map_err(|t| format!("{what}: {}.", t.0))?;
+        if !matches!(target, Target::New) && Self::says_no_such_tour(&reply) {
+            return Err(format!("{what}: {GONE}"));
+        }
+        if replace && Self::says_not_found(&reply, NO_SUCH_CHAPTER) {
+            return Err(format!("{what}: {CHAPTER_GONE}"));
+        }
+        // A site that does not know the `replace` target yet refuses it by that name.
+        if replace && reply.status == 400 && reply.error_code().as_deref() == Some("bad_target") {
+            return Err(format!("{what}: {UPDATE_NEEDS_UPDATE}"));
+        }
+        let reply = self.check(what, reply)?;
+        let answer = reply.json().ok_or_else(|| not_understood(what))?;
+        let id = answer.get("upload_id").and_then(Value::as_str).filter(|id| is_upload_id(id)).ok_or_else(|| not_understood(what))?.to_string();
 
         // From here every exit but a successful commit, a panic included, sends exactly one abort.
         let guard = AbortGuard { client: self, id: &id, armed: true };
+        let parts = if replace { Parts::of_replace(&answer, &bundle).ok_or_else(|| not_understood(what))? } else { Parts { have: Vec::new(), logo: bundle.logo.is_some() } };
+        let total = (bundle.steps.len() - parts.have.len() + usize::from(parts.logo) + 2) as f32;
         let mut done = 1.0;
-        let published = self.send_parts(&id, dir, &bundle, &mut || {
+        let published = self.send_parts(&id, dir, &bundle, &parts, target, &mut || {
             let go = progress(done / total);
             done += 1.0;
             go
@@ -662,18 +798,26 @@ impl Client {
         Ok(published)
     }
 
-    /// Every image, the logo, then commit. `next` reports progress and says whether to go on.
-    fn send_parts(&self, id: &str, dir: &Path, bundle: &Bundle, next: &mut dyn FnMut() -> bool) -> Result<Published, String> {
+    /// Every image the site does not have yet, the logo when it is wanted, then commit.
+    /// `next` reports progress and says whether to go on.
+    fn send_parts(&self, id: &str, dir: &Path, bundle: &Bundle, parts: &Parts, target: &Target, next: &mut dyn FnMut() -> bool) -> Result<Published, String> {
         for (i, step) in bundle.steps.iter().enumerate() {
+            let n = i + 1;
+            if parts.have.contains(&n) {
+                continue;
+            }
             if !next() {
                 return Err(CANCELLED.into());
             }
-            let n = i + 1;
             let what = format!("Could not send step {n}");
             let data = read_bundle_file(dir, step).map_err(|e| format!("{what}: {e}"))?;
+            // The site matched its pictures against the hash taken at the check, so what goes out must be those bytes.
+            if sha256_hex(&data) != step.sha256 {
+                return Err(format!("{what}: {} changed since it was checked.", step.file));
+            }
             self.send_image(&what, &format!("/api/v1/uploads/{id}/steps/{n}"), step.content_type, &data)?;
         }
-        if let Some(logo) = &bundle.logo {
+        if let Some(logo) = bundle.logo.as_ref().filter(|_| parts.logo) {
             if !next() {
                 return Err(CANCELLED.into());
             }
@@ -684,7 +828,7 @@ impl Client {
         if !next() {
             return Err(CANCELLED.into());
         }
-        self.commit(id)
+        self.commit(id, target)
     }
 
     /// PUTs an image. Sent a second time only when the first got no answer at all; a 409
@@ -701,22 +845,44 @@ impl Client {
     }
 
     /// Commit, sent a second time only when the first got no answer: the server answers a repeat with the first result.
-    fn commit(&self, id: &str) -> Result<Published, String> {
+    /// The answer names the tour and the chapter; for a replace they must be the ones replaced,
+    /// and it must say what to do about publishing.
+    fn commit(&self, id: &str, target: &Target) -> Result<Published, String> {
         let what = "Could not finish the upload";
         let path = format!("/api/v1/uploads/{id}/commit");
         let reply = match self.send(Method::Post, &path, None) {
             Ok(r) => r,
             Err(_) => self.send(Method::Post, &path, None).map_err(|t| format!("{what}: {}. Check the tour list before uploading again.", t.0))?,
         };
+        if matches!(target, Target::Replace { .. }) && reply.status == 409 && reply.error_code().as_deref() == Some("chapter_changed") {
+            return Err(format!("{what}: the chapter was changed by another upload meanwhile. Update again."));
+        }
         let reply = self.check(what, reply)?;
         let v = reply.json().ok_or_else(|| not_understood(what))?;
-        let tour_id = v.get("tour_id").and_then(Value::as_str).ok_or_else(|| not_understood(what))?.to_string();
+        // Both ids are checked for their form: they are kept, and name folders of a saved recording.
+        let id_of = |key: &str, prefix: &str| v.get(key).and_then(Value::as_str).filter(|id| is_id(id, prefix)).map(str::to_string).ok_or_else(|| not_understood(what));
+        let (tour_id, chapter_id) = (id_of("tour_id", "tour_")?, id_of("chapter_id", "ch_")?);
         let steps = v.get("steps").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| not_understood(what))?;
-        Ok(Published { tour_id, steps })
+        let publish = match target {
+            Target::Replace { tour_id: tour, chapter_id: chapter } => {
+                if *tour != tour_id || *chapter != chapter_id {
+                    return Err(not_understood(what));
+                }
+                Some(match v.get("publish").and_then(Value::as_str) {
+                    Some("draft") => PublishAdvice::Draft,
+                    Some("ready") => PublishAdvice::Ready,
+                    Some("other_changes") => PublishAdvice::OtherChanges,
+                    _ => return Err(not_understood(what)),
+                })
+            }
+            Target::New | Target::Chapter(_) => None,
+        };
+        Ok(Published { tour_id, chapter_id, steps, publish })
     }
 }
 
 impl Client {
+    #[allow(clippy::too_many_arguments)]
     fn upload_and_publish(
         &self,
         dir: &Path,
@@ -724,14 +890,45 @@ impl Client {
         publish_now: bool,
         pause: Duration,
         upload_progress: impl FnMut(f32) -> bool,
+        uploaded: impl FnOnce(&Published),
         publish_progress: impl FnMut(Option<Images>) -> bool,
     ) -> Result<Finished, String> {
         let up = self.upload_bundle(dir, target, upload_progress)?;
+        uploaded(&up);
         if !publish_now {
-            return Ok(Finished { tour_id: up.tour_id, steps: up.steps, outcome: Outcome::Draft });
+            return Ok(Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft });
         }
         let result = self.publish_tour(&up.tour_id, pause, publish_progress);
-        Ok(after_publish(&up.tour_id, up.steps, result))
+        Ok(after_publish(&up.tour_id, &up.chapter_id, up.steps, result))
+    }
+
+    /// Replace the chapter, hand the commit's answer to `uploaded`, then publish only when the
+    /// commit said that is safe.
+    #[allow(clippy::too_many_arguments)]
+    fn update_tour(
+        &self,
+        dir: &Path,
+        tour_id: &str,
+        chapter_id: &str,
+        pause: Duration,
+        upload_progress: impl FnMut(f32) -> bool,
+        uploaded: impl FnOnce(&Published),
+        publish_progress: impl FnMut(Option<Images>) -> bool,
+    ) -> Result<Finished, String> {
+        let target = Target::Replace { tour_id: tour_id.to_string(), chapter_id: chapter_id.to_string() };
+        let up = self.upload_bundle(dir, &target, upload_progress)?;
+        // The site holds the update from here on. Whatever the caller's hook does, a panic
+        // included, the publish decision below is made and the real outcome is reported.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uploaded(&up)));
+        let outcome = match up.publish {
+            Some(PublishAdvice::Ready) => {
+                let result = self.publish_tour(&up.tour_id, pause, publish_progress);
+                return Ok(after_publish(&up.tour_id, &up.chapter_id, up.steps, result));
+            }
+            Some(PublishAdvice::OtherChanges) => Outcome::Held,
+            Some(PublishAdvice::Draft) | None => Outcome::Draft,
+        };
+        Ok(Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome })
     }
 
     /// The publish loop: one call with no body, then calls naming the publish it started,
@@ -804,7 +1001,12 @@ impl Client {
 impl Client {
     /// Whether a 404 says the tour is not there, as opposed to the route not being there.
     fn says_no_such_tour(reply: &Reply) -> bool {
-        reply.status == 404 && reply.json().is_some_and(|v| v.get("error").and_then(Value::as_str) == Some("not_found") && v.get("detail").and_then(Value::as_str) == Some(NO_SUCH_TOUR))
+        Self::says_not_found(reply, NO_SUCH_TOUR)
+    }
+
+    /// Whether the answer is the site's own 404 with exactly this detail.
+    fn says_not_found(reply: &Reply, detail: &str) -> bool {
+        reply.status == 404 && reply.json().is_some_and(|v| v.get("error").and_then(Value::as_str) == Some("not_found") && v.get("detail").and_then(Value::as_str) == Some(detail))
     }
 
     /// Whether the answer means the site has no such route: any other 404, or a 405.
@@ -839,7 +1041,7 @@ impl Client {
     /// for a tour that is gone. Unlike publish, a call may be sent again: the server
     /// carries on where it stopped, so a 500 `cleanup_pending` is simply called again.
     /// Gives up after [`MAX_STALLED_CALLS`] calls in a row that removed nothing more.
-    fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+    fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<Deleted, DeleteFailed> {
         let what = "Could not delete the tour";
         let failed = |message: String, unfinished: bool| {
             let message = if unfinished { format!("{message}{UNFINISHED_TRAILER}") } else { message };
@@ -862,8 +1064,9 @@ impl Client {
                 Err(t) => return Err(failed(format!("{what}: {}.", t.0), unfinished)),
             };
             // Gone: deleted by this loop's earlier call, or elsewhere. Either way it is not there.
+            // Only after an earlier answer about this tour is it known to have been the token's.
             if Self::says_no_such_tour(&reply) {
-                return Ok(());
+                return Ok(if unfinished { Deleted::BySite } else { Deleted::NotThere });
             }
             // Never with the "files remain" ending: half-way through, a 404 that is not the
             // site's own (a proxy's page) says nothing about the tour either way.
@@ -886,7 +1089,7 @@ impl Client {
                 let reply = self.check(what, reply).map_err(|m| if rejected { refused(m, unfinished) } else { failed(m, unfinished) })?;
                 let v = reply.json().ok_or_else(|| failed(not_understood(what), unfinished))?;
                 match reply.status {
-                    200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(()),
+                    200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(Deleted::BySite),
                     202 if v.get("status").and_then(Value::as_str) == Some("in_progress") => {}
                     _ => return Err(failed(not_understood(what), unfinished)),
                 }
@@ -1037,6 +1240,49 @@ struct BundleFile {
     bytes: u64,
     /// Whether `bytes` must match exactly.
     exact: bool,
+    /// The SHA-256 of a step picture as it was when the bundle was checked, in lowercase hex. Empty for the logo.
+    sha256: String,
+}
+
+/// Which parts of a bundle an upload sends.
+struct Parts {
+    /// The step numbers (from 1) the site already has: not sent.
+    have: Vec<usize>,
+    /// Whether the logo is sent (only ever when the bundle has one).
+    logo: bool,
+}
+
+impl Parts {
+    /// What the site's answer to a replace asks for. `have` must be a list of step numbers of
+    /// this bundle (it may be left out: then every step is sent), and `settings` yes or no.
+    fn of_replace(answer: &Value, bundle: &Bundle) -> Option<Parts> {
+        let mut have = Vec::new();
+        match answer.get("have") {
+            None => {}
+            Some(list) => {
+                for n in list.as_array()? {
+                    let n = n.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| (1..=bundle.steps.len()).contains(n))?;
+                    if !have.contains(&n) {
+                        have.push(n);
+                    }
+                }
+            }
+        }
+        let settings = match answer.get("settings") {
+            None => false,
+            Some(v) => v.as_bool()?,
+        };
+        Some(Parts { have, logo: settings && bundle.logo.is_some() })
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex(sha2::Sha256::digest(bytes))
+}
+
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 struct Bundle {
@@ -1048,7 +1294,8 @@ struct Bundle {
 
 impl Bundle {
     /// Reads `tour.json` and checks every file it names (the logo only when `with_logo`),
-    /// so a bad bundle fails before anything is created.
+    /// so a bad bundle fails before anything is created. Each step picture is read once
+    /// here, in pieces, for its SHA-256, and once more when it is sent.
     fn read(dir: &Path, with_logo: bool) -> Result<Bundle, String> {
         let text = std::fs::read_to_string(dir.join("tour.json")).map_err(|_| "Could not read tour.json in the export folder.".to_string())?;
         let manifest: Value = serde_json::from_str(&text).map_err(|_| "tour.json is not valid JSON.".to_string())?;
@@ -1062,7 +1309,9 @@ impl Bundle {
             .map(|(i, s)| {
                 let name = s.get("image").and_then(Value::as_str).ok_or_else(|| format!("Step {} in tour.json has no image.", i + 1))?;
                 let bytes = s.get("bytes").and_then(Value::as_u64).filter(|&b| b <= MAX_IMAGE_BYTES).ok_or_else(|| format!("Step {} in tour.json has no valid size.", i + 1))?;
-                bundle_file(dir, name, bytes, true).map_err(|e| format!("Step {}: {e}", i + 1))
+                let mut file = bundle_file(dir, name, bytes, true).map_err(|e| format!("Step {}: {e}", i + 1))?;
+                file.sha256 = hash_bundle_file(dir, &file).map_err(|e| format!("Step {}: {e}", i + 1))?;
+                Ok::<_, String>(file)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let logo = match manifest.get("cover").and_then(|c| c.get("logo")).and_then(Value::as_str) {
@@ -1095,7 +1344,7 @@ fn bundle_file(dir: &Path, name: &str, bytes: u64, exact: bool) -> Result<Bundle
     if !size_ok {
         return Err(if exact { format!("{name} is not the size tour.json gives.") } else { format!("{name} is larger than {bytes} bytes.") });
     }
-    Ok(BundleFile { file: name.to_string(), content_type, bytes, exact })
+    Ok(BundleFile { file: name.to_string(), content_type, bytes, exact, sha256: String::new() })
 }
 
 fn check_regular(name: &str, meta: &std::fs::Metadata) -> Result<(), String> {
@@ -1109,6 +1358,18 @@ fn check_regular(name: &str, meta: &std::fs::Metadata) -> Result<(), String> {
 /// most its size plus one byte, refusing it if it is no longer what was checked.
 fn read_bundle_file(dir: &Path, f: &BundleFile) -> Result<Vec<u8>, String> {
     use std::io::Read;
+    let file = open_bundle_file(dir, f)?;
+    let mut data = Vec::new();
+    file.take(f.bytes + 1).read_to_end(&mut data).map_err(|_| format!("could not read {}.", f.file))?;
+    let len = data.len() as u64;
+    if len > f.bytes || (f.exact && len != f.bytes) {
+        return Err(format!("{} changed since it was checked.", f.file));
+    }
+    Ok(data)
+}
+
+/// Opens a checked bundle file, without following a link on Windows, and checks again that it is a regular file.
+fn open_bundle_file(dir: &Path, f: &BundleFile) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -1119,13 +1380,29 @@ fn read_bundle_file(dir: &Path, f: &BundleFile) -> Result<Vec<u8>, String> {
     }
     let file = options.open(dir.join(&f.file)).map_err(|_| format!("could not read {}.", f.file))?;
     check_regular(&f.file, &file.metadata().map_err(|_| format!("could not read {}.", f.file))?)?;
-    let mut data = Vec::new();
-    file.take(f.bytes + 1).read_to_end(&mut data).map_err(|_| format!("could not read {}.", f.file))?;
-    let len = data.len() as u64;
+    Ok(file)
+}
+
+/// The SHA-256 of a checked bundle file in lowercase hex, read in pieces and never past its size.
+fn hash_bundle_file(dir: &Path, f: &BundleFile) -> Result<String, String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = open_bundle_file(dir, f)?.take(f.bytes + 1);
+    let mut hasher = sha2::Sha256::new();
+    let mut piece = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = file.read(&mut piece).map_err(|_| format!("could not read {}.", f.file))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&piece[..n]);
+        len += n as u64;
+    }
     if len > f.bytes || (f.exact && len != f.bytes) {
         return Err(format!("{} changed since it was checked.", f.file));
     }
-    Ok(data)
+    Ok(hex(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -1138,6 +1415,7 @@ pub(crate) mod tests {
 
     pub(crate) const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
     const UP: &str = "up_0123456789abcdef01234567";
+    pub(crate) const CH: &str = "ch_0123456789abcdef01234567";
 
     #[derive(Debug, Clone)]
     pub(crate) struct Req {
@@ -1249,14 +1527,14 @@ pub(crate) mod tests {
     }
 
     /// The happy-path server: every route answers as the platform does.
-    fn platform(req: &Req, seen: usize) -> Answer {
+    pub(crate) fn platform(req: &Req, seen: usize) -> Answer {
         let l = req.line.as_str();
         if l == "POST /api/v1/uploads" {
             reply(201, &format!(r#"{{"upload_id":"{UP}","steps":2}}"#))
         } else if l.starts_with("PUT ") {
             if seen > 0 { reply(409, r#"{"error":"already_sent","detail":"step was already sent"}"#) } else { reply(204, "") }
         } else if l.ends_with("/commit") {
-            reply(201, r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":"ch_x","steps":2}"#)
+            reply(201, &format!(r#"{{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":"{CH}","steps":2}}"#))
         } else if l.starts_with("DELETE ") {
             reply(204, "")
         } else if l == "GET /api/v1/me" {
@@ -1293,9 +1571,9 @@ pub(crate) mod tests {
         upload_bundle(&stub.base, TOKEN, dir.path(), target, |_| true)
     }
 
-    const TOUR: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const TOUR: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
     const PUB: &str = "pub_0123456789abcdef01234567";
-    const PUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
+    pub(crate) const PUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
 
     fn client(stub: &Stub) -> Client {
         Client::new(&stub.base, TOKEN, Timeouts::default()).unwrap()
@@ -1305,17 +1583,22 @@ pub(crate) mod tests {
         reply(202, &format!(r#"{{"status":"in_progress","publish_id":"{PUB}","done":{done},"total":{total}}}"#))
     }
 
-    const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
+    pub(crate) const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
 
     /// A stub whose publish route answers as `publish` says (given how many publish calls came
     /// before) and that holds the client to the protocol: a call after a 202 must name that
     /// publish, any other must have no body; a call that does not is answered 400. Every other
     /// route answers as the platform does.
-    fn publish_stub(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+    pub(crate) fn publish_stub(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+        publish_stub_over(platform, publish)
+    }
+
+    /// [`publish_stub`], with `rest` answering every route but publish.
+    pub(crate) fn publish_stub_over(rest: impl Fn(&Req, usize) -> Answer + Send + 'static, publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
         let named = std::sync::atomic::AtomicBool::new(false);
         stub(move |req, seen| {
             if req.line != PUBLISH {
-                return platform(req, seen);
+                return rest(req, seen);
             }
             use std::sync::atomic::Ordering::SeqCst;
             let ok = if named.load(SeqCst) { serde_json::from_slice::<Value>(&req.body).ok() == Some(json!({ "publish_id": PUB })) } else { req.body.is_empty() };
@@ -1542,21 +1825,45 @@ pub(crate) mod tests {
 
     fn upload_and_publish_to(stub: &Stub, publish_now: bool, go: impl FnMut(Option<Images>) -> bool) -> Result<Finished, String> {
         let dir = bundle(2, false);
-        client(stub).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, go)
+        client(stub).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, |_| {}, go)
+    }
+
+    #[test]
+    fn the_upload_is_handed_over_once_after_the_commit_and_before_the_publish_step() {
+        for publish_now in [true, false] {
+            let s = platform_with(|_| reply(200, LIVE));
+            let dir = bundle(2, false);
+            let seen: RefCell<Vec<(Published, Vec<String>)>> = RefCell::new(Vec::new());
+            client(&s).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, |up| seen.borrow_mut().push((up.clone(), s.lines())), |_| true).unwrap();
+            let seen = seen.into_inner();
+            assert_eq!(seen.len(), 1);
+            let (up, lines) = &seen[0];
+            assert_eq!(up, &Published { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, publish: None });
+            assert!(lines.last().is_some_and(|l| l.ends_with("/commit")), "the commit had answered: {lines:?}");
+            assert!(!lines.iter().any(|l| l == PUBLISH), "and the publish step had not begun");
+        }
+        // An upload that fails or is cancelled hands nothing over.
+        let s = stub(|req, seen| if req.line.ends_with("/commit") { reply(500, r#"{"error":"commit_failed","detail":"no"}"#) } else { platform(req, seen) });
+        let dir = bundle(2, false);
+        let mut called = 0;
+        assert!(client(&s).upload_and_publish(dir.path(), &Target::New, true, Duration::ZERO, |_| true, |_| called += 1, |_| true).is_err());
+        let s = platform_with(|_| reply(200, LIVE));
+        assert_eq!(client(&s).upload_and_publish(dir.path(), &Target::New, true, Duration::ZERO, |_| false, |_| called += 1, |_| true), Err(CANCELLED.to_string()));
+        assert_eq!(called, 0);
     }
 
     #[test]
     fn publish_now_uploads_then_publishes_and_a_draft_only_uploads() {
         let s = platform_with(|seen| if seen == 0 { in_progress(2, 2) } else { reply(200, LIVE) });
         let done = upload_and_publish_to(&s, true, |_| true).unwrap();
-        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 5, outcome: Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) } });
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 5, outcome: Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) } });
         let lines = s.lines();
         let commit = lines.iter().position(|l| l.ends_with("/commit")).unwrap();
         assert_eq!(&lines[commit + 1..], [PUBLISH, PUBLISH], "publishing starts after the commit");
 
         let s = platform_with(|_| reply(200, LIVE));
         let done = upload_and_publish_to(&s, false, |_| true).unwrap();
-        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::Draft });
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft });
         assert!(!s.lines().iter().any(|l| l == PUBLISH), "a draft upload never calls publish");
     }
 
@@ -1572,7 +1879,7 @@ pub(crate) mod tests {
         let before = s.lines().len();
 
         // "Try again" is the publish step alone.
-        let again = after_publish(&done.tour_id, done.steps, client(&s).publish_tour(&done.tour_id, Duration::ZERO, |_| true));
+        let again = after_publish(&done.tour_id, &done.chapter_id, done.steps, client(&s).publish_tour(&done.tour_id, Duration::ZERO, |_| true));
         assert_eq!(again.outcome, Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) });
         assert_eq!(again.steps, 5);
         let lines = s.lines();
@@ -1591,7 +1898,7 @@ pub(crate) mod tests {
             calls < 2
         })
         .unwrap();
-        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: true, error: String::new() } });
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: true, error: String::new() } });
         let lines = s.lines();
         assert_eq!(lines.iter().filter(|l| *l == PUBLISH).count(), 1);
         assert!(!lines.iter().any(|l| l.starts_with("DELETE ")), "the upload is not aborted: {lines:?}");
@@ -1648,9 +1955,9 @@ pub(crate) mod tests {
     #[test]
     fn a_publish_result_says_whether_the_tour_is_public() {
         let live = Live { steps: 7, url: Some("https://x.dev/t/a".into()) };
-        assert_eq!(after_publish(TOUR, 2, Ok(live)), Finished { tour_id: TOUR.into(), steps: 7, outcome: Outcome::Public { url: Some("https://x.dev/t/a".into()) } });
-        assert_eq!(after_publish(TOUR, 2, Err(CANCELLED.into())).outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
-        assert_eq!(after_publish(TOUR, 2, Err("Could not publish the tour: x.".into())), Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: x.".into() } });
+        assert_eq!(after_publish(TOUR, CH, 2, Ok(live)), Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 7, outcome: Outcome::Public { url: Some("https://x.dev/t/a".into()) } });
+        assert_eq!(after_publish(TOUR, CH, 2, Err(CANCELLED.into())).outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
+        assert_eq!(after_publish(TOUR, CH, 2, Err("Could not publish the tour: x.".into())), Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: x.".into() } });
     }
 
     #[test]
@@ -1688,7 +1995,7 @@ pub(crate) mod tests {
     fn upload_sends_create_then_each_image_then_commit() {
         let s = stub(platform);
         let out = upload(&s, 2, false, &Target::New).unwrap();
-        assert_eq!(out, Published { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 2 });
+        assert_eq!(out, Published { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: CH.into(), steps: 2, publish: None });
         assert_eq!(
             s.lines(),
             [
@@ -1706,6 +2013,592 @@ pub(crate) mod tests {
         assert_eq!(create["manifest"]["steps"][1]["image"], "step-002.png");
         assert_eq!(reqs[1].body, PNG);
         assert_eq!(reqs[1].content_type.as_deref(), Some("image/png"));
+    }
+
+    // ---- Update: replace a chapter ----
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The bytes of step `n` in [`distinct_bundle`]: every step its own.
+    fn picture(n: usize) -> Vec<u8> {
+        [PNG, format!("-{n}").as_bytes()].concat()
+    }
+
+    /// A bundle like [`bundle`], but every step has its own bytes.
+    fn distinct_bundle(steps: usize, logo: bool) -> tempfile::TempDir {
+        let dir = bundle(steps, logo);
+        let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("tour.json")).unwrap()).unwrap();
+        for n in 1..=steps {
+            std::fs::write(dir.path().join(format!("step-{n:03}.png")), picture(n)).unwrap();
+            manifest["steps"][n - 1]["bytes"] = json!(picture(n).len());
+        }
+        std::fs::write(dir.path().join("tour.json"), manifest.to_string()).unwrap();
+        dir
+    }
+
+    fn replace_target() -> Target {
+        Target::Replace { tour_id: TOUR.into(), chapter_id: CH.into() }
+    }
+
+    pub(crate) fn created(have: &str, settings: bool) -> String {
+        format!(r#"{{"upload_id":"{UP}","steps":3,"have":{have},"settings":{settings}}}"#)
+    }
+
+    pub(crate) fn committed(advice: &str) -> String {
+        format!(r#"{{"tour_id":"{TOUR}","chapter_id":"{CH}","steps":3,"publish":"{advice}"}}"#)
+    }
+
+    /// The platform for a replace: create answers `have` and `settings`, commit gives `advice`,
+    /// and publish answers as `publish` says. Every other route is the platform's.
+    pub(crate) fn replace_stub(have: &'static str, settings: bool, advice: &'static str, publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+        publish_stub_over(
+            move |req, seen| {
+                if req.line == "POST /api/v1/uploads" {
+                    reply(201, &created(have, settings))
+                } else if req.line.ends_with("/commit") {
+                    reply(201, &committed(advice))
+                } else {
+                    platform(req, seen)
+                }
+            },
+            publish,
+        )
+    }
+
+    fn update(stub: &Stub, dir: &Path) -> Result<Finished, String> {
+        client(stub).update_tour(dir, TOUR, CH, Duration::ZERO, |_| true, |_| {}, |_| true)
+    }
+
+    fn count(lines: &[String], test: impl Fn(&str) -> bool) -> usize {
+        lines.iter().filter(|l| test(l)).count()
+    }
+
+    const CREATE: &str = "POST /api/v1/uploads";
+
+    #[test]
+    fn an_update_sends_one_hash_per_step_and_only_the_pictures_the_site_lacks() {
+        let s = replace_stub("[1,3]", false, "draft", |_| reply(200, LIVE));
+        let dir = distinct_bundle(3, false);
+        update(&s, dir.path()).unwrap();
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("PUT /api/v1/uploads/{UP}/steps/2"), format!("POST /api/v1/uploads/{UP}/commit")]);
+        let reqs = s.requests();
+        let create: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(create["target"], json!({ "kind": "replace", "tour_id": TOUR, "chapter_id": CH }));
+        assert_eq!(create["sha256"], json!([sha256_hex(&picture(1)), sha256_hex(&picture(2)), sha256_hex(&picture(3))]));
+        assert_eq!(create["manifest"]["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(reqs[1].body, picture(2));
+        assert!(reqs.iter().all(|r| r.auth.as_deref() == Some(&format!("Bearer {TOKEN}")[..])));
+
+        // Two steps with the same bytes get the same hash, one entry each.
+        let s = replace_stub("[]", false, "draft", |_| reply(200, LIVE));
+        let dir = bundle(2, false);
+        update(&s, dir.path()).unwrap();
+        let create: Value = serde_json::from_slice(&s.requests()[0].body).unwrap();
+        assert_eq!(create["sha256"], json!([sha256_hex(PNG), sha256_hex(PNG)]));
+        assert_eq!(count(&s.lines(), |l| l.starts_with("PUT ")), 2);
+
+        // A new tour and a new chapter send no hashes: the site refuses them there.
+        for target in [Target::New, Target::Chapter(TOUR.into())] {
+            let s = stub(platform);
+            upload(&s, 2, false, &target).unwrap();
+            let create: Value = serde_json::from_slice(&s.requests()[0].body).unwrap();
+            assert!(create.get("sha256").is_none(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn an_update_with_nothing_changed_sends_no_picture_and_still_commits() {
+        let s = replace_stub("[1,2,3]", false, "draft", |_| reply(200, LIVE));
+        let dir = distinct_bundle(3, false);
+        let mut seen = Vec::new();
+        let done = client(&s)
+            .update_tour(
+                dir.path(),
+                TOUR,
+                CH,
+                Duration::ZERO,
+                |p| {
+                    seen.push(p);
+                    true
+                },
+                |_| {},
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, outcome: Outcome::Draft });
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("POST /api/v1/uploads/{UP}/commit")]);
+        // Progress counts only what is really sent, and still ends at one.
+        assert_eq!(seen.first(), Some(&0.0));
+        assert_eq!(seen.last(), Some(&1.0));
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+    }
+
+    #[test]
+    fn the_logo_goes_only_when_the_site_asks_for_the_settings() {
+        // The first chapter: the site takes the tour's settings, so the logo is sent, once, before the commit.
+        let s = replace_stub("[1]", true, "draft", |_| reply(200, LIVE));
+        let dir = distinct_bundle(2, true);
+        update(&s, dir.path()).unwrap();
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("PUT /api/v1/uploads/{UP}/steps/2"), format!("PUT /api/v1/uploads/{UP}/logo"), format!("POST /api/v1/uploads/{UP}/commit")]);
+
+        // Any other chapter: the tour keeps its logo, and the site would refuse one.
+        let s = replace_stub("[1]", false, "draft", |_| reply(200, LIVE));
+        update(&s, dir.path()).unwrap();
+        assert_eq!(count(&s.lines(), |l| l.ends_with("/logo")), 0);
+
+        // Every picture is there already, the logo still goes.
+        let s = replace_stub("[1,2]", true, "draft", |_| reply(200, LIVE));
+        update(&s, dir.path()).unwrap();
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("PUT /api/v1/uploads/{UP}/logo"), format!("POST /api/v1/uploads/{UP}/commit")]);
+
+        // The site asks for the settings, but the tour has no logo: nothing to send.
+        let s = replace_stub("[]", true, "draft", |_| reply(200, LIVE));
+        let plain = distinct_bundle(2, false);
+        update(&s, plain.path()).unwrap();
+        assert_eq!(count(&s.lines(), |l| l.ends_with("/logo")), 0);
+
+        // An answer whose `settings` is not yes or no is not guessed at.
+        let s = stub(|req, seen| if req.line == CREATE { reply(201, &format!(r#"{{"upload_id":"{UP}","steps":2,"have":[],"settings":"yes"}}"#)) } else { platform(req, seen) });
+        assert_eq!(update(&s, dir.path()).unwrap_err(), "Could not start the upload: the server's answer was not understood.");
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("DELETE /api/v1/uploads/{UP}")]);
+    }
+
+    #[test]
+    fn a_public_tour_is_published_after_the_update_and_a_draft_is_not() {
+        let s = replace_stub("[]", false, "ready", |seen| if seen == 0 { in_progress(2, 2) } else { reply(200, LIVE) });
+        let dir = distinct_bundle(3, false);
+        let done = update(&s, dir.path()).unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 5, outcome: Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) } });
+        let lines = s.lines();
+        let commit = lines.iter().position(|l| l.ends_with("/commit")).unwrap();
+        assert_eq!(&lines[commit + 1..], [PUBLISH, PUBLISH], "publishing starts after the commit");
+
+        let s = replace_stub("[]", false, "draft", |_| reply(200, LIVE));
+        let done = update(&s, dir.path()).unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, outcome: Outcome::Draft });
+        assert_eq!(count(&s.lines(), |l| l == PUBLISH), 0, "a draft stays a draft");
+    }
+
+    #[test]
+    fn a_tour_with_other_unpublished_changes_is_uploaded_and_not_published() {
+        let s = replace_stub("[2]", false, "other_changes", |_| reply(200, LIVE));
+        let dir = distinct_bundle(3, false);
+        let done = update(&s, dir.path()).unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, outcome: Outcome::Held });
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l == PUBLISH), 0, "{lines:?}");
+        assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 0, "the upload is kept: {lines:?}");
+        assert_eq!(count(&lines, |l| l.ends_with("/commit")), 1);
+    }
+
+    #[test]
+    fn cancel_before_the_commit_aborts_once_and_never_publishes() {
+        let s = replace_stub("[1]", false, "ready", |_| reply(200, LIVE));
+        let dir = distinct_bundle(3, false);
+        let mut calls = 0;
+        let r = client(&s).update_tour(
+            dir.path(),
+            TOUR,
+            CH,
+            Duration::ZERO,
+            |_| {
+                calls += 1;
+                calls <= 2 // 0.0, then before step 2; false before step 3
+            },
+            |_| {},
+            |_| true,
+        );
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("PUT /api/v1/uploads/{UP}/steps/2"), format!("DELETE /api/v1/uploads/{UP}")]);
+
+        // Cancelled when nothing is left to send but the commit itself.
+        let s = replace_stub("[1,2,3]", false, "ready", |_| reply(200, LIVE));
+        let mut calls = 0;
+        let r = client(&s).update_tour(
+            dir.path(),
+            TOUR,
+            CH,
+            Duration::ZERO,
+            |_| {
+                calls += 1;
+                calls <= 1
+            },
+            |_| {},
+            |_| true,
+        );
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("DELETE /api/v1/uploads/{UP}")]);
+
+        // Cancelled before anything was asked: nothing is sent at all.
+        let s = replace_stub("[]", false, "ready", |_| reply(200, LIVE));
+        assert_eq!(client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| false, |_| {}, |_| true).unwrap_err(), CANCELLED);
+        assert!(s.lines().is_empty());
+    }
+
+    #[test]
+    fn a_lost_connection_mid_upload_aborts_once_and_says_which_step() {
+        let s = publish_stub_over(
+            |req, seen| {
+                if req.line == CREATE {
+                    reply(201, &created("[1]", false))
+                } else if req.line.ends_with("/steps/3") {
+                    Answer::Drop
+                } else {
+                    platform(req, seen)
+                }
+            },
+            |_| reply(200, LIVE),
+        );
+        let dir = distinct_bundle(3, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert!(e.starts_with("Could not send step 3: ") && e.ends_with('.') && !e.contains("dp_"), "{e}");
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 1, "{lines:?}");
+        assert_eq!(lines.last().unwrap(), &format!("DELETE /api/v1/uploads/{UP}"));
+        assert_eq!(count(&lines, |l| l.ends_with("/commit") || l == PUBLISH), 0, "{lines:?}");
+        // The step the site already has was never sent; the lost one was tried twice, as for any upload.
+        assert_eq!(count(&lines, |l| l.ends_with("/steps/1")), 0);
+        assert_eq!(count(&lines, |l| l.ends_with("/steps/3")), 2);
+    }
+
+    #[test]
+    fn a_failed_publish_after_the_update_reports_the_upload_as_done() {
+        let s = replace_stub("[]", false, "ready", |_| reply(500, r#"{"error":"publish_failed","detail":"the tour could not be published"}"#));
+        let dir = distinct_bundle(3, false);
+        let done = update(&s, dir.path()).unwrap();
+        assert_eq!(
+            done,
+            Finished {
+                tour_id: TOUR.into(),
+                chapter_id: CH.into(),
+                steps: 3,
+                outcome: Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: the tour could not be published (HTTP 500).".into() }
+            }
+        );
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 0, "the committed update is not aborted: {lines:?}");
+        assert_eq!(count(&lines, |l| l == PUBLISH), 1, "a failed publish is not sent again");
+
+        // The same when the publish is cancelled.
+        let s = replace_stub("[]", false, "ready", |_| in_progress(1, 2));
+        let done = client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| {}, |images| images.is_none()).unwrap();
+        assert_eq!(done.outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
+        assert_eq!(done.chapter_id, CH);
+        assert_eq!(count(&s.lines(), |l| l.starts_with("DELETE ")), 0);
+    }
+
+    #[test]
+    fn an_update_is_handed_over_once_after_the_commit_and_before_anything_is_published() {
+        // Whatever the site says about publishing: published, a draft, or held back.
+        for (advice, outcome_is) in [("ready", "public"), ("draft", "draft"), ("other_changes", "held")] {
+            let s = replace_stub("[1]", false, advice, |_| reply(200, LIVE));
+            let dir = distinct_bundle(3, false);
+            let seen: RefCell<Vec<(Published, Vec<String>)>> = RefCell::new(Vec::new());
+            let done = client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |up| seen.borrow_mut().push((up.clone(), s.lines())), |_| true).unwrap();
+            let seen = seen.into_inner();
+            assert_eq!(seen.len(), 1, "{advice}");
+            let (up, lines) = &seen[0];
+            assert_eq!((up.tour_id.as_str(), up.chapter_id.as_str(), up.steps), (TOUR, CH, 3), "{advice}");
+            assert!(lines.last().is_some_and(|l| l.ends_with("/commit")), "the commit had answered: {lines:?}");
+            assert!(!lines.iter().any(|l| l == PUBLISH), "and nothing was published yet");
+            let is = match done.outcome {
+                Outcome::Public { .. } => "public",
+                Outcome::Draft => "draft",
+                Outcome::Held => "held",
+                Outcome::NotPublic { .. } => "not public",
+            };
+            assert_eq!(is, outcome_is);
+        }
+        // A publish that fails afterwards does not hand it over a second time.
+        let s = replace_stub("[]", false, "ready", |_| reply(500, r#"{"error":"publish_failed","detail":"no"}"#));
+        let dir = distinct_bundle(3, false);
+        let mut called = 0;
+        let done = client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| called += 1, |_| true).unwrap();
+        assert!(matches!(done.outcome, Outcome::NotPublic { cancelled: false, .. }));
+        assert_eq!(called, 1);
+    }
+
+    #[test]
+    fn an_update_that_fails_or_is_cancelled_hands_nothing_over() {
+        let dir = distinct_bundle(3, false);
+        let mut called = 0;
+        // Cancelled before the commit.
+        let s = replace_stub("[1]", false, "ready", |_| reply(200, LIVE));
+        assert_eq!(client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| false, |_| called += 1, |_| true), Err(CANCELLED.to_string()));
+        // Refused at create, and refused at the commit.
+        let s = refusing_create(404, r#"{"error":"not_found","detail":"no such tour"}"#);
+        assert!(client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| called += 1, |_| true).is_err());
+        let s = stub(|req, seen| {
+            if req.line == CREATE {
+                reply(201, &created("[]", false))
+            } else if req.line.ends_with("/commit") {
+                reply(409, r#"{"error":"chapter_changed","detail":"the chapter was changed"}"#)
+            } else {
+                platform(req, seen)
+            }
+        });
+        assert!(client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| called += 1, |_| true).is_err());
+        assert_eq!(called, 0);
+    }
+
+    #[test]
+    fn an_update_whose_commit_answer_was_lost_hands_nothing_over_and_says_to_check() {
+        // Both tries of the commit get no answer: the site may or may not hold the update.
+        let s = publish_stub_over(
+            |req, seen| {
+                if req.line == CREATE {
+                    reply(201, &created("[1,2,3]", false))
+                } else if req.line.ends_with("/commit") {
+                    Answer::Drop
+                } else {
+                    platform(req, seen)
+                }
+            },
+            |_| reply(200, LIVE),
+        );
+        let dir = distinct_bundle(3, false);
+        let mut called = 0;
+        let e = client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| called += 1, |_| true).unwrap_err();
+        assert!(e.starts_with("Could not finish the upload: ") && e.ends_with(" Check the tour list before uploading again."), "{e}");
+        assert_eq!(called, 0, "nothing is known about the site, so nothing is handed over");
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l.ends_with("/commit")), 2);
+        assert_eq!(count(&lines, |l| l == PUBLISH), 0);
+    }
+
+    #[test]
+    fn a_hand_over_that_panics_does_not_change_what_the_update_reports() {
+        for (advice, published) in [("ready", 1), ("draft", 0), ("other_changes", 0)] {
+            let s = replace_stub("[]", false, advice, |_| reply(200, LIVE));
+            let dir = distinct_bundle(3, false);
+            let done = client(&s).update_tour(dir.path(), TOUR, CH, Duration::ZERO, |_| true, |_| panic!("the hand-over broke"), |_| true).unwrap();
+            assert_eq!((done.tour_id.as_str(), done.chapter_id.as_str()), (TOUR, CH));
+            match advice {
+                "ready" => assert_eq!(done.outcome, Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) }),
+                "draft" => assert_eq!(done.outcome, Outcome::Draft),
+                _ => assert_eq!(done.outcome, Outcome::Held),
+            }
+            let lines = s.lines();
+            assert_eq!(count(&lines, |l| l == PUBLISH), published, "{advice}");
+            assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 0, "the committed update is never aborted");
+        }
+    }
+
+    #[test]
+    fn an_update_error_says_whether_updating_again_can_work() {
+        let dir = distinct_bundle(3, false);
+        let gone = update(&refusing_create(404, r#"{"error":"not_found","detail":"no such tour"}"#), dir.path()).unwrap_err();
+        assert!(is_gone(&gone) && !is_chapter_gone(&gone) && !needs_newer_site(&gone), "{gone}");
+        let chapter = update(&refusing_create(404, r#"{"error":"not_found","detail":"no such chapter"}"#), dir.path()).unwrap_err();
+        assert_eq!(chapter, "Could not start the upload: that chapter is no longer part of the tour.");
+        assert!(is_chapter_gone(&chapter) && !is_gone(&chapter) && !needs_newer_site(&chapter));
+        let old = update(&refusing_create(400, r#"{"error":"bad_target","detail":"unknown target"}"#), dir.path()).unwrap_err();
+        assert_eq!(old, "Could not start the upload: the site needs an update to version 0.1.4 or newer.");
+        assert!(needs_newer_site(&old) && !is_gone(&old) && !is_chapter_gone(&old));
+        // Text from the site can never look like one of them: it is followed by the status.
+        let said = update(&refusing_create(500, r#"{"error":"x","detail":"Could not start the upload: that chapter is no longer part of the tour."}"#), dir.path()).unwrap_err();
+        assert!(!is_chapter_gone(&said) && !needs_newer_site(&said) && !is_gone(&said), "{said}");
+    }
+
+    /// A stub whose create answers `status` and `body`; nothing else should ever be asked.
+    fn refusing_create(status: u16, body: &'static str) -> Stub {
+        stub(move |req, seen| if req.line == CREATE { reply(status, body) } else { platform(req, seen) })
+    }
+
+    #[test]
+    fn a_tour_that_is_gone_says_so() {
+        let s = refusing_create(404, r#"{"error":"not_found","detail":"no such tour"}"#);
+        let dir = distinct_bundle(2, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not start the upload: that tour no longer exists.");
+        assert!(is_gone(&e));
+        assert_eq!(s.lines(), [CREATE], "nothing was created, so nothing is aborted");
+        // An id that is not a tour id never reaches the network, and reads the same.
+        let e = client(&s).update_tour(dir.path(), "tour_x/../y", CH, Duration::ZERO, |_| true, |_| {}, |_| true).unwrap_err();
+        assert!(is_gone(&e), "{e}");
+        assert_eq!(s.lines().len(), 1);
+    }
+
+    #[test]
+    fn a_chapter_that_is_gone_says_so() {
+        let s = refusing_create(404, r#"{"error":"not_found","detail":"no such chapter"}"#);
+        let dir = distinct_bundle(2, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not start the upload: that chapter is no longer part of the tour.");
+        assert!(!is_gone(&e), "the tour is still there");
+        assert_eq!(s.lines(), [CREATE]);
+        let e = client(&s).update_tour(dir.path(), TOUR, "ch_../x", Duration::ZERO, |_| true, |_| {}, |_| true).unwrap_err();
+        assert_eq!(e, "Could not start the upload: that chapter is no longer part of the tour.");
+        assert_eq!(s.lines().len(), 1);
+    }
+
+    #[test]
+    fn an_older_site_is_told_to_update_and_nothing_is_retried() {
+        let s = refusing_create(400, r#"{"error":"bad_target","detail":"target.kind must be \"new\" or \"chapter\""}"#);
+        let dir = distinct_bundle(2, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not start the upload: the site needs an update to version 0.1.4 or newer.");
+        assert_eq!(s.lines(), [CREATE], "not sent again, and not sent as a new tour instead");
+        // Another 400 keeps the site's own words.
+        let s = refusing_create(400, r#"{"error":"bad_manifest","detail":"steps: too many"}"#);
+        assert_eq!(update(&s, dir.path()).unwrap_err(), "Could not start the upload: steps: too many (HTTP 400).");
+    }
+
+    #[test]
+    fn a_chapter_changed_meanwhile_is_a_sentence_and_aborts_once() {
+        let s = publish_stub_over(
+            |req, seen| {
+                if req.line == CREATE {
+                    reply(201, &created("[1]", false))
+                } else if req.line.ends_with("/commit") {
+                    reply(409, r#"{"error":"chapter_changed","detail":"the chapter was changed by another upload since this one started; start again"}"#)
+                } else {
+                    platform(req, seen)
+                }
+            },
+            |_| reply(200, LIVE),
+        );
+        let dir = distinct_bundle(3, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.");
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l.ends_with("/commit")), 1, "{lines:?}");
+        assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 1, "{lines:?}");
+        assert_eq!(count(&lines, |l| l == PUBLISH), 0);
+    }
+
+    #[test]
+    fn an_answer_naming_a_step_the_bundle_does_not_have_is_refused() {
+        let dir = distinct_bundle(2, false);
+        for have in ["[3]", "[0]", "[1,200]", "[-1]", "[1.5]", r#"["1"]"#, "[[1]]", r#""1""#, "1", "null", "{}", "true"] {
+            let s = replace_stub(have, false, "ready", |_| reply(200, LIVE));
+            let e = update(&s, dir.path()).unwrap_err();
+            assert_eq!(e, "Could not start the upload: the server's answer was not understood.", "{have}");
+            // The upload exists by then, so it is aborted; no picture, no commit, no publish.
+            assert_eq!(s.lines(), [CREATE.to_string(), format!("DELETE /api/v1/uploads/{UP}")], "{have}");
+        }
+        // A step named twice is that step, once.
+        let s = replace_stub("[2,2]", false, "draft", |_| reply(200, LIVE));
+        update(&s, dir.path()).unwrap();
+        assert_eq!(s.lines(), [CREATE.to_string(), format!("PUT /api/v1/uploads/{UP}/steps/1"), format!("POST /api/v1/uploads/{UP}/commit")]);
+    }
+
+    #[test]
+    fn only_0_1_4_and_newer_support_update() {
+        for (version, yes) in [("0.1.3", false), ("0.1.4", true), ("0.2.0", true), ("1.0.0", true), ("abc", false), ("0.1.10", true), ("0.0.9", false), ("0.1", false), ("", false), ("0.1.4.1", false), ("0.1.x", false), ("1.-1.0", false), ("+1.0.0", false)] {
+            assert_eq!(supports_update(Some(version)), yes, "{version}");
+        }
+        assert!(!supports_update(None));
+    }
+
+    #[test]
+    fn the_commit_answer_gives_the_chapter_id_for_every_target() {
+        for target in [Target::New, Target::Chapter(TOUR.into())] {
+            let s = stub(platform);
+            let out = upload(&s, 2, false, &target).unwrap();
+            assert_eq!(out, Published { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, publish: None }, "{target:?}");
+        }
+        for (advice, means) in [("draft", PublishAdvice::Draft), ("ready", PublishAdvice::Ready), ("other_changes", PublishAdvice::OtherChanges)] {
+            let s = replace_stub("[]", false, advice, |_| reply(200, LIVE));
+            let out = upload(&s, 2, false, &replace_target()).unwrap();
+            assert_eq!(out, Published { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, publish: Some(means) });
+        }
+        // An id that is not one is never handed on: it names a folder later.
+        let other_tour = r#"{"tour_id":"tour_bbbbbbbbbbbbbbbbbbbbbbbb","chapter_id":"ch_0123456789abcdef01234567","steps":2,"publish":"ready"}"#;
+        let other_chapter = r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":"ch_ffffffffffffffffffffffff","steps":2,"publish":"ready"}"#;
+        let cases: [(&str, bool); 7] = [
+            (r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","steps":2}"#, false),
+            (r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":"ch_../../x","steps":2}"#, false),
+            (r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":7,"steps":2}"#, false),
+            (r#"{"tour_id":"..\\x","chapter_id":"ch_0123456789abcdef01234567","steps":2}"#, false),
+            // A replace must be answered about the chapter it replaced, and say what to do about publishing.
+            (other_tour, true),
+            (other_chapter, true),
+            (r#"{"tour_id":"tour_aaaaaaaaaaaaaaaaaaaaaaaa","chapter_id":"ch_0123456789abcdef01234567","steps":2,"publish":"maybe"}"#, true),
+        ];
+        for (body, replace) in cases {
+            let s = stub(move |req, seen| {
+                if req.line == CREATE && replace {
+                    reply(201, &created("[]", false))
+                } else if req.line.ends_with("/commit") {
+                    reply(201, body)
+                } else {
+                    platform(req, seen)
+                }
+            });
+            let target = if replace { replace_target() } else { Target::New };
+            assert_eq!(upload(&s, 2, false, &target).unwrap_err(), "Could not finish the upload: the server's answer was not understood.", "{body}");
+        }
+        // A replace answer without the advice is not understood either.
+        let s = stub(|req, seen| if req.line == CREATE { reply(201, &created("[]", false)) } else { platform(req, seen) });
+        assert!(upload(&s, 2, false, &replace_target()).unwrap_err().ends_with("not understood."));
+    }
+
+    #[test]
+    fn the_token_is_never_in_an_update_error() {
+        let echo = format!(r#"{{"error":"x","detail":"you sent {TOKEN}"}}"#);
+        let dir = distinct_bundle(2, false);
+        let mut errors = Vec::new();
+        // Refused at create, at a step, at the commit; an answer that is not understood; no answer at all.
+        for at in ["create", "/steps/1", "/commit"] {
+            let echo = echo.clone();
+            let s = stub(move |req, seen| {
+                let here = if at == "create" { req.line == CREATE } else { req.line.ends_with(at) };
+                if here {
+                    Answer::Reply(500, echo.clone(), vec![])
+                } else if req.line == CREATE {
+                    reply(201, &created("[]", false))
+                } else {
+                    platform(req, seen)
+                }
+            });
+            errors.push(update(&s, dir.path()).unwrap_err());
+        }
+        let e2 = echo.clone();
+        errors.push(update(&stub(move |_, _| Answer::Reply(201, e2.clone(), vec![])), dir.path()).unwrap_err());
+        errors.push(update(&stub(|_, _| Answer::Drop), dir.path()).unwrap_err());
+        errors.push(update(&stub(|_, _| reply(302, "")), dir.path()).unwrap_err());
+        errors.push(update_tour("http://example.com", TOKEN, dir.path(), TOUR, CH, |_| true, |_| {}, |_| true).unwrap_err());
+        // The publish step's error is part of a result that is shown, too.
+        let s = replace_stub("[]", false, "ready", move |_| Answer::Reply(500, echo.clone(), vec![]));
+        match update(&s, dir.path()).unwrap().outcome {
+            Outcome::NotPublic { error, .. } => errors.push(error),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(errors.len(), 8);
+        for e in &errors {
+            assert!(!e.contains(TOKEN) && !format!("{e:?}").contains(TOKEN), "{e}");
+            assert!(!e.contains("0123456789abcdef0123"), "{e}");
+        }
+        assert!(errors[0].contains("you sent [token]"), "{}", errors[0]);
+        // A 401 anywhere is the token sentence, and an upload that exists is still aborted once.
+        let s = stub(|req, seen| if req.line == CREATE { reply(201, &created("[]", false)) } else if req.line.ends_with("/commit") { reply(401, r#"{"error":"unauthorized"}"#) } else { platform(req, seen) });
+        assert_eq!(update(&s, dir.path()).unwrap_err(), REJECTED_TOKEN);
+        assert_eq!(count(&s.lines(), |l| l.starts_with("DELETE ")), 1);
+    }
+
+    #[test]
+    fn a_step_file_changed_after_it_was_hashed_is_not_sent() {
+        // The hash the site matched against must be of the bytes that are sent.
+        let dir = distinct_bundle(2, false);
+        let path = dir.path().join("step-002.png");
+        let other: Vec<u8> = picture(2).iter().rev().copied().collect();
+        let s = stub(move |req, seen| {
+            if req.line == CREATE {
+                // Same size, other bytes, between the check and the send.
+                std::fs::write(&path, &other).unwrap();
+                reply(201, &created("[1]", false))
+            } else {
+                platform(req, seen)
+            }
+        });
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not send step 2: step-002.png changed since it was checked.");
+        let lines = s.lines();
+        assert_eq!(lines, [CREATE.to_string(), format!("DELETE /api/v1/uploads/{UP}")]);
     }
 
     #[test]
@@ -1815,8 +2708,8 @@ pub(crate) mod tests {
         assert_eq!(
             tours,
             [
-                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None, updated_at: Some(1700000000000), published_at: None },
-                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None, updated_at: Some(1), published_at: None },
+                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None, updated_at: Some(1700000000000), published_at: None, unpublished_changes: false },
+                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None, updated_at: Some(1), published_at: None, unpublished_changes: false },
             ]
         );
         // A list that names a tour's slug or url gives its link, by the same rule as a publish answer.
@@ -2076,7 +2969,7 @@ pub(crate) mod tests {
     }
 
     /// Deletes TOUR against the stub with no pause, recording every progress report.
-    fn delete(stub: &Stub) -> (Result<(), DeleteFailed>, Vec<Option<Images>>) {
+    fn delete(stub: &Stub) -> (Result<Deleted, DeleteFailed>, Vec<Option<Images>>) {
         let mut seen = Vec::new();
         let r = client(stub).delete_tour(TOUR, Duration::ZERO, |p| seen.push(p));
         (r, seen)
@@ -2147,7 +3040,7 @@ pub(crate) mod tests {
     fn a_small_tour_is_deleted_in_one_call() {
         let s = stub(|_, _| reply(200, r#"{"deleted":true}"#));
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None]);
         assert_eq!(s.lines(), [DELETE]);
         let req = &s.requests()[0];
@@ -2163,21 +3056,25 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None, Some((250, 601)), Some((500, 601))]);
         assert_eq!(s.lines(), [DELETE; 3]);
     }
 
     #[test]
     fn a_tour_that_is_already_gone_counts_as_deleted() {
-        // Deleted elsewhere before the first call.
+        // Deleted elsewhere before the first call. The site says the same of another workspace's
+        // tour, so this answer alone does not say the tour was ever the token's.
         let s = stub(|_, _| reply(404, NO_TOUR));
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::NotThere));
         assert_eq!(s.lines().len(), 1);
-        // Or finished by someone else between two calls.
+        // Or finished by someone else between two calls: the site had answered for this tour.
         let s = stub(|_, seen| if seen == 0 { deleting(250, 601) } else { reply(404, NO_TOUR) });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         assert_eq!(s.lines().len(), 2);
+        // The same after files that could not be removed yet.
+        let s = stub(|_, seen| if seen == 0 { reply(500, CLEANUP_PENDING) } else { reply(404, NO_TOUR) });
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
     }
 
     #[test]
@@ -2222,12 +3119,12 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(s.lines().len(), 4);
         assert_eq!(seen, [None, Some((250, 601)), Some((250, 601)), Some((500, 601))]);
         // On the very first call too: the tour is deleted by then, only files are left.
         let s = stub(|_, seen| if seen == 0 { reply(500, CLEANUP_PENDING) } else { reply(200, r#"{"deleted":true}"#) });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         // A site that keeps failing is given up, and the error says what is left.
         let s = stub(|_, _| reply(500, CLEANUP_PENDING));
         let e = delete(&s).0.unwrap_err();
@@ -2250,7 +3147,7 @@ pub(crate) mod tests {
             3 | 4 | 5 => deleting(500, 1000),
             _ => reply(200, r#"{"deleted":true}"#),
         });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         // An answer without counts is not progress.
         let s = stub(|_, _| reply(202, r#"{"status":"in_progress"}"#));
         let (r, seen) = delete(&s);
@@ -2317,7 +3214,7 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None, None, None]);
     }
 
@@ -2451,6 +3348,31 @@ pub(crate) mod tests {
         let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"t","title":"T","status":"published","chapters":1,"steps":1,"updated_at":-5,"published_at":"yesterday"}]}"#));
         let t = &list_tours(&s.base, TOKEN).unwrap()[0];
         assert_eq!((t.updated_at, t.published_at), (None, None));
+    }
+
+    #[test]
+    fn the_tour_list_says_which_public_tours_have_changes_waiting() {
+        let row = |id: &str, status: &str, extra: &str| format!(r#"{{"id":"{id}","title":"T","status":"{status}","slug":"abc123","url":"/t/abc123","chapters":1,"steps":3,"updated_at":1700000000000{extra}}}"#);
+        let rows = [
+            row("yes", "published", r#","unpublished_changes":true"#),
+            row("no", "published", r#","unpublished_changes":false"#),
+            // An older site sends no such field.
+            row("absent", "published", ""),
+            // Anything that is not a yes or a no reads as no.
+            row("null", "published", r#","unpublished_changes":null"#),
+            row("string", "published", r#","unpublished_changes":"true""#),
+            row("number", "published", r#","unpublished_changes":1"#),
+            // A draft has nothing public to be behind, whatever the row says.
+            row("draft", "draft", r#","unpublished_changes":true"#),
+        ];
+        let body = format!(r#"{{"tours":[{}]}}"#, rows.join(","));
+        let s = stub(move |_, _| reply(200, &body));
+        let tours = list_tours(&s.base, TOKEN).unwrap();
+        let read: Vec<(&str, bool)> = tours.iter().map(|t| (t.id.as_str(), t.unpublished_changes)).collect();
+        assert_eq!(read, [("yes", true), ("no", false), ("absent", false), ("null", false), ("string", false), ("number", false), ("draft", false)]);
+        // The rest of each row is read as before.
+        assert!(tours.iter().all(|t| t.title == "T" && t.steps == 3 && t.updated_at == Some(1700000000000)));
+        assert!(tours[..6].iter().all(|t| t.link.is_some()) && tours[6].link.is_none());
     }
 
     #[test]

@@ -10,9 +10,11 @@
 //! leaves the pointer out; the overlay renderer draws it back in at export.
 
 mod cursor;
+mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
+pub use saved::{OpenError, SaveError, SaveStep};
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -54,9 +56,12 @@ pub struct FrameMeta {
     pub cursor: Option<(i32, i32)>,
 }
 
-/// A finished recording: compressed frames in a temp folder plus their timing.
+/// A finished recording: compressed frames in a folder plus their timing. A recording that
+/// was just made owns a temp folder; one opened from a saved folder does not own it.
 pub struct Recording {
     dir: PathBuf,
+    /// Whether the folder is this recording's to delete.
+    owned: bool,
     pub width: u32,
     pub height: u32,
     pub frames: Vec<FrameMeta>,
@@ -110,19 +115,49 @@ impl Recording {
     #[doc(hidden)]
     pub fn timing_only(width: u32, height: u32, times: &[u64], end_ms: u64) -> Recording {
         let frames = times.iter().map(|t| FrameMeta { offset: 0, len: 0, key: true, t_ms: *t, cursor: None }).collect();
-        Recording { dir: PathBuf::new(), width, height, frames, end_ms }
+        Recording { dir: PathBuf::new(), owned: false, width, height, frames, end_ms }
+    }
+
+    /// A small real recording that owns `dir` (which must exist), as the recorder leaves one:
+    /// one frame per entry of `times`, each a little different from the one before. For tests
+    /// of code that reads frames or deletes a recording.
+    #[doc(hidden)]
+    pub fn synthetic_in(dir: &std::path::Path, width: u32, height: u32, times: &[u64], end_ms: u64) -> Result<Recording, String> {
+        let mut writer = FrameWriter::create(dir, width, height)?;
+        for (i, t_ms) in times.iter().enumerate() {
+            let mut px = vec![40u8; (width * height * 4) as usize];
+            for (n, p) in px.chunks_exact_mut(4).enumerate() {
+                if (n + i * 7) % 13 == 0 {
+                    p[0] = (i * 31 % 256) as u8;
+                }
+                p[3] = 255;
+            }
+            writer.push(&px, *t_ms, None)?;
+        }
+        writer.finish(dir.to_path_buf(), end_ms)
     }
 
     pub fn duration_ms(&self) -> u64 {
         self.end_ms
     }
 
+    /// Whether `other` holds the same recording: the same picture size and end time, and for
+    /// every frame the same time, pointer, place and length in the frames file, and kind.
+    pub fn same_frames(&self, other: &Recording) -> bool {
+        let whole = |m: &FrameMeta| (m.offset, m.len, m.key, m.t_ms, m.cursor);
+        (self.width, self.height, self.end_ms, self.frames.len()) == (other.width, other.height, other.end_ms, other.frames.len()) && self.frames.iter().zip(&other.frames).all(|(a, b)| whole(a) == whole(b))
+    }
+
     pub fn delete(self) {
         self.delete_files();
     }
 
-    /// Remove the temp files; for a recording shared through an `Arc`.
+    /// Remove the temp files; for a recording shared through an `Arc`. A recording opened
+    /// from a saved folder does not own that folder, and nothing is removed.
     pub fn delete_files(&self) {
+        if !self.owned {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -453,7 +488,7 @@ impl FrameWriter {
 
     fn finish(mut self, dir: PathBuf, end_ms: u64) -> Result<Recording, String> {
         self.out.flush().map_err(|e| e.to_string())?;
-        Ok(Recording { dir, width: self.width, height: self.height, frames: self.frames, end_ms })
+        Ok(Recording { dir, owned: true, width: self.width, height: self.height, frames: self.frames, end_ms })
     }
 }
 
@@ -462,7 +497,7 @@ mod tests {
     use super::*;
 
     /// A frame that differs from its neighbours in a few places, like a screen.
-    fn synthetic(i: usize, w: u32, h: u32) -> Vec<u8> {
+    pub(crate) fn synthetic(i: usize, w: u32, h: u32) -> Vec<u8> {
         let mut px = vec![30u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -475,6 +510,23 @@ mod tests {
             }
         }
         px
+    }
+
+    #[test]
+    fn two_recordings_are_the_same_only_when_every_frame_lies_and_reads_the_same() {
+        let frame = |offset, len, key, t_ms, cursor| FrameMeta { offset, len, key, t_ms, cursor };
+        let rec = |width, end_ms, frames: Vec<FrameMeta>| Recording { dir: PathBuf::new(), owned: false, width, height: 80, frames, end_ms };
+        let base = || vec![frame(0, 10, true, 0, None), frame(10, 12, false, 100, None)];
+        assert!(rec(100, 200, base()).same_frames(&rec(100, 200, base())));
+        // Equal times and no pointer, and still other frames: a length, where one lies, a whole frame.
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 13, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(11, 12, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 12, true, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 12, false, 101, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, Some((1, 2))), frame(10, 12, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(101, 200, base())));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 201, base())));
     }
 
     #[test]
