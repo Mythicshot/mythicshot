@@ -392,12 +392,12 @@ fn is_hash(s: &str) -> bool {
 }
 
 /// Only `pictures/<hash>.png`, so a file edited by hand cannot name a file outside the project.
-fn is_picture_name(name: &str) -> bool {
+pub(super) fn is_picture_name(name: &str) -> bool {
     name.strip_prefix("pictures/").and_then(|r| r.strip_suffix(".png")).is_some_and(is_hash)
 }
 
 /// Only `logo-<hash>.<extension>`.
-fn is_logo_name(name: &str) -> bool {
+pub(super) fn is_logo_name(name: &str) -> bool {
     let ext_ok = |e: &str| (1..=8).contains(&e.len()) && e.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     name.strip_prefix("logo-").and_then(|r| r.split_once('.')).is_some_and(|(hash, ext)| is_hash(hash) && ext_ok(ext))
 }
@@ -872,7 +872,7 @@ pub fn parse(text: &str) -> Result<ProjectFile, ParseError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use image::RgbaImage;
     use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
@@ -897,7 +897,7 @@ mod tests {
         Recording::timing_only(100, 80, &[0, 100, 200, 300, 400, 500, 600, 700, 800, 900], 1000)
     }
 
-    fn picture() -> ImageData {
+    pub(in crate::project) fn picture() -> ImageData {
         let mut img = RgbaImage::from_pixel(2, 2, image::Rgba([200, 30, 40, 255]));
         img.put_pixel(1, 1, image::Rgba([0, 0, 255, 255]));
         img.put_pixel(0, 1, image::Rgba([200, 30, 40, 128]));
@@ -909,7 +909,7 @@ mod tests {
     }
 
     /// One of every kind of shape; some on a frame range, one pinned to a step, one restyled.
-    fn items() -> Vec<Item> {
+    pub(in crate::project) fn items() -> Vec<Item> {
         let shapes = vec![
             Shape::Rect(b(1.0, 2.0, 30.0, 40.0)),
             Shape::Ellipse(b(5.5, 6.25, 50.0, 60.0)),
@@ -939,7 +939,7 @@ mod tests {
         items
     }
 
-    fn events() -> Vec<InputEvent> {
+    pub(in crate::project) fn events() -> Vec<InputEvent> {
         vec![
             InputEvent { t_ms: 150, kind: InputKind::MouseDown(MouseButton::Left, 50, 40) },
             InputEvent { t_ms: 160, kind: InputKind::KeyDown("Hunter2Key".into()) },
@@ -950,12 +950,12 @@ mod tests {
         ]
     }
 
-    fn mouse_only(events: &[InputEvent]) -> Vec<InputEvent> {
+    pub(in crate::project) fn mouse_only(events: &[InputEvent]) -> Vec<InputEvent> {
         events.iter().filter(|e| matches!(e.kind, InputKind::MouseDown(..) | InputKind::MouseUp(..))).cloned().collect()
     }
 
     /// Every field of an `Edit` away from its default, with cards on two steps.
-    fn edit(rec: &Recording, logo: Option<&Path>) -> Edit {
+    pub(in crate::project) fn edit(rec: &Recording, logo: Option<&Path>) -> Edit {
         let mut e = Edit::new(rec, OverlayStyle { keys: KeyStyle::Chips, clicks: ClickStyle::Both, halo: true, pointer: false });
         e.trim = (1, 8);
         e.deleted = BTreeSet::from([3, 4]);
@@ -982,14 +982,14 @@ mod tests {
     }
 
     /// A folder holding the logo's source file, and its path.
-    fn logo_source() -> (tempfile::TempDir, std::path::PathBuf) {
+    pub(in crate::project) fn logo_source() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Company Logo.PNG");
         std::fs::write(&path, LOGO).unwrap();
         (dir, path)
     }
 
-    fn logo_name() -> String {
+    pub(in crate::project) fn logo_name() -> String {
         format!("logo-{}.png", hash16(LOGO))
     }
 
@@ -1007,12 +1007,12 @@ mod tests {
         }
     }
 
-    fn image_item(id: u64, image: ImageData) -> Item {
+    pub(in crate::project) fn image_item(id: u64, image: ImageData) -> Item {
         Item { id, shape: Shape::Image { rect: b(0.0, 0.0, 2.0, 2.0), image }, style: Style::default(), frames: None, pin: None }
     }
 
     /// A 2 x 2 picture of one colour.
-    fn plain(colour: [u8; 4]) -> ImageData {
+    pub(in crate::project) fn plain(colour: [u8; 4]) -> ImageData {
         ImageData::from_rgba(&RgbaImage::from_pixel(2, 2, image::Rgba(colour)))
     }
 
@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     /// Equal items; two pictures are equal when their pixels are.
-    fn assert_same_items(got: &[Item], want: &[Item]) {
+    pub(in crate::project) fn assert_same_items(got: &[Item], want: &[Item]) {
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want) {
             match (&g.shape, &w.shape) {
@@ -1043,7 +1043,7 @@ mod tests {
         }
     }
 
-    fn assert_same_edit(got: &Edit, want: &Edit) {
+    pub(in crate::project) fn assert_same_edit(got: &Edit, want: &Edit) {
         assert_eq!(got.trim, want.trim);
         assert_eq!(got.deleted, want.deleted);
         assert_eq!(got.speed, want.speed);
