@@ -116,6 +116,10 @@ pub struct DeleteFailed {
     /// The site has already removed the tour itself; only some of its files are left.
     /// Deleting the same tour again carries on where this stopped.
     pub unfinished: bool,
+    /// The site refused before it began (or was never asked): the tour is as it was, whole.
+    /// Never set together with `unfinished`. Neither set: the answer was lost or unclear, so
+    /// the site may or may not have begun.
+    pub not_started: bool,
 }
 
 /// Whether `error` (from rename, publish or unpublish) says the tour is no longer on the site.
@@ -313,7 +317,7 @@ pub fn rename_tour(server: &str, token: &str, tour_id: &str, title: &str) -> Res
 /// its files, and stopping half-way would leave files nobody can find again. Blocks like
 /// [`publish_tour`].
 pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
-    Client::new(server, token, Timeouts::default()).map_err(|message| DeleteFailed { message, unfinished: false })?.delete_tour(tour_id, PUBLISH_PAUSE, progress)
+    Client::new(server, token, Timeouts::default()).map_err(|message| DeleteFailed { message, unfinished: false, not_started: true })?.delete_tour(tour_id, PUBLISH_PAUSE, progress)
 }
 
 /// Takes the tour off the public web: calls the unpublish route until its public images
@@ -839,10 +843,12 @@ impl Client {
         let what = "Could not delete the tour";
         let failed = |message: String, unfinished: bool| {
             let message = if unfinished { format!("{message}{UNFINISHED_TRAILER}") } else { message };
-            DeleteFailed { message, unfinished }
+            DeleteFailed { message, unfinished, not_started: false }
         };
+        // A clear refusal: unless an earlier answer said the delete is under way, nothing was begun.
+        let refused = |message: String, unfinished: bool| DeleteFailed { not_started: !unfinished, ..failed(message, unfinished) };
         if !is_id(tour_id, "tour_") {
-            return Err(failed(not_understood(what), false));
+            return Err(refused(not_understood(what), false));
         }
         let path = format!("/api/v1/tours/{tour_id}");
         // Once the server has answered that the delete is under way, the tour itself is gone.
@@ -862,10 +868,10 @@ impl Client {
             // Never with the "files remain" ending: half-way through, a 404 that is not the
             // site's own (a proxy's page) says nothing about the tour either way.
             if Self::says_no_such_route(&reply) {
-                return Err(failed(format!("{what}: {NEEDS_UPDATE}"), false));
+                return Err(DeleteFailed { not_started: !unfinished, ..failed(format!("{what}: {NEEDS_UPDATE}"), false) });
             }
             if reply.status == 409 && reply.error_code().as_deref() == Some("publish_busy") {
-                return Err(failed(format!("{what}: a publish of this tour is in progress. Wait for it to finish, or unpublish the tour, then delete it again."), unfinished));
+                return Err(refused(format!("{what}: a publish of this tour is in progress. Wait for it to finish, or unpublish the tour, then delete it again."), unfinished));
             }
             if reply.status == 500 && reply.error_code().as_deref() == Some("cleanup_pending") {
                 // The tour is deleted; some files could not be removed yet. Calling again retries.
@@ -875,7 +881,9 @@ impl Client {
                     return Err(failed(format!("{what} completely: the site could not remove some of its files yet."), true));
                 }
             } else {
-                let reply = self.check(what, reply).map_err(|m| failed(m, unfinished))?;
+                // A rejected token is a refusal too; any other answer that is not a yes says nothing either way.
+                let rejected = reply.status == 401;
+                let reply = self.check(what, reply).map_err(|m| if rejected { refused(m, unfinished) } else { failed(m, unfinished) })?;
                 let v = reply.json().ok_or_else(|| failed(not_understood(what), unfinished))?;
                 match reply.status {
                     200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(()),
@@ -2177,7 +2185,7 @@ pub(crate) mod tests {
         for (status, body) in [(404, NO_ROUTE), (404, "404 Not Found"), (404, ""), (404, r#"{"error":"not_found","detail":"no such page"}"#), (405, "")] {
             let s = stub(move |_, _| reply(status, body));
             let e = delete(&s).0.unwrap_err();
-            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false }, "{status} {body}");
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false, not_started: true }, "{status} {body}");
             assert_eq!(s.lines().len(), 1);
         }
     }
@@ -2195,12 +2203,13 @@ pub(crate) mod tests {
         for (status, body, message) in cases {
             let s = stub(move |_, _| reply(status, body));
             let (r, _) = delete(&s);
-            assert_eq!(r.unwrap_err(), DeleteFailed { message: message.into(), unfinished: false });
+            assert_eq!(r.unwrap_err(), DeleteFailed { message: message.into(), unfinished: false, not_started: matches!(status, 401 | 409) }, "{status}");
             assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
         }
         let s = stub(|_, _| Answer::Drop);
         let e = delete(&s).0.unwrap_err();
         assert!(e.message.starts_with("Could not delete the tour: ") && e.message.ends_with('.') && !e.message.contains("dp_") && !e.unfinished, "{e:?}");
+        assert!(!e.not_started, "a lost answer says nothing about what the site did");
         assert_eq!(s.lines().len(), 1);
     }
 
@@ -2277,7 +2286,7 @@ pub(crate) mod tests {
         for (status, body) in [(404, "<html>Not Found</html>"), (404, NO_ROUTE), (405, "")] {
             let s = stub(move |_, seen| if seen == 0 { deleting(250, 601) } else { reply(status, body) });
             let e = delete(&s).0.unwrap_err();
-            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false }, "{status} {body}");
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false, not_started: false }, "{status} {body}");
             assert!(!e.message.contains("gone from the site"));
             assert_eq!(s.lines().len(), 2);
         }
@@ -2298,7 +2307,7 @@ pub(crate) mod tests {
         for (status, body) in [(200, "{}"), (200, r#"{"deleted":false}"#), (200, "<html>Sign in</html>"), (202, "{}"), (202, r#"{"status":"done"}"#), (204, ""), (201, r#"{"deleted":true}"#)] {
             let s = stub(move |_, _| reply(status, body));
             let e = delete(&s).0.unwrap_err();
-            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the server's answer was not understood.".into(), unfinished: false }, "{status} {body}");
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the server's answer was not understood.".into(), unfinished: false, not_started: false }, "{status} {body}");
             assert_eq!(s.lines().len(), 1);
         }
         // Counts that make no sense are not shown, but the loop goes on.

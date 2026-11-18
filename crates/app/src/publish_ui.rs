@@ -77,18 +77,7 @@ pub fn init(settings: &crate::settings::Settings) {
     }
     set_server(&settings.publish_server);
     config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
-    let recorded = settings.publish_saved_for.clone();
-    std::thread::spawn(move || {
-        refresh_token_now();
-        // A settings file from before the token was tied to an address: tie it once.
-        let (token, server) = {
-            let c = config();
-            (c.token.clone(), c.server.clone())
-        };
-        if let Some(site) = first_binding(recorded.as_deref(), &token, &server) {
-            bind_token(site);
-        }
-    });
+    std::thread::spawn(refresh_token_now);
     std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
 }
 
@@ -140,8 +129,10 @@ pub fn refresh_token_now() {
 // ---- The token belongs to one site ----
 
 /// Where to sort out a token that belongs to another address.
-pub const FIX_ON_WORKSPACE: &str = "Choose on the Workspace page whether to use it for this address or replace it.";
-pub const USE_IT_HERE: &str = "Use it for this address too";
+pub const FIX_ON_WORKSPACE: &str = "Choose on the Workspace page whether to use it for this address instead or replace it.";
+pub const USE_IT_HERE: &str = "Use it for this address instead";
+/// Beside that button: what pressing it does to the address the token belonged to.
+pub const USE_IT_HERE_MEANS: &str = "The token will then be used only for this address, and no longer for the one it was saved for. Or replace the token above.";
 
 /// Why the saved token may not be sent to `server`, when it may not: it was saved for
 /// another address, or for none. None when it may, and for an address that is not one (the
@@ -158,18 +149,30 @@ pub fn binding_problem(bound: Option<&str>, server: &str) -> Option<String> {
     }
 }
 
-/// What a settings file without a recorded address gets at start-up, once: the configured
-/// address when a token is saved and the address is usable, none otherwise. None when
-/// nothing is decided: the file already records one, or the token state is not known.
-pub fn first_binding(recorded: Option<&str>, token: &TokenStatus, server: &str) -> Option<Option<String>> {
-    if recorded.is_some() {
+/// What a settings file from before the token was tied to an address records, once per
+/// install: the address configured at this very start when it is usable, none (an empty
+/// string) otherwise. It does not wait for the credential store, which may be locked or
+/// slow: whatever token is in it was saved while this address was the configured one.
+/// None when nothing is to be done: the adoption already ran, or the file records an address.
+pub fn first_binding(settled: bool, recorded: Option<&str>, server: &str) -> Option<String> {
+    if settled || recorded.is_some() {
         return None;
     }
-    match token {
-        TokenStatus::Saved => Some(publish::check_server(server).ok()),
-        TokenStatus::Missing => Some(None),
-        TokenStatus::Checking | TokenStatus::Unavailable(_) => None,
+    Some(publish::check_server(server).unwrap_or_default())
+}
+
+/// Run the one-time adoption on the settings read at start-up, and mark it as run whatever
+/// it did, so that it never runs again: from then on a token with no recorded address is
+/// tied to none, and only the user ties it. True when the settings changed and must be saved.
+pub fn settle_first_binding(settings: &mut crate::settings::Settings) -> bool {
+    if settings.publish_binding_settled {
+        return false;
     }
+    if let Some(site) = first_binding(false, settings.publish_saved_for.as_deref(), &settings.publish_server) {
+        settings.publish_saved_for = Some(site);
+    }
+    settings.publish_binding_settled = true;
+    true
 }
 
 /// The address the saved token belongs to. In a debug build run with the test hook, that is
@@ -183,7 +186,7 @@ pub fn token_site() -> Option<String> {
 }
 
 /// Tie the saved token to `site` (None: to no address). Called when a token is saved or
-/// forgotten, and for "Use it for this address too". The app writes it to the settings.
+/// forgotten, and for "Use it for this address instead". The app writes it to the settings.
 pub fn bind_token(site: Option<String>) {
     let mut c = config();
     c.saved_for = site.clone();
@@ -974,25 +977,82 @@ mod tests {
         assert_eq!(publish_blocked(false, true, "https://tours.example.co", &TokenStatus::Missing, Some("https://tours.example.com")), Some(Blocked::NoToken));
     }
 
+    /// The settings as the next start reads them from the file.
+    fn restarted(settings: &crate::settings::Settings) -> crate::settings::Settings {
+        toml::from_str(&toml::to_string_pretty(settings).unwrap()).unwrap()
+    }
+
+    /// What the pages say about the saved token and `server`, with these settings.
+    fn problem(settings: &crate::settings::Settings) -> Option<String> {
+        let bound = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
+        binding_problem(bound.as_deref(), &settings.publish_server)
+    }
+
     #[test]
-    fn an_install_from_before_the_tie_adopts_the_configured_address_once() {
-        let saved = TokenStatus::Saved;
-        // No record in the settings file, a token saved, a usable address: that address.
-        assert_eq!(first_binding(None, &saved, " https://Tours.Example.com/ "), Some(Some("https://tours.example.com".into())));
-        // No usable address: tied to none, and that is recorded, so no later address is adopted silently.
-        assert_eq!(first_binding(None, &saved, ""), Some(None));
-        assert_eq!(first_binding(None, &saved, "http://tours.example.com"), Some(None));
-        // No token: nothing to tie; recorded too.
-        assert_eq!(first_binding(None, &TokenStatus::Missing, "https://tours.example.com"), Some(None));
-        // Not known yet: decided at a later start.
-        assert_eq!(first_binding(None, &TokenStatus::Checking, "https://tours.example.com"), None);
-        assert_eq!(first_binding(None, &TokenStatus::Unavailable("locked".into()), "https://tours.example.com"), None);
-        // Once there is a record, even an empty one, nothing is adopted again.
-        for recorded in ["", "https://tours.example.com", "https://old.example.com"] {
-            assert_eq!(first_binding(Some(recorded), &saved, "https://new.example.com"), None, "{recorded:?}");
+    fn a_normal_upgrade_ties_the_token_to_the_configured_address() {
+        // A file from before the tie: an address, no record.
+        let mut s: crate::settings::Settings = toml::from_str("publish_server = \" https://Tours.Example.com/ \"\n").unwrap();
+        assert!(!s.publish_binding_settled && s.publish_saved_for.is_none());
+        assert!(settle_first_binding(&mut s));
+        assert_eq!((s.publish_saved_for.as_deref(), s.publish_binding_settled), (Some("https://tours.example.com"), true));
+        assert_eq!(problem(&s), None);
+        // The next start does nothing, and the file says why.
+        let mut s = restarted(&s);
+        assert!(!settle_first_binding(&mut s));
+        assert_eq!(s.publish_saved_for.as_deref(), Some("https://tours.example.com"));
+        // A file of the version that recorded the address but had no flag yet keeps its record.
+        let mut s: crate::settings::Settings = toml::from_str("publish_server = \"https://new.example.com\"\npublish_saved_for = \"https://old.example.com\"\n").unwrap();
+        assert!(settle_first_binding(&mut s));
+        assert_eq!((s.publish_saved_for.as_deref(), s.publish_binding_settled), (Some("https://old.example.com"), true));
+        let mut s: crate::settings::Settings = toml::from_str("publish_server = \"https://new.example.com\"\npublish_saved_for = \"\"\n").unwrap();
+        assert!(settle_first_binding(&mut s));
+        assert_eq!(s.publish_saved_for.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_adoption_does_not_wait_for_the_token_so_a_later_address_is_never_adopted() {
+        // First start: the credential store is locked or still being read. That is not asked at all.
+        let mut s: crate::settings::Settings = toml::from_str("publish_server = \"https://tours.example.com\"\n").unwrap();
+        assert!(settle_first_binding(&mut s));
+        assert_eq!(s.publish_saved_for.as_deref(), Some("https://tours.example.com"));
+        // The address is changed afterwards, and the app is started again with the store usable.
+        s.publish_server = "https://tours.example.co".into();
+        let mut s = restarted(&s);
+        assert!(!settle_first_binding(&mut s));
+        assert_eq!(s.publish_saved_for.as_deref(), Some("https://tours.example.com"), "still the address of the first start");
+        assert_eq!(problem(&s).as_deref(), Some("The saved token belongs to tours.example.com, so it is not sent to this address."));
+        assert!(matches!(publish_blocked(false, true, &s.publish_server, &TokenStatus::Saved, s.publish_saved_for.as_deref()), Some(Blocked::OtherSite(_))));
+    }
+
+    #[test]
+    fn with_no_address_at_the_first_start_the_token_is_tied_to_none_for_good() {
+        for first in ["", "http://tours.example.com", "not an address"] {
+            let mut s = crate::settings::Settings::default();
+            s.publish_server = first.into();
+            assert!(settle_first_binding(&mut s), "{first:?}");
+            assert_eq!((s.publish_saved_for.as_deref(), s.publish_binding_settled), (Some(""), true), "{first:?}");
+            // An address typed afterwards is not adopted, at this start or any later one.
+            s.publish_server = "https://tours.example.com".into();
+            let mut s = restarted(&s);
+            assert!(!settle_first_binding(&mut s));
+            assert_eq!(problem(&s).as_deref(), Some("The saved token is not tied to a site address yet, so it is not sent anywhere."), "{first:?}");
         }
+        // The flag alone decides: with it set and no record at all, nothing is adopted either.
+        let mut s = crate::settings::Settings::default();
+        (s.publish_server, s.publish_binding_settled) = ("https://tours.example.com".into(), true);
+        assert!(!settle_first_binding(&mut s));
+        assert_eq!(s.publish_saved_for, None);
+        assert_eq!(problem(&s).as_deref(), Some("The saved token is not tied to a site address yet, so it is not sent anywhere."));
+        assert_eq!(first_binding(true, None, "https://tours.example.com"), None);
+        assert_eq!(first_binding(false, Some(""), "https://tours.example.com"), None);
+        assert_eq!(first_binding(false, None, "https://tours.example.com").as_deref(), Some("https://tours.example.com"));
+    }
+
+    #[test]
+    fn the_tie_survives_the_settings_file_and_holds_no_token() {
         // The record survives the settings file, and holds no token.
         let mut settings = crate::settings::Settings::default();
+        settings.publish_binding_settled = true;
         settings.publish_saved_for = Some("https://tours.example.com".into());
         let text = toml::to_string_pretty(&settings).unwrap();
         assert!(!text.to_ascii_lowercase().contains("token"), "{text}");
