@@ -2,17 +2,20 @@
 //!
 //! The root eframe window is the region-selector overlay. It stays hidden
 //! until a capture starts, then covers the whole desktop. Hotkeys, tray menu
-//! clicks and raw key events (only while the settings page records a new
-//! shortcut) arrive on one channel and wake the UI.
+//! clicks and raw key events (only while the Preferences page records a new
+//! shortcut) arrive on one channel and wake the UI. The main window (Home,
+//! Tours, Workspace, Preferences) is a second window, see `main_window`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod editor_ui;
+mod home_ui;
 mod hotkeys;
 mod hook;
 mod icons;
 mod input;
 mod live_draw;
+mod main_window;
 mod overlay;
 mod password;
 mod platform;
@@ -68,10 +71,15 @@ struct App {
     rx: Receiver<AppEvent>,
     tx: Sender<AppEvent>,
     overlay: Option<Overlay>,
-    settings_open: bool,
-    focus_settings: bool,
+    /// The main window's state, shared with its viewport.
+    window: Arc<std::sync::Mutex<main_window::Shared>>,
+    /// The page the main window was asked to open on, until its next frame.
+    window_request: Option<main_window::Request>,
+    /// The window the user was in before Mythicshot, to give focus back to before a capture.
+    last_foreground: main_window::LastForeground,
+    /// A capture started from the main window, waiting for the window to be gone.
+    hide_then_run: main_window::HideThenRun,
     settings_state: SettingsState,
-    settings_shared: Arc<std::sync::Mutex<settings_ui::Shared>>,
     recorder: ShortcutRecorder,
     key_hook_started: bool,
     /// Open editors; the flag is true until the window has been shown once.
@@ -155,16 +163,14 @@ impl App {
             })
             .collect();
         let tray = Tray::new(&settings, &displays).expect("create tray icon");
-        let settings_shared = Arc::new(std::sync::Mutex::new(settings_ui::Shared {
+        let window = Arc::new(std::sync::Mutex::new(main_window::Shared::new(settings_ui::Shared {
             settings: settings.clone(),
             errors: HashMap::new(),
             snipping_tool: None,
             autostart: false,
             state: SettingsState::default(),
             actions: Vec::new(),
-            close_requested: false,
-            focus: false,
-        }));
+        })));
 
         let mut app = Self {
             settings,
@@ -173,10 +179,11 @@ impl App {
             rx,
             tx,
             overlay: None,
-            settings_open: std::env::args().any(|a| a == "--settings"),
-            focus_settings: true,
+            window,
+            window_request: main_window::start_request(std::env::args()),
+            last_foreground: main_window::LastForeground::default(),
+            hide_then_run: main_window::HideThenRun::default(),
             settings_state: SettingsState::default(),
-            settings_shared,
             recorder: ShortcutRecorder::default(),
             key_hook_started: false,
             editors: Vec::new(),
@@ -245,7 +252,11 @@ impl App {
                         self.run(ctx, cmd);
                     }
                 }
-                AppEvent::TrayClick => self.run(ctx, Command::Region),
+                AppEvent::TrayClick => {
+                    if let Some(cmd) = tray::left_click(self.settings.tray_left_click, self.activity()) {
+                        self.run(ctx, cmd);
+                    }
+                }
                 AppEvent::Key(ev) => self.record_key(&ev),
                 AppEvent::Input(ev) => {
                     if self.session.is_some() {
@@ -256,7 +267,21 @@ impl App {
         }
     }
 
+    /// What is on screen that a tray click must not disturb. A capture started from the main
+    /// window counts from the moment its tile is clicked.
+    fn activity(&self) -> tray::Activity {
+        tray::Activity { overlay: self.overlay.is_some(), session: self.session.is_some(), picker: !self.pickers.is_empty(), pending: self.hide_then_run.is_waiting() }
+    }
+
     fn run(&mut self, ctx: &egui::Context, cmd: Command) {
+        // The main window never opens over a capture, whether asked for by a click or from the menu.
+        if !tray::allowed(cmd, self.activity()) {
+            return;
+        }
+        // A capture waiting for the main window to be gone gives way to whatever runs now.
+        if cmd.changes_the_screen() {
+            self.hide_then_run.cancel();
+        }
         match cmd {
             Command::Region => self.start_overlay(ctx),
             Command::LastRegion => match self.settings.last_region {
@@ -298,10 +323,8 @@ impl App {
                 self.settings.magnifier = !self.settings.magnifier;
                 self.settings_changed();
             }
-            Command::Preferences => {
-                self.settings_open = true;
-                self.focus_settings = true;
-            }
+            // The main window, on Home or on Preferences. Already open, it comes to the front on that page.
+            Command::OpenApp | Command::Preferences => self.window_request = main_window::request_for(cmd),
             Command::OpenFolder => platform::open_folder(&self.settings.output_dir),
             Command::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
@@ -822,18 +845,23 @@ impl App {
         self.listening.store(false, Ordering::Relaxed);
     }
 
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let builder = ViewportBuilder::default()
-            .with_title("Mythicshot settings")
-            .with_inner_size([860.0, 560.0])
-            .with_min_inner_size([640.0, 420.0])
-            .with_icon(self.icon.clone());
-        // Pull what the settings window did since our last frame.
-        let (actions, close, edited, tab) = {
-            let mut s = self.settings_shared.lock().expect("settings state");
-            (std::mem::take(&mut s.actions), std::mem::take(&mut s.close_requested), s.settings.clone(), s.state.tab)
+    /// Each frame: apply what the main window queued, start a capture it asked for once it is
+    /// hidden, and keep it drawn while it is open.
+    fn main_window(&mut self, ctx: &egui::Context) {
+        // Pull what the window did since our last frame.
+        let (actions, edited, tab, capture) = {
+            let mut s = self.window.lock().expect("main window state");
+            s.settle(ctx);
+            let actions = std::mem::take(&mut s.prefs.actions);
+            let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
+            (actions, edited, s.prefs.state.tab, s.capture.take())
         };
         self.settings_state.tab = tab;
+        let edited = edited.unwrap_or_else(|| self.settings.clone());
+        // Which app the user is in, for a capture started from the main window.
+        if let Some(front) = platform::foreground_window() {
+            self.last_foreground.note(front, platform::window_kind(front));
+        }
         for a in actions {
             match a {
                 UiAction::Listen(action) => self.listen(Some(action)),
@@ -870,6 +898,7 @@ impl App {
                     self.settings.overlays = edited.overlays;
                     self.settings.gif_quality = edited.gif_quality;
                     self.settings.publish_server = edited.publish_server.clone();
+                    self.settings.tray_left_click = edited.tray_left_click;
                     self.settings_changed();
                 }
                 UiAction::SetTakePrintScreen(on) => {
@@ -884,27 +913,49 @@ impl App {
                 }
             }
         }
-        if close {
-            self.stop_listening();
-            self.settings_open = false;
-            if let Ok(mut s) = self.settings_shared.lock() {
-                s.state.publishing.clear_token_field(ctx);
+        // A Home tile: close the window so it is not in the picture, then capture. It stays
+        // closed afterwards, so it never comes back over the overlay or the editor.
+        if let Some(cmd) = capture {
+            if let Ok(mut s) = self.window.lock() {
+                s.nav.close();
+                s.settle(ctx);
             }
-            return;
+            self.window_request = None;
+            // Focus goes back to the app the user came from, so "Window" captures that one.
+            if let Some(previous) = self.last_foreground.get() {
+                platform::set_foreground(previous);
+            }
+            self.hide_then_run.start(cmd, Instant::now());
+        }
+        if let Some(cmd) = self.hide_then_run.take_due(Instant::now()) {
+            // Anything started in the meantime dropped it already (see `run`); this is the last check.
+            if tray::pending_may_run(self.activity()) {
+                // "Window" never captures one of our own windows.
+                let front = platform::foreground_window().map(platform::window_kind);
+                self.run(ctx, main_window::tile_command(cmd, front));
+            }
+        }
+        if let Some(wait) = self.hide_then_run.due_in(Instant::now()) {
+            ctx.request_repaint_after(wait);
         }
 
-        // Push the current state back and keep the window drawn.
-        {
-            let mut s = self.settings_shared.lock().expect("settings state");
-            s.settings = self.settings.clone();
-            s.errors = self.binding_errors();
-            s.snipping_tool = self.snipping_tool;
-            s.autostart = platform::autostart_enabled();
-            s.state.listening = self.settings_state.listening;
-            s.focus |= std::mem::take(&mut self.focus_settings);
+        // Push the current state back and keep the window drawn while it is open.
+        // A closed window costs nothing more per frame.
+        let open = self.window.lock().map(|s| s.nav.is_open()).unwrap_or(false);
+        if !open && self.window_request.is_none() {
+            return;
         }
-        settings_ui::show(ctx, &self.settings_shared, builder);
-        ctx.request_repaint_of(settings_ui::viewport_id());
+        {
+            let mut s = self.window.lock().expect("main window state");
+            s.busy = self.activity().busy();
+            let p = &mut s.prefs;
+            p.settings = self.settings.clone();
+            p.errors = self.binding_errors();
+            p.snipping_tool = self.snipping_tool;
+            p.autostart = platform::autostart_enabled();
+            p.state.listening = self.settings_state.listening;
+        }
+        main_window::show(ctx, &self.window, self.icon.clone(), self.window_request.take());
     }
 }
 
@@ -969,9 +1020,7 @@ impl eframe::App for App {
         self.show_editors(&ctx);
         self.show_pickers(&ctx);
         self.toast.show(&ctx);
-        if self.settings_open {
-            self.settings_window(&ctx);
-        }
+        self.main_window(&ctx);
         // Keep the event loop ticking slowly while hidden so queued events are never stranded.
         ctx.request_repaint_after(Duration::from_millis(250));
     }

@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.2 (2026-11-18)
+
+- Main window: a left-click on the tray icon opens Mythicshot with a menu for Home, Tours, Workspace and Preferences. Tours and Workspace are placeholders until the next update.
+- Home: tiles for Region, Window, Full screen and Record with their hotkeys, and the five newest captures.
+- Preferences now live inside the main window. A new setting chooses what a left-click on the tray icon does.
+- The tray menu has "Open Mythicshot" at the top. The window stays out of the way during a capture or recording.
+- A damaged or unreadable settings file is copied aside and never overwritten with defaults; one bad value costs only that setting.
+
 ## 0.2.1 (2026-11-18)
 
 - Publish tour now offers "Publish now" (the default) or "Upload as a private draft".

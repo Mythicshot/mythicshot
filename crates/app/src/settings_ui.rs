@@ -1,4 +1,4 @@
-//! The settings window (screen 5 of the mockup): General and Hotkeys tabs.
+//! The Preferences page of the main window: the General, Output and Hotkeys tabs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_patte
 
 use crate::hotkeys::{self, Action, EditorAction};
 use crate::publish_ui::{self, TokenStatus};
-use crate::settings::Settings;
+use crate::settings::{Settings, TrayLeftClick};
 
 const WARN_BG: Color32 = Color32::from_rgb(58, 42, 16);
 const WARN_TEXT: Color32 = Color32::from_rgb(255, 196, 107);
@@ -134,6 +134,17 @@ impl PublishingState {
         }
     }
 
+    /// Whether a token has been typed and not saved.
+    #[cfg(test)]
+    pub fn has_unsaved_token(&self) -> bool {
+        !self.token_input.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn type_token_for_test(&mut self, token: &str) {
+        self.token_input = token.to_string();
+    }
+
     fn clear_message(&self) {
         if let Ok(mut m) = self.message.lock() {
             *m = None;
@@ -165,9 +176,8 @@ pub enum UiAction {
     SetTakePrintScreen(bool),
 }
 
-/// State shared between the app and the settings window. The window is a
-/// deferred viewport (eframe's OpenGL backend can't open an immediate one from
-/// a tray click), so it draws on its own schedule: it edits `settings`, queues
+/// The Preferences page's part of the state shared between the app and the main window (see
+/// `main_window::Shared`). The window draws on its own schedule: it edits `settings`, queues
 /// `actions`, and the app applies them on its next frame and refreshes the rest.
 pub struct Shared {
     pub settings: Settings,
@@ -176,30 +186,6 @@ pub struct Shared {
     pub autostart: bool,
     pub state: SettingsState,
     pub actions: Vec<UiAction>,
-    pub close_requested: bool,
-    pub focus: bool,
-}
-
-pub fn viewport_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("settings")
-}
-
-pub fn show(ctx: &egui::Context, shared: &std::sync::Arc<std::sync::Mutex<Shared>>, builder: egui::ViewportBuilder) {
-    let shared = shared.clone();
-    ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
-        let mut guard = shared.lock().expect("settings state");
-        let s = &mut *guard;
-        if std::mem::take(&mut s.focus) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        if ui.ctx().input(|i| i.viewport().close_requested()) {
-            s.close_requested = true;
-            s.state.publishing.clear_token_field(ui.ctx());
-        }
-        let view = View { settings: &mut s.settings, errors: &s.errors, snipping_tool: s.snipping_tool, autostart: s.autostart };
-        let out = self::ui(ui, &mut s.state, view);
-        s.actions.extend(out);
-    });
 }
 
 pub struct View<'a> {
@@ -209,15 +195,13 @@ pub struct View<'a> {
     pub autostart: bool,
 }
 
+/// Draw the page: the three tabs in a row, and the selected one under them.
 pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<UiAction> {
     let mut out = Vec::new();
-    egui::Panel::left("settings-nav").resizable(false).exact_size(180.0).show(ui, |ui| {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Mythicshot settings").strong().size(15.0));
-        ui.add_space(10.0);
+    ui.horizontal(|ui| {
         for (tab, name) in [(Tab::General, "General"), (Tab::Output, "Output"), (Tab::Hotkeys, "Hotkeys")] {
             let selected = state.tab == tab;
-            if ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(selected, name)).clicked() {
+            if ui.add(egui::Button::selectable(selected, name).min_size(vec2(96.0, 30.0))).clicked() {
                 if state.tab != tab {
                     state.publishing.clear_token_field(ui.ctx());
                 }
@@ -225,17 +209,22 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
                 out.push(UiAction::StopListening);
             }
         }
-        // Which build this is, at the bottom of the sidebar.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(egui::Color32::from_rgb(140, 148, 164)));
-        });
     });
-    egui::CentralPanel::default().show(ui, |ui| match state.tab {
+    ui.separator();
+    ui.add_space(6.0);
+    // The settings file could not be used as it was at start-up.
+    if let Some(problem) = &view.settings.load_problem {
+        egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(problem.sentence()).color(WARN_TEXT)).wrap());
+        });
+        ui.add_space(8.0);
+    }
+    match state.tab {
         Tab::General => general(ui, view, &mut out),
         Tab::Output => output_tab(ui, &mut state.publishing, view, &mut out),
         Tab::Hotkeys => hotkeys_tab(ui, state, view, &mut out),
-    });
+    }
     out
 }
 
@@ -250,10 +239,22 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
         out.push(UiAction::SettingsChanged);
     }
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("Left-click on the tray icon");
+        for choice in TrayLeftClick::ALL {
+            if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
+                out.push(UiAction::SettingsChanged);
+            }
+        }
+    });
     ui.add_space(16.0);
     if ui.button("Open settings folder").clicked() {
         out.push(UiAction::OpenSettingsFolder);
     }
+    // Which build this is.
+    ui.add_space(16.0);
+    ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(Color32::from_rgb(140, 148, 164)));
 }
 
 fn output_tab(ui: &mut egui::Ui, publishing: &mut PublishingState, view: View<'_>, out: &mut Vec<UiAction>) {

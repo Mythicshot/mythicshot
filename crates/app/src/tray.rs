@@ -8,7 +8,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use mythicshot_destinations::DestId;
 
 use crate::hotkeys::{self, Action};
-use crate::settings::Settings;
+use crate::settings::{Settings, TrayLeftClick};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -29,12 +29,23 @@ pub enum Command {
     OpenFile,
     ToggleDestination(DestId),
     ToggleMagnifier,
+    /// Open the main window on its Home page.
+    OpenApp,
+    /// Open the main window on its Preferences page.
     Preferences,
     OpenFolder,
     Exit,
 }
 
 impl Command {
+    /// Whether running the command puts something new on the screen or takes a picture of it: a
+    /// capture, a recording, an editor, a file dialog, a folder, the main window. A capture that
+    /// is waiting for the main window to be gone is dropped when one of these runs, so the two
+    /// never both fire and the waiting one never photographs what the other opened.
+    pub fn changes_the_screen(self) -> bool {
+        !matches!(self, Command::PauseRecording | Command::LiveDraw | Command::ToggleDestination(_) | Command::ToggleMagnifier)
+    }
+
     pub fn from_action(a: Action) -> Command {
         match a {
             Action::CaptureRegion => Command::Region,
@@ -48,6 +59,56 @@ impl Command {
             Action::PauseRecording => Command::PauseRecording,
             Action::LiveDraw => Command::LiveDraw,
         }
+    }
+}
+
+/// What is on screen that a tray click must not disturb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Activity {
+    /// The region selector covers the desktop.
+    pub overlay: bool,
+    /// A recording session: its countdown, or the recording itself.
+    pub session: bool,
+    /// An "after capture" picker is waiting for a choice.
+    pub picker: bool,
+    /// A capture started from the main window is waiting for the window to be off the screen.
+    pub pending: bool,
+}
+
+impl Activity {
+    /// Something is being captured or chosen: the main window must not open over it.
+    pub fn busy(self) -> bool {
+        self.overlay || self.session || self.picker || self.pending
+    }
+}
+
+/// Whether a command may run now. The two that open the main window, from the tray menu as much as
+/// from a click, do nothing while something is being captured or chosen: the window would land in
+/// a recording, take focus from the app being recorded, or be in the picture a waiting capture is
+/// about to take. Everything else is left to the command itself.
+pub fn allowed(cmd: Command, activity: Activity) -> bool {
+    !(matches!(cmd, Command::OpenApp | Command::Preferences) && activity.busy())
+}
+
+/// Whether a capture that waited for the main window to be gone may start now: not when a region
+/// is already being selected or a recording session exists.
+pub fn pending_may_run(activity: Activity) -> bool {
+    !activity.overlay && !activity.session
+}
+
+/// What a left-click on the tray icon runs, or `None` when the click is ignored.
+///
+/// Opening the app is ignored while a region is being selected, a recording is counting down or
+/// running, or a picker is waiting: the window would cover the capture, take focus from the app
+/// being recorded, or land in the recording. A region capture is ignored while the selector is
+/// already up, a recording session exists or another capture is about to start, since a second
+/// one cannot start then.
+pub fn left_click(choice: TrayLeftClick, activity: Activity) -> Option<Command> {
+    match choice {
+        TrayLeftClick::OpenApp if !allowed(Command::OpenApp, activity) => None,
+        TrayLeftClick::OpenApp => Some(Command::OpenApp),
+        TrayLeftClick::CaptureRegion if activity.overlay || activity.session || activity.pending => None,
+        TrayLeftClick::CaptureRegion => Some(Command::Region),
     }
 }
 
@@ -74,6 +135,7 @@ impl Tray {
             it
         };
 
+        let open_app = item("Open Mythicshot", Command::OpenApp, true);
         let region = item(&label("Capture region", settings.binding(Action::CaptureRegion)), Command::Region, true);
         let last = item(&label("Capture last region", settings.binding(Action::CaptureLastRegion)), Command::LastRegion, true);
         let window = item(&label("Capture window", settings.binding(Action::CaptureWindow)), Command::Window, true);
@@ -118,6 +180,8 @@ impl Tray {
 
         let menu = Menu::new();
         let sep = PredefinedMenuItem::separator;
+        menu.append(&open_app).map_err(|e| e.to_string())?;
+        menu.append(&sep()).map_err(|e| e.to_string())?;
         for it in [&region as &dyn tray_icon::menu::IsMenuItem, &last, &window, &full, &from_clipboard, &open_file] {
             menu.append(it).map_err(|e| e.to_string())?;
         }
@@ -206,4 +270,83 @@ pub fn icon_rgba(size: u32) -> (Vec<u8>, u32) {
         }
     }
     (px, size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDLE: Activity = Activity { overlay: false, session: false, picker: false, pending: false };
+
+    #[test]
+    fn the_menu_items_that_open_the_window_do_nothing_while_busy() {
+        let busy = [Activity { overlay: true, ..IDLE }, Activity { session: true, ..IDLE }, Activity { picker: true, ..IDLE }, Activity { pending: true, ..IDLE }];
+        for a in busy {
+            assert!(a.busy(), "{a:?}");
+            for cmd in [Command::OpenApp, Command::Preferences] {
+                assert!(!allowed(cmd, a), "{cmd:?} during {a:?}");
+            }
+            // Nothing else is held back here.
+            for cmd in [Command::Region, Command::Record, Command::PauseRecording, Command::LiveDraw, Command::OpenFolder, Command::ToggleMagnifier, Command::Exit] {
+                assert!(allowed(cmd, a), "{cmd:?} during {a:?}");
+            }
+        }
+        assert!(allowed(Command::OpenApp, IDLE) && allowed(Command::Preferences, IDLE));
+    }
+
+    #[test]
+    fn the_wait_before_a_capture_counts_as_busy() {
+        let waiting = Activity { pending: true, ..IDLE };
+        assert!(waiting.busy());
+        assert_eq!(left_click(TrayLeftClick::OpenApp, waiting), None);
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, waiting), None, "one capture is already about to start");
+    }
+
+    #[test]
+    fn a_waiting_capture_starts_only_when_nothing_else_did() {
+        assert!(pending_may_run(IDLE));
+        // Its own wait, and a picker from an earlier capture, do not hold it back.
+        assert!(pending_may_run(Activity { pending: true, ..IDLE }));
+        assert!(pending_may_run(Activity { picker: true, ..IDLE }));
+        assert!(!pending_may_run(Activity { overlay: true, ..IDLE }));
+        assert!(!pending_may_run(Activity { session: true, ..IDLE }));
+    }
+
+    #[test]
+    fn only_switches_and_recording_controls_leave_a_waiting_capture_alone() {
+        for cmd in [Command::Region, Command::LastRegion, Command::Window, Command::FullScreen, Command::Record, Command::RecordLastRegion, Command::RecordWindow, Command::RecordFullScreen, Command::Display(0), Command::FromClipboard, Command::OpenFile, Command::OpenApp, Command::Preferences, Command::OpenFolder, Command::Exit] {
+            assert!(cmd.changes_the_screen(), "{cmd:?}");
+        }
+        for cmd in [Command::PauseRecording, Command::LiveDraw, Command::ToggleMagnifier, Command::ToggleDestination(DestId::File)] {
+            assert!(!cmd.changes_the_screen(), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn a_left_click_follows_the_setting_when_nothing_is_going_on() {
+        assert_eq!(left_click(TrayLeftClick::OpenApp, IDLE), Some(Command::OpenApp));
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, IDLE), Some(Command::Region));
+        assert_eq!(left_click(TrayLeftClick::default(), IDLE), Some(Command::OpenApp));
+    }
+
+    #[test]
+    fn a_left_click_never_opens_the_window_over_a_capture() {
+        let overlay = Activity { overlay: true, ..IDLE };
+        // The countdown and the recording are one session.
+        let session = Activity { session: true, ..IDLE };
+        let picker = Activity { picker: true, ..IDLE };
+        for busy in [overlay, session, picker, Activity { overlay: true, session: true, picker: true, pending: true }] {
+            assert!(busy.busy());
+            assert_eq!(left_click(TrayLeftClick::OpenApp, busy), None, "{busy:?}");
+        }
+        assert!(!IDLE.busy());
+    }
+
+    #[test]
+    fn a_region_click_does_not_start_a_second_capture() {
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { overlay: true, ..IDLE }), None);
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { session: true, ..IDLE }), None);
+        // A waiting picker never stopped a new capture, and still does not.
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { picker: true, ..IDLE }), Some(Command::Region));
+    }
 }

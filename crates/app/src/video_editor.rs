@@ -1211,7 +1211,7 @@ impl Editor {
                 let no_keys = !v.events.iter().any(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_)));
                 if no_keys && v.edit.overlays.keys != KeyStyle::Off {
                     ui.label(RichText::new("No key presses were recorded").color(AMBER).size(12.0))
-                        .on_hover_text("Key logging is off by default. Turn on Keys on the recording bar (or Record key presses in Settings › Output) before recording.");
+                        .on_hover_text("Key logging is off by default. Turn on Keys on the recording bar (or Record key presses in Preferences › Output) before recording.");
                 }
                 if v.edit.crop.is_some() && ui.button("Clear crop").clicked() {
                     v.edit.crop = None;
