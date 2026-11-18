@@ -13,6 +13,29 @@ use crate::hotkeys::{Action, EditorAction};
 /// Bumped when default editor keys change in a way old files need moving.
 const EDITOR_KEYS_VERSION: u32 = 1;
 
+/// What a left-click on the tray icon does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayLeftClick {
+    /// Open the main window on its Home page.
+    #[default]
+    OpenApp,
+    /// Start a region capture straight away, as every version before the main window did.
+    CaptureRegion,
+}
+
+impl TrayLeftClick {
+    pub const ALL: [TrayLeftClick; 2] = [TrayLeftClick::OpenApp, TrayLeftClick::CaptureRegion];
+
+    /// The choice as the Preferences page words it.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrayLeftClick::OpenApp => "Open Mythicshot",
+            TrayLeftClick::CaptureRegion => "Capture a region",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -53,6 +76,9 @@ pub struct Settings {
     /// Tour platform address for "Publish tour", empty until set. The API token is never
     /// kept here, only in the OS credential store (see `publish`).
     pub publish_server: String,
+    /// What a left-click on the tray icon does. Files from before the main window have no such key
+    /// and read as `OpenApp`.
+    pub tray_left_click: TrayLeftClick,
 
     // Phase 1–2 options, read once to fill `destinations`, never written.
     #[serde(skip_serializing)]
@@ -160,6 +186,7 @@ impl Default for Settings {
             editor: EditorPrefs::default(),
             editor_keys_version: EDITOR_KEYS_VERSION,
             publish_server: String::new(),
+            tray_left_click: TrayLeftClick::default(),
             open_editor: None,
             save_to_file: None,
             copy_to_clipboard: None,
@@ -346,6 +373,27 @@ crop = \"KeyX\"
         s.editor.tour_animate_hotspot = false;
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert!(!back.editor.tour_animate_hotspot);
+    }
+
+    #[test]
+    fn the_tray_left_click_opens_the_app_by_default_and_is_remembered() {
+        assert_eq!(Settings::default().tray_left_click, TrayLeftClick::OpenApp);
+        // A file from before the main window has no such key.
+        let old: Settings = toml::from_str("magnifier = false
+publish_server = \"https://tours.example.com\"
+").unwrap();
+        assert_eq!(old.upgrade().tray_left_click, TrayLeftClick::OpenApp);
+        let empty: Settings = toml::from_str("").unwrap();
+        assert_eq!(empty.tray_left_click, TrayLeftClick::OpenApp);
+        // Both values round-trip, under the names the file uses.
+        for (choice, word) in [(TrayLeftClick::CaptureRegion, "capture_region"), (TrayLeftClick::OpenApp, "open_app")] {
+            let s = Settings { tray_left_click: choice, ..Settings::default() };
+            let text = toml::to_string_pretty(&s).unwrap();
+            assert!(text.contains(&format!("tray_left_click = \"{word}\"")), "{text}");
+            let back: Settings = toml::from_str(&text).unwrap();
+            assert_eq!(back.tray_left_click, choice);
+        }
+        assert_eq!((TrayLeftClick::OpenApp.label(), TrayLeftClick::CaptureRegion.label()), ("Open Mythicshot", "Capture a region"));
     }
 
     #[test]

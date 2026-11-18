@@ -8,7 +8,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use mythicshot_destinations::DestId;
 
 use crate::hotkeys::{self, Action};
-use crate::settings::Settings;
+use crate::settings::{Settings, TrayLeftClick};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -29,6 +29,9 @@ pub enum Command {
     OpenFile,
     ToggleDestination(DestId),
     ToggleMagnifier,
+    /// Open the main window on its Home page.
+    OpenApp,
+    /// Open the main window on its Preferences page.
     Preferences,
     OpenFolder,
     Exit,
@@ -48,6 +51,39 @@ impl Command {
             Action::PauseRecording => Command::PauseRecording,
             Action::LiveDraw => Command::LiveDraw,
         }
+    }
+}
+
+/// What is on screen that a tray click must not disturb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Activity {
+    /// The region selector covers the desktop.
+    pub overlay: bool,
+    /// A recording session: its countdown, or the recording itself.
+    pub session: bool,
+    /// An "after capture" picker is waiting for a choice.
+    pub picker: bool,
+}
+
+impl Activity {
+    /// Something is being captured or chosen: the main window must not open over it.
+    pub fn busy(self) -> bool {
+        self.overlay || self.session || self.picker
+    }
+}
+
+/// What a left-click on the tray icon runs, or `None` when the click is ignored.
+///
+/// Opening the app is ignored while a region is being selected, a recording is counting down or
+/// running, or a picker is waiting: the window would cover the capture, take focus from the app
+/// being recorded, or land in the recording. A region capture is ignored while the selector is
+/// already up or a recording session exists, since a second one cannot start then.
+pub fn left_click(choice: TrayLeftClick, activity: Activity) -> Option<Command> {
+    match choice {
+        TrayLeftClick::OpenApp if activity.busy() => None,
+        TrayLeftClick::OpenApp => Some(Command::OpenApp),
+        TrayLeftClick::CaptureRegion if activity.overlay || activity.session => None,
+        TrayLeftClick::CaptureRegion => Some(Command::Region),
     }
 }
 
@@ -74,6 +110,7 @@ impl Tray {
             it
         };
 
+        let open_app = item("Open Mythicshot", Command::OpenApp, true);
         let region = item(&label("Capture region", settings.binding(Action::CaptureRegion)), Command::Region, true);
         let last = item(&label("Capture last region", settings.binding(Action::CaptureLastRegion)), Command::LastRegion, true);
         let window = item(&label("Capture window", settings.binding(Action::CaptureWindow)), Command::Window, true);
@@ -118,6 +155,8 @@ impl Tray {
 
         let menu = Menu::new();
         let sep = PredefinedMenuItem::separator;
+        menu.append(&open_app).map_err(|e| e.to_string())?;
+        menu.append(&sep()).map_err(|e| e.to_string())?;
         for it in [&region as &dyn tray_icon::menu::IsMenuItem, &last, &window, &full, &from_clipboard, &open_file] {
             menu.append(it).map_err(|e| e.to_string())?;
         }
@@ -206,4 +245,39 @@ pub fn icon_rgba(size: u32) -> (Vec<u8>, u32) {
         }
     }
     (px, size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDLE: Activity = Activity { overlay: false, session: false, picker: false };
+
+    #[test]
+    fn a_left_click_follows_the_setting_when_nothing_is_going_on() {
+        assert_eq!(left_click(TrayLeftClick::OpenApp, IDLE), Some(Command::OpenApp));
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, IDLE), Some(Command::Region));
+        assert_eq!(left_click(TrayLeftClick::default(), IDLE), Some(Command::OpenApp));
+    }
+
+    #[test]
+    fn a_left_click_never_opens_the_window_over_a_capture() {
+        let overlay = Activity { overlay: true, ..IDLE };
+        // The countdown and the recording are one session.
+        let session = Activity { session: true, ..IDLE };
+        let picker = Activity { picker: true, ..IDLE };
+        for busy in [overlay, session, picker, Activity { overlay: true, session: true, picker: true }] {
+            assert!(busy.busy());
+            assert_eq!(left_click(TrayLeftClick::OpenApp, busy), None, "{busy:?}");
+        }
+        assert!(!IDLE.busy());
+    }
+
+    #[test]
+    fn a_region_click_does_not_start_a_second_capture() {
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { overlay: true, ..IDLE }), None);
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { session: true, ..IDLE }), None);
+        // A waiting picker never stopped a new capture, and still does not.
+        assert_eq!(left_click(TrayLeftClick::CaptureRegion, Activity { picker: true, ..IDLE }), Some(Command::Region));
+    }
 }
