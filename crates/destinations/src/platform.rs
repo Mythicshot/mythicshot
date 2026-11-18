@@ -10,23 +10,31 @@ fn wide(s: &str) -> Vec<u16> {
 /// Hand the file to the system's "print" verb (the image viewer's print dialog).
 #[cfg(windows)]
 pub fn print(path: &Path) -> Result<(), String> {
-    shell_execute("print", &path.to_string_lossy())
+    let target = path.to_string_lossy();
+    shell_execute("print", &target).map_err(|code| format!("Windows could not print {target} (code {code})"))
 }
 
+/// Open a link with its default app. The error never repeats the link.
 #[cfg(windows)]
 pub fn open_url(url: &str) -> Result<(), String> {
-    shell_execute("open", url)
+    shell_execute("open", url).map_err(open_failed)
+}
+
+/// What a failed open says: the system's code, never the link.
+#[cfg(windows)]
+fn open_failed(code: isize) -> String {
+    format!("Windows could not open the link (code {code})")
 }
 
 #[cfg(windows)]
-fn shell_execute(verb: &str, target: &str) -> Result<(), String> {
+fn shell_execute(verb: &str, target: &str) -> Result<(), isize> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
     let (v, t) = (wide(verb), wide(target));
     let code = unsafe { ShellExecuteW(None, PCWSTR(v.as_ptr()), PCWSTR(t.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
     // ShellExecute returns a value above 32 on success.
-    if code.0 as isize > 32 { Ok(()) } else { Err(format!("Windows could not {verb} {target} (code {})", code.0 as isize)) }
+    if code.0 as isize > 32 { Ok(()) } else { Err(code.0 as isize) }
 }
 
 /// Open the default mail app's compose window with the file attached, through
@@ -85,4 +93,12 @@ pub fn email(_path: &Path, _subject: &str) -> Result<(), String> {
 pub fn open_url(url: &str) -> Result<(), String> {
     let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(cmd).arg(url).spawn().map(|_| ()).map_err(|e| format!("could not run {cmd}: {e}"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn a_failed_open_says_the_code_and_never_the_link() {
+        assert_eq!(super::open_failed(31), "Windows could not open the link (code 31)");
+    }
 }

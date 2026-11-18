@@ -66,7 +66,7 @@ Guide cards, the cover, the end card, the buttons, the hotspot and the progress 
 
 ## Publish tour
 
-"Publish tour…", beside "Export tour" in the export panel, uploads the tour to your own tour platform as a private draft. Nothing goes public from Mythicshot; you publish the draft on the platform.
+"Publish tour…", beside "Export tour" in the export panel, uploads the tour to your own tour platform. The dialog offers "Publish now" (the default: anyone with the link can view the tour) or "Upload as a private draft" (nothing goes public). After a publish it shows the tour's link, with "Copy" and "Open in browser". Adding a chapter to a tour with "Publish now" publishes the whole tour; as a private draft, a tour that is already public stays as it was. If publishing fails or is cancelled after the upload, the draft is on the server but not public, and "Try again" publishes it without uploading again.
 
 First set it up in Settings › Output › Tour publishing: enter the server address (`https://`, or `http://` for `localhost` only), paste the API token from the server's setup page and press Save, then "Test connection", which shows the workspace's name or what went wrong. "Forget" removes the token.
 
