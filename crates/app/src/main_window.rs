@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::home_ui::{self, HomeState};
+use crate::platform::{WindowId, WindowKind};
 use crate::publish_ui::{self, TokenStatus};
 use crate::settings_ui::{self, UiAction};
 use crate::tray::Command;
@@ -60,18 +61,28 @@ impl Page {
     }
 }
 
-/// The page a command opens the main window on, for the commands that open it.
-pub fn page_for(cmd: Command) -> Option<Page> {
+/// A request to show the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// A tray click or "Open Mythicshot": a closed window opens on Home; an open one comes to the
+    /// front as it is, on the page it shows, with whatever is typed there left alone.
+    Open,
+    /// "Preferences…" or a link from another page: open on this page, or switch to it.
+    Page(Page),
+}
+
+/// The request a command makes of the main window, for the commands that open it.
+pub fn request_for(cmd: Command) -> Option<Request> {
     match cmd {
-        Command::OpenApp => Some(Page::Home),
-        Command::Preferences => Some(Page::Preferences),
+        Command::OpenApp => Some(Request::Open),
+        Command::Preferences => Some(Request::Page(Page::Preferences)),
         _ => None,
     }
 }
 
-/// The page to open at start-up: Preferences for `--settings`, otherwise the app starts in the tray.
-pub fn start_page(args: impl IntoIterator<Item = String>) -> Option<Page> {
-    args.into_iter().any(|a| a == "--settings").then_some(Page::Preferences)
+/// What to open at start-up: Preferences for `--settings`, otherwise the app starts in the tray.
+pub fn start_request(args: impl IntoIterator<Item = String>) -> Option<Request> {
+    args.into_iter().any(|a| a == "--settings").then_some(Request::Page(Page::Preferences))
 }
 
 /// Which page is up and whether the window is open, without any drawing.
@@ -90,6 +101,24 @@ impl Nav {
 
     pub fn page(&self) -> Page {
         self.page
+    }
+
+    /// Apply a request to show the window.
+    pub fn apply(&mut self, request: Request) {
+        match request {
+            Request::Open => self.open_or_raise(),
+            Request::Page(page) => self.request(page),
+        }
+    }
+
+    /// A closed window opens on Home. An open one only comes to the front: its page stays, so
+    /// nothing typed on it is lost.
+    pub fn open_or_raise(&mut self) {
+        if !self.open {
+            self.page = Page::Home;
+            self.open = true;
+        }
+        self.focus = true;
     }
 
     /// Open the window on `page`. When it is already open this switches the page and brings the
@@ -184,6 +213,11 @@ impl HideThenRun {
         self.waiting.is_some()
     }
 
+    /// Drop the waiting capture: something else was started in the meantime.
+    pub fn cancel(&mut self) {
+        self.waiting = None;
+    }
+
     /// The command, once, when its time has come.
     pub fn take_due(&mut self, now: Instant) -> Option<Command> {
         match self.waiting {
@@ -198,6 +232,29 @@ impl HideThenRun {
     /// How long until the command is due, to wake the UI then.
     pub fn due_in(&self, now: Instant) -> Option<Duration> {
         self.waiting.map(|(_, at)| at.saturating_duration_since(now))
+    }
+}
+
+/// The window the user was in before Mythicshot: the last window seen in front that is neither one
+/// of ours nor the taskbar (which is in front while the tray icon is clicked). A capture started
+/// from the main window gives focus back to it first, so "Window" captures that window and not
+/// whatever Windows happens to pick once the main window is gone.
+#[derive(Debug, Default)]
+pub struct LastForeground {
+    window: Option<WindowId>,
+}
+
+impl LastForeground {
+    /// The window in front now, and whose it is.
+    pub fn note(&mut self, window: WindowId, kind: WindowKind) {
+        if kind == WindowKind::Other {
+            self.window = Some(window);
+        }
+    }
+
+    /// The window to give focus back to, if one was ever seen.
+    pub fn get(&self) -> Option<WindowId> {
+        self.window
     }
 }
 
@@ -221,14 +278,14 @@ pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("main-window")
 }
 
-/// Show the window. `page_request` opens it on that page, or, when it is already open, switches
-/// to the page and brings the window to the front. Without a request, an open window is kept
-/// drawn and a closed one stays closed.
-pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::IconData>, page_request: Option<Page>) {
+/// Show the window. A request opens it, or, when it is already open, brings it to the front (see
+/// [`Request`] for which page it shows). Without a request, an open window is kept drawn and a
+/// closed one stays closed.
+pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::IconData>, request: Option<Request>) {
     {
         let mut s = shared.lock().expect("main window state");
-        if let Some(page) = page_request {
-            s.nav.request(page);
+        if let Some(request) = request {
+            s.nav.apply(request);
         }
         s.settle(ctx);
         if !s.nav.is_open() {
@@ -400,15 +457,89 @@ mod tests {
     #[test]
     fn every_way_in_to_preferences_opens_the_main_window_on_that_page() {
         // The tray's "Preferences…" item and the debug test hook both run this command.
-        assert_eq!(page_for(Command::Preferences), Some(Page::Preferences));
-        assert_eq!(page_for(Command::OpenApp), Some(Page::Home));
+        assert_eq!(request_for(Command::Preferences), Some(Request::Page(Page::Preferences)));
         // The `--settings` argument.
-        assert_eq!(start_page(["mythicshot.exe".to_string(), "--settings".to_string()]), Some(Page::Preferences));
-        assert_eq!(start_page(["mythicshot.exe".to_string()]), None);
+        assert_eq!(start_request(["mythicshot.exe".to_string(), "--settings".to_string()]), Some(Request::Page(Page::Preferences)));
+        assert_eq!(start_request(["mythicshot.exe".to_string()]), None);
+        let mut nav = Nav::default();
+        nav.request(Page::Tours);
+        nav.take_focus();
+        nav.apply(Request::Page(Page::Preferences));
+        assert_eq!(nav.page(), Page::Preferences);
+        assert!(nav.is_open() && nav.take_focus());
+        // The tray click and "Open Mythicshot" ask for the window, not for a page.
+        assert_eq!(request_for(Command::OpenApp), Some(Request::Open));
         // Nothing else opens the window.
         for cmd in [Command::Region, Command::Window, Command::FullScreen, Command::Record, Command::OpenFolder, Command::Exit, Command::ToggleMagnifier] {
-            assert_eq!(page_for(cmd), None, "{cmd:?}");
+            assert_eq!(request_for(cmd), None, "{cmd:?}");
         }
+    }
+
+    #[test]
+    fn a_tray_click_opens_a_closed_window_on_home() {
+        let mut nav = Nav::default();
+        nav.apply(Request::Open);
+        assert!(nav.is_open() && nav.take_focus());
+        assert_eq!(nav.page(), Page::Home);
+        // Closed on another page, it opens on Home again.
+        nav.request(Page::Preferences);
+        nav.close();
+        nav.take_left_preferences();
+        nav.apply(Request::Open);
+        assert_eq!(nav.page(), Page::Home);
+        assert!(nav.is_open() && nav.take_focus());
+    }
+
+    #[test]
+    fn a_tray_click_on_an_open_window_raises_it_and_keeps_its_page_and_what_is_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Preferences);
+        s.nav.take_focus();
+        s.prefs.state.publishing.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
+        s.nav.apply(Request::Open);
+        s.settle(&ctx);
+        assert_eq!(s.nav.page(), Page::Preferences, "it does not jump to Home");
+        assert!(s.nav.take_focus(), "it comes to the front");
+        assert!(s.prefs.state.publishing.has_unsaved_token(), "the typed token is still there");
+        assert!(s.prefs.actions.is_empty(), "a shortcut being recorded is not stopped");
+        assert!(!s.nav.take_left_preferences());
+        // The same on every other page.
+        for page in [Page::Home, Page::Tours, Page::Workspace] {
+            s.nav.go(page);
+            s.nav.apply(Request::Open);
+            assert_eq!(s.nav.page(), page);
+            assert!(s.nav.take_focus());
+        }
+    }
+
+    #[test]
+    fn the_window_to_go_back_to_is_the_last_one_that_was_not_ours_or_the_taskbar() {
+        let mut last = LastForeground::default();
+        assert_eq!(last.get(), None);
+        last.note(11, WindowKind::Other);
+        // The click on the tray icon, then our own window in front.
+        last.note(22, WindowKind::Shell);
+        last.note(33, WindowKind::Ours);
+        assert_eq!(last.get(), Some(11));
+        // The user went to another app and came back: that app is the one to return to.
+        last.note(44, WindowKind::Other);
+        last.note(33, WindowKind::Ours);
+        assert_eq!(last.get(), Some(44));
+    }
+
+    #[test]
+    fn a_waiting_capture_can_be_dropped() {
+        let t0 = Instant::now();
+        let mut h = HideThenRun::default();
+        h.start(Command::Region, t0);
+        h.cancel();
+        assert!(!h.is_waiting());
+        assert_eq!(h.take_due(t0 + HIDE_BEFORE_CAPTURE * 2), None, "it never fires");
+        assert_eq!(h.due_in(t0), None);
+        // Dropping nothing is fine.
+        h.cancel();
     }
 
     #[test]
@@ -484,7 +615,15 @@ mod tests {
         let mut s = shared(tmp.path());
         let ctx = egui::Context::default();
         s.nav.request(Page::Home);
-        let home = drawn(&ctx, &mut s);
+        // The first frame says the folder is being read; the answer follows.
+        let first = drawn(&ctx, &mut s);
+        assert!(first.contains(home_ui::READING_RECENT) && !first.contains(home_ui::NOTHING_RECENT), "{first}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut home = first;
+        while home.contains(home_ui::READING_RECENT) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            home = drawn(&ctx, &mut s);
+        }
         for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
             assert!(home.lines().any(|l| l == word), "Home is missing {word:?} in:\n{home}");
         }

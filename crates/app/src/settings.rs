@@ -208,8 +208,60 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let parsed: Option<Settings> = std::fs::read_to_string(Self::path()).ok().and_then(|text| toml::from_str(&text).ok());
-        parsed.unwrap_or_default().upgrade()
+        Self::load_from(&Self::path())
+    }
+
+    /// Read the settings file at `path`. A file that is not TOML at all cannot be used; since the
+    /// next change saves over it, a copy is kept beside it first (`settings.unreadable.toml`).
+    fn load_from(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else { return Settings::default().upgrade() };
+        match Self::parse(&text) {
+            Some(s) => s.upgrade(),
+            None => {
+                eprintln!("settings file {} could not be read; starting from the defaults", path.display());
+                let _ = std::fs::copy(path, path.with_file_name("settings.unreadable.toml"));
+                Settings::default().upgrade()
+            }
+        }
+    }
+
+    /// Settings from the file's text. A value this version does not understand (a mistyped word, a
+    /// choice or an action from a newer version, a number where text belongs) costs only that
+    /// one setting, which reads as its default; every other setting is kept. Without this, one
+    /// such value made the whole file read as the defaults, and the next save wrote them over it.
+    /// `None` only when the text is not TOML.
+    fn parse(text: &str) -> Option<Settings> {
+        if let Ok(s) = toml::from_str::<Settings>(text) {
+            return Some(s);
+        }
+        let mut table: toml::Table = toml::from_str(text).ok()?;
+        // Whether the file would load with just this one key (or one entry of a section) in it.
+        let alone = |key: &str, value: toml::Value| {
+            let mut one = toml::Table::new();
+            one.insert(key.to_string(), value);
+            one.try_into::<Settings>().is_ok()
+        };
+        let keys: Vec<String> = table.keys().cloned().collect();
+        for key in keys {
+            let value = table[&key].clone();
+            if alone(&key, value.clone()) {
+                continue;
+            }
+            // A section (hotkeys, editor, overlays): keep its good entries.
+            let kept = match value {
+                toml::Value::Table(section) => {
+                    let good: toml::Table = section.into_iter().filter(|(k, v)| alone(&key, toml::Value::Table(toml::Table::from_iter([(k.clone(), v.clone())])))).collect();
+                    Some(toml::Value::Table(good)).filter(|v| alone(&key, v.clone()))
+                }
+                _ => None,
+            };
+            eprintln!("settings: \"{key}\" has a value this version does not understand; using the default for it");
+            match kept {
+                Some(v) => table.insert(key, v),
+                None => table.remove(&key),
+            };
+        }
+        table.try_into().ok()
     }
 
     /// Bring a file written by an older version up to date.
@@ -394,6 +446,57 @@ publish_server = \"https://tours.example.com\"
             assert_eq!(back.tray_left_click, choice);
         }
         assert_eq!((TrayLeftClick::OpenApp.label(), TrayLeftClick::CaptureRegion.label()), ("Open Mythicshot", "Capture a region"));
+    }
+
+    #[test]
+    fn an_unknown_value_costs_only_that_setting() {
+        // A typo, or a choice from a newer version.
+        let text = "tray_left_click = \"open_dashboard\"\noutput_dir = \"D:/Shots\"\npublish_server = \"https://tours.example.com\"\nmagnifier = false\n\n[hotkeys]\ncapture_region = \"control+KeyQ\"\n";
+        assert!(toml::from_str::<Settings>(text).is_err(), "the strict parse refuses the file");
+        let s = Settings::parse(text).expect("still loads").upgrade();
+        assert_eq!(s.tray_left_click, TrayLeftClick::OpenApp);
+        assert_eq!(s.output_dir, PathBuf::from("D:/Shots"));
+        assert_eq!(s.publish_server, "https://tours.example.com");
+        assert!(!s.magnifier);
+        assert_eq!(s.binding(Action::CaptureRegion), "control+KeyQ");
+        // The same for a value of the wrong kind.
+        let s = Settings::parse("tray_left_click = 3\npublish_server = \"https://tours.example.com\"\n").unwrap();
+        assert_eq!((s.tray_left_click, s.publish_server.as_str()), (TrayLeftClick::OpenApp, "https://tours.example.com"));
+    }
+
+    #[test]
+    fn every_other_enum_valued_setting_is_as_forgiving() {
+        // The image format, a destination, an overlay style, and an action in each shortcut section.
+        let text = "image_format = \"avif\"\ndestinations = [\"file\", \"hologram\"]\njpeg_quality = \"high\"\npublish_server = \"https://tours.example.com\"\n\n[overlays]\nkeys = \"neon\"\npointer = false\n\n[hotkeys]\ncapture_window = \"alt+KeyW\"\nteleport = \"KeyT\"\n\n[editor_keys]\ncrop = \"KeyX\"\nsculpt = \"KeyS\"\n";
+        assert!(toml::from_str::<Settings>(text).is_err());
+        let s = Settings::parse(text).expect("still loads").upgrade();
+        let d = Settings::default();
+        assert_eq!(s.publish_server, "https://tours.example.com");
+        assert_eq!((s.image_format, s.jpeg_quality), (d.image_format, d.jpeg_quality));
+        assert_eq!(s.destinations(), d.destinations(), "a list with an unknown destination reads as the default list");
+        // Sections keep their good entries.
+        assert!(!s.overlays.pointer);
+        assert_eq!(s.overlays.keys, OverlayStyle::default().keys, "as when the section never named it");
+        assert_eq!(s.binding(Action::CaptureWindow), "alt+KeyW");
+        assert_eq!(s.editor_binding(EditorAction::Crop), "KeyX");
+        assert_eq!(s.binding(Action::CaptureRegion), d.binding(Action::CaptureRegion));
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_is_copied_aside_before_the_defaults_are_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "publish_server = \"https://tours.example.com\n[[[").unwrap();
+        assert!(Settings::parse(&std::fs::read_to_string(&path).unwrap()).is_none());
+        let s = Settings::load_from(&path);
+        assert_eq!(s.publish_server, "");
+        assert_eq!(std::fs::read_to_string(tmp.path().join("settings.unreadable.toml")).unwrap(), std::fs::read_to_string(&path).unwrap());
+        // A good file and a missing one leave nothing beside them.
+        let good = tempfile::tempdir().unwrap();
+        std::fs::write(good.path().join("settings.toml"), "tray_left_click = \"capture_region\"\n").unwrap();
+        assert_eq!(Settings::load_from(&good.path().join("settings.toml")).tray_left_click, TrayLeftClick::CaptureRegion);
+        assert_eq!(Settings::load_from(&good.path().join("none.toml")).tray_left_click, TrayLeftClick::OpenApp);
+        assert_eq!(std::fs::read_dir(good.path()).unwrap().count(), 1);
     }
 
     #[test]

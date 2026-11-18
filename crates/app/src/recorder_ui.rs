@@ -289,6 +289,34 @@ pub struct ExportSpec {
 
 /// An export running on a background thread. `T` is what a finished export
 /// reports: the file and its size for GIF, APNG, MP4 and WebM.
+/// The files being exported right now. An export writes straight to its final name, so until it
+/// ends the file there is incomplete and "Recent" leaves it out.
+static EXPORTING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The files being exported right now.
+pub fn exporting_paths() -> Vec<PathBuf> {
+    EXPORTING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Marks a file as being exported until it is dropped, also when the export fails or panics.
+struct Exporting(PathBuf);
+
+impl Exporting {
+    fn begin(path: &std::path::Path) -> Exporting {
+        EXPORTING.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
+        Exporting(path.to_path_buf())
+    }
+}
+
+impl Drop for Exporting {
+    fn drop(&mut self) {
+        let mut list = EXPORTING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = list.iter().position(|p| *p == self.0) {
+            list.remove(i);
+        }
+    }
+}
+
 pub struct EncodeJob<T = (PathBuf, u64)> {
     progress: Arc<AtomicU32>,
     result: Arc<Mutex<Option<Result<T, String>>>>,
@@ -301,7 +329,9 @@ impl EncodeJob {
         let progress = Arc::new(AtomicU32::new(0));
         let result = Arc::new(Mutex::new(None));
         let (p, r, out) = (progress.clone(), result.clone(), path);
+        let exporting = Exporting::begin(&out);
         std::thread::spawn(move || {
+            let _exporting = exporting;
             let (frames, end_ms) = video::plan(&rec, &edit);
             let (width, height) = video::output_size(&rec, &edit);
             let job = Job { frames, end_ms, width, height, format: spec.format, quality: spec.quality, loop_forever: spec.loop_forever, video_fps: spec.video_fps };
@@ -350,5 +380,32 @@ impl<T: Send + 'static> EncodeJob<T> {
     /// The outcome once the export has finished.
     pub fn take_result(&self) -> Option<Result<T, String>> {
         self.result.lock().ok().and_then(|mut r| r.take())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_counts_as_being_exported_until_its_export_ends() {
+        let path = PathBuf::from("C:/captures/only-in-this-test-a1b2.gif");
+        assert!(!exporting_paths().contains(&path));
+        let first = Exporting::begin(&path);
+        // The same file exported again before the first ends stays marked until both end.
+        let second = Exporting::begin(&path);
+        assert!(exporting_paths().contains(&path));
+        drop(first);
+        assert!(exporting_paths().contains(&path));
+        drop(second);
+        assert!(!exporting_paths().contains(&path));
+        // A panic in the export thread still clears the mark.
+        let marked = Exporting::begin(&path);
+        let _ = std::thread::spawn(move || {
+            let _marked = marked;
+            panic!("export failed");
+        })
+        .join();
+        assert!(!exporting_paths().contains(&path));
     }
 }

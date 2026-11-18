@@ -74,7 +74,9 @@ struct App {
     /// The main window's state, shared with its viewport.
     window: Arc<std::sync::Mutex<main_window::Shared>>,
     /// The page the main window was asked to open on, until its next frame.
-    window_request: Option<main_window::Page>,
+    window_request: Option<main_window::Request>,
+    /// The window the user was in before Mythicshot, to give focus back to before a capture.
+    last_foreground: main_window::LastForeground,
     /// A capture started from the main window, waiting for the window to be gone.
     hide_then_run: main_window::HideThenRun,
     settings_state: SettingsState,
@@ -178,7 +180,8 @@ impl App {
             tx,
             overlay: None,
             window,
-            window_request: main_window::start_page(std::env::args()),
+            window_request: main_window::start_request(std::env::args()),
+            last_foreground: main_window::LastForeground::default(),
             hide_then_run: main_window::HideThenRun::default(),
             settings_state: SettingsState::default(),
             recorder: ShortcutRecorder::default(),
@@ -267,10 +270,18 @@ impl App {
     /// What is on screen that a tray click must not disturb. A capture started from the main
     /// window counts from the moment its tile is clicked.
     fn activity(&self) -> tray::Activity {
-        tray::Activity { overlay: self.overlay.is_some() || self.hide_then_run.is_waiting(), session: self.session.is_some(), picker: !self.pickers.is_empty() }
+        tray::Activity { overlay: self.overlay.is_some(), session: self.session.is_some(), picker: !self.pickers.is_empty(), pending: self.hide_then_run.is_waiting() }
     }
 
     fn run(&mut self, ctx: &egui::Context, cmd: Command) {
+        // The main window never opens over a capture, whether asked for by a click or from the menu.
+        if !tray::allowed(cmd, self.activity()) {
+            return;
+        }
+        // A capture waiting for the main window to be gone gives way to whatever runs now.
+        if cmd.changes_the_screen() {
+            self.hide_then_run.cancel();
+        }
         match cmd {
             Command::Region => self.start_overlay(ctx),
             Command::LastRegion => match self.settings.last_region {
@@ -313,7 +324,7 @@ impl App {
                 self.settings_changed();
             }
             // The main window, on Home or on Preferences. Already open, it comes to the front on that page.
-            Command::OpenApp | Command::Preferences => self.window_request = main_window::page_for(cmd),
+            Command::OpenApp | Command::Preferences => self.window_request = main_window::request_for(cmd),
             Command::OpenFolder => platform::open_folder(&self.settings.output_dir),
             Command::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
@@ -847,6 +858,10 @@ impl App {
         };
         self.settings_state.tab = tab;
         let edited = edited.unwrap_or_else(|| self.settings.clone());
+        // Which app the user is in, for a capture started from the main window.
+        if let Some(front) = platform::foreground_window() {
+            self.last_foreground.note(front, platform::window_kind(front));
+        }
         for a in actions {
             match a {
                 UiAction::Listen(action) => self.listen(Some(action)),
@@ -906,11 +921,15 @@ impl App {
                 s.settle(ctx);
             }
             self.window_request = None;
+            // Focus goes back to the app the user came from, so "Window" captures that one.
+            if let Some(previous) = self.last_foreground.get() {
+                platform::set_foreground(previous);
+            }
             self.hide_then_run.start(cmd, Instant::now());
         }
         if let Some(cmd) = self.hide_then_run.take_due(Instant::now()) {
-            // Nothing else started in the meantime (a hotkey, say).
-            if self.overlay.is_none() && self.session.is_none() {
+            // Anything started in the meantime dropped it already (see `run`); this is the last check.
+            if tray::pending_may_run(self.activity()) {
                 self.run(ctx, cmd);
             }
         }

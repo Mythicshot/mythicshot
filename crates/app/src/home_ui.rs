@@ -23,9 +23,19 @@ const CARD_EDGE: Color32 = Color32::from_rgb(52, 59, 72);
 pub const RECENT_LIMIT: usize = 5;
 /// How often the captures folder is read again while the page is open.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// A read that has not come back after this long is given up on (a share that went away, a drive
+/// that will not wake); the page says the folder cannot be read and a later read may start.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait before reading a folder again that could not be read.
+const RETRY_EVERY: Duration = Duration::from_secs(30);
+/// How many reads of one folder may be given up on. Each leaves a thread waiting on the drive, so
+/// after this many the folder is not tried again until the captures folder setting changes.
+const MAX_ABANDONED: u32 = 3;
 
 pub const RECORD_A_TOUR: &str = "Record a tour: record a region or window, then choose Tour view in the editor.";
 pub const NOTHING_RECENT: &str = "Nothing is saved in the captures folder yet.";
+pub const READING_RECENT: &str = "Reading the captures folder…";
+pub const CANNOT_READ_RECENT: &str = "The captures folder cannot be read right now.";
 
 /// A capture tile: what it is called, the action whose hotkey it shows, and the command it runs,
 /// the same one the tray menu and the hotkey run.
@@ -63,33 +73,114 @@ fn listed(name: &str) -> bool {
     !(name.starts_with('.') || lower.ends_with(".tmp") || lower.ends_with(".part") || lower == "desktop.ini" || lower == "thumbs.db")
 }
 
+/// The folder exists but could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreadable;
+
 /// The newest files directly in `dir`, newest first, at most `limit`. Folders are left out, and so
-/// are the files [`listed`] names. A folder that is missing or cannot be read gives an empty list.
-pub fn recent_files(dir: &Path, limit: usize) -> Vec<Recent> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+/// are the files [`listed`] names and the files in `exporting`, which the app is still writing.
+/// A folder that does not exist yet has nothing in it; one that cannot be read is an error.
+pub fn recent_files(dir: &Path, limit: usize, exporting: &[PathBuf]) -> Result<Vec<Recent>, Unreadable> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(Unreadable),
+    };
     let mut files: Vec<(SystemTime, Recent)> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if !meta.is_file() || !listed(&name) {
+            let path = e.path();
+            if !meta.is_file() || !listed(&name) || exporting.iter().any(|x| same_file(x, &path)) {
                 return None;
             }
-            Some((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), Recent { path: e.path(), name }))
+            Some((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), Recent { path, name }))
         })
         .collect();
     // Newest first; files saved in the same instant stay in name order.
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
     files.truncate(limit);
-    files.into_iter().map(|(_, f)| f).collect()
+    Ok(files.into_iter().map(|(_, f)| f).collect())
 }
 
+/// Whether two paths name the same file, however their separators and letter case are written.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    a == b || norm(a) == norm(b)
+}
+
+/// What "Recent" shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecentView {
+    /// The first read of this folder has not come back yet.
+    Reading,
+    /// The folder could not be read, or a read of it never came back.
+    Unreadable,
+    Empty,
+    Files(Vec<Recent>),
+}
+
+/// The last listing of the captures folder and the read in progress, as plain state: `poll` says
+/// when a read should start, `finish` takes its result. A read that never comes back is given up
+/// on after [`READ_TIMEOUT`], so it cannot block every later one.
 #[derive(Default)]
 struct Listing {
     dir: PathBuf,
-    files: Vec<Recent>,
+    result: Option<Result<Vec<Recent>, Unreadable>>,
     read_at: Option<Instant>,
-    reading: bool,
+    /// The read in progress: its number and when it started.
+    reading: Option<(u64, Instant)>,
+    last_read: u64,
+    abandoned: u32,
+}
+
+impl Listing {
+    /// Called every frame the page is drawn. Returns the number of a read to start now, if one should.
+    fn poll(&mut self, dir: &Path, now: Instant) -> Option<u64> {
+        if self.dir != dir {
+            // Another folder: forget the old one's files; a read of it still running is ignored.
+            *self = Listing { dir: dir.to_path_buf(), last_read: self.last_read, ..Listing::default() };
+        }
+        if let Some((_, started)) = self.reading {
+            if now.saturating_duration_since(started) < READ_TIMEOUT {
+                return None;
+            }
+            self.reading = None;
+            self.abandoned += 1;
+            self.result = Some(Err(Unreadable));
+            self.read_at = Some(now);
+        }
+        let unreadable = matches!(self.result, Some(Err(Unreadable)));
+        if unreadable && self.abandoned >= MAX_ABANDONED {
+            return None;
+        }
+        let wait = if unreadable { RETRY_EVERY } else { REFRESH_EVERY };
+        if self.read_at.is_some_and(|t| now.saturating_duration_since(t) < wait) {
+            return None;
+        }
+        self.last_read += 1;
+        self.reading = Some((self.last_read, now));
+        Some(self.last_read)
+    }
+
+    /// The result of read number `read`. One that was given up on, or was of another folder, is ignored.
+    fn finish(&mut self, read: u64, result: Result<Vec<Recent>, Unreadable>, now: Instant) {
+        if self.reading.is_some_and(|(n, _)| n == read) {
+            self.reading = None;
+            self.result = Some(result);
+            self.read_at = Some(now);
+        }
+    }
+
+    fn view(&self) -> RecentView {
+        match &self.result {
+            None => RecentView::Reading,
+            Some(Err(Unreadable)) => RecentView::Unreadable,
+            Some(Ok(files)) if files.is_empty() => RecentView::Empty,
+            Some(Ok(files)) => RecentView::Files(files.clone()),
+        }
+    }
 }
 
 /// The Home page's state: the last listing of the captures folder. The folder is read on a
@@ -100,23 +191,19 @@ pub struct HomeState {
 }
 
 impl HomeState {
-    /// The files to show for `dir`, starting a fresh read when the last one is old or was of
-    /// another folder.
-    fn recent(&self, dir: &Path) -> Vec<Recent> {
-        let Ok(mut l) = self.listing.lock() else { return Vec::new() };
-        let same = l.dir == dir;
-        let stale = l.read_at.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
-        if !l.reading && (!same || stale) {
-            l.reading = true;
+    /// What to show for `dir`, starting a fresh read when the last one is old or was of another folder.
+    pub fn recent(&self, dir: &Path) -> RecentView {
+        let Ok(mut l) = self.listing.lock() else { return RecentView::Unreadable };
+        if let Some(read) = l.poll(dir, Instant::now()) {
             let (listing, dir) = (self.listing.clone(), dir.to_path_buf());
             std::thread::spawn(move || {
-                let files = recent_files(&dir, RECENT_LIMIT);
+                let result = recent_files(&dir, RECENT_LIMIT, &crate::recorder_ui::exporting_paths());
                 if let Ok(mut l) = listing.lock() {
-                    *l = Listing { dir, files, read_at: Some(Instant::now()), reading: false };
+                    l.finish(read, result, Instant::now());
                 }
             });
         }
-        if same { l.files.clone() } else { Vec::new() }
+        l.view()
     }
 }
 
@@ -140,15 +227,24 @@ pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: b
     ui.add_space(18.0);
     ui.heading("Recent");
     ui.add_space(8.0);
-    let files = state.recent(&settings.output_dir);
-    if files.is_empty() {
-        ui.label(RichText::new(NOTHING_RECENT).color(MUTED));
-    }
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for f in &files {
-            recent_row(ui, f);
+    match state.recent(&settings.output_dir) {
+        RecentView::Reading => {
+            ui.label(RichText::new(READING_RECENT).color(MUTED));
         }
-    });
+        RecentView::Unreadable => {
+            ui.label(RichText::new(CANNOT_READ_RECENT).color(MUTED));
+        }
+        RecentView::Empty => {
+            ui.label(RichText::new(NOTHING_RECENT).color(MUTED));
+        }
+        RecentView::Files(files) => {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for f in &files {
+                    recent_row(ui, f);
+                }
+            });
+        }
+    }
     // New captures show up without a click.
     ui.ctx().request_repaint_after(REFRESH_EVERY);
 }
@@ -202,7 +298,7 @@ mod tests {
     }
 
     fn names(dir: &Path, limit: usize) -> Vec<String> {
-        recent_files(dir, limit).into_iter().map(|f| f.name).collect()
+        recent_files(dir, limit, &[]).unwrap().into_iter().map(|f| f.name).collect()
     }
 
     #[test]
@@ -215,7 +311,7 @@ mod tests {
         assert_eq!(names(tmp.path(), 2), ["a.png", "b.gif"]);
         assert_eq!(names(tmp.path(), 0), Vec::<String>::new());
         // Each one carries its full path, for Open and Show in folder.
-        assert_eq!(recent_files(tmp.path(), 1)[0].path, tmp.path().join("a.png"));
+        assert_eq!(recent_files(tmp.path(), 1, &[]).unwrap()[0].path, tmp.path().join("a.png"));
     }
 
     #[test]
@@ -236,10 +332,104 @@ mod tests {
     #[test]
     fn a_missing_or_empty_folder_lists_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(recent_files(tmp.path(), RECENT_LIMIT).is_empty());
-        assert!(recent_files(&tmp.path().join("never made"), RECENT_LIMIT).is_empty());
+        assert_eq!(recent_files(tmp.path(), RECENT_LIMIT, &[]), Ok(vec![]));
+        assert_eq!(recent_files(&tmp.path().join("never made"), RECENT_LIMIT, &[]), Ok(vec![]));
         // Looking never creates the folder.
         assert!(!tmp.path().join("never made").exists());
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_is_not_called_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The setting names something that is there but is not a folder.
+        file(tmp.path(), "not a folder", 5);
+        assert_eq!(recent_files(&tmp.path().join("not a folder"), RECENT_LIMIT, &[]), Err(Unreadable));
+    }
+
+    #[test]
+    fn a_file_still_being_exported_is_left_out_until_it_is_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        file(tmp.path(), "done.gif", 100);
+        file(tmp.path(), "Half Written.gif", 1);
+        let exporting = [tmp.path().join("Half Written.gif")];
+        let listed = |x: &[PathBuf]| recent_files(tmp.path(), RECENT_LIMIT, x).unwrap().into_iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(listed(&exporting), ["done.gif"]);
+        // The same path written another way is the same file.
+        let other = PathBuf::from(tmp.path().join("half written.GIF").to_string_lossy().replace('\\', "/"));
+        assert_eq!(listed(&[other]), ["done.gif"]);
+        // Once the export has ended it is listed, newest first.
+        assert_eq!(listed(&[]), ["Half Written.gif", "done.gif"]);
+        // An export elsewhere with the same file name hides nothing here.
+        assert_eq!(listed(&[PathBuf::from("Z:/elsewhere/done.gif")]), ["Half Written.gif", "done.gif"]);
+    }
+
+    fn recent(name: &str) -> Recent {
+        Recent { path: PathBuf::from(name), name: name.into() }
+    }
+
+    #[test]
+    fn the_page_says_reading_then_what_the_read_found() {
+        let (dir, t0) = (Path::new("C:/captures"), Instant::now());
+        let mut l = Listing::default();
+        let read = l.poll(dir, t0).expect("the first look starts a read");
+        assert_eq!(l.view(), RecentView::Reading);
+        assert_eq!(l.poll(dir, t0 + Duration::from_secs(1)), None, "one read at a time");
+        l.finish(read, Ok(vec![]), t0 + Duration::from_secs(1));
+        assert_eq!(l.view(), RecentView::Empty);
+        // Read again after the refresh time; the last answer stays up meanwhile.
+        assert_eq!(l.poll(dir, t0 + Duration::from_secs(2)), None);
+        let read = l.poll(dir, t0 + Duration::from_secs(1) + REFRESH_EVERY).expect("a refresh");
+        assert_eq!(l.view(), RecentView::Empty);
+        l.finish(read, Ok(vec![recent("a.png")]), t0 + Duration::from_secs(4));
+        assert_eq!(l.view(), RecentView::Files(vec![recent("a.png")]));
+        // A folder that cannot be read says so, and is tried again later, not every two seconds.
+        let read = l.poll(dir, t0 + Duration::from_secs(10)).unwrap();
+        l.finish(read, Err(Unreadable), t0 + Duration::from_secs(10));
+        assert_eq!(l.view(), RecentView::Unreadable);
+        assert_eq!(l.poll(dir, t0 + Duration::from_secs(10) + REFRESH_EVERY), None);
+        assert!(l.poll(dir, t0 + Duration::from_secs(10) + RETRY_EVERY).is_some());
+    }
+
+    #[test]
+    fn a_read_that_never_comes_back_is_given_up_on_and_a_later_one_can_start() {
+        let (dir, t0) = (Path::new("//gone/share"), Instant::now());
+        let mut l = Listing::default();
+        let hung = l.poll(dir, t0).unwrap();
+        assert_eq!(l.poll(dir, t0 + READ_TIMEOUT - Duration::from_millis(1)), None);
+        assert_eq!(l.view(), RecentView::Reading);
+        // Given up on: the page stops saying "reading".
+        assert_eq!(l.poll(dir, t0 + READ_TIMEOUT), None);
+        assert_eq!(l.view(), RecentView::Unreadable);
+        // A later read starts, and its answer is shown.
+        let retry = l.poll(dir, t0 + READ_TIMEOUT + RETRY_EVERY).expect("a new read after the wait");
+        assert_ne!(retry, hung);
+        // The hung read coming back late changes nothing.
+        l.finish(hung, Ok(vec![recent("stale.png")]), t0 + READ_TIMEOUT + RETRY_EVERY);
+        assert_eq!(l.view(), RecentView::Unreadable);
+        l.finish(retry, Ok(vec![recent("a.png")]), t0 + READ_TIMEOUT + RETRY_EVERY + Duration::from_secs(1));
+        assert_eq!(l.view(), RecentView::Files(vec![recent("a.png")]));
+    }
+
+    #[test]
+    fn a_folder_that_keeps_hanging_is_left_alone_after_a_few_tries() {
+        let (dir, mut now) = (Path::new("//gone/share"), Instant::now());
+        let mut l = Listing::default();
+        let mut started = 0;
+        for _ in 0..200 {
+            if l.poll(dir, now).is_some() {
+                started += 1;
+            }
+            now += Duration::from_secs(5);
+        }
+        assert_eq!(started, MAX_ABANDONED as usize, "each hung read leaves a waiting thread");
+        assert_eq!(l.view(), RecentView::Unreadable);
+        // Pointing the setting at another folder starts over, and the old folder's reads are ignored.
+        let read = l.poll(Path::new("C:/captures"), now).expect("another folder is read at once");
+        assert_eq!(l.view(), RecentView::Reading);
+        l.finish(read - 1, Ok(vec![recent("old.png")]), now);
+        assert_eq!(l.view(), RecentView::Reading);
+        l.finish(read, Ok(vec![]), now);
+        assert_eq!(l.view(), RecentView::Empty);
     }
 
     #[test]
@@ -283,13 +473,14 @@ mod tests {
         let state = HomeState::default();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut got = state.recent(tmp.path());
-        while got.is_empty() && Instant::now() < deadline {
+        assert_eq!(got, RecentView::Reading);
+        while got == RecentView::Reading && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
             got = state.recent(tmp.path());
         }
-        assert_eq!(got.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["shot.png"]);
+        assert_eq!(got, RecentView::Files(vec![Recent { path: tmp.path().join("shot.png"), name: "shot.png".into() }]));
         // Another folder never shows the first one's files.
         let other = tempfile::tempdir().unwrap();
-        assert!(state.recent(other.path()).is_empty());
+        assert_eq!(state.recent(other.path()), RecentView::Reading);
     }
 }

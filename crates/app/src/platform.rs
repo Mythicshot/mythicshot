@@ -191,6 +191,48 @@ pub fn set_foreground(hwnd: WindowId) {
     }
 }
 
+/// Whose window it is, for remembering which app the user was in before the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    /// One of this app's own windows.
+    Ours,
+    /// The taskbar, the tray's overflow or the desktop: what has focus while the tray icon is clicked.
+    Shell,
+    Other,
+}
+
+/// The window classes of the taskbar and the tray's overflow panel, old and new.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_shell_class(class: &str) -> bool {
+    matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "Progman" | "WorkerW")
+}
+
+#[cfg(windows)]
+pub fn window_kind(hwnd: WindowId) -> WindowKind {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetShellWindow, GetWindowThreadProcessId};
+    let h = HWND(hwnd as *mut _);
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return WindowKind::Ours;
+        }
+        let mut name = [0u16; 128];
+        let len = GetClassNameW(h, &mut name).max(0) as usize;
+        if h == GetShellWindow() || is_shell_class(&String::from_utf16_lossy(&name[..len])) {
+            return WindowKind::Shell;
+        }
+    }
+    WindowKind::Other
+}
+
+#[cfg(not(windows))]
+pub fn window_kind(_hwnd: WindowId) -> WindowKind {
+    WindowKind::Other
+}
+
 #[cfg(not(windows))]
 pub fn exclude_from_capture(_hwnd: WindowId) -> bool {
     false
@@ -313,6 +355,16 @@ pub fn open_folder(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_taskbar_and_the_desktop_are_shell_windows() {
+        for class in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland", "Progman", "WorkerW"] {
+            assert!(is_shell_class(class), "{class}");
+        }
+        for class in ["Chrome_WidgetWin_1", "Notepad", "CabinetWClass", ""] {
+            assert!(!is_shell_class(class), "{class}");
+        }
+    }
 
     #[test]
     fn the_file_to_select_is_quoted_whole() {
