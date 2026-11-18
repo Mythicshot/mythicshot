@@ -95,9 +95,10 @@ pub fn limit_rate(frames: &[OutFrame], max_fps: u32) -> Vec<OutFrame> {
     out
 }
 
-/// Whether ffmpeg can be run, for MP4 and WebM.
+/// Whether ffmpeg can be run, for MP4 and WebM: whether it was found at start-up
+/// ([`crate::ffmpeg::find_now`]). Starts no program, so it is safe on the UI thread.
 pub fn ffmpeg_available() -> bool {
-    hidden(Command::new("ffmpeg").arg("-version")).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    crate::ffmpeg::find().is_some()
 }
 
 /// Export `job` to `path`. `progress` gets 0.0–1.0 and returns false to
@@ -191,7 +192,9 @@ fn video(rec: Arc<Recording>, job: &Job, path: &Path, decorate: Decorate, progre
         Format::Webm => &["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "34", "-row-mt", "1"],
         _ => &["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart"],
     };
-    let mut child = hidden(Command::new("ffmpeg").args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s"]))
+    // The ffmpeg found on the PATH at start-up, by its absolute path, never a bare name.
+    let ffmpeg = crate::ffmpeg::find().ok_or("could not start ffmpeg (is it installed?)")?;
+    let mut child = hidden(Command::new(ffmpeg.exe()).args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s"]))
         .arg(format!("{}x{}", job.width, job.height))
         .args(["-r", &fps.to_string(), "-i", "-"])
         .args(codec)
