@@ -840,7 +840,7 @@ mod tests {
     use super::*;
 
     fn tour(title: &str, chapters: u32, steps: u32, status: &str) -> RemoteTour {
-        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None }
+        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None, updated_at: None, published_at: None }
     }
 
     #[test]
