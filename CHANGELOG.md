@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.1 (2026-11-18)
+
+- Publish tour now offers "Publish now" (the default) or "Upload as a private draft".
+- After publishing, a result screen shows the tour's link with Copy, Open in browser and Done.
+- If publishing fails after the upload, "Try again" publishes without uploading a second time.
+- The app only shows and opens web links on the tour site you set up.
+
 ## 0.2.0 (2026-11-18)
 
 Everything added since 0.1.1, in the order it was built.
