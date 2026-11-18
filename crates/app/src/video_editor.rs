@@ -3211,4 +3211,7 @@ mod tests {
         let ed = editor_of(&state(tmp.path()));
         assert!(Arc::ptr_eq(&ed.video.as_ref().unwrap().notices.0, &background_notices().0));
     }
+
+    /// One real pass against a platform server running on this computer; ignored unless asked for.
+    mod e2e_platform;
 }
