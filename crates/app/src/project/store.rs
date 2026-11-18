@@ -131,6 +131,21 @@ pub enum LoadError {
     AlreadyOpen,
 }
 
+/// What [`Store::remove_project`] did.
+// Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removed {
+    /// The project's files are gone.
+    Now,
+    /// The project is open in an editor: it is no longer listed, and its files go when that
+    /// editor closes it, or at the next start.
+    WhenItsEditorCloses,
+    /// There was no project in that folder, and nothing was touched or only a removal that was
+    /// already under way was finished.
+    NotThere,
+}
+
 /// Registers a project as open until dropped. A project whose tour was removed while it was open
 /// is removed when its guard is dropped.
 #[derive(Debug)]
@@ -447,6 +462,80 @@ impl Store {
         match failed {
             Some(e) => Err(reason("a saved recording of this tour could not be removed", &e)),
             None => Ok(removed),
+        }
+    }
+
+    /// Remove the project of one chapter, by its folder: a [`ProjectInfo::dir`] of this store's
+    /// own list, so that a project whose file names no address (a damaged one), or one saved by
+    /// a newer Mythicshot, can be removed too. As [`Store::remove_tour`] for that one folder: a
+    /// project that is open in an editor is only marked, and only files the store wrote are
+    /// removed.
+    ///
+    /// `dir` must be this store's folder `<site>/<tour>/<chapter>` with the names the store
+    /// gives, spelled without a way round, and a real folder below real folders. Anything else
+    /// is refused with an error and nothing is touched. A folder with such a name that is not
+    /// there, or holds no project, is [`Removed::NotThere`].
+    // Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remove_project(&self, dir: &Path) -> Result<Removed, String> {
+        const NOT_REMOVED: &str = "this saved recording could not be removed";
+        let refused = || {
+            eprintln!("Saved recordings: {NOT_REMOVED} (the folder is not a project of this store).");
+            Err(format!("{NOT_REMOVED}."))
+        };
+        // The names, from the path as it is spelled: exactly three below the projects folder.
+        let Ok(below) = dir.strip_prefix(&self.root) else { return refused() };
+        let mut names = Vec::new();
+        for part in below.components() {
+            match part {
+                std::path::Component::Normal(name) => names.push(name.to_str()),
+                _ => return refused(),
+            }
+        }
+        let [Some(site), Some(tour), Some(chapter)] = names[..] else { return refused() };
+        if !(is_random_name(site) && is_folder_id(tour) && is_folder_id(chapter)) {
+            return refused();
+        }
+        // From here on only the path built from the checked names is used.
+        let site_dir = self.root.join(site);
+        let tour_dir = site_dir.join(tour);
+        let dir = tour_dir.join(chapter);
+
+        let _changing = changing();
+        // Real folders all the way down: a link or a junction could lead anywhere.
+        for level in [&site_dir, &tour_dir, &dir] {
+            match std::fs::symlink_metadata(level) {
+                Err(_) => return Ok(Removed::NotThere),
+                Ok(meta) if !meta.file_type().is_dir() => return refused(),
+                Ok(_) => {}
+            }
+        }
+        // And where the folder really is, is that place in this store's folder.
+        match (std::fs::canonicalize(&self.root), std::fs::canonicalize(&dir)) {
+            (Ok(root), Ok(real)) if real == root.join(site).join(tour).join(chapter) => {}
+            _ => return refused(),
+        }
+        let marked = is_removing(&dir);
+        let was_listed = is_project(&dir) && !marked;
+        if !was_listed && !marked {
+            // No project, and no removal to finish: whatever the folder holds is not the store's to take.
+            return Ok(Removed::NotThere);
+        }
+        // An open project is only marked: its editor still reads it.
+        let open = is_open(&dir);
+        let done = if open { mark_removing(&dir) } else { remove_files(&dir) };
+        if !open {
+            // Folders the store made, when nothing is left in them.
+            prune_parents(&dir);
+        }
+        if !(open && marked) {
+            self.bump();
+        }
+        match done {
+            Err(e) => Err(reason(NOT_REMOVED, &e)),
+            Ok(()) if open => Ok(Removed::WhenItsEditorCloses),
+            Ok(()) if was_listed => Ok(Removed::Now),
+            Ok(()) => Ok(Removed::NotThere),
         }
     }
 
@@ -2100,5 +2189,271 @@ mod tests {
             w.store.finish_removals();
         }
         assert_eq!(contents(&outside), kept);
+    }
+
+    /// [`Store::remove_project`]: one chapter's project, by its folder.
+    mod one_project {
+        use super::*;
+
+        /// The folder behind a link: a folder link where the system allows one, else a junction.
+        #[cfg(windows)]
+        fn link_to(outside: &Path, link: &Path) {
+            let linked = std::os::windows::fs::symlink_dir(outside, link).is_ok() || std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(outside).output().is_ok_and(|o| o.status.success());
+            assert!(linked, "neither a folder link nor a junction could be made on this computer");
+        }
+
+        #[test]
+        fn removing_one_project_leaves_the_other_chapters_and_tours_alone() {
+            let w = World::new();
+            let (gone, sibling, other_tour, other_site) = (key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2), key(SITE_A, TOUR_2, CH_1), key(SITE_B, TOUR_1, CH_1));
+            for k in [&gone, &sibling, &other_tour, &other_site] {
+                w.save(k);
+            }
+            let kept = |w: &World| [&sibling, &other_tour, &other_site].map(|k| contents(&w.dir(k)));
+            let before = kept(&w);
+            assert_eq!(w.store.remove_project(&w.dir(&gone)), Ok(Removed::Now));
+            assert!(!w.dir(&gone).exists(), "the project's folder went with its files");
+            assert_eq!(kept(&w), before, "no other project lost or gained a byte");
+            assert_eq!(keys(&w.store.list()), {
+                let mut left = vec![sibling.clone(), other_tour.clone(), other_site.clone()];
+                left.sort_by_key(|k| w.dir(k));
+                left
+            });
+            for k in [&sibling, &other_tour, &other_site] {
+                loaded(&w.store, k);
+            }
+            // The tour's folder goes with its last chapter, the site's with its last tour, and no sooner.
+            let site_a = w.store.root().join(site_of(SITE_A));
+            assert_eq!(w.store.remove_project(&w.dir(&sibling)), Ok(Removed::Now));
+            assert!(!site_a.join(TOUR_1).exists() && site_a.join(TOUR_2).is_dir());
+            assert_eq!(w.store.remove_project(&w.dir(&other_site)), Ok(Removed::Now));
+            assert!(!w.store.root().join(site_of(SITE_B)).exists());
+            assert_eq!(keys(&w.store.list()), vec![other_tour.clone()]);
+            assert_eq!(kept(&w)[1], before[1]);
+        }
+
+        #[test]
+        fn a_project_open_in_an_editor_is_removed_when_the_editor_closes() {
+            let w = World::new();
+            let (open_key, sibling) = (key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2));
+            w.save(&open_key);
+            let sibling_info = w.save(&sibling).info;
+            let open = loaded(&w.store, &open_key);
+            let dir = open.info.dir.clone();
+            let whole = contents(&dir);
+            let before = changes(&w.store);
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::WhenItsEditorCloses));
+            assert_eq!(changes(&w.store), before + 1);
+            // Not listed or counted any more; its files are whole, with the mark, until its editor closes.
+            assert_eq!(w.store.list(), vec![sibling_info.clone()]);
+            assert_eq!(w.store.totals().count, 1);
+            assert!(dir.join(REMOVING_FILE).is_file());
+            assert_eq!(contents(&dir).into_iter().filter(|(name, _)| name != REMOVING_FILE).collect::<Vec<_>>(), whole);
+            assert_eq!(load_err(&w.store, &open_key), LoadError::AlreadyOpen);
+            // Asked again, the answer is the same and nothing more happens; housekeeping leaves it too.
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::WhenItsEditorCloses));
+            w.store.finish_removals();
+            assert_eq!(std::fs::read(dir.join(FRAMES_FILE)).unwrap(), frames_and_index(FRAMES).0);
+            let before = changes(&w.store);
+            drop(open);
+            assert_eq!(changes(&w.store), before + 1);
+            assert_eq!(tree(&w.store.root().join(site_of(SITE_A)).join(TOUR_1)).into_iter().filter(|n| !n.starts_with(CH_2)).collect::<Vec<_>>(), Vec::<String>::new(), "the open project is gone, the other chapter is not");
+            assert_eq!(load_err(&w.store, &open_key), LoadError::NotSaved);
+            assert_eq!(w.store.list(), vec![sibling_info]);
+            loaded(&w.store, &sibling);
+        }
+
+        #[test]
+        fn a_removal_cut_off_by_a_crash_is_finished_at_the_next_start() {
+            let w = World::new();
+            let (first, second, stays) = (key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2), key(SITE_A, TOUR_2, CH_1));
+            for k in [&first, &second, &stays] {
+                w.save(k);
+            }
+            std::fs::write(w.dir(&first).join("notes.txt"), b"mine").unwrap();
+            // The app dies with the editor of a removed project open: the guard never runs.
+            let open = loaded(&w.store, &first);
+            assert_eq!(w.store.remove_project(&w.dir(&first)), Ok(Removed::WhenItsEditorCloses));
+            forget_open(open);
+            // The app dies in the middle of a removal: the mark is written and the project file is gone.
+            mark_removing(&w.dir(&second)).unwrap();
+            std::fs::remove_file(w.dir(&second).join(PROJECT_FILE)).unwrap();
+            assert!(w.dir(&first).join(FRAMES_FILE).is_file() && w.dir(&second).join(FRAMES_FILE).is_file(), "the files are still there");
+            // The removal the user asked for holds across the restart: not listed, not counted, not opened.
+            assert_eq!(keys(&w.store.list()), vec![stays.clone()]);
+            assert_eq!(w.store.totals().count, 1);
+            assert_eq!(load_err(&w.store, &first), LoadError::NotSaved);
+            w.store.finish_removals();
+            assert_eq!(tree(&w.store.root().join(site_of(SITE_A)).join(TOUR_1)), vec![format!("{CH_1}/"), format!("{CH_1}/notes.txt")], "what the store wrote is gone, and nothing else");
+            assert_eq!(keys(&w.store.list()), vec![stays.clone()]);
+            loaded(&w.store, &stays);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_removal_that_cannot_take_every_file_says_so_and_is_finished_later() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let w = World::new();
+            w.save(&key_1());
+            let dir = w.dir(&key_1());
+            // Another program has the frames file open and does not let it be deleted.
+            let held = std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(dir.join(FRAMES_FILE)).unwrap();
+            let before = changes(&w.store);
+            let err = w.store.remove_project(&dir).unwrap_err();
+            assert_eq!(err, "this saved recording could not be removed.");
+            assert!(reads_as_a_reason(&err, w.tmp.path()));
+            assert_eq!(changes(&w.store), before + 1, "it is no longer listed, so the pages read the list again");
+            assert!(!dir.join(PROJECT_FILE).exists() && dir.join(REMOVING_FILE).is_file() && dir.join(FRAMES_FILE).is_file());
+            assert_eq!(w.store.list(), vec![]);
+            drop(held);
+            // Asked again, the removal is finished; there was no project left to count.
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::NotThere));
+            assert_eq!(tree(w.store.root()), Vec::<String>::new());
+        }
+
+        #[test]
+        fn a_damaged_or_newer_project_can_be_removed_and_a_file_somebody_else_put_there_stays() {
+            let w = World::new();
+            let (damaged, newer, stays) = (key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2), key(SITE_A, TOUR_2, CH_1));
+            for k in [&damaged, &newer, &stays] {
+                w.save(k);
+            }
+            // A project file that names no address, tour or chapter at all.
+            std::fs::write(w.dir(&damaged).join(PROJECT_FILE), [0xffu8, 0xfe, 0x00, 0x12]).unwrap();
+            std::fs::write(w.dir(&damaged).join("notes.txt"), b"mine").unwrap();
+            std::fs::create_dir(w.dir(&damaged).join("my folder")).unwrap();
+            std::fs::write(w.dir(&damaged).join(PICTURES).join("mine.txt"), b"mine too").unwrap();
+            // A project of a later version, with a file this version has no name for.
+            let later = serde_json::json!({"format": 99, "app": "9.0.0", "saved_at": 1_800_000_000_000i64, "server": SITE_A, "tour_id": TOUR_1, "chapter_id": CH_2, "tour_title": "Customer onboarding", "title": "From later", "edit": "something new"}).to_string();
+            std::fs::write(w.dir(&newer).join(PROJECT_FILE), later).unwrap();
+            std::fs::write(w.dir(&newer).join("frames.later"), b"a later version's own").unwrap();
+            let untouched = contents(&w.dir(&stays));
+
+            // The folders come from the store's own list, as the page that asks has them.
+            let listed = w.store.for_tour(SITE_A, TOUR_1);
+            assert_eq!(listed.iter().map(|p| p.problem).collect::<Vec<_>>(), vec![Some(Problem::Damaged), Some(Problem::Newer)]);
+            for info in &listed {
+                assert_eq!(w.store.remove_project(&info.dir), Ok(Removed::Now));
+            }
+            assert_eq!(keys(&w.store.list()), vec![stays.clone()]);
+            let tour_dir = w.store.root().join(site_of(SITE_A)).join(TOUR_1);
+            assert_eq!(tree(&tour_dir), vec![format!("{CH_1}/"), format!("{CH_1}/my folder/"), format!("{CH_1}/notes.txt"), format!("{CH_1}/pictures/"), format!("{CH_1}/pictures/mine.txt"), format!("{CH_2}/"), format!("{CH_2}/frames.later")], "only files this version writes are removed");
+            assert_eq!(contents(&tour_dir).into_iter().map(|(_, bytes)| bytes).collect::<Vec<_>>(), vec![b"mine".to_vec(), b"mine too".to_vec(), b"a later version's own".to_vec()]);
+            assert_eq!(contents(&w.dir(&stays)), untouched);
+            // What is left is no project: asked again, there is nothing to remove and nothing is.
+            assert_eq!(w.store.remove_project(&listed[0].dir), Ok(Removed::NotThere));
+            assert_eq!(std::fs::read(w.dir(&damaged).join("notes.txt")).unwrap(), b"mine");
+        }
+
+        #[test]
+        fn a_folder_outside_the_store_or_with_a_name_the_store_does_not_give_is_refused() {
+            let w = World::new();
+            w.save(&key_1());
+            let (root, dir) = (w.store.root().to_path_buf(), w.dir(&key_1()));
+            let (site_dir, tour_dir) = (root.join(site_of(SITE_A)), root.join(site_of(SITE_A)).join(TOUR_1));
+            // A whole project under a name, or in a place, that the store never gives one.
+            let project = contents(&dir);
+            let copy_to = |to: PathBuf| {
+                std::fs::create_dir_all(to.join(PICTURES)).unwrap();
+                for (name, bytes) in &project {
+                    std::fs::write(to.join(name), bytes).unwrap();
+                }
+                to
+            };
+            let other_store = w.tmp.path().join("projects-of-another-store");
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            let mut refused = vec![
+                // Outside the store: the editor's own recording, another store with the same layout, the folder above.
+                w.tmp.path().join("rec"),
+                copy_to(other_store.join(site_of(SITE_A)).join(TOUR_1).join(CH_1)),
+                w.tmp.path().to_path_buf(),
+                // Inside it, but not a chapter's folder: too high, too deep.
+                root.clone(),
+                site_dir.clone(),
+                tour_dir.clone(),
+                dir.join(PICTURES),
+                copy_to(dir.join(PICTURES).join(CH_2)),
+                // Names the store does not give: a site that is not 16 hex, ids that are not folder ids.
+                copy_to(root.join(".staging-1763460000000-0123456789abcdef").join(TOUR_1).join(CH_1)),
+                copy_to(root.join(".replaced-0123456789abcdef").join(TOUR_1).join(CH_1)),
+                copy_to(root.join("0123456789ABCDEF").join(TOUR_1).join(CH_1)),
+                copy_to(root.join("0123456789abcde").join(TOUR_1).join(CH_1)),
+                copy_to(site_dir.join("Tour 2").join(CH_1)),
+                copy_to(tour_dir.join("ch 2")),
+                copy_to(tour_dir.join("ch_2.bak")),
+                // Spelled with a way round, or without a full path, or not at all.
+                tour_dir.join("..").join(TOUR_1).join(CH_1),
+                dir.join("..").join("..").join("..").join("..").join("rec"),
+                PathBuf::from(site_of(SITE_A)).join(TOUR_1).join(CH_1),
+                PathBuf::from(CH_1),
+                PathBuf::new(),
+            ];
+            // The real project through another store's eyes: it is not inside that store.
+            let elsewhere = own_store(other_store.clone());
+            // A chapter and a tour that are links to folders outside the store.
+            #[cfg(windows)]
+            {
+                let outside = copy_to(w.tmp.path().join("outside").join(CH_2));
+                link_to(&outside, &tour_dir.join(CH_2));
+                let outside_tour = w.tmp.path().join("outside tour");
+                copy_to(outside_tour.join(CH_1));
+                link_to(&outside_tour, &site_dir.join(TOUR_2));
+                refused.push(tour_dir.join(CH_2));
+                refused.push(site_dir.join(TOUR_2).join(CH_1));
+            }
+            let whole = contents(w.tmp.path());
+            let before = (changes(&w.store), changes(&elsewhere));
+            for path in &refused {
+                let err = w.store.remove_project(path).expect_err(&format!("{path:?} was not refused"));
+                assert_eq!(err, "this saved recording could not be removed.");
+                assert!(reads_as_a_reason(&err, w.tmp.path()));
+            }
+            assert!(elsewhere.remove_project(&dir).is_err());
+            assert_eq!(contents(w.tmp.path()), whole, "nothing anywhere was touched");
+            assert_eq!((changes(&w.store), changes(&elsewhere)), before);
+            assert_eq!(keys(&w.store.list()), vec![key_1()]);
+            // The same folder, named as the store names it, is removed.
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::Now));
+        }
+
+        #[test]
+        fn a_project_removed_twice_is_not_there_the_second_time() {
+            let w = World::new();
+            w.save(&key_1());
+            w.save(&key(SITE_A, TOUR_1, CH_2));
+            let (dir, with_a_note) = (w.dir(&key_1()), w.dir(&key(SITE_A, TOUR_1, CH_2)));
+            std::fs::write(with_a_note.join("notes.txt"), b"mine").unwrap();
+            assert_eq!(w.store.remove_project(&dir), Ok(Removed::Now));
+            assert_eq!(w.store.remove_project(&with_a_note), Ok(Removed::Now));
+            let (before, left) = (changes(&w.store), contents(w.store.root()));
+            // Its folder is gone; the other's is still there for the note, and is no project.
+            assert!(!dir.exists() && with_a_note.is_dir());
+            for _ in 0..2 {
+                assert_eq!(w.store.remove_project(&dir), Ok(Removed::NotThere));
+                assert_eq!(w.store.remove_project(&with_a_note), Ok(Removed::NotThere));
+            }
+            // A project that never was, and a store whose folder was never made.
+            assert_eq!(w.store.remove_project(&w.dir(&key(SITE_B, TOUR_2, CH_2))), Ok(Removed::NotThere));
+            let never = own_store(w.tmp.path().join("never made"));
+            assert_eq!(never.remove_project(&never.root().join(site_of(SITE_A)).join(TOUR_1).join(CH_1)), Ok(Removed::NotThere));
+            assert!(!never.root().exists());
+            assert_eq!((changes(&w.store), contents(w.store.root())), (before, left), "nothing was there, so nothing changed");
+        }
+
+        #[test]
+        fn the_list_no_longer_holds_a_removed_project_and_the_epoch_moved() {
+            let w = World::new();
+            let removed = w.save(&key(SITE_A, TOUR_1, CH_1)).info;
+            let kept = w.save(&key(SITE_A, TOUR_1, CH_2)).info;
+            assert_eq!((w.store.list().len(), w.store.totals()), (2, Totals { count: 2, bytes: removed.bytes + kept.bytes }));
+            let before = changes(&w.store);
+            assert_eq!(w.store.remove_project(&removed.dir), Ok(Removed::Now));
+            assert_eq!(changes(&w.store), before + 1, "the pages are told to read the list again");
+            assert_eq!(w.store.list(), vec![kept.clone()]);
+            assert_eq!(w.store.for_site(SITE_A), vec![kept.clone()]);
+            assert_eq!(w.store.for_tour(SITE_A, TOUR_1), vec![kept.clone()]);
+            assert_eq!(w.store.totals(), Totals { count: 1, bytes: kept.bytes });
+            assert_eq!(load_err(&w.store, &removed.key), LoadError::NotSaved);
+        }
     }
 }
