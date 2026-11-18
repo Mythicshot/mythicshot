@@ -930,7 +930,9 @@ impl App {
         if let Some(cmd) = self.hide_then_run.take_due(Instant::now()) {
             // Anything started in the meantime dropped it already (see `run`); this is the last check.
             if tray::pending_may_run(self.activity()) {
-                self.run(ctx, cmd);
+                // "Window" never captures one of our own windows.
+                let front = platform::foreground_window().map(platform::window_kind);
+                self.run(ctx, main_window::tile_command(cmd, front));
             }
         }
         if let Some(wait) = self.hide_then_run.due_in(Instant::now()) {

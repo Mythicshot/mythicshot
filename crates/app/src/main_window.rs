@@ -258,6 +258,17 @@ impl LastForeground {
     }
 }
 
+/// The command a Home tile's capture runs once the main window is gone, given the window in front
+/// then. "Window" captures the window in front, so when that is one of Mythicshot's own (an open
+/// editor, because the app the user came from has closed), the taskbar, the desktop or nothing,
+/// it becomes the region selector, where a window is picked by pointing at it.
+pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
+    match cmd {
+        Command::Window if front != Some(WindowKind::Other) => Command::Region,
+        cmd => cmd,
+    }
+}
+
 /// The host name for the "Connected to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
 pub fn connected_host(server: &str, token: &TokenStatus) -> Option<String> {
@@ -530,6 +541,21 @@ mod tests {
     }
 
     #[test]
+    fn the_window_tile_never_captures_one_of_our_own_windows() {
+        assert_eq!(tile_command(Command::Window, Some(WindowKind::Other)), Command::Window);
+        // The app the user came from is gone and an editor, the taskbar or nothing is in front.
+        for front in [Some(WindowKind::Ours), Some(WindowKind::Shell), None] {
+            assert_eq!(tile_command(Command::Window, front), Command::Region, "{front:?}");
+        }
+        // The other tiles do not depend on what is in front.
+        for cmd in [Command::Region, Command::FullScreen, Command::Record] {
+            for front in [Some(WindowKind::Other), Some(WindowKind::Ours), Some(WindowKind::Shell), None] {
+                assert_eq!(tile_command(cmd, front), cmd);
+            }
+        }
+    }
+
+    #[test]
     fn a_waiting_capture_can_be_dropped() {
         let t0 = Instant::now();
         let mut h = HideThenRun::default();
@@ -638,6 +664,12 @@ mod tests {
         for word in ["General", "Output", "Hotkeys", "Left-click on the tray icon", "Open Mythicshot", "Capture a region"] {
             assert!(prefs.lines().any(|l| l == word), "Preferences is missing {word:?} in:\n{prefs}");
         }
+        assert!(!prefs.contains("settings file"), "nothing is said about a file that loaded");
+        // A settings file that could not be read: the page says so, with the file's path.
+        let problem = crate::settings::LoadProblem { path: "C:/cfg/settings.toml".into(), backup: None, partly_read: false };
+        s.prefs.settings.load_problem = Some(problem.clone());
+        let warned = drawn(&ctx, &mut s).replace('\n', " ");
+        assert!(warned.contains("changes will not be saved") && warned.contains("settings.toml"), "{warned}");
     }
 
     #[test]

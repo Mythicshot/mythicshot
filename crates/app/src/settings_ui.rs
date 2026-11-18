@@ -212,6 +212,14 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     });
     ui.separator();
     ui.add_space(6.0);
+    // The settings file could not be used as it was at start-up.
+    if let Some(problem) = &view.settings.load_problem {
+        egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(problem.sentence()).color(WARN_TEXT)).wrap());
+        });
+        ui.add_space(8.0);
+    }
     match state.tab {
         Tab::General => general(ui, view, &mut out),
         Tab::Output => output_tab(ui, &mut state.publishing, view, &mut out),

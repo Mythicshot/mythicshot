@@ -79,6 +79,9 @@ pub struct Settings {
     /// What a left-click on the tray icon does. Files from before the main window have no such key
     /// and read as `OpenApp`.
     pub tray_left_click: TrayLeftClick,
+    /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
+    #[serde(skip)]
+    pub load_problem: Option<LoadProblem>,
 
     // Phase 1–2 options, read once to fill `destinations`, never written.
     #[serde(skip_serializing)]
@@ -87,6 +90,136 @@ pub struct Settings {
     save_to_file: Option<bool>,
     #[serde(skip_serializing)]
     copy_to_clipboard: Option<bool>,
+}
+
+/// The settings file was there at start-up but could not be used as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadProblem {
+    /// The settings file.
+    pub path: PathBuf,
+    /// The copy of the file as it was, when one could be made.
+    pub backup: Option<PathBuf>,
+    /// Some settings were kept; the others read as their defaults.
+    pub partly_read: bool,
+}
+
+impl LoadProblem {
+    /// Without a copy of the file as it was, nothing is saved over it this session.
+    pub fn keeps_file_untouched(&self) -> bool {
+        self.backup.is_none()
+    }
+
+    /// What the Preferences page says about it.
+    pub fn sentence(&self) -> String {
+        match (&self.backup, self.partly_read) {
+            (None, _) => format!("The settings file could not be read, so changes will not be saved. The file is {}.", self.path.display()),
+            (Some(copy), true) => format!("Some settings could not be read and are back to their defaults. A copy of the file as it was is {}.", copy.display()),
+            (Some(copy), false) => format!("The settings file could not be read, so the defaults are in use. A copy of the file as it was is {}.", copy.display()),
+        }
+    }
+}
+
+/// How many copies of unreadable settings files are kept beside the settings file.
+const BACKUPS_KEPT: usize = 5;
+const BACKUP_PREFIX: &str = "settings.unreadable-";
+
+/// The time stamp and counter in a backup's name, `settings.unreadable-20261118-093000.toml` or
+/// `settings.unreadable-20261118-093000-2.toml`; `None` for any other file.
+fn backup_stamp(name: &str) -> Option<(String, u32)> {
+    let rest = name.strip_prefix(BACKUP_PREFIX)?.strip_suffix(".toml")?;
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = rest.split('-');
+    let (date, time) = (parts.next()?, parts.next()?);
+    let counter = match parts.next() {
+        None => 1,
+        Some(c) if !c.is_empty() && c.len() <= 4 && c.bytes().all(|b| b.is_ascii_digit()) => c.parse().ok()?,
+        Some(_) => return None,
+    };
+    (parts.next().is_none() && digits(date, 8) && digits(time, 6)).then(|| (format!("{date}-{time}"), counter))
+}
+
+/// Keep a copy of the settings file as it was, beside it, under a name with the time in it, and
+/// remove all but the newest [`BACKUPS_KEPT`] such copies. Only files with exactly that kind of
+/// name are ever removed.
+fn back_up(path: &std::path::Path, bytes: &[u8], now: chrono::NaiveDateTime) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let mut made = None;
+    for n in 1..=9999u32 {
+        let name = if n == 1 { format!("{BACKUP_PREFIX}{stamp}.toml") } else { format!("{BACKUP_PREFIX}{stamp}-{n}.toml") };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&name)) {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                f.sync_all()?;
+                made = Some(dir.join(name));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let made = made.ok_or_else(|| std::io::Error::other("too many copies with the same time"))?;
+    let mut copies: Vec<((String, u32), PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| backup_stamp(&e.file_name().to_string_lossy()).map(|stamp| (stamp, e.path())))
+        .collect();
+    copies.sort();
+    let extra = copies.len().saturating_sub(BACKUPS_KEPT);
+    for (_, old) in copies.into_iter().take(extra) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(made)
+}
+
+/// One step from the settings file's top down to a value in it.
+enum Step {
+    Key(String),
+    /// An entry of a list.
+    Item,
+}
+
+/// Whether the settings would load with only `value` in the file, at the place `steps` leads to.
+fn fits(steps: &[Step], value: &toml::Value) -> bool {
+    let wrapped = steps.iter().rev().fold(value.clone(), |inner, step| match step {
+        Step::Key(k) => toml::Value::Table(toml::Table::from_iter([(k.clone(), inner)])),
+        Step::Item => toml::Value::Array(vec![inner]),
+    });
+    wrapped.try_into::<Settings>().is_ok()
+}
+
+/// `value` with everything this version cannot read taken out, however deep: a bad entry of a
+/// section or of a list goes, its neighbours stay. `None` when nothing of it can be kept.
+fn salvage(steps: &mut Vec<Step>, value: toml::Value) -> Option<toml::Value> {
+    if fits(steps, &value) {
+        return Some(value);
+    }
+    let kept = match value {
+        toml::Value::Table(section) => toml::Value::Table(
+            section
+                .into_iter()
+                .filter_map(|(key, inner)| {
+                    steps.push(Step::Key(key.clone()));
+                    let kept = salvage(steps, inner);
+                    steps.pop();
+                    kept.map(|v| (key, v))
+                })
+                .collect(),
+        ),
+        toml::Value::Array(list) => toml::Value::Array(
+            list.into_iter()
+                .filter_map(|inner| {
+                    steps.push(Step::Item);
+                    let kept = salvage(steps, inner);
+                    steps.pop();
+                    kept
+                })
+                .collect(),
+        ),
+        _ => return None,
+    };
+    fits(steps, &kept).then_some(kept)
 }
 
 /// A drawing style as saved in the settings file.
@@ -187,6 +320,7 @@ impl Default for Settings {
             editor_keys_version: EDITOR_KEYS_VERSION,
             publish_server: String::new(),
             tray_left_click: TrayLeftClick::default(),
+            load_problem: None,
             open_editor: None,
             save_to_file: None,
             copy_to_clipboard: None,
@@ -208,60 +342,49 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        Self::load_from(&Self::path())
+        let s = Self::load_with(&Self::path(), |p| std::fs::read(p), |p, bytes| back_up(p, bytes, chrono::Local::now().naive_local()));
+        if let Some(problem) = &s.load_problem {
+            eprintln!("{}", problem.sentence());
+        }
+        s
     }
 
-    /// Read the settings file at `path`. A file that is not TOML at all cannot be used; since the
-    /// next change saves over it, a copy is kept beside it first (`settings.unreadable.toml`).
-    fn load_from(path: &std::path::Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else { return Settings::default().upgrade() };
-        match Self::parse(&text) {
-            Some(s) => s.upgrade(),
-            None => {
-                eprintln!("settings file {} could not be read; starting from the defaults", path.display());
-                let _ = std::fs::copy(path, path.with_file_name("settings.unreadable.toml"));
-                Settings::default().upgrade()
-            }
+    /// Read the settings file at `path`.
+    ///
+    /// A file that is not there is a first start: the defaults, saved as usual. A file that is
+    /// there but cannot be used as it is (unreadable, not text, not TOML, or holding values this
+    /// version does not understand) is first copied aside by `backup`, because the next change
+    /// saves over it. When the file could not be read, or the copy could not be made, the app
+    /// runs on what it has for this session and never saves over the file (see [`Settings::save`]).
+    fn load_with(path: &std::path::Path, read: impl FnOnce(&std::path::Path) -> std::io::Result<Vec<u8>>, backup: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<PathBuf>) -> Self {
+        let problem = |backup: Option<PathBuf>, partly_read: bool| Some(LoadProblem { path: path.to_path_buf(), backup, partly_read });
+        let bytes = match read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default().upgrade(),
+            // Locked, no permission, a drive error: what is in it is unknown, so it is left alone.
+            Err(_) => return Settings { load_problem: problem(None, false), ..Settings::default().upgrade() },
+        };
+        let strict = std::str::from_utf8(&bytes).ok().and_then(|text| toml::from_str::<Settings>(text).ok());
+        if let Some(s) = strict {
+            return s.upgrade();
         }
+        let partly = std::str::from_utf8(&bytes).ok().and_then(Self::parse);
+        let copy = backup(path, &bytes).ok();
+        let partly_read = partly.is_some();
+        Settings { load_problem: problem(copy, partly_read), ..partly.unwrap_or_default().upgrade() }
     }
 
     /// Settings from the file's text. A value this version does not understand (a mistyped word, a
     /// choice or an action from a newer version, a number where text belongs) costs only that
-    /// one setting, which reads as its default; every other setting is kept. Without this, one
-    /// such value made the whole file read as the defaults, and the next save wrote them over it.
-    /// `None` only when the text is not TOML.
+    /// one value, which reads as its default; everything else is kept, in sections and lists too.
+    /// Without this, one such value made the whole file read as the defaults, and the next save
+    /// wrote them over it. `None` only when the text is not TOML.
     fn parse(text: &str) -> Option<Settings> {
         if let Ok(s) = toml::from_str::<Settings>(text) {
             return Some(s);
         }
-        let mut table: toml::Table = toml::from_str(text).ok()?;
-        // Whether the file would load with just this one key (or one entry of a section) in it.
-        let alone = |key: &str, value: toml::Value| {
-            let mut one = toml::Table::new();
-            one.insert(key.to_string(), value);
-            one.try_into::<Settings>().is_ok()
-        };
-        let keys: Vec<String> = table.keys().cloned().collect();
-        for key in keys {
-            let value = table[&key].clone();
-            if alone(&key, value.clone()) {
-                continue;
-            }
-            // A section (hotkeys, editor, overlays): keep its good entries.
-            let kept = match value {
-                toml::Value::Table(section) => {
-                    let good: toml::Table = section.into_iter().filter(|(k, v)| alone(&key, toml::Value::Table(toml::Table::from_iter([(k.clone(), v.clone())])))).collect();
-                    Some(toml::Value::Table(good)).filter(|v| alone(&key, v.clone()))
-                }
-                _ => None,
-            };
-            eprintln!("settings: \"{key}\" has a value this version does not understand; using the default for it");
-            match kept {
-                Some(v) => table.insert(key, v),
-                None => table.remove(&key),
-            };
-        }
-        table.try_into().ok()
+        let table: toml::Table = toml::from_str(text).ok()?;
+        salvage(&mut Vec::new(), toml::Value::Table(table))?.try_into().ok()
     }
 
     /// Bring a file written by an older version up to date.
@@ -311,13 +434,21 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let path = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    /// Write the settings to `path`, unless the file there could not be read at start-up and no
+    /// copy of it could be made: then it is never written over.
+    fn save_to(&self, path: &std::path::Path) {
+        if self.load_problem.as_ref().is_some_and(LoadProblem::keeps_file_untouched) {
+            return;
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         match toml::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
+                if let Err(e) = std::fs::write(path, text) {
                     eprintln!("could not save settings: {e}");
                 }
             }
@@ -473,7 +604,7 @@ publish_server = \"https://tours.example.com\"
         let d = Settings::default();
         assert_eq!(s.publish_server, "https://tours.example.com");
         assert_eq!((s.image_format, s.jpeg_quality), (d.image_format, d.jpeg_quality));
-        assert_eq!(s.destinations(), d.destinations(), "a list with an unknown destination reads as the default list");
+        assert_eq!(s.destinations(), &[DestId::File], "the destination it knows stays");
         // Sections keep their good entries.
         assert!(!s.overlays.pointer);
         assert_eq!(s.overlays.keys, OverlayStyle::default().keys, "as when the section never named it");
@@ -483,20 +614,150 @@ publish_server = \"https://tours.example.com\"
     }
 
     #[test]
-    fn a_file_that_is_not_toml_is_copied_aside_before_the_defaults_are_used() {
+    fn only_the_bad_value_is_lost_however_deep_it_sits() {
+        // One bad number in one tool's style, one in the tour theme, one unknown entry in a list.
+        let text = "destinations = [\"file\", \"hologram\", \"clipboard\"]\n\n[editor]\ntool = \"text\"\nexport_scale = \"huge\"\n\n[editor.styles.text]\nwidth = \"wide\"\nfont_size = 32.0\nshadow = false\n\n[editor.styles.arrow]\nwidth = 7.0\n\n[editor.tour_theme]\naccent = \"#6aa8f0\"\nzoom_percent = \"big\"\nhotspot = \"dot\"\n";
+        assert!(toml::from_str::<Settings>(text).is_err());
+        let s = Settings::parse(text).expect("still loads").upgrade();
+        assert_eq!(s.destinations(), &[DestId::File, DestId::Clipboard], "only the unknown entry goes");
+        assert_eq!(s.editor.tool, "text");
+        assert_eq!(s.editor.export_scale, EditorPrefs::default().export_scale);
+        let text_style = s.editor.styles["text"];
+        assert_eq!((text_style.width, text_style.font_size, text_style.shadow), (SavedStyle::default().width, 32.0, false));
+        assert_eq!(s.editor.styles["arrow"].width, 7.0, "the other tool's style is untouched");
+        let theme = &s.editor.tour_theme;
+        assert_eq!((theme.accent.as_str(), theme.hotspot.as_str(), theme.zoom_percent), ("#6aa8f0", "dot", SavedTheme::default().zoom_percent));
+    }
+
+    fn when() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 18).unwrap().and_hms_opt(9, 30, 0).unwrap()
+    }
+
+    fn load_at(path: &std::path::Path) -> Settings {
+        Settings::load_with(path, |p| std::fs::read(p), |p, bytes| back_up(p, bytes, when()))
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_used_is_copied_aside_before_anything_is_saved() {
+        // Not TOML, not text at all, and TOML with one value from a newer version.
+        let cases: [(&[u8], bool); 3] = [(b"publish_server = \"https://tours.example.com\n[[[", false), (b"\xff\xfe\x00magnifier", false), (b"tray_left_click = \"open_dashboard\"\nmagnifier = false\n", true)];
+        for (bytes, partly) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("settings.toml");
+            std::fs::write(&path, bytes).unwrap();
+            let s = load_at(&path);
+            let copy = tmp.path().join("settings.unreadable-20261118-093000.toml");
+            assert_eq!(s.load_problem, Some(LoadProblem { path: path.clone(), backup: Some(copy.clone()), partly_read: partly }));
+            assert_eq!(std::fs::read(&copy).unwrap(), bytes, "the copy is the file as it was");
+            assert_eq!(s.magnifier, !partly, "what could be read is kept, the rest is the default");
+            // With the copy made, saving goes ahead.
+            s.save_to(&path);
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(saved.contains("tray_left_click = \"open_app\""), "{saved}");
+            assert!(!saved.contains("load_problem") && !saved.contains("unreadable"), "the problem is never written: {saved}");
+            let sentence = s.load_problem.as_ref().unwrap().sentence();
+            assert!(sentence.contains(&copy.display().to_string()) && !sentence.contains("will not be saved"), "{sentence}");
+        }
+    }
+
+    #[test]
+    fn a_good_or_missing_file_has_no_problem_and_leaves_no_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.toml");
-        std::fs::write(&path, "publish_server = \"https://tours.example.com\n[[[").unwrap();
-        assert!(Settings::parse(&std::fs::read_to_string(&path).unwrap()).is_none());
-        let s = Settings::load_from(&path);
-        assert_eq!(s.publish_server, "");
-        assert_eq!(std::fs::read_to_string(tmp.path().join("settings.unreadable.toml")).unwrap(), std::fs::read_to_string(&path).unwrap());
-        // A good file and a missing one leave nothing beside them.
-        let good = tempfile::tempdir().unwrap();
-        std::fs::write(good.path().join("settings.toml"), "tray_left_click = \"capture_region\"\n").unwrap();
-        assert_eq!(Settings::load_from(&good.path().join("settings.toml")).tray_left_click, TrayLeftClick::CaptureRegion);
-        assert_eq!(Settings::load_from(&good.path().join("none.toml")).tray_left_click, TrayLeftClick::OpenApp);
-        assert_eq!(std::fs::read_dir(good.path()).unwrap().count(), 1);
+        std::fs::write(&path, "tray_left_click = \"capture_region\"\n").unwrap();
+        let s = load_at(&path);
+        assert_eq!((s.tray_left_click, &s.load_problem), (TrayLeftClick::CaptureRegion, &None));
+        let first = load_at(&tmp.path().join("none.toml"));
+        assert_eq!((first.tray_left_click, &first.load_problem), (TrayLeftClick::OpenApp, &None));
+        assert_eq!(names(tmp.path()), ["settings.toml"]);
+        // A first start saves as usual.
+        first.save_to(&tmp.path().join("none.toml"));
+        assert!(tmp.path().join("none.toml").exists());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_never_saved_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = "publish_server = \"https://tours.example.com\"\n[hotkeys]\ncapture_region = \"control+KeyQ\"\n";
+        std::fs::write(&path, mine).unwrap();
+        // Locked by another program, or no permission.
+        let denied = |_: &std::path::Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let mut s = Settings::load_with(&path, denied, |p, bytes| back_up(p, bytes, when()));
+        assert_eq!(s.load_problem, Some(LoadProblem { path: path.clone(), backup: None, partly_read: false }));
+        assert_eq!(s.publish_server, "", "the defaults, for this session");
+        // Changes made this session are not written, by this copy of the settings or a clone of it.
+        s.magnifier = false;
+        s.toggle_destination(DestId::File);
+        s.save_to(&path);
+        s.clone().save_to(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert_eq!(names(tmp.path()), ["settings.toml"], "and nothing else is written either");
+        let sentence = s.load_problem.as_ref().unwrap().sentence();
+        assert!(sentence.contains("changes will not be saved") && sentence.contains(&path.display().to_string()), "{sentence}");
+        // A folder where the file should be reads as an error too, not as a first start.
+        let odd = tmp.path().join("odd");
+        std::fs::create_dir_all(odd.join("settings.toml")).unwrap();
+        let s = load_at(&odd.join("settings.toml"));
+        assert!(s.load_problem.as_ref().is_some_and(LoadProblem::keeps_file_untouched));
+    }
+
+    #[test]
+    fn when_the_copy_cannot_be_made_the_file_is_never_saved_over() {
+        let no_copy = |_: &std::path::Path, _: &[u8]| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        // Whether nothing could be read or only part of it.
+        for (mine, partly) in [("publish_server = \"https://tours.example.com\n[[[", false), ("tray_left_click = \"open_dashboard\"\npublish_server = \"https://tours.example.com\"\n", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("settings.toml");
+            std::fs::write(&path, mine).unwrap();
+            let mut s = Settings::load_with(&path, |p| std::fs::read(p), no_copy);
+            assert_eq!(s.load_problem, Some(LoadProblem { path: path.clone(), backup: None, partly_read: partly }));
+            assert_eq!(s.publish_server, if partly { "https://tours.example.com" } else { "" });
+            s.magnifier = !s.magnifier;
+            s.save_to(&path);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+            assert_eq!(names(tmp.path()), ["settings.toml"]);
+        }
+    }
+
+    #[test]
+    fn each_copy_has_its_own_name_and_only_the_newest_five_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // Files that only look similar are never removed.
+        for other in ["settings.unreadable.toml", "settings.unreadable-notes.toml", "settings.unreadable-20260101-000000.toml.bak", "settings.unreadable-20260101-000000-x.toml"] {
+            std::fs::write(tmp.path().join(other), "mine").unwrap();
+        }
+        // Two in the same second do not overwrite each other.
+        let a = back_up(&path, b"first", when()).unwrap();
+        let b = back_up(&path, b"second", when()).unwrap();
+        assert_eq!((a.file_name().unwrap().to_str().unwrap(), b.file_name().unwrap().to_str().unwrap()), ("settings.unreadable-20261118-093000.toml", "settings.unreadable-20261118-093000-2.toml"));
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"first".to_vec(), b"second".to_vec()));
+        for minute in 31..37 {
+            back_up(&path, b"later", when().date().and_hms_opt(9, minute, 0).unwrap()).unwrap();
+        }
+        assert_eq!(
+            names(tmp.path()),
+            [
+                "settings.unreadable-20260101-000000-x.toml",
+                "settings.unreadable-20260101-000000.toml.bak",
+                "settings.unreadable-20261118-093200.toml",
+                "settings.unreadable-20261118-093300.toml",
+                "settings.unreadable-20261118-093400.toml",
+                "settings.unreadable-20261118-093500.toml",
+                "settings.unreadable-20261118-093600.toml",
+                "settings.unreadable-notes.toml",
+                "settings.unreadable.toml",
+            ]
+        );
+        assert_eq!(backup_stamp("settings.unreadable-20261118-093000-2.toml"), Some(("20261118-093000".into(), 2)));
+        assert_eq!(backup_stamp("settings.toml"), None);
     }
 
     #[test]
