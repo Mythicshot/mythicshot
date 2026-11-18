@@ -122,6 +122,13 @@ impl Recording {
         self.end_ms
     }
 
+    /// Whether `other` holds the same recording: the same picture size and end time, and for
+    /// every frame the same time, pointer, place and length in the frames file, and kind.
+    pub fn same_frames(&self, other: &Recording) -> bool {
+        let whole = |m: &FrameMeta| (m.offset, m.len, m.key, m.t_ms, m.cursor);
+        (self.width, self.height, self.end_ms, self.frames.len()) == (other.width, other.height, other.end_ms, other.frames.len()) && self.frames.iter().zip(&other.frames).all(|(a, b)| whole(a) == whole(b))
+    }
+
     pub fn delete(self) {
         self.delete_files();
     }
@@ -484,6 +491,23 @@ mod tests {
             }
         }
         px
+    }
+
+    #[test]
+    fn two_recordings_are_the_same_only_when_every_frame_lies_and_reads_the_same() {
+        let frame = |offset, len, key, t_ms, cursor| FrameMeta { offset, len, key, t_ms, cursor };
+        let rec = |width, end_ms, frames: Vec<FrameMeta>| Recording { dir: PathBuf::new(), owned: false, width, height: 80, frames, end_ms };
+        let base = || vec![frame(0, 10, true, 0, None), frame(10, 12, false, 100, None)];
+        assert!(rec(100, 200, base()).same_frames(&rec(100, 200, base())));
+        // Equal times and no pointer, and still other frames: a length, where one lies, a whole frame.
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 13, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(11, 12, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 12, true, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None), frame(10, 12, false, 101, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, Some((1, 2))), frame(10, 12, false, 100, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 200, vec![frame(0, 10, true, 0, None)])));
+        assert!(!rec(100, 200, base()).same_frames(&rec(101, 200, base())));
+        assert!(!rec(100, 200, base()).same_frames(&rec(100, 201, base())));
     }
 
     #[test]
