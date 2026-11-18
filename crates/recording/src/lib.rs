@@ -14,7 +14,7 @@ mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
-pub use saved::OpenError;
+pub use saved::{OpenError, SaveError, SaveStep};
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -116,6 +116,25 @@ impl Recording {
     pub fn timing_only(width: u32, height: u32, times: &[u64], end_ms: u64) -> Recording {
         let frames = times.iter().map(|t| FrameMeta { offset: 0, len: 0, key: true, t_ms: *t, cursor: None }).collect();
         Recording { dir: PathBuf::new(), owned: false, width, height, frames, end_ms }
+    }
+
+    /// A small real recording that owns `dir` (which must exist), as the recorder leaves one:
+    /// one frame per entry of `times`, each a little different from the one before. For tests
+    /// of code that reads frames or deletes a recording.
+    #[doc(hidden)]
+    pub fn synthetic_in(dir: &std::path::Path, width: u32, height: u32, times: &[u64], end_ms: u64) -> Result<Recording, String> {
+        let mut writer = FrameWriter::create(dir, width, height)?;
+        for (i, t_ms) in times.iter().enumerate() {
+            let mut px = vec![40u8; (width * height * 4) as usize];
+            for (n, p) in px.chunks_exact_mut(4).enumerate() {
+                if (n + i * 7) % 13 == 0 {
+                    p[0] = (i * 31 % 256) as u8;
+                }
+                p[3] = 255;
+            }
+            writer.push(&px, *t_ms, None)?;
+        }
+        writer.finish(dir.to_path_buf(), end_ms)
     }
 
     pub fn duration_ms(&self) -> u64 {

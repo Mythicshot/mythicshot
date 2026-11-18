@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::project::{self, Store};
 use crate::publish::{self, Finished, Images, Outcome, RemoteTour, Target};
 
 const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
@@ -31,6 +32,8 @@ pub const TEMP_PREFIX: &str = "mythicshot-publish-";
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// A leftover publish folder older than this is removed at start-up.
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// What a save of a recording that was cut off left behind is removed at start-up once it is this old.
+const STAGING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Whether an API token is saved. The token itself is never kept here.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,9 +61,11 @@ struct Config {
     saved_for: Option<String>,
     /// A new value of `saved_for` the settings file does not hold yet ("" for none).
     saved_for_change: Option<String>,
+    /// The setting: an upload keeps its recording on this computer, to be edited later.
+    keep_recordings: bool,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None });
+static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true });
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -77,8 +82,37 @@ pub fn init(settings: &crate::settings::Settings) {
     }
     set_server(&settings.publish_server);
     config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
+    set_keep_recordings(settings.keep_published_recordings);
     std::thread::spawn(refresh_token_now);
     std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
+    // The saved recordings' folder is looked at off the UI thread, whatever the switch says:
+    // what an earlier run could not finish is finished either way.
+    std::thread::spawn(|| {
+        if let Some(root) = Store::default_root() {
+            tidy_saved_recordings(&Store::at(root));
+        }
+    });
+}
+
+/// What a start does to the folder of saved recordings, in the order the store asks for: put
+/// back a recording a cut-off save moved aside, finish removals a closed editor was holding
+/// up, and remove what cut-off saves left behind a day or more ago. No saved recording is
+/// removed by it. Never call it on the UI thread.
+pub fn tidy_saved_recordings(store: &Store) {
+    store.recover_replaced();
+    store.finish_removals();
+    store.sweep_staging(STAGING_AFTER);
+}
+
+/// The setting "keep the recording when I publish a tour": set at start-up and whenever the
+/// settings change.
+pub fn set_keep_recordings(keep: bool) {
+    config().keep_recordings = keep;
+}
+
+/// Whether an upload keeps its recording on this computer.
+pub fn keeps_recordings() -> bool {
+    config().keep_recordings
 }
 
 pub fn set_server(server: &str) {
@@ -489,6 +523,88 @@ pub fn publishing_message(images: Option<Images>) -> String {
     }
 }
 
+// ---- Keeping the recording ----
+
+/// What became of keeping the recording of an upload on this computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// Saved, with what could not be saved with it in words for a sentence ("the cover logo",
+    /// "a pasted picture"); empty when everything was.
+    Saved(Vec<String>),
+    /// The setting is off: nothing was saved, and there is nothing to say.
+    Off,
+    /// Not saved; the reason, as the store words it (lower-case, to follow [`NOT_KEPT`]), or
+    /// [`project::NOT_PUT_BACK`], a sentence that stands alone.
+    Failed(String),
+}
+
+/// An upload that worked: what became of it on the site, and of its recording on this computer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishDone {
+    pub finished: Finished,
+    pub kept: Kept,
+}
+
+/// Before the reason a recording could not be kept; true for a new tour and for a chapter
+/// added to one. The wording is proposed and waits for the owner's approval.
+pub const NOT_KEPT: &str = "The recording could not be saved on this computer, so it can't be edited later: ";
+/// Before the list of what a kept recording was saved without. The wording is proposed and waits for the owner's approval.
+pub const KEPT_WITHOUT: &str = "The recording was kept for later editing, but without ";
+/// The reason when this computer has no folder for saved recordings: keeping is simply off.
+/// The wording is proposed and waits for the owner's approval.
+pub const NO_FOLDER_FOR_RECORDINGS: &str = "the folder for saved recordings could not be found on this computer.";
+/// The reason when saving broke off for no reason the store could name.
+/// The wording is proposed and waits for the owner's approval.
+pub const KEEPING_BROKE_OFF: &str = "saving failed because of an internal error.";
+
+/// What the project format calls a thing that could not be saved or restored, and what
+/// several of them are called after their number. The wording is proposed and waits for the
+/// owner's approval.
+const SEVERAL: [(&str, &str); 5] = [
+    ("a pasted picture", "pasted pictures"),
+    ("an annotation on a frame the recording does not have", "annotations on frames the recording does not have"),
+    ("an annotation that could not be read", "annotations that could not be read"),
+    ("an annotation of a kind this version does not know", "annotations of a kind this version does not know"),
+    ("an annotation far outside the picture", "annotations far outside the picture"),
+];
+
+/// The end of a sentence that lists `things`: "the cover logo and 2 pasted pictures.". Each
+/// kind is named once, in the order it came up, with its number when there are several.
+pub fn listed(things: &[String]) -> String {
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for thing in things.iter().map(|t| t.as_str()) {
+        match kinds.iter_mut().find(|(kind, _)| *kind == thing) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((thing, 1)),
+        }
+    }
+    let named: Vec<String> = kinds
+        .iter()
+        .map(|(kind, n)| match (n, SEVERAL.iter().find(|(one, _)| one == kind)) {
+            (1, _) => kind.to_string(),
+            (n, Some((_, several))) => format!("{n} {several}"),
+            (n, None) => format!("{kind} ({n} times)"),
+        })
+        .collect();
+    match named.split_last() {
+        None => ".".to_string(),
+        Some((last, [])) => format!("{last}."),
+        Some((last, rest)) => format!("{} and {last}.", rest.join(", ")),
+    }
+}
+
+/// The result screen's sentence about the recording, when there is something to say: it could
+/// not be kept, or it was kept without something.
+pub fn kept_note(kept: &Kept) -> Option<String> {
+    match kept {
+        Kept::Off => None,
+        Kept::Saved(left_out) if left_out.is_empty() => None,
+        Kept::Saved(left_out) => Some(format!("{KEPT_WITHOUT}{}", listed(left_out))),
+        Kept::Failed(reason) if reason == project::NOT_PUT_BACK => Some(reason.clone()),
+        Kept::Failed(reason) => Some(format!("{NOT_KEPT}{reason}")),
+    }
+}
+
 // ---- The result screen ----
 
 /// What the tour was before this upload, as far as the app knows: the result screen needs
@@ -610,8 +726,13 @@ pub struct Retry {
     pub title: String,
     pub before: Before,
     pub tour_id: String,
+    /// The chapter the upload made, as its commit answered.
+    pub chapter_id: String,
     /// The steps the upload had.
     pub steps: usize,
+    /// What became of the upload's recording. A retry publishes only: it saves nothing again,
+    /// and its result screen says what the first one said.
+    pub kept: Kept,
 }
 
 /// "Try again": takes the result screen away and says what to publish, but only when
@@ -621,7 +742,7 @@ pub fn take_retry(screen: &mut Option<ResultDialog>, job_running: bool) -> Optio
     if job_running || !screen.as_ref().is_some_and(ResultDialog::can_retry) {
         return None;
     }
-    screen.take().map(|d| Retry { title: d.title, before: d.before, tour_id: d.done.tour_id, steps: d.done.steps })
+    screen.take().map(|d| Retry { title: d.title, before: d.before, tour_id: d.done.tour_id, chapter_id: d.done.chapter_id, steps: d.done.steps, kept: d.kept })
 }
 
 /// The screen after a publish or a draft upload: what happened, and for a public tour its link.
@@ -629,12 +750,18 @@ pub struct ResultDialog {
     title: String,
     before: Before,
     done: Finished,
+    kept: Kept,
     copied: Option<Instant>,
 }
 
 impl ResultDialog {
-    pub fn new(title: String, before: Before, done: Finished) -> ResultDialog {
-        ResultDialog { title, before, done, copied: None }
+    pub fn new(title: String, before: Before, done: PublishDone) -> ResultDialog {
+        ResultDialog { title, before, done: done.finished, kept: done.kept, copied: None }
+    }
+
+    /// The sentence about the recording on this computer, when the screen has one.
+    fn kept_line(&self) -> Option<String> {
+        kept_note(&self.kept)
     }
 
     fn url(&self) -> Option<&str> {
@@ -672,6 +799,11 @@ impl ResultDialog {
             if let Some((note, is_error)) = result_note(&self.done.outcome, &self.before) {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(note).color(if is_error { ERROR } else { MUTED })).wrap());
+            }
+            // Not an error of the upload: the tour is on the site either way.
+            if let Some(note) = self.kept_line() {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap());
             }
             if let Some(url) = self.url().map(str::to_string) {
                 ui.add_space(12.0);
@@ -931,7 +1063,7 @@ impl Picker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `publish_blocked` with the token saved for the very address that is asked about.
@@ -1253,8 +1385,15 @@ mod tests {
     const TOUR_ID: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
     const LINK: &str = "https://tours.example.com/t/abc";
 
+    const CHAPTER_ID: &str = "ch_0123456789abcdef01234567";
+
     fn finished(steps: usize, outcome: Outcome) -> Finished {
-        Finished { tour_id: TOUR_ID.into(), chapter_id: String::new(), steps, outcome }
+        Finished { tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps, outcome }
+    }
+
+    /// An upload whose recording was kept whole.
+    fn done(steps: usize, outcome: Outcome) -> PublishDone {
+        PublishDone { finished: finished(steps, outcome), kept: Kept::Saved(vec![]) }
     }
 
     fn failed() -> Outcome {
@@ -1361,34 +1500,133 @@ mod tests {
     #[test]
     fn try_again_keeps_the_result_screen_while_another_job_runs() {
         let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
-        let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), finished(2, failed())));
+        let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), done(2, failed())));
         // A job is running: nothing starts, and the screen with its "Try again" stays.
         assert_eq!(take_retry(&mut screen, true), None);
         assert!(screen.as_ref().is_some_and(ResultDialog::can_retry));
         // Free: the screen goes and the retry names the uploaded tour, with what the next screen needs.
-        assert_eq!(take_retry(&mut screen, false), Some(Retry { title: "Demo".into(), before: was.clone(), tour_id: TOUR_ID.into(), steps: 2 }));
+        assert_eq!(take_retry(&mut screen, false), Some(Retry { title: "Demo".into(), before: was.clone(), tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 2, kept: Kept::Saved(vec![]) }));
         assert!(screen.is_none());
         assert_eq!(take_retry(&mut screen, false), None);
+        // What the first screen said about the recording goes along, so the next one says it too.
+        let not_kept = Kept::Failed("the disk is full.".into());
+        let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), PublishDone { finished: finished(2, failed()), kept: not_kept.clone() }));
+        assert_eq!(take_retry(&mut screen, false).map(|r| (r.chapter_id, r.kept)), Some((CHAPTER_ID.to_string(), not_kept)));
         // A screen that offers no "Try again" is never taken away by one.
         for outcome in [Outcome::Draft, cancelled(), Outcome::Public { url: Some(LINK.into()) }] {
-            let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), finished(2, outcome)));
+            let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), done(2, outcome)));
             assert_eq!(take_retry(&mut screen, false), None);
             assert!(screen.is_some());
         }
     }
 
     #[test]
+    fn the_result_screen_says_when_the_recording_could_not_be_kept() {
+        let screen = |kept: Kept| ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, Outcome::Public { url: Some(LINK.into()) }), kept });
+        // Kept whole, or the switch is off: nothing to say.
+        assert_eq!(screen(Kept::Saved(vec![])).kept_line(), None);
+        assert_eq!(screen(Kept::Off).kept_line(), None);
+        // Not kept: one sentence with the store's reason after the colon.
+        let failed_to_keep = screen(Kept::Failed(project::DISK_FULL.into()));
+        assert_eq!(failed_to_keep.kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the disk is full."));
+        // The upload itself is reported as it went: a kept recording is no part of that.
+        assert_eq!(result_heading(&failed_to_keep.done.outcome), "Tour published");
+        assert!(!failed_to_keep.can_retry());
+        // No folder on this computer: the same sentence, with that reason.
+        assert_eq!(screen(Kept::Failed(NO_FOLDER_FOR_RECORDINGS.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the folder for saved recordings could not be found on this computer."));
+        assert_eq!(screen(Kept::Failed(project::SAVING_CANCELLED.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
+        assert_eq!(screen(Kept::Failed(KEEPING_BROKE_OFF.into())).kept_line().as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
+        // The one reason that is a sentence of its own is shown on its own.
+        assert_eq!(screen(Kept::Failed(project::NOT_PUT_BACK.into())).kept_line().as_deref(), Some(project::NOT_PUT_BACK));
+        // Kept, but without something: a full sentence that says how many of a kind.
+        let without = screen(Kept::Saved(vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()]));
+        assert_eq!(without.kept_line().as_deref(), Some("The recording was kept for later editing, but without the cover logo and 2 pasted pictures."));
+        assert_eq!(screen(Kept::Saved(vec!["a pasted picture".into()])).kept_line().as_deref(), Some("The recording was kept for later editing, but without a pasted picture."));
+        // Every case draws, with and without a link, and after a publish that failed.
+        let ctx = egui::Context::default();
+        for kept in [Kept::Off, Kept::Saved(vec!["the cover logo".into()]), Kept::Failed("the disk is full.".into())] {
+            for outcome in [Outcome::Public { url: Some(LINK.into()) }, Outcome::Draft, failed()] {
+                let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, outcome), kept: kept.clone() });
+                let mut out = None;
+                ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx())).textures_delta.clear();
+                assert_eq!(out, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_list_names_each_kind_once_and_says_how_many() {
+        let list = |things: &[&str]| listed(&things.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        assert_eq!(list(&["the cover logo"]), "the cover logo.");
+        assert_eq!(list(&["the cover logo", "a pasted picture"]), "the cover logo and a pasted picture.");
+        assert_eq!(list(&["a pasted picture", "the cover logo", "a pasted picture", "an annotation that could not be read"]), "2 pasted pictures, the cover logo and an annotation that could not be read.");
+        assert_eq!(list(&["an annotation on a frame the recording does not have"; 3]), "3 annotations on frames the recording does not have.");
+        assert_eq!(list(&["an annotation of a kind this version does not know"; 2]), "2 annotations of a kind this version does not know.");
+        assert_eq!(list(&["an annotation far outside the picture"; 2]), "2 annotations far outside the picture.");
+        assert_eq!(list(&["an annotation that could not be read"; 12]), "12 annotations that could not be read.");
+        // A kind this list has no word for is still counted.
+        assert_eq!(list(&["a thing", "a thing"]), "a thing (2 times).");
+        // Every kind the project format can name is known here by exactly its words.
+        let format = include_str!("project/state.rs");
+        for (one, _) in SEVERAL {
+            assert!(format.contains(&format!("\"{one}\"")), "the project format no longer says: {one}");
+        }
+        let mut said: Vec<&str> = format.split("dropped.push(\"").skip(1).filter_map(|rest| rest.split('"').next()).collect();
+        said.sort();
+        said.dedup();
+        let mut known: Vec<&str> = SEVERAL.iter().map(|(one, _)| *one).chain(["the cover logo"]).collect();
+        known.sort();
+        assert_eq!(said, known, "a new kind needs its word for several (the cover logo is only ever one)");
+    }
+
+    /// Tests that change the shared switch take this first, so they do not cross.
+    pub(crate) static SWITCH: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn keeping_recordings_is_on_until_the_setting_says_otherwise() {
+        // It leaves the shared switch as it found it.
+        let _alone = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        let was = keeps_recordings();
+        set_keep_recordings(false);
+        assert!(!keeps_recordings());
+        set_keep_recordings(true);
+        assert!(keeps_recordings());
+        set_keep_recordings(was);
+    }
+
+    #[test]
+    fn a_start_finishes_what_a_cut_off_save_left_and_removes_no_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("projects"));
+        // No folder yet: nothing happens, and none is made.
+        tidy_saved_recordings(&store);
+        assert!(!store.root().exists());
+        // A staging folder from two days ago goes; one from now, and anything else, stays.
+        std::fs::create_dir_all(store.root()).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let old = store.root().join(format!(".staging-{}-0123456789abcdef", now - 2 * 24 * 60 * 60 * 1000));
+        let fresh = store.root().join(format!(".staging-{now}-0123456789abcdef"));
+        let other = store.root().join("mine");
+        for dir in [&old, &fresh, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("frames.zst"), b"x").unwrap();
+        }
+        tidy_saved_recordings(&store);
+        assert!(!old.exists() && fresh.exists() && other.join("frames.zst").exists());
+    }
+
+    #[test]
     fn open_in_browser_asks_for_the_shown_link_and_nothing_else() {
         let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
-        let d = ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, Outcome::Public { url: Some("https://x.dev/t/a".into()) }));
+        let d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some("https://x.dev/t/a".into()) }));
         assert_eq!(d.open_action(), Some(ResultAction::Open("https://x.dev/t/a".into())));
         assert!(!d.link_is_older());
         // A draft in a tour that is public: the older version's link, marked as such.
-        let d = ResultDialog::new("Demo".into(), was, finished(2, Outcome::Draft));
+        let d = ResultDialog::new("Demo".into(), was, done(2, Outcome::Draft));
         assert_eq!(d.open_action(), Some(ResultAction::Open(LINK.into())));
         assert!(d.link_is_older());
         // No link, nothing to open.
-        let d = ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, Outcome::Draft));
+        let d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Draft));
         assert_eq!(d.open_action(), None);
         // Whatever is opened passes the opener's own rule.
         assert!(mythicshot_destinations::is_web_link(LINK));
@@ -1396,7 +1634,7 @@ mod tests {
 
     #[test]
     fn only_a_failed_publish_can_be_tried_again() {
-        let screen = |outcome| ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, outcome));
+        let screen = |outcome| ResultDialog::new("Demo".into(), Before::new_tour(), done(2, outcome));
         assert!(screen(failed()).can_retry());
         assert!(!screen(cancelled()).can_retry());
         assert!(!screen(Outcome::Draft).can_retry());
@@ -1417,7 +1655,7 @@ mod tests {
         let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
         let cases = [Outcome::Public { url: Some("https://x.dev/t/a".into()) }, Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled()];
         for (outcome, before) in cases.iter().cloned().map(|o| (o, Before::new_tour())).chain(cases.iter().cloned().map(|o| (o, was.clone()))) {
-            let mut d = ResultDialog::new("Demo".into(), before, finished(2, outcome));
+            let mut d = ResultDialog::new("Demo".into(), before, done(2, outcome));
             let mut out = None;
             ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx())).textures_delta.clear();
             assert_eq!(out, None, "it stays until the user chooses");

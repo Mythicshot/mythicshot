@@ -63,6 +63,49 @@ pub enum OpenError {
     Newer(u32),
 }
 
+/// Why a recording could not be kept.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The caller's check said to stop while the frames were copied. What the call wrote is removed.
+    Cancelled,
+    /// The recording or the folder cannot be used for this; the words say why.
+    Unusable(&'static str),
+    /// A file could not be linked, copied, written or put in place: which one, what was
+    /// being done, and the system's error.
+    Io { step: SaveStep, context: &'static str, error: io::Error },
+}
+
+/// The file a save was working on when it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveStep {
+    Frames,
+    Index,
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Cancelled => f.write_str("keeping the recording was cancelled"),
+            SaveError::Unusable(why) => f.write_str(why),
+            SaveError::Io { context, error, .. } => write!(f, "{context}: {error}"),
+        }
+    }
+}
+
+const KEEP_FRAMES: &str = "could not keep the frames";
+const WRITE_INDEX: &str = "could not write the recording's index";
+
+fn frames_failed(error: io::Error) -> SaveError {
+    SaveError::Io { step: SaveStep::Frames, context: KEEP_FRAMES, error }
+}
+
+fn index_failed(error: io::Error) -> SaveError {
+    SaveError::Io { step: SaveStep::Index, context: WRITE_INDEX, error }
+}
+
+/// How much of the frames file a copy writes between two looks at the caller's check.
+const COPY_CHUNK: usize = 1 << 20;
+
 impl Recording {
     /// Keep this recording in `dir`, which must exist: the frames file by hard link, or by
     /// copy when a link cannot be made, then the index. Returns the frames file's size.
@@ -72,18 +115,44 @@ impl Recording {
         self.save_with(dir, |from, to| std::fs::hard_link(from, to), copy_whole)
     }
 
+    /// [`Recording::save_into`] for a caller that may have to stop, and that wants to know
+    /// what went wrong: when the frames have to be copied, `keep_going` is asked before every
+    /// megabyte, and a no ends the save as [`SaveError::Cancelled`] with nothing left in `dir`
+    /// of what this call wrote. A link is made at once and is never cancelled.
+    pub fn save_into_with(&self, dir: &Path, keep_going: &dyn Fn() -> bool) -> Result<u64, SaveError> {
+        self.save_while(dir, |from, to| std::fs::hard_link(from, to), COPY_CHUNK, keep_going)
+    }
+
+    /// [`Recording::save_into_with`] with the link and the copy's chunk size handed in, for a test.
+    fn save_while(&self, dir: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>, chunk: usize, keep_going: &dyn Fn() -> bool) -> Result<u64, SaveError> {
+        let stopped = std::cell::Cell::new(false);
+        let go = || {
+            let go = keep_going();
+            stopped.set(!go);
+            go
+        };
+        match self.save_typed(dir, link, |from, to| copy_while(from, to, chunk, &go)) {
+            Err(_) if stopped.get() => Err(SaveError::Cancelled),
+            other => other,
+        }
+    }
+
     /// [`Recording::save_into`] with the link and the copy handed in, so a test can make
     /// either fail. Both put the file `from` at the new path `to`.
     fn save_with(&self, dir: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<u64, String> {
+        self.save_typed(dir, link, copy).map_err(|e| e.to_string())
+    }
+
+    fn save_typed(&self, dir: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<u64, SaveError> {
         if !dir.is_dir() {
-            return Err("the folder to keep the recording in does not exist".into());
+            return Err(SaveError::Unusable("the folder to keep the recording in does not exist"));
         }
-        let expected = self.frames_end().filter(|end| *end > 0).ok_or("the recording has no frames to keep")?;
+        let expected = self.frames_end().filter(|end| *end > 0).ok_or(SaveError::Unusable("the recording has no frames to keep"))?;
         let dest = dir.join(FRAMES_FILE);
         if same_folder(&self.dir, dir) {
-            let size = std::fs::metadata(&dest).map_err(|e| format!("could not read the frames file: {e}"))?.len();
+            let size = std::fs::metadata(&dest).map_err(|error| SaveError::Io { step: SaveStep::Frames, context: "could not read the frames file", error })?.len();
             if size != expected {
-                return Err("the frames file is not the one this recording was read from".into());
+                return Err(SaveError::Unusable("the frames file is not the one this recording was read from"));
             }
             self.write_index(dir)?;
             return Ok(size);
@@ -92,11 +161,11 @@ impl Recording {
         let staged = self.stage(dir, expected, link, copy)?;
         if let Err(e) = staged.swap_frames() {
             staged.undo(false);
-            return Err(format!("could not keep the frames: {e}"));
+            return Err(frames_failed(e));
         }
         if let Err(e) = staged.swap_index() {
             staged.undo(true);
-            return Err(format!("could not write the recording's index: {e}"));
+            return Err(index_failed(e));
         }
         Ok(expected)
     }
@@ -104,7 +173,7 @@ impl Recording {
     /// The first half of a save: the frames file and the index, each whole and on the disk
     /// under a temporary name in `dir`. Nothing that was in the folder has been touched yet,
     /// and a failure removes both temporary files.
-    fn stage(&self, dir: &Path, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<Staged, String> {
+    fn stage(&self, dir: &Path, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<Staged, SaveError> {
         let src = self.dir.join(FRAMES_FILE);
         let (frames, index) = (dir.join(FRAMES_FILE), dir.join(INDEX_FILE));
         let staged = Staged { frames_tmp: temp_beside(&frames), index_tmp: temp_beside(&index), replaces: frames.exists(), frames, index };
@@ -120,8 +189,8 @@ impl Recording {
                 size if size == expected => Ok(()),
                 _ => Err(io::Error::other("the frames file is not complete")),
             })
-            .map_err(|e| format!("could not keep the frames: {e}"))
-            .and_then(|()| self.write_index_to(&staged.index_tmp).map_err(|e| format!("could not write the recording's index: {e}")));
+            .map_err(frames_failed)
+            .and_then(|()| self.write_index_to(&staged.index_tmp).map_err(index_failed));
         match result {
             Ok(()) => Ok(staged),
             Err(e) => {
@@ -153,12 +222,12 @@ impl Recording {
 
     /// Write `recording.json` through a temporary file and one rename, so the folder never
     /// holds half an index.
-    fn write_index(&self, dir: &Path) -> Result<(), String> {
+    fn write_index(&self, dir: &Path) -> Result<(), SaveError> {
         let path = dir.join(INDEX_FILE);
         let tmp = temp_beside(&path);
         self.write_index_to(&tmp).and_then(|()| patiently(|| std::fs::rename(&tmp, &path))).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("could not write the recording's index: {e}")
+            index_failed(e)
         })
     }
 
@@ -303,6 +372,29 @@ fn copy_whole(from: &Path, to: &Path) -> io::Result<()> {
     let mut src = File::open(from)?;
     let mut out = File::create(to)?;
     io::copy(&mut src, &mut out)?;
+    out.flush()?;
+    out.sync_all()
+}
+
+/// [`copy_whole`] in pieces of `chunk` bytes, asking `keep_going` before each: a no stops the
+/// copy with an error, and the caller removes the half-written file.
+fn copy_while(from: &Path, to: &Path, chunk: usize, keep_going: &dyn Fn() -> bool) -> io::Result<()> {
+    use std::io::Read;
+    let mut src = File::open(from)?;
+    let mut out = File::create(to)?;
+    let mut buf = vec![0u8; chunk.max(1)];
+    loop {
+        if !keep_going() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "the copy was cancelled"));
+        }
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        out.write_all(&buf[..n])?;
+    }
     out.flush()?;
     out.sync_all()
 }
@@ -708,5 +800,50 @@ mod tests {
         assert!(rec.save_with(&kept, no_link, |_, _| Err(io::Error::other("the disk is full"))).is_err());
         assert_eq!(names(&kept), [FRAMES_FILE, INDEX_FILE]);
         assert_every_frame(&opened(&kept));
+    }
+
+    #[test]
+    fn a_copy_can_be_stopped_part_way_and_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorded(tmp.path());
+        let kept = folder(tmp.path(), "kept");
+        let no_link = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("links are not supported here")) };
+        // Asked before every 64 bytes; the third answer is no.
+        let asked = std::cell::Cell::new(0);
+        let stop_at_three = || {
+            asked.set(asked.get() + 1);
+            asked.get() < 3
+        };
+        let err = rec.save_while(&kept, no_link, 64, &stop_at_three).unwrap_err();
+        assert!(matches!(err, SaveError::Cancelled), "{err:?}");
+        assert_eq!(asked.get(), 3, "the copy stopped where it was told to");
+        assert_eq!(names(&kept), Vec::<String>::new());
+        // Never told to stop: the same copy, piece by piece, is whole.
+        let size = rec.save_while(&kept, no_link, 64, &|| true).unwrap();
+        assert_eq!(std::fs::read(kept.join(FRAMES_FILE)).unwrap().len() as u64, size);
+        let again = Recording::open_saved(&kept).unwrap();
+        assert_eq!(again.frame(N - 1).unwrap(), rec.frame(N - 1).unwrap());
+    }
+
+    #[test]
+    fn a_link_is_never_cancelled_and_a_real_failure_says_which_file_and_what_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorded(tmp.path());
+        // A link is made at once: the check is not even asked.
+        let kept = folder(tmp.path(), "kept");
+        assert!(rec.save_into_with(&kept, &|| panic!("a link needs no check")).is_ok());
+        // The recording's own frames file is gone: neither a link nor a copy can be made.
+        let gone = recorded_as(tmp.path(), "gone", 4);
+        std::fs::remove_file(tmp.path().join("gone").join(FRAMES_FILE)).unwrap();
+        let other = folder(tmp.path(), "other");
+        match gone.save_into_with(&other, &|| true) {
+            Err(SaveError::Io { step: SaveStep::Frames, error, .. }) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(names(&other), Vec::<String>::new());
+        // What `save_into` says is what it always said.
+        let said = gone.save_into(&other).unwrap_err();
+        assert!(said.starts_with("could not keep the frames: "), "{said}");
+        assert!(matches!(rec.save_into_with(&tmp.path().join("never-made"), &|| true), Err(SaveError::Unusable("the folder to keep the recording in does not exist"))));
     }
 }
