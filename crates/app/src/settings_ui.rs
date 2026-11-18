@@ -275,8 +275,10 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &SavedRecordings, open_
     });
     ui.add_space(8.0);
     // Turning the switch off deletes nothing: the line and the button stay as they are.
-    ui.horizontal_wrapped(|ui| {
-        changed |= ui.checkbox(&mut s.keep_published_recordings, KEEP_RECORDING).changed();
+    changed |= ui.checkbox(&mut s.keep_published_recordings, KEEP_RECORDING).changed();
+    // Their own row, under the switch's label.
+    ui.horizontal(|ui| {
+        ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
         if let Some(line) = saved.line() {
             ui.add(egui::Label::new(RichText::new(line).color(MUTED)).extend()).on_hover_text(RECORDINGS_STAY);
         }
@@ -314,15 +316,17 @@ pub fn saved_recordings_line(t: Totals) -> String {
 }
 
 /// A size as the editor's status bar writes one (KB under a megabyte, else MB with one
-/// decimal), and in whole megabytes from a hundred up.
+/// decimal), in whole megabytes from a hundred up, and in GB with one decimal from a gigabyte.
 fn size_text(bytes: u64) -> String {
     let mb = bytes as f64 / 1_048_576.0;
     if bytes < 1_048_576 {
         format!("{} KB", (bytes + 512) / 1024)
     } else if mb < 99.95 {
         format!("{mb:.1} MB")
-    } else {
+    } else if bytes < 1_073_741_824 {
         format!("{mb:.0} MB")
+    } else {
+        format!("{:.1} GB", mb / 1024.0)
     }
 }
 
@@ -575,15 +579,20 @@ mod tests {
         texts
     }
 
-    fn middle_of(out: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
-        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+    /// Where `text` was drawn.
+    fn rect_of(out: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
             match shape {
-                egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos + t.galley.size() / 2.0),
+                egui::Shape::Text(t) if t.galley.text() == text => Some(egui::Rect::from_min_size(t.pos, t.galley.size())),
                 egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, text)),
                 _ => None,
             }
         }
         out.shapes.iter().find_map(|c| find(&c.shape, text))
+    }
+
+    fn middle_of(out: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+        rect_of(out, text).map(|r| r.center())
     }
 
     /// The Output tab drawn without a window: its settings, its state, what it asked the app
@@ -594,16 +603,17 @@ mod tests {
         state: SettingsState,
         actions: Vec<UiAction>,
         opened: Vec<PathBuf>,
+        screen: egui::Vec2,
     }
 
     impl Page {
         fn new(root: Option<PathBuf>) -> Page {
             let state = SettingsState { tab: Tab::Output, listening: None, saved: SavedRecordings::at(root) };
-            Page { ctx: egui::Context::default(), settings: Settings::default(), state, actions: Vec::new(), opened: Vec::new() }
+            Page { ctx: egui::Context::default(), settings: Settings::default(), state, actions: Vec::new(), opened: Vec::new(), screen: SCREEN }
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)), events, ..Default::default() };
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)), events, ..Default::default() };
             let errors = HashMap::new();
             let (settings, state, actions, opened) = (&mut self.settings, &mut self.state, &mut self.actions, &mut self.opened);
             let mut out = self.ctx.run_ui(input, |ui| {
@@ -669,7 +679,12 @@ mod tests {
         assert_eq!(line(2, 32_505_856), "2 saved recordings · 31.0 MB");
         assert_eq!(line(2, 104_752_742), "2 saved recordings · 99.9 MB");
         assert_eq!(line(2, 104_857_599), "2 saved recordings · 100 MB");
-        assert_eq!(line(40, 5_368_709_120), "40 saved recordings · 5120 MB");
+        // From a gigabyte in GB with one decimal.
+        assert_eq!(line(9, 1_073_741_823), "9 saved recordings · 1024 MB");
+        assert_eq!(line(9, 1_073_741_824), "9 saved recordings · 1.0 GB");
+        assert_eq!(line(40, 5_368_709_120), "40 saved recordings · 5.0 GB");
+        assert_eq!(line(90, 13_314_398_618), "90 saved recordings · 12.4 GB");
+        assert_eq!(line(900, 161_061_273_600), "900 saved recordings · 150.0 GB");
     }
 
     #[test]
@@ -799,6 +814,34 @@ mod tests {
         let texts = texts_of(&page.settled());
         assert!(texts.iter().any(|t| t == "2 saved recordings · 1.5 MB") && texts.iter().any(|t| t == OPEN_FOLDER), "{texts:?}");
         assert_eq!(Store::at(root).totals(), Totals { count: 2, bytes: 1_572_864 });
+    }
+
+    #[test]
+    fn the_count_and_the_button_share_a_row_under_the_switch_at_the_default_window_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        for i in 0..3 {
+            project(&root, SITE, "tour_a", &format!("ch_{i}"), 1_048_576);
+        }
+        for width in [590.0, 470.0, 900.0] {
+            let mut page = Page::new(Some(root.clone()));
+            page.screen = vec2(width, 2000.0);
+            let out = page.settled();
+            let rect = |text: &str| rect_of(&out, text).unwrap_or_else(|| panic!("{text} is drawn at {width}: {:?}", texts_of(&out)));
+            let (switch, line, button) = (rect(KEEP_RECORDING), rect("3 saved recordings · 3.0 MB"), rect(OPEN_FOLDER));
+            // Row 1 the switch; row 2 the count and then the button, under the switch's label.
+            assert!(line.top() > switch.bottom() && button.top() > switch.bottom(), "{width}: {switch:?} {line:?} {button:?}");
+            assert!((line.center().y - button.center().y).abs() < 2.0, "{width}: one row: {line:?} {button:?}");
+            assert!(button.left() > line.right(), "{width}: {line:?} {button:?}");
+            assert!((line.left() - switch.left()).abs() < 1.0, "{width}: under the label: {switch:?} {line:?}");
+            assert!(button.right() < width && switch.right() < width, "{width}: nothing is cut off: {switch:?} {button:?}");
+        }
+        // While the first count runs the button already stands under the label.
+        let mut page = Page::new(Some(root));
+        page.screen = vec2(590.0, 2000.0);
+        let first = page.frame(vec![]);
+        let (switch, button) = (rect_of(&first, KEEP_RECORDING).unwrap(), rect_of(&first, OPEN_FOLDER).unwrap());
+        assert!(button.top() > switch.bottom() && button.left() > switch.left(), "{switch:?} {button:?}");
     }
 
     #[test]
