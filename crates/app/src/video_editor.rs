@@ -17,7 +17,7 @@ use mythicshot_recording::{FrameReader, Recording};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::publish::{Finished, Target};
-use crate::publish_ui::{self, Mode, Picker, PickerOutcome, ResultAction, ResultDialog, Run};
+use crate::publish_ui::{self, Before, Mode, Picker, PickerOutcome, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
 use crate::site_ui::{SiteDialog, SiteOutcome};
@@ -123,8 +123,9 @@ enum ExportJob {
     Tour(EncodeJob<TourSummary>, TourOutput, Arc<Run>),
     /// A tour added to a site, cancelled like a tour export, with the site title to remember once it worked.
     Site(EncodeJob<SiteSummary>, Arc<Run>, String),
-    /// An upload (then a publish, when asked), or a publish alone, with the tour's title for the result screen.
-    Publish(EncodeJob<Finished>, Arc<Run>, String),
+    /// An upload (then a publish, when asked), or a publish alone, with the tour's title and
+    /// what the tour was before, for the result screen.
+    Publish(EncodeJob<Finished>, Arc<Run>, String, Before),
 }
 
 /// What a finished export made.
@@ -132,7 +133,7 @@ enum Exported {
     File(PathBuf, u64),
     Tour(TourSummary, TourOutput),
     Site(SiteSummary, String),
-    Published(Finished, String),
+    Published(Finished, String, Before),
 }
 
 impl ExportJob {
@@ -160,14 +161,14 @@ impl ExportJob {
             ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
             ExportJob::Tour(j, out, _) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
             ExportJob::Site(j, _, title) => j.take_result().map(|r| r.map(|s| Exported::Site(s, title.clone()))),
-            ExportJob::Publish(j, _, title) => j.take_result().map(|r| r.map(|done| Exported::Published(done, title.clone()))),
+            ExportJob::Publish(j, _, title, before) => j.take_result().map(|r| r.map(|done| Exported::Published(done, title.clone(), before.clone()))),
         }
     }
 
     /// For a publish: whether cancel was asked for (None for any other export).
     fn cancelling(&self) -> Option<bool> {
         match self {
-            ExportJob::Publish(_, run, _) => Some(run.is_cancelled()),
+            ExportJob::Publish(_, run, ..) => Some(run.is_cancelled()),
             _ => None,
         }
     }
@@ -175,8 +176,16 @@ impl ExportJob {
     /// For a publish past its upload: the images the server has copied so far, when it said (None before that step).
     fn publishing(&self) -> Option<Option<crate::publish::Images>> {
         match self {
-            ExportJob::Publish(_, run, _) => run.publishing(),
+            ExportJob::Publish(_, run, ..) => run.publishing(),
             _ => None,
+        }
+    }
+
+    /// The editor is going away: a publish is cancelled, since nobody would see its result.
+    /// It stops calling the server; any other export runs on to its end.
+    fn abandon(&self) {
+        if let ExportJob::Publish(_, run, ..) = self {
+            run.cancel();
         }
     }
 
@@ -376,8 +385,8 @@ impl Drop for VideoState {
     /// The recording's temp files go with the editor; an export still running
     /// keeps them until it finishes. A publish is cancelled: nobody would see its result.
     fn drop(&mut self) {
-        if let Some(ExportJob::Publish(_, run, _)) = &self.job {
-            run.cancel();
+        if let Some(job) = &self.job {
+            job.abandon();
         }
         let rec = self.rec.clone();
         match self.job.take() {
@@ -562,7 +571,7 @@ impl Editor {
         match v.picker.as_mut().and_then(|p| p.show(ctx)) {
             None => {}
             Some(PickerOutcome::Cancel) => v.picker = None,
-            Some(PickerOutcome::Upload { title, target, mode, tour_title }) => {
+            Some(PickerOutcome::Upload { title, target, mode, tour_title, before }) => {
                 let has_steps = tour::plan_steps(&v.rec, &v.edit, &v.events).is_ok();
                 match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status()) {
                     Some(blocked) => {
@@ -572,7 +581,7 @@ impl Editor {
                     }
                     None => {
                         v.picker = None;
-                        self.start_publish(title, target, mode, tour_title);
+                        self.start_publish(title, target, mode, tour_title, before);
                     }
                 }
             }
@@ -583,14 +592,17 @@ impl Editor {
             None => {}
             Some(ResultAction::Done) => v.publish_result = None,
             Some(ResultAction::Open(url)) => {
+                // The opener checks the link itself, and its error never repeats the link.
                 if let Err(e) = dest::open_url(&url) {
                     eprintln!("Publish tour: could not open the browser: {e}");
                     self.notify("Could not open the browser. Copy the link instead.");
                 }
             }
-            Some(ResultAction::Retry { tour_id, steps }) => {
-                if let Some(title) = v.publish_result.take().map(|d| d.title().to_string()) {
-                    self.start_publish_only(title, tour_id, steps);
+            Some(ResultAction::Retry) => {
+                // The screen is only taken away when the publish can start.
+                let running = v.job.is_some();
+                if let Some(retry) = publish_ui::take_retry(&mut v.publish_result, running) {
+                    self.start_publish_only(retry);
                 }
             }
         }
@@ -679,13 +691,13 @@ impl Editor {
                                 self.prefs_changed = true;
                             }
                         }
-                        Exported::Published(done, title) => {
+                        Exported::Published(done, title, before) => {
                             // Never the link itself in the log: the result screen shows it.
-                            let msg = publish_ui::result_status(done.steps, &done.outcome);
+                            let msg = publish_ui::result_status(&done, &before);
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {
-                                v.publish_result = Some(ResultDialog::new(title, done));
+                                v.publish_result = Some(ResultDialog::new(title, before, done));
                             }
                         }
                     }
@@ -882,7 +894,7 @@ impl Editor {
 
     /// Write the tour bundle into a fresh temporary folder and upload it, then publish the
     /// tour when `mode` says so. The folder is removed afterwards whether it worked or not.
-    fn start_publish(&mut self, title: String, target: Target, mode: Mode, tour_title: String) {
+    fn start_publish(&mut self, title: String, target: Target, mode: Mode, tour_title: String, before: Before) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
@@ -931,18 +943,19 @@ impl Editor {
             })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Publish(job, run, tour_title));
+            v.job = Some(ExportJob::Publish(job, run, tour_title, before));
         }
         self.notify("Publishing tour… 0%");
     }
 
     /// "Try again" after a publish that failed: publish the tour that is already uploaded.
     /// Nothing is written or uploaded again.
-    fn start_publish_only(&mut self, tour_title: String, tour_id: String, steps: usize) {
+    fn start_publish_only(&mut self, retry: publish_ui::Retry) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
+        let publish_ui::Retry { title: tour_title, before, tour_id, steps } = retry;
         let server = publish_ui::server();
         let run = Run::begin();
         let worker = run.clone();
@@ -960,7 +973,7 @@ impl Editor {
             })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Publish(job, run, tour_title));
+            v.job = Some(ExportJob::Publish(job, run, tour_title, before));
         }
         self.notify(publish_ui::publishing_message(None));
     }
@@ -969,7 +982,7 @@ impl Editor {
     /// "Cancelling…" shows until it does.
     pub(crate) fn cancel_publish(&mut self) {
         let Some(v) = self.video.as_ref() else { return };
-        if let Some(ExportJob::Publish(_, run, _)) = &v.job {
+        if let Some(ExportJob::Publish(_, run, ..)) = &v.job {
             run.cancel();
             self.notify("Cancelling…");
         }
@@ -1454,6 +1467,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(matches!(result, Some(Err(_))));
+    }
+
+    #[test]
+    fn closing_the_editor_cancels_a_publish_and_no_other_export() {
+        let done = || Ok(Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 1, outcome: crate::publish::Outcome::Draft });
+        // Runs of their own, not in the shared list that quitting cancels.
+        let run = Arc::new(Run::default());
+        let publish = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), "Demo".into(), Before::new_tour());
+        assert_eq!(publish.cancelling(), Some(false));
+        publish.abandon();
+        assert!(run.is_cancelled());
+        assert_eq!(publish.cancelling(), Some(true));
+        // A tour export is left to finish: its run is not touched.
+        let run = Arc::new(Run::default());
+        let summary = || Ok(TourSummary { path: PathBuf::from("x"), steps: 1, bytes: 1, squeezed: 0 });
+        let export = ExportJob::Tour(EncodeJob::spawn(move |_| summary()), TourOutput::Folder, run.clone());
+        export.abandon();
+        assert!(!run.is_cancelled());
+    }
+
+    #[test]
+    fn a_finished_publish_hands_the_result_screen_what_the_tour_was() {
+        let was = Before { public: true, link: None, steps: Some(14) };
+        let done = Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 2, outcome: crate::publish::Outcome::Draft };
+        let sent = done.clone();
+        let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut result = None;
+        while result.is_none() && Instant::now() < deadline {
+            result = job.take_result();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        match result {
+            Some(Ok(Exported::Published(got, title, before))) => {
+                assert_eq!((got, title.as_str(), &before), (done, "Customer onboarding", &was));
+                assert_eq!(publish_ui::result_status(&Finished { tour_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, &before), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
+            }
+            _ => panic!("the publish did not finish as a published result"),
+        }
     }
 
     #[test]

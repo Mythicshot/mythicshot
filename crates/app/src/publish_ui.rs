@@ -396,6 +396,30 @@ pub fn publishing_message(images: Option<Images>) -> String {
 
 // ---- The result screen ----
 
+/// What the tour was before this upload, as far as the app knows: the result screen needs
+/// it to say the truth about a tour that was already public, and to count the tour's steps.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Before {
+    /// The tour was public already. An upload that is not published leaves that version live.
+    pub public: bool,
+    /// Its public link, when the tour list gave one.
+    pub link: Option<String>,
+    /// The steps it had: 0 for a new tour, None when not known.
+    pub steps: Option<u32>,
+}
+
+impl Before {
+    /// A tour that this upload creates.
+    pub fn new_tour() -> Before {
+        Before { public: false, link: None, steps: Some(0) }
+    }
+
+    /// A tour from the picker's list.
+    pub fn of(tour: &RemoteTour) -> Before {
+        Before { public: tour.status == "published", link: tour.link.clone(), steps: Some(tour.steps) }
+    }
+}
+
 pub fn result_heading(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Public { .. } => "Tour published",
@@ -403,31 +427,70 @@ pub fn result_heading(outcome: &Outcome) -> &'static str {
     }
 }
 
-/// "Customer onboarding · 14 steps · public".
-pub fn result_line(title: &str, steps: usize, outcome: &Outcome) -> String {
-    let steps = count(u32::try_from(steps).unwrap_or(u32::MAX), "step", "steps");
-    let public = if matches!(outcome, Outcome::Public { .. }) { "public" } else { "not public" };
-    format!("{} · {steps} · {public}", short_title(title, ROW_TITLE_MAX))
-}
-
-/// What else the result screen has to say, and whether it is an error.
-pub fn result_note(outcome: &Outcome) -> Option<(String, bool)> {
-    match outcome {
-        Outcome::Draft | Outcome::Public { url: Some(_) } => None,
-        Outcome::Public { url: None } => Some(("The tour is public, but the server gave no link that can be shown. Look it up in the server's tour list.".to_string(), false)),
-        Outcome::NotPublic { cancelled: true, .. } => Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)),
-        Outcome::NotPublic { cancelled: false, error } => Some((format!("{error} The draft is uploaded, but it is not public."), true)),
+/// The step count beside the tour's title, always the tour's own when it can be known:
+/// after a publish the server's count; otherwise what the tour had plus what was
+/// uploaded. When what the tour had is not known, the upload's count, named as such.
+pub fn result_steps(done: &Finished, before: &Before) -> String {
+    let n = |steps: usize| count(u32::try_from(steps).unwrap_or(u32::MAX), "step", "steps");
+    match (&done.outcome, before.steps) {
+        (Outcome::Public { .. }, _) => n(done.steps),
+        (_, Some(had)) => n(done.steps.saturating_add(had as usize)),
+        (_, None) => format!("this chapter: {}", n(done.steps)),
     }
 }
 
-/// The one-line message for the status bar and the log.
-pub fn result_status(steps: usize, outcome: &Outcome) -> String {
-    let steps = count(u32::try_from(steps).unwrap_or(u32::MAX), "step", "steps");
+/// Whether the tour is public after this upload, in the line's last words. A tour that
+/// was public before stays public whatever became of this upload: the server switches
+/// versions only when a publish finishes.
+fn result_visibility(outcome: &Outcome, before: &Before) -> &'static str {
+    match (outcome, before.public) {
+        (Outcome::Public { .. }, _) => "public",
+        (_, true) => "the public version is unchanged",
+        (_, false) => "not public",
+    }
+}
+
+/// "Customer onboarding · 14 steps · public".
+pub fn result_line(title: &str, done: &Finished, before: &Before) -> String {
+    format!("{} · {} · {}", short_title(title, ROW_TITLE_MAX), result_steps(done, before), result_visibility(&done.outcome, before))
+}
+
+/// Where the upload stands when it was not published, as a sentence.
+fn uploaded_sentence(before: &Before) -> &'static str {
+    if before.public { "The draft is uploaded; the public version is unchanged." } else { "The draft is uploaded, but it is not public." }
+}
+
+/// What else the result screen has to say, and whether it is an error.
+pub fn result_note(outcome: &Outcome, before: &Before) -> Option<(String, bool)> {
     match outcome {
+        Outcome::Draft | Outcome::Public { url: Some(_) } => None,
+        Outcome::Public { url: None } if before.link.is_some() => None,
+        Outcome::Public { url: None } => Some(("The tour is public, but the server gave no link that can be shown. Look it up in the server's tour list.".to_string(), false)),
+        Outcome::NotPublic { cancelled: true, .. } => Some((format!("Publishing was cancelled. {}", uploaded_sentence(before)), false)),
+        Outcome::NotPublic { cancelled: false, error } => Some((format!("{error} {}", uploaded_sentence(before)), true)),
+    }
+}
+
+/// The link the result screen offers: the new one after a publish; for a tour that was
+/// public before and still is, the link the tour list gave.
+pub fn result_link<'a>(outcome: &'a Outcome, before: &'a Before) -> Option<&'a str> {
+    match outcome {
+        Outcome::Public { url: Some(url) } => Some(url),
+        Outcome::Public { url: None } => before.link.as_deref(),
+        Outcome::Draft | Outcome::NotPublic { .. } => before.link.as_deref().filter(|_| before.public),
+    }
+}
+
+/// The one-line message for the status bar and the log. It never holds the link.
+pub fn result_status(done: &Finished, before: &Before) -> String {
+    let steps = result_steps(done, before);
+    let rest = if before.public { "the public version is unchanged" } else { "the draft is uploaded, but not public" };
+    match &done.outcome {
         Outcome::Public { .. } => format!("Tour published: {steps}"),
+        Outcome::Draft if before.public => format!("Tour uploaded as a draft: {steps}; the public version is unchanged"),
         Outcome::Draft => format!("Tour uploaded as a draft: {steps}"),
-        Outcome::NotPublic { cancelled: true, .. } => "Publishing cancelled: the draft is uploaded, but not public".to_string(),
-        Outcome::NotPublic { cancelled: false, .. } => "Publishing failed: the draft is uploaded, but not public".to_string(),
+        Outcome::NotPublic { cancelled: true, .. } => format!("Publishing cancelled: {rest}"),
+        Outcome::NotPublic { cancelled: false, .. } => format!("Publishing failed: {rest}"),
     }
 }
 
@@ -440,33 +503,57 @@ pub fn copied_note(since_copy: Option<Duration>) -> Option<&'static str> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultAction {
     Done,
-    /// Publish the uploaded tour again, without uploading: the tour's id and its step count.
-    Retry { tour_id: String, steps: usize },
+    /// Publish the uploaded tour again, without uploading; see [`take_retry`].
+    Retry,
     /// Open the public link in the browser; the screen stays.
     Open(String),
+}
+
+/// What "Try again" needs: the tour to publish, and what the next result screen shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Retry {
+    pub title: String,
+    pub before: Before,
+    pub tour_id: String,
+    /// The steps the upload had.
+    pub steps: usize,
+}
+
+/// "Try again": takes the result screen away and says what to publish, but only when
+/// the publish can start. While another job runs the screen stays as it is, so the
+/// result and its "Try again" are never lost.
+pub fn take_retry(screen: &mut Option<ResultDialog>, job_running: bool) -> Option<Retry> {
+    if job_running || !screen.as_ref().is_some_and(ResultDialog::can_retry) {
+        return None;
+    }
+    screen.take().map(|d| Retry { title: d.title, before: d.before, tour_id: d.done.tour_id, steps: d.done.steps })
 }
 
 /// The screen after a publish or a draft upload: what happened, and for a public tour its link.
 pub struct ResultDialog {
     title: String,
+    before: Before,
     done: Finished,
     copied: Option<Instant>,
 }
 
 impl ResultDialog {
-    pub fn new(title: String, done: Finished) -> ResultDialog {
-        ResultDialog { title, done, copied: None }
-    }
-
-    pub fn title(&self) -> &str {
-        &self.title
+    pub fn new(title: String, before: Before, done: Finished) -> ResultDialog {
+        ResultDialog { title, before, done, copied: None }
     }
 
     fn url(&self) -> Option<&str> {
-        match &self.done.outcome {
-            Outcome::Public { url } => url.as_deref(),
-            _ => None,
-        }
+        result_link(&self.done.outcome, &self.before)
+    }
+
+    /// The link is the version published before, not something this upload made.
+    fn link_is_older(&self) -> bool {
+        !matches!(self.done.outcome, Outcome::Public { .. })
+    }
+
+    /// What a press on "Open in browser" asks for.
+    fn open_action(&self) -> Option<ResultAction> {
+        self.url().map(|u| ResultAction::Open(u.to_string()))
     }
 
     fn can_retry(&self) -> bool {
@@ -486,13 +573,16 @@ impl ResultDialog {
         egui::Modal::new(egui::Id::unique("publish-tour-result")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(result_heading(&self.done.outcome));
-            ui.label(RichText::new(result_line(&self.title, self.done.steps, &self.done.outcome)).color(MUTED)).on_hover_text(&self.title);
-            if let Some((note, is_error)) = result_note(&self.done.outcome) {
+            ui.label(RichText::new(result_line(&self.title, &self.done, &self.before)).color(MUTED)).on_hover_text(&self.title);
+            if let Some((note, is_error)) = result_note(&self.done.outcome, &self.before) {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(note).color(if is_error { ERROR } else { MUTED })).wrap());
             }
             if let Some(url) = self.url().map(str::to_string) {
                 ui.add_space(12.0);
+                if self.link_is_older() {
+                    ui.label(RichText::new("The public version's link:").color(MUTED).size(12.0));
+                }
                 // A `&str` buffer: the text can be selected and copied, never changed.
                 let mut shown = url.as_str();
                 ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
@@ -503,7 +593,7 @@ impl ResultDialog {
                         self.copied = Some(Instant::now());
                     }
                     if ui.button("Open in browser").clicked() {
-                        action = Some(ResultAction::Open(url.clone()));
+                        action = self.open_action();
                     }
                     if let Some(note) = copied_note(self.copied.map(|t| t.elapsed())) {
                         ui.label(RichText::new(note).color(MUTED));
@@ -517,7 +607,7 @@ impl ResultDialog {
                     action = Some(ResultAction::Done);
                 }
                 if self.can_retry() && ui.button("Try again").on_hover_text("Publish the uploaded draft, without uploading it again").clicked() {
-                    action = Some(ResultAction::Retry { tour_id: self.done.tour_id.clone(), steps: self.done.steps });
+                    action = Some(ResultAction::Retry);
                 }
             });
         });
@@ -543,8 +633,9 @@ enum Choice {
 pub enum PickerOutcome {
     Cancel,
     /// Upload with this title (the new tour's, or the chapter's) into this target, then
-    /// publish it or leave it a draft. `tour_title` names the tour on the result screen.
-    Upload { title: String, target: Target, mode: Mode, tour_title: String },
+    /// publish it or leave it a draft. `tour_title` names the tour on the result screen,
+    /// and `before` is what that tour was.
+    Upload { title: String, target: Target, mode: Mode, tour_title: String, before: Before },
 }
 
 /// The "Publish tour" dialog: a new tour with an editable title, or a new chapter of
@@ -624,11 +715,14 @@ impl Picker {
         match &self.choice {
             Choice::New => {
                 let title = self.title.trim().to_string();
-                PickerOutcome::Upload { title: title.clone(), target: Target::New, mode: self.mode, tour_title: title }
+                PickerOutcome::Upload { title: title.clone(), target: Target::New, mode: self.mode, tour_title: title, before: Before::new_tour() }
             }
             Choice::Tour(id) => {
-                let tour_title = self.chosen_tour().map_or_else(|| self.default_title.clone(), |t| t.title);
-                PickerOutcome::Upload { title: self.default_title.clone(), target: Target::Chapter(id.clone()), mode: self.mode, tour_title }
+                // A tour the list no longer holds: its title and what it was are not known.
+                let tour = self.chosen_tour();
+                let before = tour.as_ref().map(Before::of).unwrap_or_default();
+                let tour_title = tour.map_or_else(|| self.default_title.clone(), |t| t.title);
+                PickerOutcome::Upload { title: self.default_title.clone(), target: Target::Chapter(id.clone()), mode: self.mode, tour_title, before }
             }
         }
     }
@@ -746,7 +840,7 @@ mod tests {
     use super::*;
 
     fn tour(title: &str, chapters: u32, steps: u32, status: &str) -> RemoteTour {
-        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps }
+        RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None }
     }
 
     #[test]
@@ -868,7 +962,7 @@ mod tests {
         assert_eq!(p.mode, Mode::PublishNow);
         assert_eq!(Mode::default(), Mode::PublishNow);
         assert_eq!(p.mode.button(), "Publish");
-        assert!(matches!(p.upload(), PickerOutcome::Upload { mode: Mode::PublishNow, target: Target::New, ref tour_title, .. } if tour_title == "Demo"));
+        assert!(matches!(p.upload(), PickerOutcome::Upload { mode: Mode::PublishNow, target: Target::New, ref tour_title, ref before, .. } if tour_title == "Demo" && *before == Before::new_tour()));
         p.mode = Mode::Draft;
         assert_eq!(p.mode.button(), "Upload draft");
         assert!(matches!(p.upload(), PickerOutcome::Upload { mode: Mode::Draft, .. }));
@@ -904,12 +998,19 @@ mod tests {
         assert_eq!(p.goes(), Goes::PublicTour);
         p.mode = Mode::Draft;
         match p.upload() {
-            PickerOutcome::Upload { title, target, mode, tour_title } => {
+            PickerOutcome::Upload { title, target, mode, tour_title, before } => {
                 assert_eq!((title.as_str(), tour_title.as_str(), mode), ("Recording", "Customer onboarding", Mode::Draft));
                 assert_eq!(target, Target::Chapter("tour_bbbbbbbbbbbbbbbbbbbbbbbb".into()));
+                // The result screen is told the tour was public, and how many steps it had.
+                assert_eq!(before, Before { public: true, link: None, steps: Some(14) });
             }
             PickerOutcome::Cancel => panic!("cancelled"),
         }
+        p.choice = Choice::Tour("t1".into());
+        assert!(matches!(p.upload(), PickerOutcome::Upload { before: Before { public: false, steps: Some(2), .. }, .. }));
+        // A tour that is not in the list: nothing is known about it, and nothing is claimed.
+        p.choice = Choice::Tour("gone".into());
+        assert!(matches!(p.upload(), PickerOutcome::Upload { before: Before { public: false, link: None, steps: None }, .. }));
     }
 
     #[test]
@@ -925,49 +1026,157 @@ mod tests {
         assert_eq!(run.publishing(), Some(Some((12, 22))));
     }
 
+    const TOUR_ID: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const LINK: &str = "https://tours.example.com/t/abc";
+
+    fn finished(steps: usize, outcome: Outcome) -> Finished {
+        Finished { tour_id: TOUR_ID.into(), steps, outcome }
+    }
+
+    fn failed() -> Outcome {
+        Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: the server is busy (HTTP 429). Try again later.".into() }
+    }
+
+    fn cancelled() -> Outcome {
+        Outcome::NotPublic { cancelled: true, error: String::new() }
+    }
+
     #[test]
-    fn the_result_screen_says_what_happened() {
-        let public = Outcome::Public { url: Some("https://tours.example.com/t/abc".into()) };
+    fn the_result_screen_says_what_happened_to_a_new_tour() {
+        let new = Before::new_tour();
+        let public = Outcome::Public { url: Some(LINK.into()) };
         assert_eq!(result_heading(&public), "Tour published");
-        assert_eq!(result_line("Customer onboarding", 14, &public), "Customer onboarding · 14 steps · public");
-        assert_eq!(result_line("One", 1, &public), "One · 1 step · public");
-        assert_eq!(result_note(&public), None);
-        assert_eq!(result_status(14, &public), "Tour published: 14 steps");
+        assert_eq!(result_line("Customer onboarding", &finished(14, public.clone()), &new), "Customer onboarding · 14 steps · public");
+        assert_eq!(result_line("One", &finished(1, public.clone()), &new), "One · 1 step · public");
+        assert_eq!(result_note(&public, &new), None);
+        assert_eq!(result_link(&public, &new), Some(LINK));
+        assert_eq!(result_status(&finished(14, public.clone()), &new), "Tour published: 14 steps");
 
         assert_eq!(result_heading(&Outcome::Draft), "Draft uploaded");
-        assert_eq!(result_line("Customer onboarding", 14, &Outcome::Draft), "Customer onboarding · 14 steps · not public");
-        assert_eq!(result_line("One", 1, &Outcome::Draft), "One · 1 step · not public");
-        assert_eq!(result_note(&Outcome::Draft), None);
-        assert_eq!(result_status(1, &Outcome::Draft), "Tour uploaded as a draft: 1 step");
+        assert_eq!(result_line("Customer onboarding", &finished(14, Outcome::Draft), &new), "Customer onboarding · 14 steps · not public");
+        assert_eq!(result_line("One", &finished(1, Outcome::Draft), &new), "One · 1 step · not public");
+        assert_eq!(result_note(&Outcome::Draft, &new), None);
+        assert_eq!(result_link(&Outcome::Draft, &new), None);
+        assert_eq!(result_status(&finished(1, Outcome::Draft), &new), "Tour uploaded as a draft: 1 step");
 
         // A publish that failed or was cancelled after the upload: the truth is "uploaded, not public".
-        let failed = Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: the server is busy (HTTP 429). Try again later.".into() };
-        assert_eq!(result_heading(&failed), "Draft uploaded");
-        assert_eq!(result_line("One", 2, &failed), "One · 2 steps · not public");
-        assert_eq!(result_note(&failed), Some(("Could not publish the tour: the server is busy (HTTP 429). Try again later. The draft is uploaded, but it is not public.".to_string(), true)));
-        let cancelled = Outcome::NotPublic { cancelled: true, error: String::new() };
-        assert_eq!(result_note(&cancelled), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
-        assert!(result_status(2, &cancelled).contains("not public") && result_status(2, &failed).contains("not public"));
+        assert_eq!(result_heading(&failed()), "Draft uploaded");
+        assert_eq!(result_line("One", &finished(2, failed()), &new), "One · 2 steps · not public");
+        assert_eq!(result_note(&failed(), &new), Some(("Could not publish the tour: the server is busy (HTTP 429). Try again later. The draft is uploaded, but it is not public.".to_string(), true)));
+        assert_eq!(result_note(&cancelled(), &new), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
+        assert_eq!(result_status(&finished(2, cancelled()), &new), "Publishing cancelled: the draft is uploaded, but not public");
+        assert_eq!(result_status(&finished(2, failed()), &new), "Publishing failed: the draft is uploaded, but not public");
+        assert_eq!(result_link(&failed(), &new), None);
 
         // Public without a usable link: say so, show none.
         let no_link = Outcome::Public { url: None };
         assert_eq!(result_heading(&no_link), "Tour published");
-        assert!(result_note(&no_link).is_some_and(|(n, is_error)| n.contains("no link") && !is_error));
+        assert!(result_note(&no_link, &new).is_some_and(|(n, is_error)| n.contains("no link") && !is_error));
+        assert_eq!(result_link(&no_link, &new), None);
         // A long title is cut.
-        assert!(result_line(&"x".repeat(100), 2, &Outcome::Draft).chars().count() < 70);
+        assert!(result_line(&"x".repeat(100), &finished(2, Outcome::Draft), &new).chars().count() < 70);
     }
 
     #[test]
-    fn only_a_public_tour_has_a_link_and_only_a_failed_publish_can_be_tried_again() {
-        let done = |outcome| ResultDialog::new("Demo".into(), Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 2, outcome });
-        let public = done(Outcome::Public { url: Some("https://x.dev/t/a".into()) });
-        assert_eq!(public.url(), Some("https://x.dev/t/a"));
-        assert!(!public.can_retry());
-        let draft = done(Outcome::Draft);
-        assert_eq!(draft.url(), None);
-        assert!(!draft.can_retry());
-        assert!(done(Outcome::NotPublic { cancelled: false, error: "x".into() }).can_retry());
-        assert!(!done(Outcome::NotPublic { cancelled: true, error: String::new() }).can_retry());
+    fn a_tour_that_was_public_is_never_called_not_public() {
+        // A chapter of 2 steps went into a public tour of 14; the tour list gave its link.
+        let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
+        for outcome in [Outcome::Draft, failed(), cancelled()] {
+            let done = finished(2, outcome.clone());
+            assert_eq!(result_heading(&outcome), "Draft uploaded");
+            let line = result_line("Customer onboarding", &done, &was);
+            assert_eq!(line, "Customer onboarding · 16 steps · the public version is unchanged", "{outcome:?}");
+            assert!(!line.contains("not public"));
+            // The tour is public, so its link is still offered.
+            assert_eq!(result_link(&outcome, &was), Some(LINK), "{outcome:?}");
+            let status = result_status(&done, &was);
+            assert!(status.contains("the public version is unchanged") && !status.contains("not public"), "{status}");
+            assert!(!status.contains("https://"), "the link stays out of the status bar and the log");
+        }
+        assert_eq!(result_note(&Outcome::Draft, &was), None);
+        assert_eq!(result_note(&failed(), &was), Some(("Could not publish the tour: the server is busy (HTTP 429). Try again later. The draft is uploaded; the public version is unchanged.".to_string(), true)));
+        assert_eq!(result_note(&cancelled(), &was), Some(("Publishing was cancelled. The draft is uploaded; the public version is unchanged.".to_string(), false)));
+        assert_eq!(result_status(&finished(2, Outcome::Draft), &was), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
+
+        // The list gave no link (today's server gives none): the words are the same, no link is shown.
+        let no_link = Before { link: None, ..was.clone() };
+        assert_eq!(result_line("T", &finished(2, Outcome::Draft), &no_link), "T · 16 steps · the public version is unchanged");
+        assert_eq!(result_link(&Outcome::Draft, &no_link), None);
+        // A link of a tour that is not public is never offered, whatever the list said.
+        let draft_tour = Before { public: false, link: Some(LINK.into()), steps: Some(14) };
+        assert_eq!(result_link(&Outcome::Draft, &draft_tour), None);
+        assert_eq!(result_line("T", &finished(2, failed()), &draft_tour), "T · 16 steps · not public");
+
+        // Republished: the new version is public, with the server's link, or the list's when it gave none.
+        let republished = Outcome::Public { url: Some("https://tours.example.com/t/new".into()) };
+        assert_eq!(result_line("T", &finished(16, republished.clone()), &was), "T · 16 steps · public");
+        assert_eq!(result_link(&republished, &was), Some("https://tours.example.com/t/new"));
+        assert_eq!(result_link(&Outcome::Public { url: None }, &was), Some(LINK));
+        assert_eq!(result_note(&Outcome::Public { url: None }, &was), None);
+    }
+
+    #[test]
+    fn the_step_count_is_the_tours_or_says_it_is_the_chapters() {
+        // A new tour: what was uploaded is the tour.
+        assert_eq!(result_steps(&finished(3, Outcome::Draft), &Before::new_tour()), "3 steps");
+        // A chapter of 2 into a tour of 14: the tour has 16, published or not.
+        let had = Before { public: false, link: None, steps: Some(14) };
+        assert_eq!(result_steps(&finished(2, Outcome::Draft), &had), "16 steps");
+        assert_eq!(result_steps(&finished(2, failed()), &had), "16 steps");
+        // After a publish the server's count is the tour's; nothing is added to it.
+        assert_eq!(result_steps(&finished(16, Outcome::Public { url: None }), &had), "16 steps");
+        assert_eq!(result_steps(&finished(1, Outcome::Public { url: None }), &Before::new_tour()), "1 step");
+        // What the tour had is not known: the count is named as the chapter's.
+        let unknown = Before::default();
+        assert_eq!(result_steps(&finished(2, Outcome::Draft), &unknown), "this chapter: 2 steps");
+        assert_eq!(result_steps(&finished(1, cancelled()), &unknown), "this chapter: 1 step");
+        assert_eq!(result_line("T", &finished(1, Outcome::Draft), &unknown), "T · this chapter: 1 step · not public");
+        assert_eq!(result_steps(&finished(5, Outcome::Public { url: None }), &unknown), "5 steps");
+    }
+
+    #[test]
+    fn try_again_keeps_the_result_screen_while_another_job_runs() {
+        let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
+        let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), finished(2, failed())));
+        // A job is running: nothing starts, and the screen with its "Try again" stays.
+        assert_eq!(take_retry(&mut screen, true), None);
+        assert!(screen.as_ref().is_some_and(ResultDialog::can_retry));
+        // Free: the screen goes and the retry names the uploaded tour, with what the next screen needs.
+        assert_eq!(take_retry(&mut screen, false), Some(Retry { title: "Demo".into(), before: was.clone(), tour_id: TOUR_ID.into(), steps: 2 }));
+        assert!(screen.is_none());
+        assert_eq!(take_retry(&mut screen, false), None);
+        // A screen that offers no "Try again" is never taken away by one.
+        for outcome in [Outcome::Draft, cancelled(), Outcome::Public { url: Some(LINK.into()) }] {
+            let mut screen = Some(ResultDialog::new("Demo".into(), was.clone(), finished(2, outcome)));
+            assert_eq!(take_retry(&mut screen, false), None);
+            assert!(screen.is_some());
+        }
+    }
+
+    #[test]
+    fn open_in_browser_asks_for_the_shown_link_and_nothing_else() {
+        let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
+        let d = ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, Outcome::Public { url: Some("https://x.dev/t/a".into()) }));
+        assert_eq!(d.open_action(), Some(ResultAction::Open("https://x.dev/t/a".into())));
+        assert!(!d.link_is_older());
+        // A draft in a tour that is public: the older version's link, marked as such.
+        let d = ResultDialog::new("Demo".into(), was, finished(2, Outcome::Draft));
+        assert_eq!(d.open_action(), Some(ResultAction::Open(LINK.into())));
+        assert!(d.link_is_older());
+        // No link, nothing to open.
+        let d = ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, Outcome::Draft));
+        assert_eq!(d.open_action(), None);
+        // Whatever is opened passes the opener's own rule.
+        assert!(mythicshot_destinations::is_web_link(LINK));
+    }
+
+    #[test]
+    fn only_a_failed_publish_can_be_tried_again() {
+        let screen = |outcome| ResultDialog::new("Demo".into(), Before::new_tour(), finished(2, outcome));
+        assert!(screen(failed()).can_retry());
+        assert!(!screen(cancelled()).can_retry());
+        assert!(!screen(Outcome::Draft).can_retry());
+        assert!(!screen(Outcome::Public { url: Some(LINK.into()) }).can_retry());
     }
 
     #[test]
@@ -981,9 +1190,10 @@ mod tests {
     fn the_result_screen_draws_and_enter_or_escape_is_done() {
         let ctx = egui::Context::default();
         let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
-        let finished = |outcome| Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 2, outcome };
-        for outcome in [Outcome::Public { url: Some("https://x.dev/t/a".into()) }, Outcome::Public { url: None }, Outcome::Draft, Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: x.".into() }] {
-            let mut d = ResultDialog::new("Demo".into(), finished(outcome));
+        let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
+        let cases = [Outcome::Public { url: Some("https://x.dev/t/a".into()) }, Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled()];
+        for (outcome, before) in cases.iter().cloned().map(|o| (o, Before::new_tour())).chain(cases.iter().cloned().map(|o| (o, was.clone()))) {
+            let mut d = ResultDialog::new("Demo".into(), before, finished(2, outcome));
             let mut out = None;
             ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx())).textures_delta.clear();
             assert_eq!(out, None, "it stays until the user chooses");

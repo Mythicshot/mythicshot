@@ -67,6 +67,8 @@ pub struct RemoteTour {
     pub status: String,
     pub chapters: u32,
     pub steps: u32,
+    /// The tour's public link, when the tour list gives one (a `url` or a `slug`) and it passes the link rule.
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,16 +123,24 @@ pub fn after_publish(tour_id: &str, steps: usize, result: Result<Live, String>) 
     Finished { tour_id: tour_id.to_string(), steps, outcome }
 }
 
-/// The public link for a published tour. `url` is what the server answered: a full
-/// address is used as it is, a path is put after the configured server address, and
-/// without either the link is built from the slug. The result is https, or http for
-/// localhost and 127.0.0.1 only, and holds nothing but plain address characters;
-/// None when no such link can be made.
+/// The public link for a published tour. `url` is what the server answered: a path is
+/// put after the configured server address, and a full address is used only when it is
+/// on the configured server (same scheme, host and port); otherwise, or without a url,
+/// the link is built from the slug. The result is https, or http for localhost and
+/// 127.0.0.1 only, and holds nothing but plain address characters; None when no such
+/// link can be made. A link never leads to another host than the one the user set up.
 pub fn public_url(server: &str, url: Option<&str>, slug: Option<&str>) -> Option<String> {
     let base = check_server(server).ok()?;
+    // `scheme://host[:port]` of the configured server.
+    let origin = match base.find("://").and_then(|i| base[i + 3..].find('/').map(|j| i + 3 + j)) {
+        Some(end) => &base[..end],
+        None => base.as_str(),
+    };
     let from_server = url.and_then(|u| {
         if u.contains("://") {
-            Some(u.to_string())
+            let full = check_server(u).ok()?;
+            let on_server = full.strip_prefix(origin).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+            on_server.then_some(full)
         } else if u.starts_with('/') && !u.starts_with("//") {
             Some(format!("{base}{u}"))
         } else {
@@ -141,11 +151,11 @@ pub fn public_url(server: &str, url: Option<&str>, slug: Option<&str>) -> Option
     from_server.and_then(|u| safe_link(&u)).or_else(|| from_slug.and_then(|u| safe_link(&u)))
 }
 
-/// `url` when it is an address the server-address rule accepts, short, and made only of
-/// characters that mean nothing to a shell or a browser's address parser beyond a plain path.
+/// `url` when it is an address the server-address rule accepts and one the opener
+/// itself accepts ([`mythicshot_destinations::is_web_link`]: short, https or local http,
+/// plain address characters only).
 fn safe_link(url: &str) -> Option<String> {
-    let plain = url.len() <= MAX_URL_CHARS && url.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/:[]".contains(&b));
-    (plain && check_server(url).is_ok()).then(|| url.to_string())
+    (url.len() <= MAX_URL_CHARS && mythicshot_destinations::is_web_link(url) && check_server(url).is_ok()).then(|| url.to_string())
 }
 
 /// Accepts https URLs, and http only for localhost and 127.0.0.1. Returns the URL without a trailing slash.
@@ -505,7 +515,8 @@ impl Client {
             .map(|r| {
                 let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
                 let n = |k: &str| r.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
-                Some(RemoteTour { id: s("id")?, title: s("title")?, status: s("status")?, chapters: n("chapters")?, steps: n("steps")? })
+                let link = public_url(&self.base, r.get("url").and_then(Value::as_str), r.get("slug").and_then(Value::as_str));
+                Some(RemoteTour { id: s("id")?, title: s("title")?, status: s("status")?, chapters: n("chapters")?, steps: n("steps")?, link })
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| not_understood(what))
@@ -618,8 +629,9 @@ impl Client {
 
     /// The publish loop: one call with no body, then calls naming the publish it started,
     /// `pause` apart, until the server answers 200. Gives up after [`MAX_STALLED_CALLS`]
-    /// answers in a row without progress. A call that fails is not sent again: publishing
-    /// again later joins the same publish on the server, or starts a new one.
+    /// answers in a row without progress: only a `done` count higher than any before is
+    /// progress, so an answer without one counts as none. A call that fails is not sent
+    /// again: publishing again later joins the same publish on the server, or starts a new one.
     fn publish_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
         let what = "Could not publish the tour";
         if !is_id(tour_id, "tour_") {
@@ -650,14 +662,20 @@ impl Client {
                 let id = v.get("publish_id").and_then(Value::as_str).filter(|id| is_id(id, "pub_")).ok_or_else(|| not_understood(what))?;
                 publish_id = Some(id.to_string());
                 let done = v.get("done").and_then(Value::as_u64);
-                images = done.zip(v.get("total").and_then(Value::as_u64));
+                // A count is shown only when it makes sense.
+                images = done.zip(v.get("total").and_then(Value::as_u64)).filter(|(d, t)| *t > 0 && d <= t);
                 // Each call should move the work on. If several in a row do not, say so and stop.
-                let now = done.map_or(i128::from(call), i128::from);
-                stalled = if now > last_done { 0 } else { stalled + 1 };
-                last_done = last_done.max(now);
-                if stalled >= MAX_STALLED_CALLS || call >= MAX_PUBLISH_CALLS {
-                    let counts = images.map(|(d, t)| format!(" at {d} of {t} images")).unwrap_or_default();
-                    return Err(format!("{what}: the server stopped making progress{counts}."));
+                let moved = done.is_some_and(|d| i128::from(d) > last_done);
+                stalled = if moved { 0 } else { stalled + 1 };
+                last_done = done.map_or(last_done, |d| last_done.max(i128::from(d)));
+                if stalled >= MAX_STALLED_CALLS {
+                    return Err(match images {
+                        Some((d, t)) => format!("{what}: the server stopped making progress at {d} of {t} images."),
+                        None => not_understood(what),
+                    });
+                }
+                if call >= MAX_PUBLISH_CALLS {
+                    return Err(format!("{what}: the server did not finish within {MAX_PUBLISH_CALLS} calls."));
                 }
                 std::thread::sleep(pause);
                 continue;
@@ -1017,6 +1035,28 @@ mod tests {
 
     const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
 
+    /// A stub whose publish route answers as `publish` says (given how many publish calls came
+    /// before) and that holds the client to the protocol: a call after a 202 must name that
+    /// publish, any other must have no body; a call that does not is answered 400. Every other
+    /// route answers as the platform does.
+    fn publish_stub(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+        let named = std::sync::atomic::AtomicBool::new(false);
+        stub(move |req, seen| {
+            if req.line != PUBLISH {
+                return platform(req, seen);
+            }
+            use std::sync::atomic::Ordering::SeqCst;
+            let ok = if named.load(SeqCst) { serde_json::from_slice::<Value>(&req.body).ok() == Some(json!({ "publish_id": PUB })) } else { req.body.is_empty() };
+            if !ok {
+                named.store(false, SeqCst);
+                return reply(400, r#"{"error":"bad_request","detail":"the stub got a publish call that breaks the protocol"}"#);
+            }
+            let answer = publish(seen);
+            named.store(matches!(answer, Answer::Reply(202, ..)), SeqCst);
+            answer
+        })
+    }
+
     /// Publishes TOUR against the stub with no pause, recording every progress report.
     fn publish(stub: &Stub) -> (Result<Live, String>, Vec<Option<Images>>) {
         let mut seen = Vec::new();
@@ -1029,11 +1069,10 @@ mod tests {
 
     #[test]
     fn publish_calls_until_the_server_says_it_is_live_and_returns_the_link() {
-        let s = stub(|req, seen| match (req.line.as_str(), seen) {
-            (PUBLISH, 0) => in_progress(12, 22),
-            (PUBLISH, 1) => in_progress(22, 22),
-            (PUBLISH, _) => reply(200, LIVE),
-            _ => reply(404, "{}"),
+        let s = publish_stub(|seen| match seen {
+            0 => in_progress(12, 22),
+            1 => in_progress(22, 22),
+            _ => reply(200, LIVE),
         });
         let (r, progress) = publish(&s);
         assert_eq!(r.unwrap(), Live { steps: 5, url: Some(format!("{}/t/abc123", s.base)) });
@@ -1051,7 +1090,7 @@ mod tests {
 
     #[test]
     fn a_small_tour_is_live_after_one_call() {
-        let s = stub(|_, _| reply(200, LIVE));
+        let s = publish_stub(|_| reply(200, LIVE));
         let (r, progress) = publish(&s);
         assert_eq!(r.unwrap().steps, 5);
         assert_eq!(progress, [None]);
@@ -1060,7 +1099,7 @@ mod tests {
 
     #[test]
     fn a_publish_that_stops_making_progress_is_given_up() {
-        let s = stub(|_, _| in_progress(12, 22));
+        let s = publish_stub(|_| in_progress(12, 22));
         let (r, _) = publish(&s);
         assert_eq!(r.unwrap_err(), "Could not publish the tour: the server stopped making progress at 12 of 22 images.");
         // The first answer counts as progress; three more without any end it.
@@ -1069,13 +1108,89 @@ mod tests {
 
     #[test]
     fn a_stall_counter_starts_again_when_the_server_moves_on() {
-        let s = stub(|_, seen| match seen {
+        let s = publish_stub(|seen| match seen {
             0..=2 => in_progress(12, 22),
             3..=5 => in_progress(20, 22),
             _ => reply(200, LIVE),
         });
         assert!(publish(&s).0.is_ok());
         assert_eq!(s.lines().len(), 7);
+    }
+
+    #[test]
+    fn the_stub_refuses_a_follow_up_call_that_does_not_name_the_publish() {
+        // The check the other tests rely on: after a 202, a call with no body is a protocol error.
+        let s = publish_stub(|_| in_progress(1, 2));
+        let c = client(&s);
+        assert_eq!(c.send(Method::Post, "/api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish", None).ok().map(|r| r.status), Some(202));
+        assert_eq!(c.send(Method::Post, "/api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish", None).ok().map(|r| r.status), Some(400));
+        // And a first call that names one is refused as well.
+        let body = json!({ "publish_id": PUB }).to_string();
+        assert_eq!(c.send(Method::Post, "/api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish", Some(("application/json", body.as_bytes()))).ok().map(|r| r.status), Some(400));
+    }
+
+    #[test]
+    fn an_answer_without_a_count_is_not_progress() {
+        // No `done` at all, or one that is not a number: three such answers end it as not understood.
+        for body in [format!(r#"{{"status":"in_progress","publish_id":"{PUB}"}}"#), format!(r#"{{"status":"in_progress","publish_id":"{PUB}","done":"12","total":22}}"#)] {
+            let s = publish_stub(move |_| reply(202, &body));
+            let (r, progress) = publish(&s);
+            assert_eq!(r.unwrap_err(), "Could not publish the tour: the server's answer was not understood.");
+            assert_eq!(s.lines().len(), 3);
+            assert!(progress.iter().all(Option::is_none));
+        }
+        // A count that goes missing in the middle does not reset the stall counter.
+        let s = publish_stub(|seen| if seen == 0 { in_progress(12, 22) } else { reply(202, &format!(r#"{{"status":"in_progress","publish_id":"{PUB}"}}"#)) });
+        assert!(publish(&s).0.is_err());
+        assert_eq!(s.lines().len(), 4);
+    }
+
+    #[test]
+    fn counts_that_make_no_sense_are_not_shown() {
+        // More done than there is: the work still moves, so the publish goes on, but no count is shown.
+        let s = publish_stub(|seen| match seen {
+            0 => in_progress(30, 22),
+            1 => in_progress(40, 22),
+            _ => reply(200, LIVE),
+        });
+        let (r, progress) = publish(&s);
+        assert!(r.is_ok());
+        assert_eq!(progress, [None, None, None]);
+        // Nothing of nothing, again and again: no progress, and no "0 of 0 images" in the sentence.
+        let s = publish_stub(|_| in_progress(0, 0));
+        let (r, progress) = publish(&s);
+        assert_eq!(r.unwrap_err(), "Could not publish the tour: the server's answer was not understood.");
+        assert_eq!(s.lines().len(), 4);
+        assert!(progress.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_publish_that_never_finishes_stops_at_the_hard_limit() {
+        // Always a little further, never done.
+        let s = publish_stub(|seen| in_progress(seen as u32 + 1, 100_000));
+        let (r, progress) = publish(&s);
+        assert_eq!(r.unwrap_err(), "Could not publish the tour: the server did not finish within 200 calls.");
+        assert_eq!(s.lines().len(), 200);
+        assert_eq!(progress.last(), Some(&Some((199, 100_000))));
+    }
+
+    #[test]
+    fn a_web_page_or_a_redirect_instead_of_an_answer_is_refused() {
+        // A 200 that is a web page (a login wall, a proxy's page), not the platform's answer.
+        let s = publish_stub(|_| reply(200, "<!doctype html><html><body>Sign in</body></html>"));
+        assert_eq!(publish(&s).0.unwrap_err(), "Could not publish the tour: the server's answer was not understood.");
+        assert_eq!(s.lines().len(), 1);
+        // A redirect is never followed: the token stays with the configured server.
+        for status in [301, 302, 307, 308] {
+            let s = publish_stub(move |_| Answer::Reply(status, String::new(), vec![("Location", "https://elsewhere.example/api/v1/tours/x/publish".to_string())]));
+            let e = publish(&s).0.unwrap_err();
+            assert_eq!(e, format!("Could not publish the tour: the server answered with a redirect (HTTP {status}), which is not followed. Check the server address."));
+            assert_eq!(s.lines(), [PUBLISH]);
+        }
+        // The same in the middle of a publish.
+        let s = publish_stub(|seen| if seen == 0 { in_progress(12, 22) } else { Answer::Reply(302, String::new(), vec![("Location", "/login".to_string())]) });
+        assert!(publish(&s).0.unwrap_err().contains("redirect"));
+        assert_eq!(s.lines().len(), 2);
     }
 
     #[test]
@@ -1089,29 +1204,29 @@ mod tests {
             (400, r#"{"error":"empty_tour","detail":"a tour with no steps cannot be published"}"#, "Could not publish the tour: a tour with no steps cannot be published (HTTP 400)."),
         ];
         for (status, body, message) in cases {
-            let s = stub(move |_, _| reply(status, body));
+            let s = publish_stub(move |_| reply(status, body));
             let (r, _) = publish(&s);
             assert_eq!(r.unwrap_err(), message);
             assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
         }
-        let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
+        let s = publish_stub(|_| reply(401, r#"{"error":"unauthorized"}"#));
         assert_eq!(publish(&s).0.unwrap_err(), REJECTED_TOKEN);
     }
 
     #[test]
     fn a_refusal_in_the_middle_of_a_publish_ends_it() {
-        let s = stub(|_, seen| if seen == 0 { in_progress(12, 22) } else { reply(409, r#"{"error":"publish_cancelled"}"#) });
+        let s = publish_stub(|seen| if seen == 0 { in_progress(12, 22) } else { reply(409, r#"{"error":"publish_cancelled"}"#) });
         assert!(publish(&s).0.unwrap_err().contains("stopped on the server"));
         assert_eq!(s.lines().len(), 2);
     }
 
     #[test]
     fn a_lost_connection_while_publishing_says_so_without_the_token() {
-        let s = stub(|_, _| Answer::Drop);
+        let s = publish_stub(|_| Answer::Drop);
         let e = publish(&s).0.unwrap_err();
         assert!(e.starts_with("Could not publish the tour: ") && e.ends_with('.') && !e.contains("dp_"), "{e}");
         assert_eq!(s.lines().len(), 1);
-        let s = stub(|_, seen| if seen == 0 { in_progress(12, 22) } else { Answer::Drop });
+        let s = publish_stub(|seen| if seen == 0 { in_progress(12, 22) } else { Answer::Drop });
         let e = publish(&s).0.unwrap_err();
         assert!(e.ends_with("while the images were being copied.") && !e.contains("dp_"), "{e}");
     }
@@ -1119,20 +1234,21 @@ mod tests {
     #[test]
     fn publish_answers_that_make_no_sense_are_refused() {
         for body in [r#"{"status":"in_progress","done":1,"total":2}"#, r#"{"status":"in_progress","publish_id":"pub_../../x","done":1,"total":2}"#] {
-            let s = stub(move |_, _| reply(202, body));
+            let s = publish_stub(move |_| reply(202, body));
             assert_eq!(publish(&s).0.unwrap_err(), "Could not publish the tour: the server's answer was not understood.");
+            assert_eq!(s.lines().len(), 1);
         }
-        let s = stub(|_, _| reply(200, r#"{"slug":"abc"}"#));
+        let s = publish_stub(|_| reply(200, r#"{"slug":"abc"}"#));
         assert!(publish(&s).0.unwrap_err().contains("not understood"));
         // A tour id that is not one never reaches the network.
-        let s = stub(|_, _| reply(200, LIVE));
+        let s = publish_stub(|_| reply(200, LIVE));
         assert!(client(&s).publish_tour("tour_x/../y", Duration::ZERO, |_| true).is_err());
         assert!(s.lines().is_empty());
     }
 
     #[test]
     fn cancel_in_the_middle_of_a_publish_stops_calling() {
-        let s = stub(|_, _| in_progress(12, 22));
+        let s = publish_stub(|_| in_progress(12, 22));
         let mut calls = 0;
         let r = client(&s).publish_tour(TOUR, Duration::ZERO, |_| {
             calls += 1;
@@ -1142,14 +1258,14 @@ mod tests {
         // Two calls went out; nothing else is sent, the server clears a publish nobody drives.
         assert_eq!(s.lines(), [PUBLISH, PUBLISH]);
         // Cancelled before the first call: nothing is sent at all.
-        let s = stub(|_, _| reply(200, LIVE));
+        let s = publish_stub(|_| reply(200, LIVE));
         assert_eq!(client(&s).publish_tour(TOUR, Duration::ZERO, |_| false).unwrap_err(), CANCELLED);
         assert!(s.lines().is_empty());
     }
 
-    /// The platform, with a publish route that answers as `publish` says.
+    /// The platform, with a publish route that answers as `publish` says and checks the protocol.
     fn platform_with(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
-        stub(move |req, seen| if req.line == PUBLISH { publish(seen) } else { platform(req, seen) })
+        publish_stub(publish)
     }
 
     fn upload_and_publish_to(stub: &Stub, publish_now: bool, go: impl FnMut(Option<Images>) -> bool) -> Result<Finished, String> {
@@ -1222,8 +1338,17 @@ mod tests {
         // A path goes after the configured address; a server under a path keeps it.
         assert_eq!(public_url(base, Some("/t/abc123"), Some("abc123")).as_deref(), Some("https://tours.example.com/t/abc123"));
         assert_eq!(public_url("https://x.dev/demo/", Some("/t/abc"), None).as_deref(), Some("https://x.dev/demo/t/abc"));
-        // A full https address is used as it is.
-        assert_eq!(public_url(base, Some("https://view.example.com/t/abc"), Some("abc")).as_deref(), Some("https://view.example.com/t/abc"));
+        // A full address is used only when it is on the configured server.
+        assert_eq!(public_url(base, Some("https://tours.example.com/t/abc"), None).as_deref(), Some("https://tours.example.com/t/abc"));
+        assert_eq!(public_url(base, Some("HTTPS://Tours.Example.com/t/abc"), None).as_deref(), Some("https://tours.example.com/t/abc"));
+        assert_eq!(public_url("https://x.dev:8443/demo", Some("https://x.dev:8443/t/abc"), None).as_deref(), Some("https://x.dev:8443/t/abc"));
+        // Another host, another port, a look-alike host: the link is built from the slug instead, or there is none.
+        for elsewhere in ["https://view.example.com/t/abc", "https://tours.example.com:8443/t/abc", "https://tours.example.com.evil.example/t/abc", "https://tours.example.comx/t/abc", "https://evil.example/tours.example.com/t/abc"] {
+            assert_eq!(public_url(base, Some(elsewhere), Some("abc")).as_deref(), Some("https://tours.example.com/t/abc"), "{elsewhere}");
+            assert_eq!(public_url(base, Some(elsewhere), None), None, "{elsewhere}");
+        }
+        assert_eq!(public_url("http://localhost:8787", Some("http://localhost:9999/t/abc"), None), None);
+        assert_eq!(public_url("http://localhost:8787", Some("https://localhost:8787/t/abc"), None), None);
         // No url: built from the slug.
         assert_eq!(public_url(base, None, Some("abc-1_2")).as_deref(), Some("https://tours.example.com/t/abc-1_2"));
         // http is for localhost and 127.0.0.1 only.
@@ -1242,6 +1367,10 @@ mod tests {
         }
         assert_eq!(public_url(base, Some(&format!("/t/{}", "a".repeat(400))), None), None);
         assert_eq!(public_url("http://example.com", Some("/t/abc"), Some("abc")), None);
+        // Every link this makes is one the opener accepts.
+        for (server, url, slug) in [(base, Some("/t/abc123"), None), ("http://localhost:8787", None, Some("abc")), ("https://x.dev:8443/demo/", Some("/t/a-b_c"), None)] {
+            assert!(mythicshot_destinations::is_web_link(&public_url(server, url, slug).unwrap()));
+        }
     }
 
     #[test]
@@ -1414,10 +1543,14 @@ mod tests {
         assert_eq!(
             tours,
             [
-                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9 },
-                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3 },
+                RemoteTour { id: "tour_1".into(), title: "Onboarding".into(), status: "draft".into(), chapters: 2, steps: 9, link: None },
+                RemoteTour { id: "tour_2".into(), title: "Billing".into(), status: "published".into(), chapters: 1, steps: 3, link: None },
             ]
         );
+        // A list that names a tour's slug or url gives its link, by the same rule as a publish answer.
+        let s2 = stub(|_, _| reply(200, r#"{"tours":[{"id":"a","title":"A","status":"published","chapters":1,"steps":3,"slug":"abc"},{"id":"b","title":"B","status":"published","chapters":1,"steps":3,"url":"https://evil.example/t/x"}]}"#));
+        let links: Vec<Option<String>> = list_tours(&s2.base, TOKEN).unwrap().into_iter().map(|t| t.link).collect();
+        assert_eq!(links, [Some(format!("{}/t/abc", s2.base)), None]);
         assert_eq!(s.lines(), ["GET /api/v1/tours"]);
         assert_eq!(workspace_name(&stub(platform).base, TOKEN).unwrap(), "Acme");
 
