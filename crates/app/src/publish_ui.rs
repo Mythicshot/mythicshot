@@ -269,7 +269,7 @@ pub enum Blocked {
     Store(String),
 }
 
-pub const ADD_SERVER_AND_TOKEN: &str = "Add a server and token in Preferences › Output to publish.";
+pub const ADD_SERVER_AND_TOKEN: &str = "Add a site address and a token on the Workspace page of the main window to publish.";
 
 /// What stops a publish, in the order the user would fix it; None when it can start.
 pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus) -> Option<Blocked> {

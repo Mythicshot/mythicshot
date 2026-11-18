@@ -34,6 +34,7 @@ mod tour_view;
 mod tours_ui;
 mod video;
 mod video_editor;
+mod workspace_ui;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -886,7 +887,7 @@ impl App {
                     }
                 }
                 UiAction::SettingsChanged => {
-                    // Only the General tab edits fields directly; shortcuts go through SetBinding.
+                    // The General and Output tabs and the Workspace page edit fields directly; shortcuts go through SetBinding.
                     self.settings.output_dir = edited.output_dir.clone();
                     self.settings.destinations = edited.destinations.clone();
                     self.settings.filename_pattern = edited.filename_pattern.clone();
@@ -912,6 +913,8 @@ impl App {
                         self.notify(e);
                     }
                 }
+                // A page switch: the main window takes it and never queues it.
+                UiAction::OpenWorkspace => {}
             }
         }
         // A Home tile: close the window so it is not in the picture, then capture. It stays

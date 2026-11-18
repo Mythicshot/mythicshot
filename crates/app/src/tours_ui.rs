@@ -1470,7 +1470,8 @@ mod tests {
         loop {
             let (text, _) = drawn(ctx, state, conn);
             if done(&lock(&state.model), &text) {
-                return text;
+                // The model may have moved on right after that frame was drawn: draw what it holds now.
+                return drawn(ctx, state, conn).0;
             }
             assert!(Instant::now() < deadline, "the page did not settle:\n{text}");
             std::thread::sleep(Duration::from_millis(10));
@@ -1486,7 +1487,8 @@ mod tests {
         let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(404, r#"{"error":"not_found"}"#) });
         let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
         let (first, _) = drawn(&ctx, &mut state, &conn);
-        assert!(has_line(&first, "Tours") && has_line(&first, RECORD_A_TOUR) && has_line(&first, LOADING), "{first}");
+        // The list is being read, unless the stub already answered.
+        assert!(has_line(&first, "Tours") && has_line(&first, RECORD_A_TOUR) && (has_line(&first, LOADING) || has_line(&first, "Testing")), "{first}");
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading());
         for word in ["Tours", RECORD_A_TOUR, "Customer onboarding", "Public", "Testing", "Draft", "Copy link", "Open", "Rename", "Unpublish", "Delete", "Publish", "2 tours in this workspace"] {
             assert!(has_line(&text, word), "the page is missing {word:?} in:\n{text}");

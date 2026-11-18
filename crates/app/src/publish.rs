@@ -272,10 +272,6 @@ fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
     Some((host, port))
 }
 
-pub fn workspace_name(server: &str, token: &str) -> Result<String, String> {
-    Client::new(server, token, Timeouts::default())?.workspace_name()
-}
-
 /// The workspace's name and the site's version.
 pub fn workspace(server: &str, token: &str) -> Result<Workspace, String> {
     Client::new(server, token, Timeouts::default())?.workspace()
@@ -576,10 +572,6 @@ impl Client {
         let clean = clean.replace(&self.token.0, "[token]").replace("dp_", "dp-");
         let clean = clean.trim().to_string();
         (!clean.is_empty()).then_some(clean)
-    }
-
-    fn workspace_name(&self) -> Result<String, String> {
-        self.workspace().map(|w| w.name)
     }
 
     fn workspace(&self) -> Result<Workspace, String> {
@@ -1771,7 +1763,7 @@ pub(crate) mod tests {
     #[test]
     fn a_401_reads_as_a_token_problem_without_the_token() {
         let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
-        assert_eq!(workspace_name(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
+        assert_eq!(workspace(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
         assert_eq!(list_tours(&s.base, TOKEN).unwrap_err(), "The server rejected the API token.");
         let err = upload(&s, 1, false, &Target::New).unwrap_err();
         assert_eq!(err, "The server rejected the API token.");
@@ -1801,7 +1793,7 @@ pub(crate) mod tests {
         let links: Vec<Option<String>> = list_tours(&s2.base, TOKEN).unwrap().into_iter().map(|t| t.link).collect();
         assert_eq!(links, [Some(format!("{}/t/abc", s2.base)), None]);
         assert_eq!(s.lines(), ["GET /api/v1/tours"]);
-        assert_eq!(workspace_name(&stub(platform).base, TOKEN).unwrap(), "Acme");
+        assert_eq!(workspace(&stub(platform).base, TOKEN).unwrap().name, "Acme");
 
         let s = stub(|_, _| reply(200, r#"{"tours":[{"id":"t"}]}"#));
         assert_eq!(list_tours(&s.base, TOKEN).unwrap_err(), "Could not list the tours: the server's answer was not understood.");
@@ -1812,19 +1804,19 @@ pub(crate) mod tests {
         let echo = format!(r#"{{"error":"x","detail":"you sent {TOKEN}"}}"#);
         let mut errors = vec![
             check_server("http://example.com").unwrap_err(),
-            workspace_name("http://example.com", TOKEN).unwrap_err(),
-            workspace_name("https://x.dev", "dp_short").unwrap_err(),
+            workspace("http://example.com", TOKEN).unwrap_err(),
+            workspace("https://x.dev", "dp_short").unwrap_err(),
             store_token_in(&FakeStore::default(), &format!("{TOKEN}x")).unwrap_err(),
         ];
         let e2 = echo.clone();
         let s = stub(move |req, seen| if req.line.ends_with("/steps/1") { Answer::Reply(500, e2.clone(), vec![]) } else { platform(req, seen) });
         errors.push(upload(&s, 1, false, &Target::New).unwrap_err());
         let s = stub(move |_, _| Answer::Reply(400, echo.clone(), vec![]));
-        errors.push(workspace_name(&s.base, TOKEN).unwrap_err());
+        errors.push(workspace(&s.base, TOKEN).unwrap_err());
         errors.push(list_tours(&s.base, TOKEN).unwrap_err());
         errors.push(upload(&s, 1, false, &Target::New).unwrap_err());
         errors.push(upload(&stub(|_, _| reply(302, "")), 1, false, &Target::New).unwrap_err());
-        errors.push(workspace_name(&stub(|_, _| Answer::Drop).base, TOKEN).unwrap_err());
+        errors.push(workspace(&stub(|_, _| Answer::Drop).base, TOKEN).unwrap_err());
         for e in &errors {
             assert!(!e.contains(TOKEN) && !format!("{e:?}").contains(TOKEN), "{e}");
             assert!(!e.contains("0123456789abcdef0123"), "{e}");
@@ -1841,7 +1833,7 @@ pub(crate) mod tests {
         let other = stub(platform);
         let to = format!("{}/api/v1/me", other.base);
         let s = stub(move |_, _| Answer::Reply(307, String::new(), vec![("Location", to.clone())]));
-        let err = workspace_name(&s.base, TOKEN).unwrap_err();
+        let err = workspace(&s.base, TOKEN).unwrap_err();
         assert!(err.contains("redirect"), "{err}");
         assert!(other.lines().is_empty());
         let err = upload(&s, 1, false, &Target::New).unwrap_err();
@@ -1886,7 +1878,7 @@ pub(crate) mod tests {
         let s = stub(|_, _| Answer::Hang);
         let client = Client::new(&s.base, TOKEN, Timeouts { connect: Duration::from_millis(500), request: Duration::from_millis(300) }).unwrap();
         let start = std::time::Instant::now();
-        assert_eq!(client.workspace_name().unwrap_err(), "Could not check the server: the server did not answer in time.");
+        assert_eq!(client.workspace().unwrap_err(), "Could not check the server: the server did not answer in time.");
         assert!(start.elapsed() < Duration::from_secs(3));
     }
 
@@ -1894,7 +1886,7 @@ pub(crate) mod tests {
     fn a_huge_answer_is_cut_off() {
         let big = format!(r#"{{"workspace":"{}"}}"#, "x".repeat(MAX_RESPONSE_BYTES as usize + 10));
         let s = stub(move |_, _| Answer::Reply(200, big.clone(), vec![]));
-        assert_eq!(workspace_name(&s.base, TOKEN).unwrap_err(), "Could not check the server: the server's answer was too large.");
+        assert_eq!(workspace(&s.base, TOKEN).unwrap_err(), "Could not check the server: the server's answer was too large.");
     }
 
     #[test]
@@ -2031,7 +2023,7 @@ pub(crate) mod tests {
         let detail = format!("a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{00AD}f\u{061C}g\u{2060}h{}", "x".repeat(1000));
         let body = json!({ "error": "bad", "detail": detail }).to_string();
         let s = stub(move |_, _| Answer::Reply(400, body.clone(), vec![]));
-        let err = workspace_name(&s.base, TOKEN).unwrap_err();
+        let err = workspace(&s.base, TOKEN).unwrap_err();
         assert!(err.contains("abcdefgh"), "{err}");
         assert!(!err.chars().any(|c| is_invisible(c) || c.is_control()), "{err:?}");
         assert!(err.chars().count() < MAX_DETAIL_CHARS + 60, "{}", err.len());
