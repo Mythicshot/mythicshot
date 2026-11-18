@@ -11,7 +11,7 @@ use std::path::Path;
 
 use image::codecs::png::{PngDecoder, PngEncoder};
 use image::{DynamicImage, ImageDecoder, ImageEncoder};
-use mythicshot_editor::overlays::{InputEvent, InputKind, MouseButton, OverlayStyle};
+use mythicshot_editor::overlays::{ClickStyle, InputEvent, InputKind, KeyStyle, MouseButton, OverlayStyle};
 use mythicshot_editor::{Bounds, ImageData, Item, MAX_DIM, MIN_DIM, ObfuscateMode, Pixmap, Pt, Rgba, Shape, Style, to_rgba_image};
 use mythicshot_recording::Recording;
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,26 @@ pub const FORMAT: u32 = 1;
 
 /// A cover logo larger than this is not copied into a project; the tour export refuses it too.
 const LOGO_MAX_FILE_BYTES: u64 = 30_000_000;
-/// A picture file larger than this, or with more pixels than [`PICTURE_MAX_PIXELS`], is not loaded.
+/// A `project.json` longer than this is refused as damaged before it is read as JSON.
+pub const MAX_PROJECT_JSON_BYTES: usize = 64 * 1_048_576;
+
+/// A picture file larger than this is not loaded.
 const PICTURE_MAX_FILE_BYTES: u64 = 256 * 1_048_576;
-const PICTURE_MAX_PIXELS: u64 = 100_000_000;
+/// How many pixels one picture, and all the pictures of a project together, may hold when the
+/// project is opened; a picture past either is left out.
+const LIMITS: Limits = Limits { picture_pixels: 40_000_000, total_pixels: 120_000_000 };
+/// An item is kept when it lies within one frame size of the frame, and at least this many pixels.
+/// The editor keeps what is drawn close to the frame; anything further out was put there by hand.
+const ITEM_MARGIN_MIN: f32 = 1024.0;
+const FONT_SIZE_MIN: f32 = 4.0;
+const FONT_SIZE_MAX: f32 = 200.0;
+const LINE_WIDTH_MAX: f32 = 200.0;
+
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    picture_pixels: u64,
+    total_pixels: u64,
+}
 
 /// What a project belongs to. `server` is the address as `publish::check_server` returns it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -67,7 +84,16 @@ pub struct ProjectFile {
     #[serde(default)]
     pub events: Vec<SavedEvent>,
     #[serde(default)]
-    pub items: Vec<SavedItem>,
+    pub items: Vec<ItemEntry>,
+}
+
+/// One entry of `items`. An entry that does not have an item's shape is kept as it was read, so
+/// it costs only itself when the project is opened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ItemEntry {
+    Item(SavedItem),
+    Unreadable(serde_json::Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,14 +107,31 @@ pub struct SavedEdit {
     /// `[x0, y0, x1, y1]` in frame pixels.
     pub crop: Option<[f32; 4]>,
     pub scale: u32,
-    pub overlays: OverlayStyle,
+    pub overlays: SavedOverlays,
     pub tour_removed: BTreeSet<usize>,
     pub tour_doc: SavedTourDoc,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedOverlays {
+    /// "off", "chips" or "keyboard".
+    pub keys: String,
+    /// "off", "ripple", "mouse" or "both".
+    pub clicks: String,
+    pub halo: bool,
+    pub pointer: bool,
+}
+
+impl Default for SavedOverlays {
+    fn default() -> Self {
+        save_overlays(&OverlayStyle::default())
+    }
+}
+
 impl Default for SavedEdit {
     fn default() -> Self {
-        Self { trim: None, deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays: OverlayStyle::default(), tour_removed: BTreeSet::new(), tour_doc: SavedTourDoc::default() }
+        Self { trim: None, deleted: BTreeSet::new(), speed: 1.0, reverse: false, crop: None, scale: 100, overlays: SavedOverlays::default(), tour_removed: BTreeSet::new(), tour_doc: SavedTourDoc::default() }
     }
 }
 
@@ -327,25 +370,36 @@ names!(placement_name, placement_from, Placement { Auto => "auto", Top => "top",
 names!(advance_name, advance_from, Advance { Hotspot => "hotspot", Anywhere => "anywhere" });
 names!(mode_name, mode_from, ObfuscateMode { Pixelate => "pixelate", Blur => "blur" });
 names!(button_name, button_from, MouseButton { Left => "left", Right => "right", Middle => "middle" });
+names!(key_style_name, key_style_from, KeyStyle { Off => "off", Chips => "chips", Keyboard => "keyboard" });
+names!(click_style_name, click_style_from, ClickStyle { Off => "off", Ripple => "ripple", Mouse => "mouse", Both => "both" });
 
-/// The first 16 hex characters of the SHA-256 of `bytes`.
+/// The first `chars` hex characters of the SHA-256 of `bytes`.
+fn hex_hash(bytes: &[u8], chars: usize) -> String {
+    let hex: String = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    hex[..chars.min(hex.len())].to_string()
+}
+
+/// The first 16 hex characters of the SHA-256 of `bytes`: what a file's name normally holds.
 fn hash16(bytes: &[u8]) -> String {
-    sha2::Sha256::digest(bytes).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hex_hash(bytes, HASH_CHARS[0])
 }
 
-fn is_hash16(s: &str) -> bool {
-    s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+/// The hash lengths a name may hold; the longer ones only when two files would share a name.
+const HASH_CHARS: [usize; 3] = [16, 32, 64];
+
+fn is_hash(s: &str) -> bool {
+    HASH_CHARS.contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Only `pictures/<16 hex>.png`, so a file edited by hand cannot name a file outside the project.
+/// Only `pictures/<hash>.png`, so a file edited by hand cannot name a file outside the project.
 fn is_picture_name(name: &str) -> bool {
-    name.strip_prefix("pictures/").and_then(|r| r.strip_suffix(".png")).is_some_and(is_hash16)
+    name.strip_prefix("pictures/").and_then(|r| r.strip_suffix(".png")).is_some_and(is_hash)
 }
 
-/// Only `logo-<16 hex>.<extension>`.
+/// Only `logo-<hash>.<extension>`.
 fn is_logo_name(name: &str) -> bool {
     let ext_ok = |e: &str| (1..=8).contains(&e.len()) && e.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-    name.strip_prefix("logo-").and_then(|r| r.split_once('.')).is_some_and(|(hash, ext)| is_hash16(hash) && ext_ok(ext))
+    name.strip_prefix("logo-").and_then(|r| r.split_once('.')).is_some_and(|(hash, ext)| is_hash(hash) && ext_ok(ext))
 }
 
 /// A number that JSON can hold: not-a-number and the infinities become 0.
@@ -375,13 +429,31 @@ fn save_style(s: &Style) -> SavedStyle {
 
 fn load_style(s: &SavedStyle) -> Style {
     let d = Style::default();
-    let width = if s.width.is_finite() { s.width.clamp(0.0, 1000.0) } else { d.width };
-    let font_size = if s.font_size.is_finite() { s.font_size.clamp(1.0, 1000.0) } else { d.font_size };
+    let width = if s.width.is_finite() { s.width.clamp(0.0, LINE_WIDTH_MAX) } else { d.width };
+    let font_size = if s.font_size.is_finite() { s.font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX) } else { d.font_size };
     Style { stroke: Rgba(s.stroke), fill: s.fill.map(Rgba), width, font_size, shadow: s.shadow }
 }
 
 fn save_theme(t: &Theme) -> SavedTheme {
     SavedTheme { card_style: card_style_name(t.card_style), accent: t.accent.clone(), hotspot: hotspot_name(t.hotspot), progress_bar: t.progress_bar, backdrop: t.backdrop.clone(), spotlight_soft: t.spotlight_soft }
+}
+
+fn save_overlays(o: &OverlayStyle) -> SavedOverlays {
+    SavedOverlays { keys: key_style_name(o.keys), clicks: click_style_name(o.clicks), halo: o.halo, pointer: o.pointer }
+}
+
+fn load_overlays(o: &SavedOverlays) -> OverlayStyle {
+    OverlayStyle { keys: key_style_from(&o.keys).unwrap_or_default(), clicks: click_style_from(&o.clicks).unwrap_or_default(), halo: o.halo, pointer: o.pointer }
+}
+
+/// The crop cut to the frame, or none when less than a pixel of the frame is inside it.
+fn load_crop(c: [f32; 4], width: f32, height: f32) -> Option<Bounds> {
+    if !c.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let n = load_rect(c).norm();
+    let cut = Bounds { x0: n.x0.clamp(0.0, width), y0: n.y0.clamp(0.0, height), x1: n.x1.clamp(0.0, width), y1: n.y1.clamp(0.0, height) };
+    (cut.x1 - cut.x0 >= 1.0 && cut.y1 - cut.y0 >= 1.0).then_some(cut)
 }
 
 fn save_link(l: &Link) -> SavedLink {
@@ -401,19 +473,38 @@ fn png(image: &ImageData) -> Option<Vec<u8>> {
 }
 
 /// The pictures and the logo collected while a file is built; each content is kept once.
-#[derive(Default)]
 struct Blobs {
     list: Vec<Blob>,
     /// Pictures already encoded, by the pixels they share.
     seen: HashMap<*const Pixmap, String>,
+    /// What could not be saved.
+    dropped: Vec<String>,
+    /// [`hex_hash`]; a test puts a hash that collides here.
+    hash: fn(&[u8], usize) -> String,
+}
+
+impl Default for Blobs {
+    fn default() -> Self {
+        Self { list: Vec::new(), seen: HashMap::new(), dropped: Vec::new(), hash: hex_hash }
+    }
 }
 
 impl Blobs {
-    fn add(&mut self, name: String, bytes: Vec<u8>) -> String {
-        if !self.list.iter().any(|b| b.name == name) {
-            self.list.push(Blob { name: name.clone(), bytes });
+    /// The name `bytes` are kept under: `before`, their hash, `after`. Two files with different
+    /// bytes never share a name: the second takes a longer hash. None when even the whole hash is taken.
+    fn add(&mut self, before: &str, after: &str, bytes: Vec<u8>) -> Option<String> {
+        for chars in HASH_CHARS {
+            let name = format!("{before}{}{after}", (self.hash)(&bytes, chars));
+            match self.list.iter().find(|b| b.name == name).map(|b| b.bytes == bytes) {
+                Some(true) => return Some(name),
+                Some(false) => continue,
+                None => {
+                    self.list.push(Blob { name: name.clone(), bytes });
+                    return Some(name);
+                }
+            }
         }
-        name
+        None
     }
 
     fn picture(&mut self, image: &ImageData) -> Option<String> {
@@ -421,21 +512,32 @@ impl Blobs {
         if let Some(name) = self.seen.get(&shared) {
             return Some(name.clone());
         }
-        let bytes = png(image)?;
-        let name = self.add(format!("pictures/{}.png", hash16(&bytes)), bytes);
+        let Some(name) = png(image).and_then(|bytes| self.add("pictures/", ".png", bytes)) else {
+            self.dropped.push("a pasted picture".to_string());
+            return None;
+        };
         self.seen.insert(shared, name.clone());
         Some(name)
     }
 
-    /// The logo's source file, copied as it is. A logo that cannot be read is left out.
+    /// The logo's source file, copied as it is. A logo that cannot be read, or is larger than the
+    /// export accepts, is left out and named in `dropped`.
     fn logo(&mut self, path: &Path) -> Option<String> {
+        let name = self.read_logo(path);
+        if name.is_none() {
+            self.dropped.push("the cover logo".to_string());
+        }
+        name
+    }
+
+    fn read_logo(&mut self, path: &Path) -> Option<String> {
         if std::fs::metadata(path).ok()?.len() > LOGO_MAX_FILE_BYTES {
             return None;
         }
         let bytes = std::fs::read(path).ok()?;
         let ext: String = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         let ext = if (1..=8).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { ext } else { "img".to_string() };
-        Some(self.add(format!("logo-{}.{ext}", hash16(&bytes)), bytes))
+        self.add("logo-", &format!(".{ext}"), bytes)
     }
 }
 
@@ -509,26 +611,33 @@ fn load_event(e: &SavedEvent) -> Option<InputEvent> {
     Some(InputEvent { t_ms: e.t_ms, kind })
 }
 
-/// A picture file of the project, or None when it is missing, too large or not a PNG.
-fn load_picture(path: &Path) -> Option<ImageData> {
+/// A picture file of the project and how many pixels it has, or None when it is missing, not a
+/// PNG, or has more than `max_pixels`.
+fn load_picture(path: &Path, max_pixels: u64) -> Option<(ImageData, u64)> {
     if std::fs::metadata(path).ok()?.len() > PICTURE_MAX_FILE_BYTES {
         return None;
     }
     let raw = std::fs::read(path).ok()?;
     let decoder = PngDecoder::new(std::io::Cursor::new(&raw[..])).ok()?;
     let (w, h) = decoder.dimensions();
-    if w == 0 || h == 0 || w as u64 * h as u64 > PICTURE_MAX_PIXELS {
+    let pixels = w as u64 * h as u64;
+    if pixels == 0 || pixels > max_pixels {
         return None;
     }
-    let img = DynamicImage::from_decoder(decoder).ok()?.to_rgba8();
-    Some(ImageData::from_rgba(&img))
+    let img = DynamicImage::from_decoder(decoder).ok()?.into_rgba8();
+    Some((ImageData::from_rgba(&img), pixels))
 }
 
 /// What is read while a file is turned back into editor state.
 struct Loader<'a> {
     dir: &'a Path,
-    /// Frames in the recording.
+    /// Frames in the recording, and the size of one.
     frames: usize,
+    width: f32,
+    height: f32,
+    limits: Limits,
+    /// Pixels the pictures still to be read may hold together.
+    pixels_left: u64,
     /// Pictures already read, so copies of one picture share its pixels again.
     pictures: HashMap<String, Option<ImageData>>,
     dropped: Vec<String>,
@@ -542,9 +651,20 @@ impl Loader<'_> {
         if let Some(known) = self.pictures.get(name) {
             return known.clone();
         }
-        let loaded = load_picture(&self.dir.join(name));
+        let loaded = load_picture(&self.dir.join(name), self.limits.picture_pixels.min(self.pixels_left)).map(|(image, pixels)| {
+            self.pixels_left -= pixels;
+            image
+        });
         self.pictures.insert(name.to_string(), loaded.clone());
         loaded
+    }
+
+    /// Whether the item lies within one frame size of the frame (at least [`ITEM_MARGIN_MIN`]),
+    /// so drawing it can never ask for a layer many times the frame.
+    fn near_frame(&self, item: &Item) -> bool {
+        let n = item.bounds().norm();
+        let (mx, my) = (self.width.max(ITEM_MARGIN_MIN), self.height.max(ITEM_MARGIN_MIN));
+        [n.x0, n.y0, n.x1, n.y1].iter().all(|v| v.is_finite()) && n.x0 >= -mx && n.y0 >= -my && n.x1 <= self.width + mx && n.y1 <= self.height + my
     }
 
     fn shape(&mut self, shape: SavedShape) -> Option<Shape> {
@@ -582,7 +702,7 @@ impl Loader<'_> {
     }
 
     /// An item whose frames or step lie wholly beyond the recording is left out; a range that
-    /// ends beyond it is cut at the last frame.
+    /// ends beyond it is cut at the last frame. An item far outside the frame is left out too.
     fn item(&mut self, item: SavedItem, id: u64) -> Option<Item> {
         let last = u32::try_from(self.frames.saturating_sub(1)).unwrap_or(u32::MAX);
         let outside = self.frames == 0 || item.pin.is_some_and(|p| p > last) || item.frames.is_some_and(|(a, b)| a.min(b) > last);
@@ -592,7 +712,12 @@ impl Loader<'_> {
         }
         let frames = item.frames.map(|(a, b)| (a.min(b), a.max(b).min(last)));
         let style = load_style(&item.style);
-        Some(Item { id, shape: self.shape(item.shape)?, style, frames, pin: item.pin })
+        let item = Item { id, shape: self.shape(item.shape)?, style, frames, pin: item.pin };
+        if !self.near_frame(&item) {
+            self.dropped.push("an annotation far outside the picture".to_string());
+            return None;
+        }
+        Some(item)
     }
 
     fn doc(&mut self, doc: SavedTourDoc) -> TourDoc {
@@ -636,9 +761,9 @@ impl Loader<'_> {
             deleted: e.deleted.into_iter().filter(|i| *i < frames).collect(),
             speed: if e.speed.is_finite() { e.speed.clamp(0.1, 10.0) } else { 1.0 },
             reverse: e.reverse,
-            crop: e.crop.filter(|c| c.iter().all(|v| v.is_finite())).map(load_rect),
+            crop: e.crop.and_then(|c| load_crop(c, self.width, self.height)),
             scale: e.scale.clamp(10, 100),
-            overlays: e.overlays,
+            overlays: load_overlays(&e.overlays),
             tour_removed: e.tour_removed.into_iter().filter(|i| *i < frames).collect(),
             tour_doc: self.doc(e.tour_doc),
         }
@@ -657,10 +782,11 @@ fn load_step(s: SavedStep) -> StepExtras {
     StepExtras { card, advance: advance_from(&s.advance).unwrap_or_default(), zoom: s.zoom }
 }
 
-/// The file for `snap` and the files that go beside it: the pasted pictures as PNG and the cover
-/// logo's source file. An item whose picture cannot be encoded and a logo that cannot be read are
-/// left out.
-pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes: u64) -> (ProjectFile, Vec<Blob>) {
+/// The file for `snap`, the files that go beside it (the pasted pictures as PNG and the cover
+/// logo's source file), and what could not be saved: an item whose picture cannot be encoded
+/// ("a pasted picture") and a logo that cannot be read or is too large ("the cover logo") are
+/// left out of the file and named in the third value.
+pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes: u64) -> (ProjectFile, Vec<Blob>, Vec<String>) {
     let mut blobs = Blobs::default();
     let e = snap.edit;
     let edit = SavedEdit {
@@ -670,11 +796,11 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
         reverse: e.reverse,
         crop: e.crop.map(save_rect),
         scale: e.scale,
-        overlays: e.overlays,
+        overlays: save_overlays(&e.overlays),
         tour_removed: e.tour_removed.clone(),
         tour_doc: save_doc(&e.tour_doc, &mut blobs),
     };
-    let items = snap.items.iter().filter_map(|it| Some(SavedItem { shape: save_shape(&it.shape, &mut blobs)?, style: save_style(&it.style), frames: it.frames, pin: it.pin })).collect();
+    let items = snap.items.iter().filter_map(|it| Some(ItemEntry::Item(SavedItem { shape: save_shape(&it.shape, &mut blobs)?, style: save_style(&it.style), frames: it.frames, pin: it.pin }))).collect();
     let file = ProjectFile {
         format: FORMAT,
         app: env!("CARGO_PKG_VERSION").to_string(),
@@ -690,7 +816,7 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
         events: snap.events.iter().filter_map(save_event).collect(),
         items,
     };
-    (file, blobs.list)
+    (file, blobs.list, blobs.dropped)
 }
 
 /// The text of `project.json`: the form `golden-v1.json` pins.
@@ -701,13 +827,25 @@ pub fn to_text(file: &ProjectFile) -> Result<String, String> {
 }
 
 /// Editor state from a parsed file whose pictures and logo are in `dir`. Frame numbers beyond
-/// `rec` are cut or left out, a missing picture or logo costs only itself and is named in
-/// `dropped`, and no input panics.
+/// `rec` are cut or left out; a missing or oversized picture, a missing logo, and an item that
+/// cannot be read or lies far outside the frame each cost only themselves and are named in
+/// `dropped`; no input panics.
 pub fn from_file(file: ProjectFile, dir: &Path, rec: &Recording) -> Restored {
-    let mut loader = Loader { dir, frames: rec.frames.len(), pictures: HashMap::new(), dropped: Vec::new() };
+    from_file_within(file, dir, rec, LIMITS)
+}
+
+fn from_file_within(file: ProjectFile, dir: &Path, rec: &Recording, limits: Limits) -> Restored {
+    let mut loader = Loader { dir, frames: rec.frames.len(), width: rec.width as f32, height: rec.height as f32, limits, pixels_left: limits.total_pixels, pictures: HashMap::new(), dropped: Vec::new() };
     let edit = loader.edit(file.edit);
     let mut items = Vec::new();
-    for saved in file.items {
+    for entry in file.items {
+        let saved = match entry {
+            ItemEntry::Item(saved) => saved,
+            ItemEntry::Unreadable(_) => {
+                loader.dropped.push("an annotation that could not be read".to_string());
+                continue;
+            }
+        };
         // Ids count up from 1 in the saved order.
         if let Some(item) = loader.item(saved, items.len() as u64 + 1) {
             items.push(item);
@@ -719,6 +857,9 @@ pub fn from_file(file: ProjectFile, dir: &Path, rec: &Recording) -> Restored {
 /// Reads `project.json`. The format number is looked at first, so a file from a newer Mythicshot
 /// is reported as newer whatever else it holds.
 pub fn parse(text: &str) -> Result<ProjectFile, ParseError> {
+    if text.len() > MAX_PROJECT_JSON_BYTES {
+        return Err(ParseError::Damaged(format!("the file is larger than {} MB", MAX_PROJECT_JSON_BYTES / 1_048_576)));
+    }
     let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| ParseError::Damaged(e.to_string()))?;
     let format = value.get("format").and_then(|f| f.as_u64()).ok_or_else(|| ParseError::Damaged("the file has no format number".to_string()))?;
     if format > u64::from(FORMAT) {
@@ -759,6 +900,7 @@ mod tests {
     fn picture() -> ImageData {
         let mut img = RgbaImage::from_pixel(2, 2, image::Rgba([200, 30, 40, 255]));
         img.put_pixel(1, 1, image::Rgba([0, 0, 255, 255]));
+        img.put_pixel(0, 1, image::Rgba([200, 30, 40, 128]));
         ImageData::from_rgba(&img)
     }
 
@@ -853,7 +995,25 @@ mod tests {
 
     fn build(rec: &Recording, edit: &Edit, events: &[InputEvent], items: &[Item]) -> (ProjectFile, Vec<Blob>) {
         let snap = Snapshot { rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit, events, items };
-        to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES)
+        let (file, blobs, dropped) = to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES);
+        assert_eq!(dropped, Vec::<String>::new());
+        (file, blobs)
+    }
+
+    fn saved(entry: &ItemEntry) -> &SavedItem {
+        match entry {
+            ItemEntry::Item(item) => item,
+            ItemEntry::Unreadable(value) => panic!("not an item: {value}"),
+        }
+    }
+
+    fn image_item(id: u64, image: ImageData) -> Item {
+        Item { id, shape: Shape::Image { rect: b(0.0, 0.0, 2.0, 2.0), image }, style: Style::default(), frames: None, pin: None }
+    }
+
+    /// A 2 x 2 picture of one colour.
+    fn plain(colour: [u8; 4]) -> ImageData {
+        ImageData::from_rgba(&RgbaImage::from_pixel(2, 2, image::Rgba(colour)))
     }
 
     fn write_blobs(dir: &Path, blobs: &[Blob]) {
@@ -943,7 +1103,7 @@ mod tests {
         let (file, blobs) = build(&rec, &Edit::new(&rec, OverlayStyle::default()), &[], &items);
         assert_eq!(blobs.len(), 1);
         assert_eq!(file.items.len(), 3);
-        assert!(file.items.iter().all(|i| matches!(&i.shape, SavedShape::Image { picture, .. } if *picture == blobs[0].name)));
+        assert!(file.items.iter().all(|i| matches!(&saved(i).shape, SavedShape::Image { picture, .. } if *picture == blobs[0].name)));
     }
 
     /// The golden state as a file, with the two values that are not part of the format pinned.
@@ -998,7 +1158,6 @@ mod tests {
         // The right format with a field of the wrong shape.
         assert!(damaged(r#"{"format": 1, "items": 5}"#));
         assert!(damaged(r#"{"format": 1, "edit": {"deleted": [-1]}}"#));
-        assert!(damaged(r#"{"format": 1, "items": [{"shape": {"kind": "rect"}}]}"#));
         // Cut off anywhere, the golden file is damaged, never newer and never a panic.
         let golden = GOLDEN.replace("\r\n", "\n");
         let whole = golden.trim_end();
@@ -1008,6 +1167,12 @@ mod tests {
         assert!(parse(whole).is_ok());
         // A byte order mark in front, as some editors leave one, is not damage.
         assert!(parse(&format!("\u{feff}{whole}")).is_ok());
+        // Longer than a project file may be: refused before it is read as JSON.
+        let mut long = whole.to_string();
+        long.push_str(&" ".repeat(MAX_PROJECT_JSON_BYTES + 1 - whole.len()));
+        assert_eq!(long.len(), MAX_PROJECT_JSON_BYTES + 1);
+        assert!(damaged(&long));
+        assert!(parse(&long[..MAX_PROJECT_JSON_BYTES]).is_ok());
     }
 
     #[test]
@@ -1070,7 +1235,7 @@ mod tests {
         assert_eq!(kept, vec![(Some((1, 4)), None), (Some((3, 4)), None), (None, Some(4)), (None, None), (None, None)]);
         assert_eq!(back.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
         assert_eq!(back.items[3].shape, Shape::Rect(b(0.0, 2.0, 3.0, 4.0)));
-        assert_eq!((back.items[3].style.width, back.items[3].style.font_size), (Style::default().width, 1.0));
+        assert_eq!((back.items[3].style.width, back.items[3].style.font_size), (Style::default().width, 4.0));
         assert_eq!(back.items[4].shape, Shape::Spotlight { rect: b(1.0, 2.0, 3.0, 4.0), dim: MAX_DIM });
         assert_eq!(back.dropped.len(), 2);
 
@@ -1109,11 +1274,11 @@ mod tests {
         assert_eq!(back.events, mouse_only(&events));
 
         // A picture file that is not a picture, and a kind of shape this build does not know.
-        let picture = file.items.iter().find_map(|i| match &i.shape { SavedShape::Image { picture, .. } => Some(picture.clone()), _ => None }).unwrap();
+        let picture = file.items.iter().find_map(|i| match &saved(i).shape { SavedShape::Image { picture, .. } => Some(picture.clone()), _ => None }).unwrap();
         write_blobs(project.path(), &[Blob { name: picture, bytes: b"not a png".to_vec() }]);
         let mut odd = file.clone();
         odd.edit.tour_doc.logo = None;
-        odd.items.push(SavedItem::default());
+        odd.items.push(ItemEntry::Item(SavedItem::default()));
         let back = from_file(odd, project.path(), &rec);
         assert_eq!(back.items.len(), without.len());
         assert_eq!(back.dropped.len(), 2);
@@ -1131,19 +1296,200 @@ mod tests {
         std::fs::create_dir_all(project.join("pictures")).unwrap();
         // Real files, outside the project folder and inside it under names the format never writes.
         let real = png(&picture()).unwrap();
-        for name in ["secret.png", "project/other.png", "project/pictures/short.png", "project/logo.png"] {
+        let hash = hash16(&real);
+        let (good_picture, good_logo) = (format!("pictures/{hash}.png"), format!("logo-{hash}.png"));
+        for name in ["secret.png", "project/other.png", "project/pictures/short.png", "project/logo.png", &format!("project/{good_picture}"), &format!("project/{good_logo}")] {
             std::fs::write(outer.path().join(name), &real).unwrap();
         }
+        // The two names the format does write are read.
+        let mut file = parse(r#"{"format": 1}"#).unwrap();
+        file.edit.tour_doc.logo = Some(good_logo.clone());
+        file.items.push(ItemEntry::Item(SavedItem { shape: SavedShape::Image { rect: [0.0, 0.0, 2.0, 2.0], picture: good_picture.clone() }, ..SavedItem::default() }));
+        let back = from_file(file, &project, &rec);
+        assert_eq!((back.edit.tour_doc.logo_path, back.items.len(), back.dropped.len()), (Some(project.join(&good_logo)), 1, 0));
+        // Other spellings that Windows would open as those same files, or as a file elsewhere.
+        let upper = hash.to_ascii_uppercase();
+        let spellings = [
+            format!("pictures\\{hash}.png"), format!("pictures/{upper}.png"), format!("pictures/{hash}.PNG"), format!("pictures/{hash}.png::$DATA"), format!("pictures/{hash}.png."), format!("pictures/{hash}.png "),
+            format!("pictures/./{hash}.png"), format!("pictures//{hash}.png"), format!(".\\{good_logo}"), format!("logo-{upper}.png"), format!("logo-{hash}.PNG"), format!("logo-{hash}.png::$DATA"), format!("logo-{hash}.png."), format!("logo-{hash}.png "),
+            "..\\secret.png".to_string(), "pictures\\..\\..\\secret.png".to_string(), "C:secret.png".to_string(), "\\secret.png".to_string(),
+        ];
         let outside = outer.path().join("secret.png").display().to_string().replace('\\', "/");
-        for name in ["../secret.png", "pictures/../../secret.png", "other.png", "pictures/short.png", "logo.png", outside.as_str(), ""] {
+        for name in ["../secret.png", "pictures/../../secret.png", "other.png", "pictures/short.png", "logo.png", outside.as_str(), ""].into_iter().chain(spellings.iter().map(String::as_str)) {
             let mut file = parse(r#"{"format": 1}"#).unwrap();
             file.edit.tour_doc.logo = Some(name.to_string());
-            file.items.push(SavedItem { shape: SavedShape::Image { rect: [0.0, 0.0, 2.0, 2.0], picture: name.to_string() }, ..SavedItem::default() });
+            file.items.push(ItemEntry::Item(SavedItem { shape: SavedShape::Image { rect: [0.0, 0.0, 2.0, 2.0], picture: name.to_string() }, ..SavedItem::default() }));
             let back = from_file(file, &project, &rec);
             assert_eq!(back.edit.tour_doc.logo_path, None, "{name:?}");
             assert!(back.items.is_empty(), "{name:?}");
             assert_eq!(back.dropped.len(), 2, "{name:?}");
         }
+    }
+
+    #[test]
+    fn an_item_far_outside_the_frame_is_left_out_and_a_huge_font_or_line_is_cut() {
+        let rec = rec();
+        let project = tempfile::tempdir().unwrap();
+        let text = r#"{"format": 1, "items": [
+            {"shape": {"kind": "rect", "rect": [-50, -50, 150, 130]}},
+            {"shape": {"kind": "rect", "rect": [0, 0, 1000000, 10]}},
+            {"shape": {"kind": "line", "from": [0, 0], "to": [0, -900000]}},
+            {"shape": {"kind": "freehand", "points": [[1, 1], [1e9, 5]]}},
+            {"shape": {"kind": "spotlight", "rect": [-1e7, -1e7, 1e7, 1e7], "dim": 50}},
+            {"shape": {"kind": "bubble", "rect": [10, 10, 50, 40], "tail": [5e6, 20], "text": "x"}},
+            {"shape": {"kind": "text", "at": [10, 10], "text": "Hi"}, "style": {"font_size": 100000}},
+            {"shape": {"kind": "step", "center": [20, 20], "number": 1}, "style": {"font_size": 0.001, "width": 1e9}}
+        ]}"#;
+        let back = from_file(parse(text).unwrap(), project.path(), &rec);
+        assert_eq!(back.items.len(), 3);
+        assert_eq!(back.items[0].shape, Shape::Rect(b(-50.0, -50.0, 150.0, 130.0)));
+        assert_eq!(back.items[1].style.font_size, 200.0);
+        assert_eq!((back.items[2].style.font_size, back.items[2].style.width), (4.0, 200.0));
+        assert_eq!(back.dropped, vec!["an annotation far outside the picture".to_string(); 5]);
+        // Whatever is kept lies within one frame size, or 1024 pixels, of the frame.
+        for item in &back.items {
+            let n = item.bounds().norm();
+            assert!(n.x0 >= -1024.0 && n.y0 >= -1024.0 && n.x1 <= 1124.0 && n.y1 <= 1104.0, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn a_crop_is_cut_to_the_frame_and_one_outside_it_is_no_crop() {
+        let rec = rec();
+        let project = tempfile::tempdir().unwrap();
+        let crop = |c: &str| from_file(parse(&format!(r#"{{"format": 1, "edit": {{"crop": {c}}}}}"#)).unwrap(), project.path(), &rec).edit.crop;
+        assert_eq!(crop("[10, 5, 90, 70]"), Some(b(10.0, 5.0, 90.0, 70.0)));
+        assert_eq!(crop("[-20, -10, 50, 40]"), Some(b(0.0, 0.0, 50.0, 40.0)));
+        assert_eq!(crop("[90, 70, 300, 300]"), Some(b(90.0, 70.0, 100.0, 80.0)));
+        assert_eq!(crop("[50, 40, 10, 5]"), Some(b(10.0, 5.0, 50.0, 40.0)));
+        // Less than a pixel of the frame, or none of it.
+        assert_eq!(crop("[99.5, 0, 200, 50]"), None);
+        assert_eq!(crop("[0, 79.5, 50, 500]"), None);
+        assert_eq!(crop("[150, 10, 200, 50]"), None);
+        assert_eq!(crop("[-50, -50, -10, -10]"), None);
+        assert_eq!(crop("[30, 30, 30, 30]"), None);
+        assert_eq!(crop("null"), None);
+    }
+
+    #[test]
+    fn an_overlay_word_this_build_does_not_know_is_the_default() {
+        let rec = rec();
+        let project = tempfile::tempdir().unwrap();
+        let text = r#"{"format": 1, "edit": {"speed": 2.0, "overlays": {"keys": "hologram", "clicks": "both", "halo": true}}}"#;
+        let back = from_file(parse(text).unwrap(), project.path(), &rec);
+        assert_eq!(back.edit.overlays, OverlayStyle { keys: KeyStyle::Off, clicks: ClickStyle::Both, halo: true, pointer: true });
+        assert_eq!(back.edit.speed, 2.0);
+        let text = r#"{"format": 1, "edit": {"overlays": {"keys": "keyboard", "clicks": "sparkle", "pointer": false}}}"#;
+        let back = from_file(parse(text).unwrap(), project.path(), &rec);
+        assert_eq!(back.edit.overlays, OverlayStyle { keys: KeyStyle::Keyboard, clicks: ClickStyle::Ripple, halo: false, pointer: false });
+    }
+
+    #[test]
+    fn an_item_with_a_field_of_the_wrong_shape_costs_only_that_item() {
+        let rec = rec();
+        let project = tempfile::tempdir().unwrap();
+        let text = r#"{"format": 1, "title": "Kept", "items": [
+            {"shape": {"kind": "rect"}},
+            {"shape": {"kind": "rect", "rect": [1, 2, 3, 4]}, "frames": "all"},
+            {"shape": {"kind": "rect", "rect": [1, 2, 3, 4]}, "style": {"stroke": [1, 2, 3]}},
+            {"shape": {"kind": "step", "center": [5, 6], "number": -1}},
+            7, "x", null,
+            {"shape": {"kind": "circle", "rect": [0, 0, 5, 5]}, "pin": 2}
+        ]}"#;
+        let back = from_file(parse(text).unwrap(), project.path(), &rec);
+        assert_eq!(back.title, "Kept");
+        assert_eq!(back.items, vec![Item { id: 1, shape: Shape::Circle(b(0.0, 0.0, 5.0, 5.0)), style: Style::default(), frames: None, pin: Some(2) }]);
+        assert_eq!(back.dropped, vec!["an annotation that could not be read".to_string(); 7]);
+    }
+
+    #[test]
+    fn pictures_past_the_pixel_budget_are_left_out() {
+        let rec = rec();
+        let first = plain([10, 20, 30, 255]);
+        // Two items share the first picture; the second and third are pictures of their own.
+        let items = vec![image_item(1, first.clone()), image_item(2, first), image_item(3, plain([40, 50, 60, 255])), image_item(4, plain([70, 80, 90, 255]))];
+        let (file, blobs) = build(&rec, &Edit::new(&rec, OverlayStyle::default()), &[], &items);
+        assert_eq!(blobs.len(), 3);
+        let project = tempfile::tempdir().unwrap();
+        write_blobs(project.path(), &blobs);
+        let open = |picture_pixels, total_pixels| from_file_within(file.clone(), project.path(), &rec, Limits { picture_pixels, total_pixels });
+        // Room for all three pictures of four pixels each.
+        let back = open(4, 12);
+        assert_eq!((back.items.len(), back.dropped.len()), (4, 0));
+        // Room for two: the shared picture counts once, the last one is left out.
+        let back = open(4, 11);
+        assert_eq!(back.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(back.dropped, vec!["a pasted picture".to_string()]);
+        let back = open(4, 7);
+        assert_eq!((back.items.len(), back.dropped), (2, vec!["a pasted picture".to_string(); 2]));
+        // Each picture is larger than one picture may be.
+        let back = open(3, 1000);
+        assert_eq!((back.items.len(), back.dropped.len()), (0, 4));
+        // The real limits take them all.
+        assert_eq!(from_file(file.clone(), project.path(), &rec).items.len(), 4);
+    }
+
+    #[test]
+    fn two_different_files_never_share_a_name() {
+        // A hash whose first 16 characters are the same for every file.
+        fn colliding(bytes: &[u8], chars: usize) -> String {
+            if chars == 16 { "0123456789abcdef".to_string() } else { hex_hash(bytes, chars) }
+        }
+        let mut blobs = Blobs { hash: colliding, ..Blobs::default() };
+        let (one, two) = (plain([1, 2, 3, 255]), plain([4, 5, 6, 255]));
+        let first = blobs.picture(&one).unwrap();
+        let second = blobs.picture(&two).unwrap();
+        // The same pixels again, as a picture of its own, take the name they already have.
+        let again = blobs.picture(&plain([4, 5, 6, 255])).unwrap();
+        assert_eq!(first, "pictures/0123456789abcdef.png");
+        assert_eq!(second, format!("pictures/{}.png", hex_hash(&png(&two).unwrap(), 32)));
+        assert_eq!(again, second);
+        assert_eq!(blobs.list.len(), 2);
+        assert_eq!((&blobs.list[0].bytes, &blobs.list[1].bytes), (&png(&one).unwrap(), &png(&two).unwrap()));
+        assert!(is_picture_name(&first) && is_picture_name(&second));
+        assert!(blobs.dropped.is_empty());
+        // The longer name loads like any other.
+        let rec = rec();
+        let project = tempfile::tempdir().unwrap();
+        write_blobs(project.path(), &blobs.list);
+        let mut file = parse(r#"{"format": 1}"#).unwrap();
+        file.items.push(ItemEntry::Item(SavedItem { shape: SavedShape::Image { rect: [0.0, 0.0, 2.0, 2.0], picture: second }, ..SavedItem::default() }));
+        let back = from_file(file, project.path(), &rec);
+        assert!(matches!(&back.items[0].shape, Shape::Image { image, .. } if pixels(image) == pixels(&two)));
+        // A logo whose name is taken by other bytes gets the longer name too.
+        let mut blobs = Blobs { hash: colliding, ..Blobs::default() };
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.png"), dir.path().join("b.png"));
+        std::fs::write(&a, b"first logo").unwrap();
+        std::fs::write(&b, b"second logo").unwrap();
+        let (first, second) = (blobs.logo(&a).unwrap(), blobs.logo(&b).unwrap());
+        assert_eq!(first, "logo-0123456789abcdef.png");
+        assert_eq!(second, format!("logo-{}.png", hex_hash(b"second logo", 32)));
+        assert!(is_logo_name(&first) && is_logo_name(&second));
+    }
+
+    #[test]
+    fn a_logo_that_cannot_be_saved_is_named_and_costs_only_itself() {
+        let rec = rec();
+        let dir = tempfile::tempdir().unwrap();
+        let (items, events) = (items(), events());
+        let build = |logo: &Path| {
+            let edit = edit(&rec, Some(logo));
+            let snap = Snapshot { rec: &rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &events, items: &items };
+            to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES)
+        };
+        // A logo file that is gone.
+        let (file, blobs, dropped) = build(&dir.path().join("gone.png"));
+        assert_eq!(dropped, vec!["the cover logo".to_string()]);
+        assert_eq!(file.edit.tour_doc.logo, None);
+        assert_eq!((file.items.len(), blobs.len()), (19, 1));
+        assert!(file.edit.tour_doc.cover.is_some());
+        // A logo file larger than the export accepts is not copied.
+        let huge = dir.path().join("huge.png");
+        std::fs::File::create(&huge).unwrap().set_len(LOGO_MAX_FILE_BYTES + 1).unwrap();
+        let (file, blobs, dropped) = build(&huge);
+        assert_eq!(dropped, vec!["the cover logo".to_string()]);
+        assert_eq!((file.edit.tour_doc.logo, blobs.len()), (None, 1));
     }
 
     #[test]
