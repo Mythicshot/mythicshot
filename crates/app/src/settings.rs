@@ -80,9 +80,13 @@ pub struct Settings {
     /// and read as `OpenApp`.
     pub tray_left_click: TrayLeftClick,
     /// The site address the saved API credential was saved for; it is never sent to any other
-    /// address. An empty string means it is tied to none. No key at all is a file from before
-    /// this existed: the address configured then is adopted once, at the next start.
+    /// address. An empty string, or no key, means it is tied to none.
     pub publish_saved_for: Option<String>,
+    /// The one-time adoption for a file from before `publish_saved_for` existed has run: the
+    /// address configured at that start, if any, was recorded there. Set at the first start of
+    /// a version that knows it, whatever the credential store said, and never run again, so an
+    /// address typed later is never adopted without the user saying so.
+    pub publish_binding_settled: bool,
     /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
     /// says nothing is left, so the delete can be finished after a restart.
     pub unfinished_deletes: Vec<UnfinishedDelete>,
@@ -336,6 +340,7 @@ impl Default for Settings {
             publish_server: String::new(),
             tray_left_click: TrayLeftClick::default(),
             publish_saved_for: None,
+            publish_binding_settled: false,
             unfinished_deletes: Vec::new(),
             load_problem: None,
             open_editor: None,
@@ -343,6 +348,12 @@ impl Default for Settings {
             copy_to_clipboard: None,
         }
     }
+}
+
+/// One writer of the settings file at a time: the app's own save, and a background job's note.
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Settings {
@@ -454,12 +465,39 @@ impl Settings {
         self.save_to(&Self::path());
     }
 
+    /// Write `list` as the file's unfinished deletes, now, from whatever thread asks, leaving
+    /// every other value in the file as it is. For a note that must be on disk before a
+    /// request goes out. False when it could not be written.
+    pub fn save_unfinished_deletes(list: &[UnfinishedDelete]) -> bool {
+        Self::patch_unfinished_deletes(&Self::path(), list)
+    }
+
+    fn patch_unfinished_deletes(path: &std::path::Path, list: &[UnfinishedDelete]) -> bool {
+        let _writing = writing();
+        let mut table: toml::Table = match std::fs::read(path) {
+            // A file that is not TOML is not written over here; the app's own save decides about it.
+            Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| toml::from_str(text).ok()) {
+                Some(table) => table,
+                None => return false,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(_) => return false,
+        };
+        let Ok(value) = toml::Value::try_from(list.to_vec()) else { return false };
+        table.insert("unfinished_deletes".to_string(), value);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        toml::to_string_pretty(&table).is_ok_and(|text| std::fs::write(path, text).is_ok())
+    }
+
     /// Write the settings to `path`, unless the file there could not be read at start-up and no
     /// copy of it could be made: then it is never written over.
     fn save_to(&self, path: &std::path::Path) {
         if self.load_problem.as_ref().is_some_and(LoadProblem::keeps_file_untouched) {
             return;
         }
+        let _writing = writing();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -784,5 +822,37 @@ publish_server = \"https://tours.example.com\"
         assert_eq!(s.destinations(), &[DestId::File, DestId::Clipboard]);
         s.toggle_destination(DestId::Clipboard);
         assert_eq!(s.destinations(), &[DestId::File]);
+    }
+
+    #[test]
+    fn a_note_written_at_once_changes_only_the_unfinished_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let note = UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing \"quoted\" · café".into() };
+        // Into an existing file: every other value stays, a key of a newer version included.
+        let mut s = Settings { publish_server: "https://tours.example.com".into(), publish_saved_for: Some("https://tours.example.com".into()), publish_binding_settled: true, ..Settings::default() };
+        s.hotkeys.insert(Action::CaptureWindow, "alt+KeyW".into());
+        std::fs::write(&path, format!("from_a_newer_version = 7
+{}", toml::to_string_pretty(&s).unwrap())).unwrap();
+        assert!(Settings::patch_unfinished_deletes(&path, std::slice::from_ref(&note)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("from_a_newer_version = 7") && !text.contains("dp_"), "{text}");
+        let read = load_at(&path);
+        assert!(read.load_problem.is_none());
+        assert_eq!(read.unfinished_deletes, [note.clone()]);
+        assert_eq!((read.publish_server.as_str(), read.publish_saved_for.as_deref(), read.publish_binding_settled, read.binding(Action::CaptureWindow)), ("https://tours.example.com", Some("https://tours.example.com"), true, "alt+KeyW"));
+        // The app's own save afterwards, and an emptied list.
+        read.save_to(&path);
+        assert_eq!(load_at(&path).unfinished_deletes, [note.clone()]);
+        assert!(Settings::patch_unfinished_deletes(&path, &[]));
+        assert!(load_at(&path).unfinished_deletes.is_empty());
+        // No file yet: the note is still on disk before the request.
+        let fresh = tmp.path().join("new").join("settings.toml");
+        assert!(Settings::patch_unfinished_deletes(&fresh, std::slice::from_ref(&note)));
+        assert_eq!(load_at(&fresh).unfinished_deletes, [note.clone()]);
+        // A file that is not TOML is left exactly as it is.
+        std::fs::write(&path, "not = [toml").unwrap();
+        assert!(!Settings::patch_unfinished_deletes(&path, &[note]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not = [toml");
     }
 }

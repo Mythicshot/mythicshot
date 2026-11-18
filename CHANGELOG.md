@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.4 (2026-11-18)
+
+- A delete is noted before it starts, so a lost answer from the site can no longer leave a tour's files behind unnoticed.
+- The one-time step that ties an existing token to its site runs exactly once and never picks up an address typed later.
+- The button that moves a token to a new address now says "Use it for this address instead".
+
 ## 0.2.3 (2026-11-18)
 
 - Tours page: see the tours on your site with their status, and copy the link, open, publish, unpublish, rename or delete each one. Delete asks first.

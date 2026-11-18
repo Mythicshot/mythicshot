@@ -144,9 +144,10 @@ pub fn footer(tours: usize) -> String {
     format!("{} in this workspace", count(tours as u64, "tour", "tours"))
 }
 
-/// What the block for an unfinished delete says.
+/// What the block for an unfinished delete says. True also when the answer was lost and the
+/// site in fact removed everything, or nothing: "Finish deleting" finds out either way.
 pub fn unfinished_sentence(title: &str) -> String {
-    format!("Deleting \"{}\" did not finish. Its remaining files are still on the site.", publish_ui::short_title(title, 60))
+    format!("Deleting \"{}\" did not finish. Some of its files may still be on the site.", publish_ui::short_title(title, 60))
 }
 
 /// What a job on a tour is doing.
@@ -664,19 +665,25 @@ impl Model {
 
 // ---- Deletes that did not finish ----
 
-/// The deletes that removed a tour but not yet all of its files. One list, shared by the
-/// page, its jobs and the app: a job writes into it the moment it knows, and the app
-/// copies every change into the settings file, from where it is read back at start-up.
-/// Entries of other sites than the configured one are kept, and shown when that site is
-/// configured again.
+/// The deletes that were sent and are not known to be complete: the site may have removed
+/// the tour but not yet all of its files. One list, shared by the page, its jobs and the
+/// app. A job notes its delete here, and on disk, before the first request goes out, so no
+/// lost answer and no crash can leave files on the site with nothing pointing at them; the
+/// note goes when the site says nothing is left, or that it never began. The app copies
+/// every change into the settings file, from where it is read back at start-up. Entries of
+/// other sites than the configured one are kept, and shown when that site is configured again.
 #[derive(Clone, Default)]
 pub struct Unfinished(Arc<Mutex<UnfinishedList>>);
+
+/// Writes the list to the settings file at once; false when it could not.
+type SaveNow = Arc<dyn Fn(&[UnfinishedDelete]) -> bool + Send + Sync>;
 
 #[derive(Default)]
 struct UnfinishedList {
     list: Vec<UnfinishedDelete>,
-    /// The settings file does not hold this list yet.
+    /// The app's copy of the settings does not hold this list yet.
     changed: bool,
+    save_now: Option<SaveNow>,
 }
 
 impl Unfinished {
@@ -691,20 +698,41 @@ impl Unfinished {
         l.changed = false;
     }
 
-    /// Note that the delete of this tour on `server` (an address as the address rule writes it) is unfinished.
-    pub fn add(&self, server: &str, tour_id: &str, title: &str) {
+    /// How a note gets to the settings file before its request is sent. Set once by the app.
+    pub fn save_with(&self, save_now: impl Fn(&[UnfinishedDelete]) -> bool + Send + Sync + 'static) {
+        self.lock().save_now = Some(Arc::new(save_now));
+    }
+
+    /// Note that a delete of this tour on `server` (an address as the address rule writes it)
+    /// is about to be sent, and write the note to the settings file before returning. False
+    /// when the tour was noted already: by an earlier delete that did not finish.
+    pub fn add(&self, server: &str, tour_id: &str, title: &str) -> bool {
         let mut l = self.lock();
         if l.list.iter().any(|e| e.server == server && e.tour_id == tour_id) {
-            return;
+            return false;
         }
         let title = if title.trim().is_empty() { "Untitled tour".to_string() } else { title.chars().take(TITLE_MAX).collect() };
         l.list.push(UnfinishedDelete { server: server.to_string(), tour_id: tour_id.to_string(), title });
         let extra = l.list.len().saturating_sub(MAX_UNFINISHED);
         l.list.drain(..extra);
+        // The app's copy still has to learn of it, or its next save would take the note away again.
         l.changed = true;
+        // Written while the list is held, so the app's own save cannot come between with an older list.
+        if let Some(save) = l.save_now.clone() {
+            save(&l.list);
+        }
+        true
     }
 
-    /// The site said nothing of this tour is left.
+    /// With the list held still: `write` gets the list if the app's copy does not have it
+    /// yet, and writes the settings file. No note can be added, or written, half-way through.
+    pub fn settle<R>(&self, write: impl FnOnce(Option<Vec<UnfinishedDelete>>) -> R) -> R {
+        let mut l = self.lock();
+        let list = std::mem::take(&mut l.changed).then(|| l.list.clone());
+        write(list)
+    }
+
+    /// The site said nothing of this tour is left, or that it never began to delete it.
     pub fn remove(&self, server: &str, tour_id: &str) {
         let mut l = self.lock();
         let before = l.list.len();
@@ -718,9 +746,9 @@ impl Unfinished {
     }
 
     /// The whole list, once, when it changed since the last call: what the settings file should hold now.
+    #[cfg(test)]
     pub fn take_changed(&self) -> Option<Vec<UnfinishedDelete>> {
-        let mut l = self.lock();
-        std::mem::take(&mut l.changed).then(|| l.list.clone())
+        self.settle(|list| list)
     }
 
     pub fn is_changed(&self) -> bool {
@@ -785,9 +813,13 @@ impl Drop for JobGuard {
     }
 }
 
-/// Do the job's requests. A delete is noted as unfinished from the moment the site has
-/// begun it, and the note goes when the site says nothing is left (a tour that is already
-/// gone included). Any other end leaves the note: files may still be there.
+/// Do the job's requests. A delete is noted, in the settings file too, before its first
+/// request is sent: the answer to that request can be lost after the site has removed the
+/// tour. The note goes when the site says nothing is left (a tour that is already gone
+/// included), or when it clearly refused before beginning (a publish in progress, a
+/// rejected token, a site too old to delete), unless the note is an earlier delete's. Any
+/// other end (no answer, a server error, an answer that makes no sense) leaves the note:
+/// files may be there.
 fn run_job(model: &Mutex<Model>, token: &TokenSource, unfinished: &Unfinished, started: &Started) -> Result<Done, Failure> {
     let (server, id) = (started.site.server.as_str(), started.id.as_str());
     let token = token(server).map_err(Failure::Message)?;
@@ -801,25 +833,20 @@ fn run_job(model: &Mutex<Model>, token: &TokenSource, unfinished: &Unfinished, s
         .map(|live| Done::Published(live.url))
         .map_err(failure),
         Job::Delete => {
-            let mut reports = 0u32;
-            let result = publish::delete_tour(server, &token, id, |files| {
-                // The second report: the site answered that the delete is under way.
-                reports += 1;
-                if reports == 2 {
-                    unfinished.add(server, id, &started.title);
-                }
-                lock(model).progress(id, Work::Deleting(files));
-            });
+            let noted_here = unfinished.add(server, id, &started.title);
+            let result = publish::delete_tour(server, &token, id, |files| lock(model).progress(id, Work::Deleting(files)));
             match result {
                 Ok(()) => {
                     unfinished.remove(server, id);
                     Ok(Done::Deleted)
                 }
-                Err(f) if f.unfinished => {
-                    unfinished.add(server, id, &started.title);
-                    Err(Failure::DeleteUnfinished(f.message))
+                Err(f) if f.unfinished => Err(Failure::DeleteUnfinished(f.message)),
+                Err(f) => {
+                    if f.not_started && noted_here {
+                        unfinished.remove(server, id);
+                    }
+                    Err(Failure::Message(f.message))
                 }
-                Err(f) => Err(Failure::Message(f.message)),
             }
         }
     }
@@ -1671,7 +1698,7 @@ mod tests {
         // A settings file from before this existed has none.
         let old: crate::settings::Settings = toml::from_str("publish_server = \"https://tours.example.com\"\n").unwrap();
         assert!(old.unfinished_deletes.is_empty() && old.publish_saved_for.is_none());
-        assert_eq!(unfinished_sentence("Testing"), "Deleting \"Testing\" did not finish. Its remaining files are still on the site.");
+        assert_eq!(unfinished_sentence("Testing"), "Deleting \"Testing\" did not finish. Some of its files may still be on the site.");
     }
 
     #[test]
@@ -1944,7 +1971,7 @@ mod tests {
             m.confirm_delete(B).unwrap()
         };
         state.spawn_job(job);
-        // It is written down while the job still runs: from the site's first "in progress".
+        // It is written down while the job still runs: before its first request.
         let deadline = Instant::now() + Duration::from_secs(20);
         while store.for_site(&s.base).is_empty() {
             assert!(Instant::now() < deadline, "the delete was never noted");
@@ -2010,19 +2037,185 @@ mod tests {
         assert_eq!(store.take_changed(), Some(vec![UnfinishedDelete { server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() }]));
     }
 
-    #[test]
-    fn a_delete_that_fails_before_the_site_began_is_not_written_down() {
-        let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(409, r#"{"error":"publish_busy"}"#) });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
-        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+    const DELETE_B: &str = "DELETE /api/v1/tours/tour_bbbbbbbbbbbbbbbbbbbbbbbb";
+    const DELETED: &str = r#"{"deleted":true}"#;
+
+    /// The settings file, as far as the notes go: what a job's write-at-once put there.
+    type File = Arc<Mutex<Vec<UnfinishedDelete>>>;
+
+    fn written_to(store: &Unfinished) -> File {
+        let file = File::default();
+        let disk = file.clone();
+        store.save_with(move |list| {
+            *disk.lock().unwrap() = list.to_vec();
+            true
+        });
+        file
+    }
+
+    /// A site stub for one delete of B: `first` answers the first DELETE, `later` the ones after
+    /// it (by how many came before). The list has B until `gone_after` list requests were answered.
+    /// Also returned: what the settings file held each time a DELETE arrived.
+    fn delete_stub(file: &File, gone_after: usize, first: fn() -> Answer, later: fn(usize) -> Answer) -> (Stub, Arc<Mutex<Vec<Vec<UnfinishedDelete>>>>) {
+        let at_request: Arc<Mutex<Vec<Vec<UnfinishedDelete>>>> = Arc::default();
+        let (file, seen) = (file.clone(), at_request.clone());
+        let s = stub(move |req, n| match req.line.as_str() {
+            "GET /api/v1/tours" => reply(200, if n < gone_after { LIST } else { ONLY_A }),
+            DELETE_B => {
+                seen.lock().unwrap().push(file.lock().unwrap().clone());
+                if n == 0 { first() } else { later(n) }
+            }
+            _ => reply(500, r#"{"error":"unexpected"}"#),
+        });
+        (s, at_request)
+    }
+
+    /// Press "Delete tour" on B's confirmation and wait for the job, and the list read after it, to end.
+    fn delete_b(ctx: &egui::Context, state: &mut ToursState, conn: &Conn) -> String {
         let job = {
             let mut m = lock(&state.model);
             m.ask_delete(B);
             m.confirm_delete(B).unwrap()
         };
         state.spawn_job(job);
-        until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && m.error(B).is_some());
-        assert!(state.unfinished().for_site(&s.base).is_empty() && !state.unfinished().is_changed());
+        until(ctx, state, conn, |m, _| m.work(B).is_none() && !m.is_loading() && !m.wants_load(Instant::now()))
+    }
+
+    #[test]
+    fn a_delete_whose_first_answer_is_lost_is_on_disk_before_the_request_and_is_finished_after_a_restart() {
+        // The site removes the tour, but its answer never arrives. Its files are still being cleared.
+        let (ctx, mut state) = (egui::Context::default(), page());
+        let store = state.unfinished();
+        let file = written_to(&store);
+        let (s, at_request) = delete_stub(&file, 1, || Answer::Drop, |n| if n < 3 { reply(202, r#"{"status":"in_progress","done":5,"total":10}"#) } else { reply(200, DELETED) });
+        let conn = stub_conn(&s);
+        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+        assert!(file.lock().unwrap().is_empty());
+        let text = delete_b(&ctx, &mut state, &conn);
+        let note = entry(&s.base, B, "Testing");
+        // The note was in the settings file when the request arrived, not a frame later.
+        assert_eq!(*at_request.lock().unwrap(), [vec![note.clone()]]);
+        assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 1, "a lost answer is not sent again by itself");
+        // Nothing said the delete began, yet the note stays: the tour is out of the list, and its block is there.
+        assert_eq!(store.for_site(&s.base), [note.clone()]);
+        assert_eq!(lock(&state.model).tours().len(), 1);
+        let sentence = unfinished_sentence("Testing");
+        assert!(text.replace('\n', " ").contains(&sentence) && has_line(&text, FINISH_DELETING), "{text}");
+
+        // The app is closed and started again: the note comes back from the file.
+        let mut settings = crate::settings::Settings::default();
+        settings.unfinished_deletes = file.lock().unwrap().clone();
+        let read: crate::settings::Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        drop(state);
+        let mut state = page();
+        let store = state.unfinished();
+        store.load(read.unfinished_deletes);
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        assert!(text.replace('\n', " ").contains(&sentence) && has_line(&text, FINISH_DELETING), "after a restart:\n{text}");
+        let job = lock(&state.model).finish_delete(&note).unwrap();
+        state.spawn_job(job);
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading());
+        assert!(!text.contains("did not finish") && !has_line(&text, FINISH_DELETING), "{text}");
+        assert!(store.for_site(&s.base).is_empty());
+        assert_eq!(store.take_changed(), Some(vec![]), "the settings file is told to forget it");
+    }
+
+    #[test]
+    fn a_clear_refusal_before_the_site_began_takes_the_note_away_again() {
+        let refusals: [fn() -> Answer; 4] = [
+            || reply(409, r#"{"error":"publish_busy","detail":"a publish of this tour is in progress; wait"}"#),
+            || reply(401, r#"{"error":"unauthorized"}"#),
+            || reply(404, r#"{"error":"not_found"}"#),
+            || reply(405, ""),
+        ];
+        for (i, refusal) in refusals.into_iter().enumerate() {
+            let (ctx, mut state) = (egui::Context::default(), page());
+            let store = state.unfinished();
+            let file = written_to(&store);
+            let (s, at_request) = delete_stub(&file, usize::MAX, refusal, |_| reply(500, r#"{"error":"unexpected"}"#));
+            let conn = stub_conn(&s);
+            until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+            let text = delete_b(&ctx, &mut state, &conn);
+            // It was noted before the request all the same.
+            assert_eq!(*at_request.lock().unwrap(), [vec![entry(&s.base, B, "Testing")]], "refusal {i}");
+            // The tour is as it was, the user is told as before, and nothing is left to finish.
+            let m = lock(&state.model);
+            assert!(m.tours().len() == 2 && m.error(B).is_some_and(|e| e.starts_with("Could not delete the tour: ") || e == "The server rejected the API token."), "refusal {i}: {:?}", m.error(B));
+            drop(m);
+            assert!(!text.contains("did not finish") && !has_line(&text, FINISH_DELETING), "refusal {i}:\n{text}");
+            assert!(store.for_site(&s.base).is_empty(), "refusal {i}");
+            assert_eq!(store.take_changed(), Some(vec![]), "refusal {i}: the settings file is told to forget it");
+        }
+    }
+
+    #[test]
+    fn a_delete_that_succeeds_at_once_was_noted_first_and_leaves_no_note() {
+        let (ctx, mut state) = (egui::Context::default(), page());
+        let store = state.unfinished();
+        let file = written_to(&store);
+        let (s, at_request) = delete_stub(&file, 1, || reply(200, DELETED), |_| reply(404, NO_TOUR));
+        let conn = stub_conn(&s);
+        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+        let text = delete_b(&ctx, &mut state, &conn);
+        assert_eq!(*at_request.lock().unwrap(), [vec![entry(&s.base, B, "Testing")]]);
+        assert!(lock(&state.model).tours().len() == 1 && !text.contains("did not finish"), "{text}");
+        assert!(store.for_site(&s.base).is_empty());
+        assert_eq!(store.take_changed(), Some(vec![]));
+    }
+
+    #[test]
+    fn an_answer_that_says_nothing_either_way_keeps_the_note_and_deleting_again_clears_it() {
+        let unclear: [fn() -> Answer; 5] = [
+            || Answer::Drop,
+            || reply(500, r#"{"error":"internal"}"#),
+            || reply(503, ""),
+            || reply(429, r#"{"error":"rate_limited"}"#),
+            || reply(200, "<html>Sign in</html>"),
+        ];
+        for (i, answer) in unclear.into_iter().enumerate() {
+            // The site in fact never began: the tour is still there, whole.
+            let (ctx, mut state) = (egui::Context::default(), page());
+            let store = state.unfinished();
+            let file = written_to(&store);
+            let (s, _) = delete_stub(&file, 2, answer, |_| reply(200, DELETED));
+            let conn = stub_conn(&s);
+            until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+            let text = delete_b(&ctx, &mut state, &conn);
+            let note = entry(&s.base, B, "Testing");
+            assert_eq!(store.for_site(&s.base), [note.clone()], "answer {i}");
+            assert_eq!(*file.lock().unwrap(), [note.clone()], "answer {i}");
+            // While the tour is in the list its row speaks for it: the error, and no block claiming files are left.
+            let mut m = lock(&state.model);
+            assert!(m.tours().len() == 2 && m.error(B).is_some() && !m.shows_unfinished(&note), "answer {i}");
+            assert_eq!(m.finish_delete(&note), None, "answer {i}: a tour in the list is deleted from its row");
+            drop(m);
+            assert!(!text.contains("did not finish") && !has_line(&text, FINISH_DELETING), "answer {i}:\n{text}");
+            // Deleting it again simply deletes it, and the note goes with it.
+            delete_b(&ctx, &mut state, &conn);
+            assert!(lock(&state.model).tours().len() == 1 && store.for_site(&s.base).is_empty(), "answer {i}");
+            assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 2, "answer {i}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_of_finish_deleting_keeps_the_earlier_note() {
+        let (ctx, mut state) = (egui::Context::default(), page());
+        let store = state.unfinished();
+        let file = written_to(&store);
+        let (s, _) = delete_stub(&file, 0, || reply(401, r#"{"error":"unauthorized"}"#), |_| reply(409, r#"{"error":"publish_busy"}"#));
+        let conn = stub_conn(&s);
+        let note = entry(&s.base, B, "Testing");
+        store.load(vec![note.clone()]);
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        for _ in 0..2 {
+            let job = lock(&state.model).finish_delete(&note).unwrap();
+            state.spawn_job(job);
+            let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading() && m.notice().is_some());
+            // The files of the earlier delete are still there: the note is not this job's to take away.
+            assert_eq!(store.for_site(&s.base), [note.clone()]);
+            assert!(text.replace('\n', " ").contains(&unfinished_sentence("Testing")) && has_line(&text, FINISH_DELETING), "{text}");
+        }
+        assert!(!store.is_changed() && file.lock().unwrap().is_empty(), "nothing new to write");
     }
 
     #[test]

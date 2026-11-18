@@ -466,8 +466,8 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 (p.bind)(publish::check_server(&effective).ok());
                 p.clear_message();
             }
-            ui.label(RichText::new("Or replace the token above.").color(MUTED).size(12.0));
         });
+        ui.add(egui::Label::new(RichText::new(publish_ui::USE_IT_HERE_MEANS).color(MUTED).size(12.0)).wrap());
     }
 
     ui.add_space(12.0);
@@ -915,6 +915,9 @@ mod tests {
         let flat = text.replace('\n', " ");
         assert!(has_line(&text, NOT_CONNECTED) && flat.contains("The saved token belongs to ") && flat.contains("so it is not sent to this address."), "{text}");
         assert!(has_line(&text, publish_ui::USE_IT_HERE) && has_line(&text, "Replace") && !has_line(&text, "Home") && !has_line(&text, PRESS_TEST), "{text}");
+        // The button says what it does: the token moves, it is not shared between the two addresses.
+        assert_eq!(publish_ui::USE_IT_HERE, "Use it for this address instead");
+        assert!(flat.contains("The token will then be used only for this address, and no longer for the one it was saved for.") && !flat.contains("address too"), "{text}");
         for _ in 0..5 {
             drawn(&ctx, &mut p, &mut server, &c(&bound));
         }
@@ -927,7 +930,7 @@ mod tests {
         let text = drawn(&ctx, &mut p, &mut server, &unbound).replace('\n', " ");
         assert!(text.contains("The saved token is not tied to a site address yet") && text.contains(publish_ui::USE_IT_HERE), "{text}");
         assert!(typo.lines().is_empty());
-        // "Use it for this address too": the tie moves, and only then is the site asked.
+        // "Use it for this address instead": the tie moves, and only then is the site asked.
         (p.bind)(publish::check_server(&server).ok());
         assert_eq!(bound.lock().unwrap().as_deref(), Some(typo.base.as_str()));
         let text = until(&ctx, &mut p, &mut server, &c(&bound), |t| has_line(t, CONNECTED));

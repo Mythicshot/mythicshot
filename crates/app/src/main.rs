@@ -143,7 +143,11 @@ impl App {
             }
         }));
 
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        // Once per install, and on disk before anything else can change the address.
+        if publish_ui::settle_first_binding(&mut settings) {
+            settings.save();
+        }
         publish_ui::init(&settings);
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
@@ -175,7 +179,13 @@ impl App {
         })));
         // Deletes a past run could not finish: the Tours page offers to carry them on.
         if let Ok(s) = window.lock() {
-            s.tours.unfinished().load(settings.unfinished_deletes.clone());
+            let unfinished = s.tours.unfinished();
+            unfinished.load(settings.unfinished_deletes.clone());
+            // A delete is noted in the file before its first request, on the job's own thread.
+            // A file that could not be read at start-up is never written over, here either.
+            if !settings.load_problem.as_ref().is_some_and(settings::LoadProblem::keeps_file_untouched) {
+                unfinished.save_with(Settings::save_unfinished_deletes);
+            }
         }
 
         let mut app = Self {
@@ -375,7 +385,7 @@ impl App {
         self.settings.magnifier = ov.magnifier;
         if let Outcome::Capture(rect) = outcome {
             self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
-            self.settings.save();
+            self.save_settings();
             // A window picked in the overlay keeps its title for the file name.
             let title = ov.desktop.windows.iter().find(|w| w.rect == rect).map(|w| w.title.clone()).unwrap_or_else(|| "Region".into());
             if ov.record {
@@ -701,7 +711,7 @@ impl App {
         }
         if self.prefs_save_at.is_some_and(|t| Instant::now() >= t) {
             self.prefs_save_at = None;
-            self.settings.save();
+            self.save_settings();
         }
     }
 
@@ -714,22 +724,33 @@ impl App {
     /// last look: a delete that did not finish (or one that now has), and the address the saved
     /// token belongs to. Neither is a secret, and neither is edited on the Preferences page.
     fn save_publish_state(&mut self) {
-        let unfinished = self.window.lock().map(|s| s.tours.unfinished()).ok().and_then(|u| u.take_changed());
-        let saved_for = publish_ui::take_token_site_change();
-        if unfinished.is_none() && saved_for.is_none() {
-            return;
+        let unfinished = self.window.lock().is_ok_and(|s| s.tours.unfinished().is_changed());
+        if unfinished || publish_ui::has_token_site_change() {
+            self.save_settings();
         }
-        if let Some(list) = unfinished {
-            self.settings.unfinished_deletes = list;
-        }
-        if let Some(site) = saved_for {
+    }
+
+    /// Every save of the settings file goes through here: what the background jobs noted is
+    /// taken in first, with their list held still, so a save can never write an older list
+    /// over a note a job has just put on disk.
+    fn save_settings(&mut self) {
+        if let Some(site) = publish_ui::take_token_site_change() {
             self.settings.publish_saved_for = Some(site);
         }
-        self.settings.save();
+        let unfinished = self.window.lock().map(|s| s.tours.unfinished()).ok();
+        match unfinished {
+            Some(unfinished) => unfinished.settle(|list| {
+                if let Some(list) = list {
+                    self.settings.unfinished_deletes = list;
+                }
+                self.settings.save();
+            }),
+            None => self.settings.save(),
+        }
     }
 
     fn settings_changed(&mut self) {
-        self.settings.save();
+        self.save_settings();
         publish_ui::set_server(&self.settings.publish_server);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
