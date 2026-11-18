@@ -484,11 +484,28 @@ impl Editor {
         }
     }
 
+    /// Whether closing asks first: for changes that are not saved, and for a recording that was
+    /// never exported. A recording opened from a saved project never asks: the question says
+    /// the recording is deleted, which would be untrue, and edits that were not sent to the
+    /// site are discarded.
+    fn asks_before_closing(&self) -> bool {
+        match &self.video {
+            Some(v) if v.origin.is_some() => false,
+            Some(v) => self.doc.dirty || !v.exported,
+            None => self.doc.dirty,
+        }
+    }
+
+    /// The status bar's message.
+    #[cfg(test)]
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status.as_ref().map(|(text, _)| text.as_str())
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
-            let unexported = self.video.as_ref().is_some_and(|v| !v.exported);
-            if self.doc.dirty || unexported {
+            if self.asks_before_closing() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm_close = true;
             } else {

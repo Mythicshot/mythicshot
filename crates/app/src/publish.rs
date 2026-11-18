@@ -399,7 +399,10 @@ pub fn publish_tour(server: &str, token: &str, tour_id: &str, progress: impl FnM
 
 /// Uploads the bundle and, with `publish_now`, publishes the tour it went into. An
 /// error means nothing was uploaded; once the upload is in, the answer is `Ok` and says
-/// whether the tour is public.
+/// whether the tour is public. `uploaded` is called once, when the commit has answered and
+/// before the publish step: with what the site made of the upload, and never for an upload
+/// that failed or was cancelled.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_and_publish(
     server: &str,
     token: &str,
@@ -407,9 +410,10 @@ pub fn upload_and_publish(
     target: &Target,
     publish_now: bool,
     upload_progress: impl FnMut(f32) -> bool,
+    uploaded: impl FnOnce(&Published),
     publish_progress: impl FnMut(Option<Images>) -> bool,
 ) -> Result<Finished, String> {
-    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, publish_progress)
+    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
 }
 
 /// Updates a tour over the same link: replaces the chapter `chapter_id` of `tour_id` with the
@@ -846,6 +850,7 @@ impl Client {
 }
 
 impl Client {
+    #[allow(clippy::too_many_arguments)]
     fn upload_and_publish(
         &self,
         dir: &Path,
@@ -853,9 +858,11 @@ impl Client {
         publish_now: bool,
         pause: Duration,
         upload_progress: impl FnMut(f32) -> bool,
+        uploaded: impl FnOnce(&Published),
         publish_progress: impl FnMut(Option<Images>) -> bool,
     ) -> Result<Finished, String> {
         let up = self.upload_bundle(dir, target, upload_progress)?;
+        uploaded(&up);
         if !publish_now {
             return Ok(Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft });
         }
@@ -1369,7 +1376,7 @@ pub(crate) mod tests {
 
     pub(crate) const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
     const UP: &str = "up_0123456789abcdef01234567";
-    const CH: &str = "ch_0123456789abcdef01234567";
+    pub(crate) const CH: &str = "ch_0123456789abcdef01234567";
 
     #[derive(Debug, Clone)]
     pub(crate) struct Req {
@@ -1481,7 +1488,7 @@ pub(crate) mod tests {
     }
 
     /// The happy-path server: every route answers as the platform does.
-    fn platform(req: &Req, seen: usize) -> Answer {
+    pub(crate) fn platform(req: &Req, seen: usize) -> Answer {
         let l = req.line.as_str();
         if l == "POST /api/v1/uploads" {
             reply(201, &format!(r#"{{"upload_id":"{UP}","steps":2}}"#))
@@ -1525,9 +1532,9 @@ pub(crate) mod tests {
         upload_bundle(&stub.base, TOKEN, dir.path(), target, |_| true)
     }
 
-    const TOUR: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const TOUR: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
     const PUB: &str = "pub_0123456789abcdef01234567";
-    const PUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
+    pub(crate) const PUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
 
     fn client(stub: &Stub) -> Client {
         Client::new(&stub.base, TOKEN, Timeouts::default()).unwrap()
@@ -1537,18 +1544,18 @@ pub(crate) mod tests {
         reply(202, &format!(r#"{{"status":"in_progress","publish_id":"{PUB}","done":{done},"total":{total}}}"#))
     }
 
-    const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
+    pub(crate) const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
 
     /// A stub whose publish route answers as `publish` says (given how many publish calls came
     /// before) and that holds the client to the protocol: a call after a 202 must name that
     /// publish, any other must have no body; a call that does not is answered 400. Every other
     /// route answers as the platform does.
-    fn publish_stub(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+    pub(crate) fn publish_stub(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
         publish_stub_over(platform, publish)
     }
 
     /// [`publish_stub`], with `rest` answering every route but publish.
-    fn publish_stub_over(rest: impl Fn(&Req, usize) -> Answer + Send + 'static, publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+    pub(crate) fn publish_stub_over(rest: impl Fn(&Req, usize) -> Answer + Send + 'static, publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
         let named = std::sync::atomic::AtomicBool::new(false);
         stub(move |req, seen| {
             if req.line != PUBLISH {
@@ -1779,7 +1786,31 @@ pub(crate) mod tests {
 
     fn upload_and_publish_to(stub: &Stub, publish_now: bool, go: impl FnMut(Option<Images>) -> bool) -> Result<Finished, String> {
         let dir = bundle(2, false);
-        client(stub).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, go)
+        client(stub).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, |_| {}, go)
+    }
+
+    #[test]
+    fn the_upload_is_handed_over_once_after_the_commit_and_before_the_publish_step() {
+        for publish_now in [true, false] {
+            let s = platform_with(|_| reply(200, LIVE));
+            let dir = bundle(2, false);
+            let seen: RefCell<Vec<(Published, Vec<String>)>> = RefCell::new(Vec::new());
+            client(&s).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, |up| seen.borrow_mut().push((up.clone(), s.lines())), |_| true).unwrap();
+            let seen = seen.into_inner();
+            assert_eq!(seen.len(), 1);
+            let (up, lines) = &seen[0];
+            assert_eq!(up, &Published { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, publish: None });
+            assert!(lines.last().is_some_and(|l| l.ends_with("/commit")), "the commit had answered: {lines:?}");
+            assert!(!lines.iter().any(|l| l == PUBLISH), "and the publish step had not begun");
+        }
+        // An upload that fails or is cancelled hands nothing over.
+        let s = stub(|req, seen| if req.line.ends_with("/commit") { reply(500, r#"{"error":"commit_failed","detail":"no"}"#) } else { platform(req, seen) });
+        let dir = bundle(2, false);
+        let mut called = 0;
+        assert!(client(&s).upload_and_publish(dir.path(), &Target::New, true, Duration::ZERO, |_| true, |_| called += 1, |_| true).is_err());
+        let s = platform_with(|_| reply(200, LIVE));
+        assert_eq!(client(&s).upload_and_publish(dir.path(), &Target::New, true, Duration::ZERO, |_| false, |_| called += 1, |_| true), Err(CANCELLED.to_string()));
+        assert_eq!(called, 0);
     }
 
     #[test]

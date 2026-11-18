@@ -87,6 +87,9 @@ pub struct Settings {
     /// a version that knows it, whatever the credential store said, and never run again, so an
     /// address typed later is never adopted without the user saying so.
     pub publish_binding_settled: bool,
+    /// Keep the recording and its edit state on this computer when a tour is uploaded, so the
+    /// tour can be opened and updated later. On by default, also for a file without the key.
+    pub keep_published_recordings: bool,
     /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
     /// says nothing is left, so the delete can be finished after a restart.
     pub unfinished_deletes: Vec<UnfinishedDelete>,
@@ -341,6 +344,7 @@ impl Default for Settings {
             tray_left_click: TrayLeftClick::default(),
             publish_saved_for: None,
             publish_binding_settled: false,
+            keep_published_recordings: true,
             unfinished_deletes: Vec::new(),
             load_problem: None,
             open_editor: None,
@@ -706,6 +710,30 @@ crop = \"KeyX\"
         s.editor.tour_animate_hotspot = false;
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert!(!back.editor.tour_animate_hotspot);
+    }
+
+    #[test]
+    fn recordings_are_kept_by_default_and_the_choice_is_remembered() {
+        assert!(Settings::default().keep_published_recordings);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A file from before the switch existed, and an empty one: kept.
+        std::fs::write(&path, "magnifier = false
+publish_server = \"https://tours.example.com\"
+").unwrap();
+        let old = load_at(&path);
+        assert!(old.load_problem.is_none() && old.keep_published_recordings && !old.magnifier);
+        std::fs::write(&path, "").unwrap();
+        assert!(load_at(&path).keep_published_recordings);
+        // Turned off, saved and read again: off. Turned on again: on.
+        let mut s = old;
+        s.keep_published_recordings = false;
+        s.save_to(&path).unwrap();
+        let mut read = load_at(&path);
+        assert!(read.load_problem.is_none() && !read.keep_published_recordings);
+        read.keep_published_recordings = true;
+        read.save_to(&path).unwrap();
+        assert!(load_at(&path).keep_published_recordings);
     }
 
     #[test]

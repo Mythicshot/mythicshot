@@ -767,6 +767,7 @@ impl App {
     fn settings_changed(&mut self) {
         self.save_settings();
         publish_ui::set_server(&self.settings.publish_server);
+        publish_ui::set_keep_recordings(self.settings.keep_published_recordings);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {

@@ -4,7 +4,8 @@
 //! [`state`] is the on-disk format (`project.json`) and its conversions to and from the editor's types.
 //! [`store`] is the folder the projects live in: save, list, open, remove.
 
-// Nothing outside the tests uses the store until publishing keeps a recording and the Tours page opens one.
+// Publishing saves through the store. Nothing outside the tests lists, opens or removes a
+// project until the Tours page and Preferences do, so that half would be reported as unused.
 #![allow(dead_code, unused_imports)]
 
 mod state;

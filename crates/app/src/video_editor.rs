@@ -16,8 +16,9 @@ use mythicshot_recording::{FrameReader, Recording};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::publish::{Finished, Target};
-use crate::publish_ui::{self, Before, Mode, Picker, PickerOutcome, ResultAction, ResultDialog, Run};
+use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Snapshot, Store};
+use crate::publish::{Published, Target};
+use crate::publish_ui::{self, Before, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
 use crate::site_ui::{SiteDialog, SiteOutcome};
@@ -125,7 +126,7 @@ enum ExportJob {
     Site(EncodeJob<SiteSummary>, Arc<Run>, String),
     /// An upload (then a publish, when asked), or a publish alone, with the tour's title and
     /// what the tour was before, for the result screen.
-    Publish(EncodeJob<Finished>, Arc<Run>, String, Before),
+    Publish(EncodeJob<PublishDone>, Arc<Run>, String, Before),
 }
 
 /// What a finished export made.
@@ -133,7 +134,7 @@ enum Exported {
     File(PathBuf, u64),
     Tour(TourSummary, TourOutput),
     Site(SiteSummary, String),
-    Published(Finished, String, Before),
+    Published(PublishDone, String, Before),
 }
 
 impl ExportJob {
@@ -253,6 +254,147 @@ fn guarded_as<T>(run: &Arc<Run>, failed: &str, work: impl FnOnce() -> Result<T, 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| Err(failed.to_string()));
     run.finish();
     result
+}
+
+/// Where an upload keeps its recording.
+pub(crate) enum Keeping {
+    /// The setting is off.
+    Off,
+    /// The setting is on, but this computer has no folder for saved recordings.
+    NoFolder,
+    In(Store),
+}
+
+/// Where an upload keeps its recording: nowhere with the setting off; else in the store at
+/// `root`, the folder [`Store::default_root`] found.
+pub(crate) fn keeping(on: bool, root: Option<PathBuf>) -> Keeping {
+    match (on, root) {
+        (false, _) => Keeping::Off,
+        (true, None) => Keeping::NoFolder,
+        (true, Some(root)) => Keeping::In(Store::at(root)),
+    }
+}
+
+/// The editor's state as it was when a publish started: what is uploaded, and what is kept.
+pub(crate) struct PublishState {
+    pub(crate) rec: Arc<Recording>,
+    pub(crate) items: Vec<mythicshot_editor::Item>,
+    pub(crate) events: Vec<InputEvent>,
+    pub(crate) edit: Edit,
+}
+
+/// Keep the recording of an upload the site has just committed, as the project of exactly the
+/// address the upload went to, the tour and the chapter. Whatever goes wrong here, a panic
+/// included, is a reason in the answer and never an error of the upload.
+fn keep_recording(keeping: &Keeping, server: &str, up: &Published, state: &PublishState, title: &str, tour_title: &str) -> Kept {
+    let store = match keeping {
+        Keeping::Off => return Kept::Off,
+        Keeping::NoFolder => return Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.to_string()),
+        Keeping::In(store) => store,
+    };
+    let saved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The address was good enough to upload to, so this never fails.
+        let server = crate::publish::check_server(server).map_err(|_| publish_ui::KEEPING_BROKE_OFF.to_string())?;
+        let key = ProjectKey { server, tour_id: up.tour_id.clone(), chapter_id: up.chapter_id.clone() };
+        let snap = Snapshot { rec: &state.rec, title, tour_title, steps: u32::try_from(up.steps).unwrap_or(u32::MAX), edit: &state.edit, events: &state.events, items: &state.items };
+        store.save(&key, &snap)
+    }));
+    match saved {
+        Ok(Ok(saved)) => Kept::Saved(saved.left_out),
+        Ok(Err(why)) => Kept::Failed(why),
+        Err(_) => Kept::Failed(publish_ui::KEEPING_BROKE_OFF.to_string()),
+    }
+}
+
+/// The work of "Publish tour", on the job's own thread and with the state the editor had when
+/// it started: write the bundle into a fresh temporary folder, upload and commit it, keep the
+/// recording (as `keeping` says), then publish when `publish_now`. The folder is removed
+/// afterwards whether it worked or not. `token` is asked for only once the bundle is written.
+/// An error means nothing was uploaded, and then nothing is kept either; a recording that
+/// cannot be kept never makes it an error.
+#[allow(clippy::too_many_arguments)]
+fn publish_job(
+    state: &PublishState,
+    title: &str,
+    tour_title: &str,
+    server: &str,
+    token: impl FnOnce() -> Result<String, String>,
+    target: &Target,
+    publish_now: bool,
+    keeping: &Keeping,
+    worker: &Arc<Run>,
+    progress: &dyn Fn(f32),
+) -> Result<PublishDone, String> {
+    let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
+    worker.set_dir(Some(tmp.path().to_path_buf()));
+    let result = (|| {
+        let dir = tmp.path().join("tour");
+        // The editor's reader stays on the UI thread; this one belongs to the publish.
+        let mut reader = FrameReader::new(state.rec.clone())?;
+        tour::write_bundle(&state.rec, &state.items, &state.events, &state.edit, title, &dir, |i| reader.get(i), |f| {
+            progress(f * PUBLISH_WRITE_SHARE);
+            !worker.is_cancelled()
+        })?;
+        if worker.is_cancelled() {
+            return Err(crate::publish::CANCELLED.to_string());
+        }
+        let token = token()?;
+        let mut kept = Kept::Off;
+        let finished = crate::publish::upload_and_publish(
+            server,
+            &token,
+            &dir,
+            target,
+            publish_now,
+            |f| {
+                progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
+                !worker.is_cancelled()
+            },
+            // The commit has answered: the project is saved now, before the publish step, so
+            // that it matches the site's draft whatever becomes of the publish.
+            |up| kept = keep_recording(keeping, server, up, state, title, tour_title),
+            |images| {
+                worker.set_publishing(images);
+                !worker.is_cancelled()
+            },
+        )?;
+        Ok(PublishDone { finished, kept })
+    })();
+    let shown = tmp.path().display().to_string();
+    if let Err(e) = tmp.close() {
+        eprintln!("Publish tour: could not remove the temporary folder {shown}: {e}");
+    }
+    result
+}
+
+/// "Try again": the publish step alone, for the upload `retry` names. Nothing is written,
+/// uploaded or saved again; what the first result said about the recording is said again.
+fn retry_done(retry: &publish_ui::Retry, result: Result<crate::publish::Live, String>) -> PublishDone {
+    PublishDone { finished: crate::publish::after_publish(&retry.tour_id, &retry.chapter_id, retry.steps, result), kept: retry.kept.clone() }
+}
+
+/// The saved project an editor was opened from.
+pub struct Origin {
+    // Not read until the publish dialog offers Update.
+    #[allow(dead_code)]
+    pub key: ProjectKey,
+    #[allow(dead_code)]
+    pub tour_title: String,
+    /// Keeps the project registered as open, for as long as this editor or a job it started
+    /// reads the recording. Shared, so that whichever of them ends last lets go of it.
+    open: Arc<OpenGuard>,
+}
+
+/// Before the list of what a saved project was opened without. The wording is proposed and waits for the owner's approval.
+// Not used until the Tours page opens a saved project.
+#[allow(dead_code)]
+pub const OPENED_WITHOUT: &str = "Opened without: ";
+
+/// The status line when a saved project opens without something it was saved with.
+// Not used until the Tours page opens a saved project.
+#[allow(dead_code)]
+pub fn opened_note(dropped: &[String]) -> Option<String> {
+    if dropped.is_empty() { None } else { Some(format!("{OPENED_WITHOUT}{}", publish_ui::listed(dropped))) }
 }
 
 /// A folder for a new tour bundle inside `parent`: `<stem>-tour`, or with
@@ -379,6 +521,9 @@ pub struct VideoState {
     drag: Option<TimelineDrag>,
     /// Overlay style last reported to the app, to notice changes.
     last_overlays: OverlayStyle,
+    /// The saved project this editor was opened from; None for a new recording. Declared last:
+    /// it lets go of the project only after the reader above has closed the frames file.
+    pub origin: Option<Origin>,
 }
 
 impl Drop for VideoState {
@@ -389,6 +534,10 @@ impl Drop for VideoState {
             job.abandon();
         }
         let rec = self.rec.clone();
+        // A recording opened from a saved project is not this editor's to delete, and
+        // `delete_files` does nothing for it. The project stays registered as open until both
+        // this editor's reader and a job still running have stopped reading it.
+        let open = self.origin.as_ref().map(|o| o.open.clone());
         match self.job.take() {
             None => rec.delete_files(),
             Some(job) => {
@@ -397,6 +546,8 @@ impl Drop for VideoState {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     rec.delete_files();
+                    drop(rec);
+                    drop(open);
                 });
             }
         }
@@ -458,6 +609,7 @@ impl Editor {
             exported: false,
             close_after_export: false,
             drag: None,
+            origin: None,
         });
         // Test hook: start with one selected annotation, to check the range bar.
         #[cfg(debug_assertions)]
@@ -479,6 +631,34 @@ impl Editor {
         #[cfg(debug_assertions)]
         if std::env::var_os("MYTHICSHOT_TEST_TOUR_VIEW").is_some() {
             editor.test_tour_view();
+        }
+        Ok(editor)
+    }
+
+    /// Open a saved project in an editor: the recording, with the edit, the mouse events and
+    /// the annotations it was saved with (a saved project holds no key presses). The editor
+    /// knows where it came from ([`VideoState::origin`]) and keeps the project registered as
+    /// open until it closes. Closing it never asks to export, and deletes nothing: the
+    /// recording stays saved. What could not be restored is named in the status bar.
+    // Not used until the Tours page opens a saved project.
+    #[allow(dead_code)]
+    pub fn open_project(loaded: Loaded, keys: std::collections::BTreeMap<crate::hotkeys::EditorAction, String>, dest: Context, overlays: OverlayStyle, prefs: crate::settings::EditorPrefs) -> Result<Editor, String> {
+        let Loaded { info, rec, restored, open } = loaded;
+        let Restored { edit, events, items, title, dropped } = restored;
+        // `new_video` numbers the items from 1 in their saved order, as they were when restored,
+        // and the next new item gets the number after the last of them.
+        let mut editor = Editor::new_video(rec, events, items, title, keys, dest, overlays, prefs)?;
+        if let Some(v) = editor.video.as_mut() {
+            v.current = edit.trim.0.min(v.rec.frames.len().saturating_sub(1));
+            // The saved overlay style is this recording's, not a new default for the next one.
+            v.last_overlays = edit.overlays;
+            v.edit = edit;
+            // The close question says the recording is deleted, which is untrue here.
+            v.exported = true;
+            v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, open: Arc::new(open) });
+        }
+        if let Some(note) = opened_note(&dropped) {
+            editor.notify(note);
         }
         Ok(editor)
     }
@@ -693,7 +873,7 @@ impl Editor {
                         }
                         Exported::Published(done, title, before) => {
                             // Never the link itself in the log: the result screen shows it.
-                            let msg = publish_ui::result_status(&done, &before);
+                            let msg = publish_ui::result_status(&done.finished, &before);
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {
@@ -892,55 +1072,27 @@ impl Editor {
         v.picker = Some(Picker::open(publish_ui::server(), title));
     }
 
-    /// Write the tour bundle into a fresh temporary folder and upload it, then publish the
-    /// tour when `mode` says so. The folder is removed afterwards whether it worked or not.
+    /// Upload the tour, keep its recording on this computer when the setting says so, then
+    /// publish the tour when `mode` says so: see [`publish_job`].
     fn start_publish(&mut self, title: String, target: Target, mode: Mode, tour_title: String, before: Before) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
         let server = publish_ui::server();
-        let (rec, items, events, edit) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone());
+        let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
+        // A recording opened from a saved project is read from that project's folder.
+        let open = v.origin.as_ref().map(|o| o.open.clone());
+        let keeping = keeping(publish_ui::keeps_recordings(), Store::default_root());
         let run = Run::begin();
         let worker = run.clone();
+        let kept_as = tour_title.clone();
         let job = EncodeJob::spawn(move |progress| {
-            guarded(&worker, || {
-                let tmp = tempfile::Builder::new().prefix(publish_ui::TEMP_PREFIX).tempdir().map_err(|e| format!("Could not create a temporary folder: {e}"))?;
-                worker.set_dir(Some(tmp.path().to_path_buf()));
-                let result = (|| {
-                    let dir = tmp.path().join("tour");
-                    // The editor's reader stays on the UI thread; this one belongs to the publish.
-                    let mut reader = FrameReader::new(rec.clone())?;
-                    tour::write_bundle(&rec, &items, &events, &edit, &title, &dir, |i| reader.get(i), |f| {
-                        progress(f * PUBLISH_WRITE_SHARE);
-                        !worker.is_cancelled()
-                    })?;
-                    if worker.is_cancelled() {
-                        return Err(crate::publish::CANCELLED.to_string());
-                    }
-                    let token = publish_ui::token_for(&server)?;
-                    crate::publish::upload_and_publish(
-                        &server,
-                        &token,
-                        &dir,
-                        &target,
-                        mode == Mode::PublishNow,
-                        |f| {
-                            progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
-                            !worker.is_cancelled()
-                        },
-                        |images| {
-                            worker.set_publishing(images);
-                            !worker.is_cancelled()
-                        },
-                    )
-                })();
-                let shown = tmp.path().display().to_string();
-                if let Err(e) = tmp.close() {
-                    eprintln!("Publish tour: could not remove the temporary folder {shown}: {e}");
-                }
-                result
-            })
+            let result = guarded(&worker, || publish_job(&state, &title, &kept_as, &server, || publish_ui::token_for(&server), &target, mode == Mode::PublishNow, &keeping, &worker, progress));
+            // The recording is let go of before the project it may have been opened from.
+            drop(state);
+            drop(open);
+            result
         });
         if let Some(v) = self.video.as_mut() {
             v.job = Some(ExportJob::Publish(job, run, tour_title, before));
@@ -949,13 +1101,13 @@ impl Editor {
     }
 
     /// "Try again" after a publish that failed: publish the tour that is already uploaded.
-    /// Nothing is written or uploaded again.
+    /// Nothing is written, uploaded or saved again.
     fn start_publish_only(&mut self, retry: publish_ui::Retry) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
-        let publish_ui::Retry { title: tour_title, before, tour_id, steps } = retry;
+        let (tour_title, before) = (retry.title.clone(), retry.before.clone());
         let server = publish_ui::server();
         let run = Run::begin();
         let worker = run.clone();
@@ -964,12 +1116,12 @@ impl Editor {
             guarded(&worker, || {
                 progress(1.0);
                 let result = publish_ui::token_for(&server).and_then(|token| {
-                    crate::publish::publish_tour(&server, &token, &tour_id, |images| {
+                    crate::publish::publish_tour(&server, &token, &retry.tour_id, |images| {
                         worker.set_publishing(images);
                         !worker.is_cancelled()
                     })
                 });
-                Ok(crate::publish::after_publish(&tour_id, "", steps, result))
+                Ok(retry_done(&retry, result))
             })
         });
         if let Some(v) = self.video.as_mut() {
@@ -1395,6 +1547,7 @@ fn overlay_controls(ui: &mut egui::Ui, o: &mut OverlayStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publish::Finished;
     use mythicshot_editor::{Bounds, Document, RgbaImage, Shape, Style, pt};
 
     #[test]
@@ -1471,7 +1624,7 @@ mod tests {
 
     #[test]
     fn closing_the_editor_cancels_a_publish_and_no_other_export() {
-        let done = || Ok(Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 1, outcome: crate::publish::Outcome::Draft });
+        let done = || Ok(PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 1, outcome: crate::publish::Outcome::Draft }, kept: Kept::Off });
         // Runs of their own, not in the shared list that quitting cancels.
         let run = Arc::new(Run::default());
         let publish = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), "Demo".into(), Before::new_tour());
@@ -1490,7 +1643,7 @@ mod tests {
     #[test]
     fn a_finished_publish_hands_the_result_screen_what_the_tour_was() {
         let was = Before { public: true, link: None, steps: Some(14) };
-        let done = Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft };
+        let done = PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, kept: Kept::Saved(vec!["the cover logo".into()]) };
         let sent = done.clone();
         let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone());
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -1599,5 +1752,358 @@ mod tests {
         assert_eq!(tour_dir(tmp.path(), "shot-01"), tmp.path().join("shot-01-tour-2"));
         std::fs::create_dir(tmp.path().join("shot-01-tour-2")).unwrap();
         assert_eq!(tour_dir(tmp.path(), "shot-01"), tmp.path().join("shot-01-tour-3"));
+    }
+
+    // ---- Keeping the recording at publish, and reopening it ----
+
+    use crate::project::{LoadError, ProjectInfo};
+    use crate::publish::tests::{CH, LIVE, PUBLISH, Stub, TOKEN, TOUR, platform, publish_stub, reply, stub};
+    use crate::publish::{CANCELLED, Outcome};
+    use crate::settings::Settings;
+    use crate::tour::{Card, Cover, StepExtras};
+    use mythicshot_editor::Item;
+    use mythicshot_editor::overlays::{InputKind, MouseButton};
+
+    const TITLE: &str = "Chapter one";
+    const TOUR_TITLE: &str = "Customer onboarding";
+
+    /// A real recording of six frames of 200 x 160 that owns its folder `<root>/rec`, as the recorder leaves one.
+    fn recorded(root: &Path) -> Arc<Recording> {
+        let dir = root.join("rec");
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(Recording::synthetic_in(&dir, 200, 160, &[0, 500, 1000, 1500, 2000, 2500], 3000).unwrap())
+    }
+
+    fn left(t_ms: u64, x: i32, y: i32) -> InputEvent {
+        InputEvent { t_ms, kind: InputKind::MouseDown(MouseButton::Left, x, y) }
+    }
+
+    /// An editor's state worth keeping: a trim, a crop, three steps of which one is removed, a
+    /// cover, a guide card on the first step, a rectangle on some frames and a note pinned to
+    /// the first step; three clicks and a key press.
+    fn state(root: &Path) -> PublishState {
+        let rec = recorded(root);
+        let events = vec![left(750, 40, 30), InputEvent { t_ms: 900, kind: InputKind::KeyDown("Ctrl".into()) }, left(1250, 60, 50), left(2250, 120, 90)];
+        let mut edit = Edit::new(&rec, OverlayStyle::default());
+        edit.trim = (1, 5);
+        edit.crop = Some(Bounds::new(pt(20.0, 10.0), pt(180.0, 150.0)));
+        let steps = tour::plan_steps(&rec, &edit, &events).unwrap();
+        assert!(steps.len() >= 3, "{steps:?}");
+        edit.tour_removed.insert(steps[1].src);
+        let card = Card { title: "Open the menu".into(), body: "It is at the top left.".into(), next_label: "Next".into(), anchor: Default::default(), point: None, placement: Default::default() };
+        edit.tour_doc.steps.insert(steps[0].src, StepExtras { card: Some(card), ..Default::default() });
+        edit.tour_doc.cover = Some(Cover { title: "Welcome".into(), body: "A short tour.".into(), button: "Start".into(), logo: None });
+        let items = vec![
+            Item { id: 1, shape: Shape::Rect(Bounds::new(pt(30.0, 20.0), pt(90.0, 70.0))), style: Style::default(), frames: Some((1, 3)), pin: None },
+            Item { id: 2, shape: Shape::Text { at: pt(40.0, 80.0), text: "Mind the gap".into() }, style: Style::default(), frames: None, pin: Some(steps[0].src as u32) },
+        ];
+        PublishState { rec, items, events, edit }
+    }
+
+    fn store_in(root: &Path) -> Store {
+        Store::at(root.join("projects"))
+    }
+
+    /// The project a publish to `stub` makes: its address as the address rule writes it, and the ids the stub answers.
+    fn key_at(stub: &Stub) -> ProjectKey {
+        ProjectKey { server: crate::publish::check_server(&stub.base).unwrap(), tour_id: TOUR.into(), chapter_id: CH.into() }
+    }
+
+    /// Run the publish job against `stub`, as the editor's job thread does, with the test token.
+    fn publish_to(stub: &Stub, state: &PublishState, publish_now: bool, keeping: &Keeping) -> Result<PublishDone, String> {
+        publish_job(state, TITLE, TOUR_TITLE, &stub.base, || Ok(TOKEN.to_string()), &Target::New, publish_now, keeping, &Arc::new(Run::default()), &|_| {})
+    }
+
+    fn project_text(info: &ProjectInfo) -> String {
+        std::fs::read_to_string(info.dir.join("project.json")).unwrap()
+    }
+
+    /// The editor a recording opens in, with nothing remembered.
+    fn editor_of(state: &PublishState) -> Editor {
+        let s = Settings::default();
+        Editor::new_video(state.rec.clone(), state.events.clone(), state.items.clone(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+    }
+
+    fn reopened(store: &Store, key: &ProjectKey) -> Editor {
+        let s = Settings::default();
+        Editor::open_project(store.load(key).unwrap(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+    }
+
+    /// Ask the editor's window to close, as the window's own close button does.
+    fn request_close(ed: &mut Editor) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
+        ctx.run_ui(input, |ui| ed.ui(ui)).textures_delta.clear();
+    }
+
+    #[test]
+    fn a_published_tour_leaves_a_project_tied_to_its_address_tour_and_chapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let keep = keeping(true, Some(store.root().to_path_buf()));
+        assert!(matches!(&keep, Keeping::In(at) if at.root() == store.root()));
+        let done = publish_to(&s, &state, true, &keep).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "{done:?}");
+        assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str()), (TOUR, CH));
+        assert_eq!(done.kept, Kept::Saved(vec![]));
+        // One project, for exactly the address the upload went to, the tour and the chapter.
+        let key = key_at(&s);
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!((&list[0].key, list[0].title.as_str(), list[0].tour_title.as_str(), list[0].problem), (&key, TITLE, TOUR_TITLE, None));
+        assert_eq!(store.for_tour(&key.server, TOUR).len(), 1);
+        assert!(store.for_tour("https://other.example.com", TOUR).is_empty());
+        // It holds the clicks and no key press, and never the token.
+        let text = project_text(&list[0]);
+        assert!(!text.contains(TOKEN) && !text.contains("Ctrl"), "{text}");
+        let loaded = store.load(&key).unwrap();
+        assert_eq!(loaded.restored.events, [left(750, 40, 30), left(1250, 60, 50), left(2250, 120, 90)]);
+    }
+
+    #[test]
+    fn a_draft_upload_leaves_a_project_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let done = publish_to(&s, &state, false, &Keeping::In(store.clone())).unwrap();
+        assert_eq!((done.finished.outcome.clone(), done.kept.clone()), (Outcome::Draft, Kept::Saved(vec![])));
+        assert!(!s.lines().iter().any(|l| l == PUBLISH));
+        assert_eq!(store.list().iter().map(|p| p.key.clone()).collect::<Vec<_>>(), [key_at(&s)]);
+    }
+
+    #[test]
+    fn the_project_is_saved_before_the_publish_step_so_a_failed_publish_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        // The site's publish route looks at the store each time it is called: first it fails.
+        let seen_at_publish = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (looking, log) = (store.clone(), seen_at_publish.clone());
+        let s = publish_stub(move |calls| {
+            log.lock().unwrap().push(looking.list().len());
+            if calls == 0 { reply(500, r#"{"error":"publish_failed","detail":"the tour could not be published"}"#) } else { reply(200, LIVE) }
+        });
+        let done = publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: false, .. }), "{done:?}");
+        assert_eq!(*seen_at_publish.lock().unwrap(), [1], "the project was there when the publish step began");
+        assert_eq!(done.kept, Kept::Saved(vec![]));
+        let key = key_at(&s);
+        let saved = project_text(&store.list()[0]);
+        drop(store.load(&key).unwrap());
+
+        // "Try again" publishes the same upload: it names the chapter the commit answered, and saves nothing again.
+        let mut screen = Some(ResultDialog::new(TOUR_TITLE.into(), Before::new_tour(), done));
+        let retry = publish_ui::take_retry(&mut screen, false).unwrap();
+        assert_eq!((retry.tour_id.as_str(), retry.chapter_id.as_str(), &retry.kept), (TOUR, CH, &Kept::Saved(vec![])));
+        let uploads = s.lines().iter().filter(|l| l.ends_with("/commit")).count();
+        let again = retry_done(&retry, crate::publish::publish_tour(&s.base, TOKEN, &retry.tour_id, |_| true));
+        assert!(matches!(again.finished.outcome, Outcome::Public { .. }), "{again:?}");
+        assert_eq!((again.finished.tour_id.as_str(), again.finished.chapter_id.as_str(), &again.kept), (TOUR, CH, &Kept::Saved(vec![])));
+        assert_eq!(s.lines().iter().filter(|l| l.ends_with("/commit")).count(), uploads, "nothing was uploaded again");
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(project_text(&store.list()[0]), saved, "the project was not written a second time");
+    }
+
+    #[test]
+    fn an_upload_that_fails_or_is_cancelled_saves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let keep = Keeping::In(store.clone());
+        // The commit fails.
+        let s = stub(|req, seen| if req.line.ends_with("/commit") { reply(500, r#"{"error":"commit_failed","detail":"no"}"#) } else { platform(req, seen) });
+        assert!(publish_to(&s, &state, true, &keep).is_err());
+        // Cancelled while the pictures go up, and cancelled before anything is sent.
+        let s = publish_stub(|_| reply(200, LIVE));
+        let run = Arc::new(Run::default());
+        let sent = std::cell::Cell::new(false);
+        let cancelled = publish_job(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &keep, &run, &|f| {
+            if f > PUBLISH_WRITE_SHARE {
+                sent.set(true);
+                run.cancel();
+            }
+        });
+        assert_eq!(cancelled, Err(CANCELLED.to_string()));
+        assert!(sent.get() && !s.lines().iter().any(|l| l.ends_with("/commit")), "{:?}", s.lines());
+        let before = s.lines().len();
+        let run = Arc::new(Run::default());
+        run.cancel();
+        assert_eq!(publish_job(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &keep, &run, &|_| {}), Err(CANCELLED.to_string()));
+        // No token: nothing is sent at all.
+        let no_token = publish_job(&state, TITLE, TOUR_TITLE, &s.base, || Err("Add the server and token first.".to_string()), &Target::New, true, &keep, &Arc::new(Run::default()), &|_| {});
+        assert_eq!(no_token, Err("Add the server and token first.".to_string()));
+        assert_eq!(s.lines().len(), before);
+        // Not one project, and not even the folder for them.
+        assert!(store.list().is_empty());
+        assert!(!store.root().exists());
+    }
+
+    #[test]
+    fn with_the_switch_off_nothing_is_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let keep = keeping(false, Some(store.root().to_path_buf()));
+        assert!(matches!(keep, Keeping::Off));
+        let done = publish_to(&s, &state, true, &keep).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }));
+        assert_eq!(done.kept, Kept::Off);
+        assert_eq!(publish_ui::kept_note(&done.kept), None);
+        assert!(!store.root().exists());
+        // Off stays off without a folder too.
+        assert!(matches!(keeping(false, None), Keeping::Off));
+    }
+
+    #[test]
+    fn a_project_that_cannot_be_saved_does_not_fail_the_publish_and_the_result_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        // Where the folder for saved recordings should be, there is a file.
+        let store = store_in(tmp.path());
+        std::fs::write(store.root(), b"in the way").unwrap();
+        let done = publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the tour is published all the same: {done:?}");
+        let Kept::Failed(reason) = &done.kept else { panic!("{:?}", done.kept) };
+        assert!(reason.starts_with(|c: char| c.is_lowercase()) && reason.ends_with('.') && !reason.contains(TOKEN), "{reason}");
+        let note = publish_ui::kept_note(&done.kept).unwrap();
+        assert_eq!(note, format!("The recording could not be saved on this computer, so this tour can't be edited later: {reason}"));
+        assert_eq!(std::fs::read(store.root()).unwrap(), b"in the way");
+        // No folder for saved recordings on this computer: keeping is off, and the result says so once.
+        let keep = keeping(true, None);
+        assert!(matches!(keep, Keeping::NoFolder));
+        let s = publish_stub(|_| reply(200, LIVE));
+        let done = publish_to(&s, &state, false, &keep).unwrap();
+        assert_eq!(done.finished.outcome, Outcome::Draft);
+        assert_eq!(done.kept, Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.into()));
+    }
+
+    #[test]
+    fn closing_the_editor_after_publishing_deletes_the_temporary_recording_and_keeps_the_saved_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let temporary = tmp.path().join("rec");
+        let third = state.rec.frame(2).unwrap().into_raw();
+        let ed = editor_of(&state);
+        assert_eq!(publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved(vec![]));
+        assert!(temporary.join("frames.zst").exists());
+        // The job has ended and the editor closes: the recording's own folder goes.
+        let frames = state.rec.frames.len();
+        drop(state);
+        drop(ed);
+        assert!(!temporary.exists(), "the temporary recording is deleted");
+        // The saved one is whole: it opens, and every frame decodes.
+        let loaded = store.load(&key_at(&s)).unwrap();
+        assert_eq!(loaded.rec.frames.len(), frames);
+        let mut reader = FrameReader::new(loaded.rec.clone()).unwrap();
+        for i in 0..frames {
+            reader.get(i).unwrap();
+        }
+        assert_eq!(loaded.rec.frame(2).unwrap().into_raw(), third);
+    }
+
+    #[test]
+    fn a_recording_closed_without_uploading_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let ed = editor_of(&state);
+        // An upload the site refused changes nothing about that.
+        let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
+        assert!(publish_to(&s, &state, true, &Keeping::In(store.clone())).is_err());
+        drop(state);
+        drop(ed);
+        assert!(!tmp.path().join("rec").exists());
+        assert!(!store.root().exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing is left of the recording");
+    }
+
+    #[test]
+    fn a_reopened_project_shows_the_saved_trim_crop_removed_steps_cards_and_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
+        let key = key_at(&s);
+        let was = tour::plan_steps(&state.rec, &state.edit, &state.events).unwrap();
+
+        // Opened with another overlay default than it was saved with: the saved one shows.
+        let other = OverlayStyle { keys: KeyStyle::Keyboard, ..OverlayStyle::default() };
+        let settings = Settings::default();
+        let mut ed = Editor::open_project(store.load(&key).unwrap(), Default::default(), settings.dest_context(TITLE), other, settings.editor.clone()).unwrap();
+        assert_eq!(ed.title(), TITLE);
+        assert_eq!(ed.status_text(), None, "nothing was left out, so nothing is said");
+        let v = ed.video.as_ref().unwrap();
+        let (e, saved) = (&v.edit, &state.edit);
+        assert_eq!((e.trim, e.crop, &e.deleted, &e.tour_removed, e.scale, e.reverse), (saved.trim, saved.crop, &saved.deleted, &saved.tour_removed, saved.scale, saved.reverse));
+        assert_eq!(e.tour_doc, saved.tour_doc, "the cover and the guide card");
+        assert_eq!((e.overlays, v.last_overlays), (saved.overlays, saved.overlays));
+        assert_eq!(v.current, saved.trim.0);
+        assert_eq!(tour::plan_steps(&v.rec, &v.edit, &v.events).unwrap(), was, "the same steps, with the removed one still removed");
+        // The clicks are back; the key press was never saved.
+        assert_eq!(v.events, [left(750, 40, 30), left(1250, 60, 50), left(2250, 120, 90)]);
+        // The rectangle and the note, as they were, and a new item gets the next number.
+        assert_eq!(ed.doc.items(), &state.items[..]);
+        assert!(!ed.doc.dirty);
+        // It knows where it came from, and it counts as exported.
+        let origin = v.origin.as_ref().unwrap();
+        assert_eq!((&origin.key, origin.tour_title.as_str(), v.exported), (&key, TOUR_TITLE, true));
+        assert_eq!(ed.add_item(Shape::Rect(Bounds::new(pt(5.0, 5.0), pt(9.0, 9.0)))), 3);
+
+        // While it is open the project cannot be opened a second time; after it closes it can.
+        assert!(matches!(store.load(&key), Err(LoadError::AlreadyOpen)));
+        drop(ed);
+        let mut loaded = store.load(&key).unwrap();
+
+        // What could not be restored is said once, in the status bar.
+        loaded.restored.dropped = vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()];
+        let ed = Editor::open_project(loaded, Default::default(), settings.dest_context(TITLE), other, settings.editor.clone()).unwrap();
+        assert_eq!(ed.status_text(), Some("Opened without: the cover logo, a pasted picture."));
+        assert_eq!(opened_note(&[]), None);
+    }
+
+    #[test]
+    fn closing_a_reopened_project_does_not_ask_to_export_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
+        let key = key_at(&s);
+
+        // A new recording that was never exported asks before it closes.
+        let mut fresh = editor_of(&state);
+        request_close(&mut fresh);
+        assert!(!fresh.closed);
+        drop(fresh);
+        drop(state);
+
+        let info = store.list().remove(0);
+        let files = |dir: &Path| {
+            let mut names: Vec<(String, u64)> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())).collect();
+            names.sort();
+            names
+        };
+        let (text, before) = (project_text(&info), files(&info.dir));
+        // Reopened and changed, and never sent to the site: closing just closes.
+        let mut ed = reopened(&store, &key);
+        ed.add_item(Shape::Rect(Bounds::new(pt(5.0, 5.0), pt(50.0, 40.0))));
+        assert!(ed.doc.dirty);
+        request_close(&mut ed);
+        assert!(ed.closed, "no question: it would say the recording is deleted");
+        drop(ed);
+        // The saved recording is as it was, and opens again.
+        assert_eq!((project_text(&info), files(&info.dir)), (text, before));
+        assert_eq!(store.list(), [info]);
+        let again = reopened(&store, &key);
+        assert_eq!(again.doc.items().len(), 2, "the change that was not sent is gone");
     }
 }
