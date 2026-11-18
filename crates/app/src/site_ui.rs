@@ -112,7 +112,7 @@ impl SiteDialog {
         self.check = check.clone();
         std::thread::spawn(move || {
             let exists = folder.symlink_metadata().is_ok();
-            let found = site::inspect(&folder);
+            let found = site::check_dedicated(&folder).and_then(|_| site::inspect(&folder));
             if let Ok(mut c) = check.lock() {
                 *c = Check::Done(folder, exists, found);
             }
@@ -364,6 +364,17 @@ mod tests {
         settle(&ctx, &mut d);
         assert_eq!(d.address, "tours/raid-groups/");
         assert!(d.note().unwrap().starts_with("This replaces \u{201c}Raid groups\u{201d}"));
+    }
+
+    #[test]
+    fn a_main_folder_is_refused_in_the_dialog() {
+        let ctx = egui::Context::default();
+        let Some(user) = directories::UserDirs::new() else { return };
+        let mut d = SiteDialog::new("", "", "A");
+        d.look_at(user.home_dir().to_path_buf(), false);
+        settle(&ctx, &mut d);
+        assert!(d.note().unwrap_err().contains("folder just for the site"));
+        assert!(d.outcome().is_none());
     }
 
     #[test]

@@ -208,6 +208,13 @@ fn site_more(s: &SiteSummary) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
+/// The site folder to remember after an add, or None to keep the remembered one: the test hook's folder
+/// stays in memory only.
+fn remembered_folder(dir: &Path, hook: Option<&str>) -> Option<String> {
+    let folder = dir.to_string_lossy().into_owned();
+    if hook.is_some_and(|h| Path::new(h.trim()) == dir) { None } else { Some(folder) }
+}
+
 /// The time a site's list records for a tour: UTC to the second.
 fn utc_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -630,7 +637,11 @@ impl Editor {
                             self.status_reveal = Some(index.clone());
                             self.status_open = Some(index);
                             self.status_more = site_more(&s);
-                            let folder = s.dir.to_string_lossy().into_owned();
+                            #[cfg(debug_assertions)]
+                            let hook = std::env::var("MYTHICSHOT_TEST_SITE").ok();
+                            #[cfg(not(debug_assertions))]
+                            let hook: Option<String> = None;
+                            let folder = remembered_folder(&s.dir, hook.as_deref()).unwrap_or_else(|| self.prefs.site_folder.clone());
                             if self.prefs.site_folder != folder || self.prefs.site_title != title {
                                 self.prefs.site_folder = folder;
                                 self.prefs.site_title = title;
@@ -1393,6 +1404,10 @@ mod tests {
         s.note = Some("The previous version of tours/a/ could not be removed.".into());
         assert_eq!(site_message(&s), "Replaced in site: 1 step");
         assert_eq!(site_more(&s).unwrap(), "1 picture was saved at lower quality to fit. The previous version of tours/a/ could not be removed.");
+        // The test hook's folder is never saved.
+        assert_eq!(remembered_folder(Path::new("sites/guides"), None).as_deref(), Some("sites/guides"));
+        assert_eq!(remembered_folder(Path::new("sites/guides"), Some("sites/guides")), None);
+        assert_eq!(remembered_folder(Path::new("sites/guides"), Some("other")).as_deref(), Some("sites/guides"));
         let now = utc_now();
         assert!(now.len() == 20 && now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
     }

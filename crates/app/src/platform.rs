@@ -249,10 +249,21 @@ pub fn set_autostart(_on: bool) -> Result<(), String> {
     Err("Start at login is not available on this system yet".into())
 }
 
+/// Explorer's argument to open a file with its default app: the path in quotes, so commas, spaces and any
+/// other characters in it stay part of the name (a Windows path cannot hold a quote). It must reach
+/// Explorer as it is, not re-quoted as a whole.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn open_arg(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
 /// Open a file with its default app.
 pub fn open_path(path: &Path) {
     #[cfg(windows)]
-    let result = std::process::Command::new("explorer").arg(path).spawn();
+    let result = {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer").raw_arg(open_arg(path)).spawn()
+    };
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -307,5 +318,11 @@ mod tests {
     fn the_file_to_select_is_quoted_whole() {
         assert_eq!(select_arg(Path::new(r"C:\Users\me\Tours\Billing, v2 tour.html")), r#"/select,"C:\Users\me\Tours\Billing, v2 tour.html""#);
         assert_eq!(select_arg(Path::new(r"D:\Führung\演示.html")), r#"/select,"D:\Führung\演示.html""#);
+    }
+
+    #[test]
+    fn the_file_to_open_is_quoted_whole() {
+        assert_eq!(open_arg(Path::new(r"C:\Users\me\Raid guides, v2\index.html")), r#""C:\Users\me\Raid guides, v2\index.html""#);
+        assert_eq!(open_arg(Path::new(r"D:\Führung & Co\演示.html")), r#""D:\Führung & Co\演示.html""#);
     }
 }

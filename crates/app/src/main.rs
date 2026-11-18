@@ -914,6 +914,8 @@ impl eframe::App for App {
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         publish_ui::shutdown(std::time::Duration::from_secs(5));
+        // An add to a site was cancelled above; one already swapping its tour in finishes or rolls back first.
+        site::wait_for_adds(std::time::Duration::from_secs(30));
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

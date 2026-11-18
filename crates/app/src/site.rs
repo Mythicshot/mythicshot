@@ -20,8 +20,14 @@ pub const SITE_VERSION: u32 = 1;
 pub const SLUG_MAX: usize = 60;
 /// The longest a site title may be.
 pub const SITE_TITLE_MAX: usize = 80;
-/// Names this feature writes at the top of a site folder.
-pub const OWN_NAMES: [&str; 6] = ["index.html", "tours.json", ".nojekyll", "favicon.ico", "assets", "tours"];
+/// The lock file an add keeps in the site folder while it runs, so only one add writes to a site at a time.
+/// It is removed when the add ends and is never part of a finished site.
+pub const LOCK: &str = ".mythicshot.lock";
+/// The site's icon. A folder may already have its own, which is then left alone and used.
+pub const FAVICON: &str = "favicon.ico";
+/// Names this feature writes at the top of a site folder; a folder holding one of them without a
+/// `tours.json` is not taken for a site. The lock file is decided by the lock itself.
+pub const OWN_NAMES: [&str; 6] = ["index.html", "tours.json", ".nojekyll", LOCK, "assets", "tours"];
 /// Which of [`OWN_NAMES`] are folders; the others are plain files.
 const OWN_FOLDERS: [&str; 2] = ["assets", "tours"];
 /// Starts of folder names the site export uses for its temporary folders inside `tours`, so no tour may have them.
@@ -120,6 +126,9 @@ pub struct TourEntry {
     pub image: String,
     /// UTC, such as `2026-11-17T22:15:00Z`.
     pub updated: String,
+    /// Anything else an entry holds, added by hand or by a later version: kept as it is when the list is rewritten.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -128,6 +137,12 @@ pub struct SiteList {
     pub generator: String,
     pub title: String,
     pub tours: Vec<TourEntry>,
+    /// Whether `favicon.ico` is the one Mythicshot wrote; one the folder already had is never touched.
+    #[serde(default)]
+    pub own_favicon: bool,
+    /// Anything else the list holds, added by hand or by a later version: kept as it is when it is rewritten.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +186,7 @@ pub fn inspect(dir: &Path) -> Result<Folder, String> {
     let list = match exists("tours.json") {
         Ok(_) => read_list(&dir.join("tours.json"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            for own in OWN_NAMES {
+            for own in OWN_NAMES.into_iter().filter(|n| *n != LOCK) {
                 match exists(own) {
                     Ok(_) => return Err(format!("{own} is already in this folder and was not made by Mythicshot. Choose an empty folder or one that already holds a Mythicshot site.")),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -182,8 +197,8 @@ pub fn inspect(dir: &Path) -> Result<Folder, String> {
         }
         Err(e) => return Err(format!("Could not check tours.json in this folder: {e}")),
     };
-    // Every name the site owns is the plain file or folder it should be, or absent; a link is never followed.
-    for own in OWN_NAMES {
+    // Every name the site uses is the plain file or folder it should be, or absent; a link is never followed.
+    for own in OWN_NAMES.into_iter().chain([FAVICON]) {
         let folder = OWN_FOLDERS.contains(&own);
         match exists(own) {
             Ok(m) if m.file_type().is_symlink() => return Err(format!("{own} in this site is a link, so Mythicshot will not write through it.")),
@@ -264,7 +279,7 @@ pub fn site_title(text: &str) -> String {
 
 #[cfg(test)]
 pub(crate) fn list(tours: &[(&str, &str)]) -> SiteList {
-    SiteList { site: 1, generator: "mythicshot 0.1.1".into(), title: "Guides".into(), tours: tours.iter().map(|(s, t)| TourEntry { slug: s.to_string(), title: t.to_string(), steps: 3, image: "thumb.jpg".into(), updated: "2026-11-17T22:15:00Z".into() }).collect() }
+    SiteList { site: 1, generator: "mythicshot 0.1.1".into(), title: "Guides".into(), tours: tours.iter().map(|(s, t)| TourEntry { slug: s.to_string(), title: t.to_string(), steps: 3, image: "thumb.jpg".into(), updated: "2026-11-17T22:15:00Z".into(), extra: Default::default() }).collect(), own_favicon: true, extra: Default::default() }
 }
 
 #[cfg(test)]
@@ -344,7 +359,7 @@ mod tests {
         std::fs::write(docs.join("README.md"), "x").unwrap();
         std::fs::write(docs.join("CNAME"), "x").unwrap();
         assert_eq!(inspect(&docs).unwrap(), Folder::New);
-        for name in OWN_NAMES.iter().filter(|n| **n != "tours.json") {
+        for name in OWN_NAMES.iter().filter(|n| **n != "tours.json" && **n != LOCK) {
             let d = tmp.path().join(format!("has-{}", name.trim_start_matches('.')));
             std::fs::create_dir(&d).unwrap();
             std::fs::write(d.join(name), "x").unwrap();
@@ -354,6 +369,12 @@ mod tests {
         let file = tmp.path().join("file.txt");
         std::fs::write(&file, "x").unwrap();
         assert!(inspect(&file).is_err());
+        // A folder that already has its own icon, or an add's lock, is still a new site.
+        let d = tmp.path().join("has-icon");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join(FAVICON), "theirs").unwrap();
+        std::fs::write(d.join(LOCK), "pid 1").unwrap();
+        assert_eq!(inspect(&d).unwrap(), Folder::New);
         // A folder of that name counts as much as a file.
         let d = tmp.path().join("has-tours-folder");
         std::fs::create_dir_all(d.join("tours")).unwrap();
@@ -457,6 +478,16 @@ mod tests {
             std::os::unix::fs::symlink(&target, site.join(name)).unwrap();
             assert!(inspect(&site).unwrap_err().contains(name), "{name}");
         }
+    }
+
+    #[test]
+    fn fields_the_list_does_not_know_are_kept() {
+        let text = r#"{"site":1,"generator":"mythicshot 0.1.1","title":"G","tours":[{"slug":"a","title":"A","steps":2,"image":"thumb.jpg","updated":"t","tags":["raid"]}],"theme":{"x":1}}"#;
+        let l: SiteList = serde_json::from_str(text).unwrap();
+        assert!(!l.own_favicon, "a list from before the icon was recorded");
+        assert_eq!((l.extra["theme"]["x"].as_i64(), l.tours[0].extra["tags"][0].as_str()), (Some(1), Some("raid")));
+        let back: serde_json::Value = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!((back["theme"]["x"].as_i64(), back["tours"][0]["tags"][0].as_str()), (Some(1), Some("raid")));
     }
 
     #[test]
