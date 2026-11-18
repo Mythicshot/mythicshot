@@ -188,6 +188,8 @@ mod tests {
             assert!(ic.contains(part), "{part}");
         }
         assert!(!ic.contains("script-src") && !ic.contains("connect-src"), "{ic}");
+        // Both name the site's own icon, so a browser does not ask the host's root for one.
+        assert!(index.contains(r#"<link rel="icon" href="favicon.ico">"#) && tour.contains(r#"<link rel="icon" href="../../favicon.ico">"#));
         for html in [&tour, &index] {
             assert!(html.find("Content-Security-Policy").unwrap() < html.find("<title>").unwrap());
             assert!(!html.contains("http:") && !html.contains("https:") && !html.contains("//"), "only relative addresses");

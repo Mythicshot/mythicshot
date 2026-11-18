@@ -6,8 +6,11 @@
 #![cfg_attr(not(test), expect(dead_code, reason = "used by the Add to site dialog, which is not built yet"))]
 
 mod pages;
+mod write;
 
 pub use pages::*;
+#[allow(unused_imports, reason = "used by the Add to site dialog, which is not built yet")]
+pub use write::*;
 
 use std::path::Path;
 
