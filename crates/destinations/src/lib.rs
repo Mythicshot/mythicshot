@@ -167,6 +167,11 @@ pub fn send(dest: DestId, img: &RgbaImage, ctx: &Context) -> Result<Sent, String
     }
 }
 
+/// Open a web address in the default browser. The caller checks the address first.
+pub fn open_url(url: &str) -> Result<(), String> {
+    platform::open_url(url)
+}
+
 /// A new, unused path in the captures folder from the file name pattern.
 /// The pattern may contain `/` or `\` to make subfolders.
 pub fn new_path(ctx: &Context) -> Result<PathBuf, String> {

@@ -10,6 +10,11 @@
 //! configured server, and is never part of an error, a log line or a `Debug` print.
 //! Redirects are never followed, so it can never reach a second host.
 //!
+//! Publishing is a second, separate step on a tour that is already uploaded: the publish
+//! route is called again and again while it answers 202 with its progress, until it
+//! answers 200 with the public link. Cancelling just stops calling; the server clears a
+//! publish nobody drives any more, and the public version changes only on the last call.
+//!
 //! Nothing is retried blindly. Only two requests are ever sent a second time, and only
 //! after a transport failure (no answer at all): a step image, where the server answers
 //! 409 `already_sent` if the first copy did arrive, and commit, which the server treats
@@ -43,6 +48,15 @@ const MAX_STEPS: usize = 200;
 /// Longest piece of server text put into a message.
 const MAX_DETAIL_CHARS: usize = 200;
 
+/// Pause between two calls of one publish, as the server's own helper does.
+const PUBLISH_PAUSE: Duration = Duration::from_millis(250);
+/// Calls in a row that may show no progress before the publish is given up.
+const MAX_STALLED_CALLS: u32 = 3;
+/// A hard stop, far above the 34 calls the largest tour takes.
+const MAX_PUBLISH_CALLS: u32 = 200;
+/// Longest public link shown or opened.
+const MAX_URL_CHARS: usize = 300;
+
 pub const REJECTED_TOKEN: &str = "The server rejected the API token.";
 pub const CANCELLED: &str = "cancelled";
 
@@ -65,6 +79,73 @@ pub enum Target {
 pub struct Published {
     pub tour_id: String,
     pub steps: usize,
+}
+
+/// A tour that went public: its step count and its link, when the server gave a usable one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Live {
+    pub steps: usize,
+    pub url: Option<String>,
+}
+
+/// Where an upload ended up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Uploaded as a draft, as asked.
+    Draft,
+    /// Uploaded and published.
+    Public { url: Option<String> },
+    /// Uploaded, but the publish did not finish: cancelled, or failed with `error`.
+    NotPublic { cancelled: bool, error: String },
+}
+
+/// An upload that worked, and what became of its publish.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finished {
+    pub tour_id: String,
+    pub steps: usize,
+    pub outcome: Outcome,
+}
+
+/// Images copied so far out of how many, from the server's last answer.
+pub type Images = (u64, u64);
+
+/// What a publish's result means for a tour that is already uploaded with `steps` steps.
+/// A failed or cancelled publish is not an error of the whole job: the draft is there.
+pub fn after_publish(tour_id: &str, steps: usize, result: Result<Live, String>) -> Finished {
+    let (steps, outcome) = match result {
+        Ok(live) => (live.steps, Outcome::Public { url: live.url }),
+        Err(e) if e == CANCELLED => (steps, Outcome::NotPublic { cancelled: true, error: String::new() }),
+        Err(error) => (steps, Outcome::NotPublic { cancelled: false, error }),
+    };
+    Finished { tour_id: tour_id.to_string(), steps, outcome }
+}
+
+/// The public link for a published tour. `url` is what the server answered: a full
+/// address is used as it is, a path is put after the configured server address, and
+/// without either the link is built from the slug. The result is https, or http for
+/// localhost and 127.0.0.1 only, and holds nothing but plain address characters;
+/// None when no such link can be made.
+pub fn public_url(server: &str, url: Option<&str>, slug: Option<&str>) -> Option<String> {
+    let base = check_server(server).ok()?;
+    let from_server = url.and_then(|u| {
+        if u.contains("://") {
+            Some(u.to_string())
+        } else if u.starts_with('/') && !u.starts_with("//") {
+            Some(format!("{base}{u}"))
+        } else {
+            None
+        }
+    });
+    let from_slug = slug.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).map(|s| format!("{base}/t/{s}"));
+    from_server.and_then(|u| safe_link(&u)).or_else(|| from_slug.and_then(|u| safe_link(&u)))
+}
+
+/// `url` when it is an address the server-address rule accepts, short, and made only of
+/// characters that mean nothing to a shell or a browser's address parser beyond a plain path.
+fn safe_link(url: &str) -> Option<String> {
+    let plain = url.len() <= MAX_URL_CHARS && url.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/:[]".contains(&b));
+    (plain && check_server(url).is_ok()).then(|| url.to_string())
 }
 
 /// Accepts https URLs, and http only for localhost and 127.0.0.1. Returns the URL without a trailing slash.
@@ -146,8 +227,31 @@ pub fn list_tours(server: &str, token: &str) -> Result<Vec<RemoteTour>, String> 
 /// requests, so a cancel takes effect when the request in flight finishes. Run it off
 /// the UI thread, and show "Cancelling…" from the moment `progress` returns false until
 /// this returns. A chapter upload never sends the bundle's logo: the tour keeps its own.
+#[cfg(test)]
 pub fn upload_bundle(server: &str, token: &str, dir: &Path, target: &Target, progress: impl FnMut(f32) -> bool) -> Result<Published, String> {
     Client::new(server, token, Timeouts::default())?.upload_bundle(dir, target, progress)
+}
+
+/// Publishes the uploaded tour `tour_id`: calls the publish route until the new version
+/// is live. `progress` gets the images copied so far (None before the first answer) and
+/// returns false to cancel, which ends in `Err(CANCELLED)`. Blocks like [`upload_bundle`].
+pub fn publish_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+    Client::new(server, token, Timeouts::default())?.publish_tour(tour_id, PUBLISH_PAUSE, progress)
+}
+
+/// Uploads the bundle and, with `publish_now`, publishes the tour it went into. An
+/// error means nothing was uploaded; once the upload is in, the answer is `Ok` and says
+/// whether the tour is public.
+pub fn upload_and_publish(
+    server: &str,
+    token: &str,
+    dir: &Path,
+    target: &Target,
+    publish_now: bool,
+    upload_progress: impl FnMut(f32) -> bool,
+    publish_progress: impl FnMut(Option<Images>) -> bool,
+) -> Result<Finished, String> {
+    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, publish_progress)
 }
 
 /// The stored token: `Ok(None)` when none is stored, `Err` when the credential store
@@ -494,12 +598,92 @@ impl Client {
     }
 }
 
+impl Client {
+    fn upload_and_publish(
+        &self,
+        dir: &Path,
+        target: &Target,
+        publish_now: bool,
+        pause: Duration,
+        upload_progress: impl FnMut(f32) -> bool,
+        publish_progress: impl FnMut(Option<Images>) -> bool,
+    ) -> Result<Finished, String> {
+        let up = self.upload_bundle(dir, target, upload_progress)?;
+        if !publish_now {
+            return Ok(Finished { tour_id: up.tour_id, steps: up.steps, outcome: Outcome::Draft });
+        }
+        let result = self.publish_tour(&up.tour_id, pause, publish_progress);
+        Ok(after_publish(&up.tour_id, up.steps, result))
+    }
+
+    /// The publish loop: one call with no body, then calls naming the publish it started,
+    /// `pause` apart, until the server answers 200. Gives up after [`MAX_STALLED_CALLS`]
+    /// answers in a row without progress. A call that fails is not sent again: publishing
+    /// again later joins the same publish on the server, or starts a new one.
+    fn publish_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+        let what = "Could not publish the tour";
+        if !is_id(tour_id, "tour_") {
+            return Err(not_understood(what));
+        }
+        let path = format!("/api/v1/tours/{tour_id}/publish");
+        let mut publish_id: Option<String> = None;
+        let mut images = None;
+        let (mut last_done, mut stalled) = (-1i128, 0u32);
+        for call in 1u32.. {
+            if !progress(images) {
+                return Err(CANCELLED.into());
+            }
+            let body = publish_id.as_ref().map(|id| json!({ "publish_id": id }).to_string().into_bytes());
+            let reply = self.send(Method::Post, &path, body.as_deref().map(|b| ("application/json", b))).map_err(|t| {
+                if call == 1 { format!("{what}: {}.", t.0) } else { format!("{what}: {} while the images were being copied.", t.0) }
+            })?;
+            if reply.status == 409 {
+                match reply.error_code().as_deref() {
+                    Some("publish_busy") => return Err(format!("{what}: another publish of this tour is starting at this moment.")),
+                    Some("publish_cancelled") => return Err(format!("{what}: the publish was stopped on the server before it finished.")),
+                    _ => {}
+                }
+            }
+            let reply = self.check(what, reply)?;
+            let v = reply.json().ok_or_else(|| not_understood(what))?;
+            if reply.status == 202 {
+                let id = v.get("publish_id").and_then(Value::as_str).filter(|id| is_id(id, "pub_")).ok_or_else(|| not_understood(what))?;
+                publish_id = Some(id.to_string());
+                let done = v.get("done").and_then(Value::as_u64);
+                images = done.zip(v.get("total").and_then(Value::as_u64));
+                // Each call should move the work on. If several in a row do not, say so and stop.
+                let now = done.map_or(i128::from(call), i128::from);
+                stalled = if now > last_done { 0 } else { stalled + 1 };
+                last_done = last_done.max(now);
+                if stalled >= MAX_STALLED_CALLS || call >= MAX_PUBLISH_CALLS {
+                    let counts = images.map(|(d, t)| format!(" at {d} of {t} images")).unwrap_or_default();
+                    return Err(format!("{what}: the server stopped making progress{counts}."));
+                }
+                std::thread::sleep(pause);
+                continue;
+            }
+            if reply.status != 200 {
+                return Err(not_understood(what));
+            }
+            let steps = v.get("steps").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| not_understood(what))?;
+            let url = public_url(&self.base, v.get("url").and_then(Value::as_str), v.get("slug").and_then(Value::as_str));
+            return Ok(Live { steps, url });
+        }
+        Err(not_understood(what))
+    }
+}
+
 fn not_understood(what: &str) -> String {
     format!("{what}: the server's answer was not understood.")
 }
 
 fn is_upload_id(id: &str) -> bool {
-    id.len() == 27 && id.starts_with("up_") && id[3..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    is_id(id, "up_")
+}
+
+/// A server id: `prefix` and 24 lowercase hex characters.
+fn is_id(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|hex| hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 
 /// The timeout for one request: `base`, plus a second per 20 KB of body, at most five minutes.
@@ -817,6 +1001,255 @@ mod tests {
     fn upload(stub: &Stub, steps: usize, logo: bool, target: &Target) -> Result<Published, String> {
         let dir = bundle(steps, logo);
         upload_bundle(&stub.base, TOKEN, dir.path(), target, |_| true)
+    }
+
+    const TOUR: &str = "tour_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUB: &str = "pub_0123456789abcdef01234567";
+    const PUBLISH: &str = "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/publish";
+
+    fn client(stub: &Stub) -> Client {
+        Client::new(&stub.base, TOKEN, Timeouts::default()).unwrap()
+    }
+
+    fn in_progress(done: u32, total: u32) -> Answer {
+        reply(202, &format!(r#"{{"status":"in_progress","publish_id":"{PUB}","done":{done},"total":{total}}}"#))
+    }
+
+    const LIVE: &str = r#"{"slug":"abc123","url":"/t/abc123","steps":5}"#;
+
+    /// Publishes TOUR against the stub with no pause, recording every progress report.
+    fn publish(stub: &Stub) -> (Result<Live, String>, Vec<Option<Images>>) {
+        let mut seen = Vec::new();
+        let r = client(stub).publish_tour(TOUR, Duration::ZERO, |p| {
+            seen.push(p);
+            true
+        });
+        (r, seen)
+    }
+
+    #[test]
+    fn publish_calls_until_the_server_says_it_is_live_and_returns_the_link() {
+        let s = stub(|req, seen| match (req.line.as_str(), seen) {
+            (PUBLISH, 0) => in_progress(12, 22),
+            (PUBLISH, 1) => in_progress(22, 22),
+            (PUBLISH, _) => reply(200, LIVE),
+            _ => reply(404, "{}"),
+        });
+        let (r, progress) = publish(&s);
+        assert_eq!(r.unwrap(), Live { steps: 5, url: Some(format!("{}/t/abc123", s.base)) });
+        assert_eq!(progress, [None, Some((12, 22)), Some((22, 22))]);
+        let reqs = s.requests();
+        assert_eq!(reqs.len(), 3);
+        // The first call has no body; the later ones name the publish. Every call carries the token.
+        assert!(reqs[0].body.is_empty());
+        for r in &reqs[1..] {
+            assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap(), json!({ "publish_id": PUB }));
+            assert_eq!(r.content_type.as_deref(), Some("application/json"));
+        }
+        assert!(reqs.iter().all(|r| r.auth.as_deref() == Some(&format!("Bearer {TOKEN}"))));
+    }
+
+    #[test]
+    fn a_small_tour_is_live_after_one_call() {
+        let s = stub(|_, _| reply(200, LIVE));
+        let (r, progress) = publish(&s);
+        assert_eq!(r.unwrap().steps, 5);
+        assert_eq!(progress, [None]);
+        assert_eq!(s.lines(), [PUBLISH]);
+    }
+
+    #[test]
+    fn a_publish_that_stops_making_progress_is_given_up() {
+        let s = stub(|_, _| in_progress(12, 22));
+        let (r, _) = publish(&s);
+        assert_eq!(r.unwrap_err(), "Could not publish the tour: the server stopped making progress at 12 of 22 images.");
+        // The first answer counts as progress; three more without any end it.
+        assert_eq!(s.lines().len(), 4);
+    }
+
+    #[test]
+    fn a_stall_counter_starts_again_when_the_server_moves_on() {
+        let s = stub(|_, seen| match seen {
+            0..=2 => in_progress(12, 22),
+            3..=5 => in_progress(20, 22),
+            _ => reply(200, LIVE),
+        });
+        assert!(publish(&s).0.is_ok());
+        assert_eq!(s.lines().len(), 7);
+    }
+
+    #[test]
+    fn publish_refusals_are_sentences_and_are_not_retried() {
+        let cases: [(u16, &str, &str); 6] = [
+            (409, r#"{"error":"publish_busy","detail":"another publish of this tour is starting at this moment; try again"}"#, "Could not publish the tour: another publish of this tour is starting at this moment."),
+            (409, r#"{"error":"publish_cancelled","detail":"x"}"#, "Could not publish the tour: the publish was stopped on the server before it finished."),
+            (429, r#"{"error":"rate_limited"}"#, "Could not publish the tour: the server is busy (HTTP 429). Try again later."),
+            (500, r#"{"error":"publish_failed","detail":"the tour could not be published; what was published before is unchanged"}"#, "Could not publish the tour: the tour could not be published; what was published before is unchanged (HTTP 500)."),
+            (503, "", "Could not publish the tour: the server answered HTTP 503."),
+            (400, r#"{"error":"empty_tour","detail":"a tour with no steps cannot be published"}"#, "Could not publish the tour: a tour with no steps cannot be published (HTTP 400)."),
+        ];
+        for (status, body, message) in cases {
+            let s = stub(move |_, _| reply(status, body));
+            let (r, _) = publish(&s);
+            assert_eq!(r.unwrap_err(), message);
+            assert_eq!(s.lines().len(), 1, "{status} must not be sent again");
+        }
+        let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
+        assert_eq!(publish(&s).0.unwrap_err(), REJECTED_TOKEN);
+    }
+
+    #[test]
+    fn a_refusal_in_the_middle_of_a_publish_ends_it() {
+        let s = stub(|_, seen| if seen == 0 { in_progress(12, 22) } else { reply(409, r#"{"error":"publish_cancelled"}"#) });
+        assert!(publish(&s).0.unwrap_err().contains("stopped on the server"));
+        assert_eq!(s.lines().len(), 2);
+    }
+
+    #[test]
+    fn a_lost_connection_while_publishing_says_so_without_the_token() {
+        let s = stub(|_, _| Answer::Drop);
+        let e = publish(&s).0.unwrap_err();
+        assert!(e.starts_with("Could not publish the tour: ") && e.ends_with('.') && !e.contains("dp_"), "{e}");
+        assert_eq!(s.lines().len(), 1);
+        let s = stub(|_, seen| if seen == 0 { in_progress(12, 22) } else { Answer::Drop });
+        let e = publish(&s).0.unwrap_err();
+        assert!(e.ends_with("while the images were being copied.") && !e.contains("dp_"), "{e}");
+    }
+
+    #[test]
+    fn publish_answers_that_make_no_sense_are_refused() {
+        for body in [r#"{"status":"in_progress","done":1,"total":2}"#, r#"{"status":"in_progress","publish_id":"pub_../../x","done":1,"total":2}"#] {
+            let s = stub(move |_, _| reply(202, body));
+            assert_eq!(publish(&s).0.unwrap_err(), "Could not publish the tour: the server's answer was not understood.");
+        }
+        let s = stub(|_, _| reply(200, r#"{"slug":"abc"}"#));
+        assert!(publish(&s).0.unwrap_err().contains("not understood"));
+        // A tour id that is not one never reaches the network.
+        let s = stub(|_, _| reply(200, LIVE));
+        assert!(client(&s).publish_tour("tour_x/../y", Duration::ZERO, |_| true).is_err());
+        assert!(s.lines().is_empty());
+    }
+
+    #[test]
+    fn cancel_in_the_middle_of_a_publish_stops_calling() {
+        let s = stub(|_, _| in_progress(12, 22));
+        let mut calls = 0;
+        let r = client(&s).publish_tour(TOUR, Duration::ZERO, |_| {
+            calls += 1;
+            calls < 3
+        });
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        // Two calls went out; nothing else is sent, the server clears a publish nobody drives.
+        assert_eq!(s.lines(), [PUBLISH, PUBLISH]);
+        // Cancelled before the first call: nothing is sent at all.
+        let s = stub(|_, _| reply(200, LIVE));
+        assert_eq!(client(&s).publish_tour(TOUR, Duration::ZERO, |_| false).unwrap_err(), CANCELLED);
+        assert!(s.lines().is_empty());
+    }
+
+    /// The platform, with a publish route that answers as `publish` says.
+    fn platform_with(publish: impl Fn(usize) -> Answer + Send + 'static) -> Stub {
+        stub(move |req, seen| if req.line == PUBLISH { publish(seen) } else { platform(req, seen) })
+    }
+
+    fn upload_and_publish_to(stub: &Stub, publish_now: bool, go: impl FnMut(Option<Images>) -> bool) -> Result<Finished, String> {
+        let dir = bundle(2, false);
+        client(stub).upload_and_publish(dir.path(), &Target::New, publish_now, Duration::ZERO, |_| true, go)
+    }
+
+    #[test]
+    fn publish_now_uploads_then_publishes_and_a_draft_only_uploads() {
+        let s = platform_with(|seen| if seen == 0 { in_progress(2, 2) } else { reply(200, LIVE) });
+        let done = upload_and_publish_to(&s, true, |_| true).unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 5, outcome: Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) } });
+        let lines = s.lines();
+        let commit = lines.iter().position(|l| l.ends_with("/commit")).unwrap();
+        assert_eq!(&lines[commit + 1..], [PUBLISH, PUBLISH], "publishing starts after the commit");
+
+        let s = platform_with(|_| reply(200, LIVE));
+        let done = upload_and_publish_to(&s, false, |_| true).unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::Draft });
+        assert!(!s.lines().iter().any(|l| l == PUBLISH), "a draft upload never calls publish");
+    }
+
+    #[test]
+    fn a_failed_publish_keeps_the_draft_and_trying_again_does_not_upload_again() {
+        let s = platform_with(|seen| if seen == 0 { reply(500, r#"{"error":"publish_failed","detail":"the tour could not be published"}"#) } else { reply(200, LIVE) });
+        let done = upload_and_publish_to(&s, true, |_| true).unwrap();
+        assert_eq!(done.tour_id, TOUR);
+        assert_eq!(done.steps, 2);
+        assert!(matches!(&done.outcome, Outcome::NotPublic { cancelled: false, error } if error == "Could not publish the tour: the tour could not be published (HTTP 500)."), "{done:?}");
+        // The failed publish did not abort the upload: the draft stays.
+        assert!(!s.lines().iter().any(|l| l.starts_with("DELETE ")));
+        let before = s.lines().len();
+
+        // "Try again" is the publish step alone.
+        let again = after_publish(&done.tour_id, done.steps, client(&s).publish_tour(&done.tour_id, Duration::ZERO, |_| true));
+        assert_eq!(again.outcome, Outcome::Public { url: Some(format!("{}/t/abc123", s.base)) });
+        assert_eq!(again.steps, 5);
+        let lines = s.lines();
+        assert_eq!(&lines[before..], [PUBLISH]);
+        assert_eq!(lines.iter().filter(|l| *l == "POST /api/v1/uploads").count(), 1, "no second upload");
+        assert_eq!(lines.iter().filter(|l| l.ends_with("/commit")).count(), 1);
+        assert_eq!(lines.iter().filter(|l| l.starts_with("PUT ")).count(), 2);
+    }
+
+    #[test]
+    fn cancel_during_the_publish_step_leaves_an_uploaded_draft() {
+        let s = platform_with(|_| in_progress(1, 2));
+        let mut calls = 0;
+        let done = upload_and_publish_to(&s, true, |_| {
+            calls += 1;
+            calls < 2
+        })
+        .unwrap();
+        assert_eq!(done, Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: true, error: String::new() } });
+        let lines = s.lines();
+        assert_eq!(lines.iter().filter(|l| *l == PUBLISH).count(), 1);
+        assert!(!lines.iter().any(|l| l.starts_with("DELETE ")), "the upload is not aborted: {lines:?}");
+    }
+
+    #[test]
+    fn a_failed_upload_never_reaches_publish() {
+        let s = stub(|req, seen| if req.line.ends_with("/commit") { reply(500, "{}") } else if req.line == PUBLISH { reply(200, LIVE) } else { platform(req, seen) });
+        assert!(upload_and_publish_to(&s, true, |_| true).is_err());
+        assert!(!s.lines().iter().any(|l| l == PUBLISH));
+    }
+
+    #[test]
+    fn the_public_link_is_the_servers_made_whole_and_never_plain_http() {
+        let base = "https://tours.example.com";
+        // A path goes after the configured address; a server under a path keeps it.
+        assert_eq!(public_url(base, Some("/t/abc123"), Some("abc123")).as_deref(), Some("https://tours.example.com/t/abc123"));
+        assert_eq!(public_url("https://x.dev/demo/", Some("/t/abc"), None).as_deref(), Some("https://x.dev/demo/t/abc"));
+        // A full https address is used as it is.
+        assert_eq!(public_url(base, Some("https://view.example.com/t/abc"), Some("abc")).as_deref(), Some("https://view.example.com/t/abc"));
+        // No url: built from the slug.
+        assert_eq!(public_url(base, None, Some("abc-1_2")).as_deref(), Some("https://tours.example.com/t/abc-1_2"));
+        // http is for localhost and 127.0.0.1 only.
+        assert_eq!(public_url("http://localhost:8787", Some("/t/abc"), None).as_deref(), Some("http://localhost:8787/t/abc"));
+        assert_eq!(public_url("http://127.0.0.1:8787", None, Some("abc")).as_deref(), Some("http://127.0.0.1:8787/t/abc"));
+        assert_eq!(public_url("http://localhost:8787", Some("http://localhost:8787/t/abc"), None).as_deref(), Some("http://localhost:8787/t/abc"));
+        // A link that is not https falls back to the slug, and without one there is no link.
+        assert_eq!(public_url(base, Some("http://tours.example.com/t/abc"), Some("abc")).as_deref(), Some("https://tours.example.com/t/abc"));
+        assert_eq!(public_url(base, Some("http://tours.example.com/t/abc"), None), None);
+        for bad in ["javascript://x/%0aalert(1)", "file:///c:/x", "//evil.example/t/abc", "t/abc", "", "/t/a b", "/t/abc?x=1", "/t/abc#x", "/t/\"x", "/t/a&calc", "/../x", "https://user@x.dev/t/a"] {
+            assert_eq!(public_url(base, Some(bad), None), None, "{bad:?}");
+            assert_eq!(public_url(base, Some(bad), Some("abc")).as_deref(), Some("https://tours.example.com/t/abc"), "{bad:?}");
+        }
+        for bad_slug in ["", "a/b", "a b", "..", "a?b"] {
+            assert_eq!(public_url(base, None, Some(bad_slug)), None, "{bad_slug:?}");
+        }
+        assert_eq!(public_url(base, Some(&format!("/t/{}", "a".repeat(400))), None), None);
+        assert_eq!(public_url("http://example.com", Some("/t/abc"), Some("abc")), None);
+    }
+
+    #[test]
+    fn a_publish_result_says_whether_the_tour_is_public() {
+        let live = Live { steps: 7, url: Some("https://x.dev/t/a".into()) };
+        assert_eq!(after_publish(TOUR, 2, Ok(live)), Finished { tour_id: TOUR.into(), steps: 7, outcome: Outcome::Public { url: Some("https://x.dev/t/a".into()) } });
+        assert_eq!(after_publish(TOUR, 2, Err(CANCELLED.into())).outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
+        assert_eq!(after_publish(TOUR, 2, Err("Could not publish the tour: x.".into())), Finished { tour_id: TOUR.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: x.".into() } });
     }
 
     #[test]
