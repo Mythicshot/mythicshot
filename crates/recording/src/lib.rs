@@ -10,9 +10,11 @@
 //! leaves the pointer out; the overlay renderer draws it back in at export.
 
 mod cursor;
+mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
+pub use saved::OpenError;
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -54,9 +56,12 @@ pub struct FrameMeta {
     pub cursor: Option<(i32, i32)>,
 }
 
-/// A finished recording: compressed frames in a temp folder plus their timing.
+/// A finished recording: compressed frames in a folder plus their timing. A recording that
+/// was just made owns a temp folder; one opened from a saved folder does not own it.
 pub struct Recording {
     dir: PathBuf,
+    /// Whether the folder is this recording's to delete.
+    owned: bool,
     pub width: u32,
     pub height: u32,
     pub frames: Vec<FrameMeta>,
@@ -110,7 +115,7 @@ impl Recording {
     #[doc(hidden)]
     pub fn timing_only(width: u32, height: u32, times: &[u64], end_ms: u64) -> Recording {
         let frames = times.iter().map(|t| FrameMeta { offset: 0, len: 0, key: true, t_ms: *t, cursor: None }).collect();
-        Recording { dir: PathBuf::new(), width, height, frames, end_ms }
+        Recording { dir: PathBuf::new(), owned: false, width, height, frames, end_ms }
     }
 
     pub fn duration_ms(&self) -> u64 {
@@ -121,8 +126,12 @@ impl Recording {
         self.delete_files();
     }
 
-    /// Remove the temp files; for a recording shared through an `Arc`.
+    /// Remove the temp files; for a recording shared through an `Arc`. A recording opened
+    /// from a saved folder does not own that folder, and nothing is removed.
     pub fn delete_files(&self) {
+        if !self.owned {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -453,7 +462,7 @@ impl FrameWriter {
 
     fn finish(mut self, dir: PathBuf, end_ms: u64) -> Result<Recording, String> {
         self.out.flush().map_err(|e| e.to_string())?;
-        Ok(Recording { dir, width: self.width, height: self.height, frames: self.frames, end_ms })
+        Ok(Recording { dir, owned: true, width: self.width, height: self.height, frames: self.frames, end_ms })
     }
 }
 
@@ -462,7 +471,7 @@ mod tests {
     use super::*;
 
     /// A frame that differs from its neighbours in a few places, like a screen.
-    fn synthetic(i: usize, w: u32, h: u32) -> Vec<u8> {
+    pub(crate) fn synthetic(i: usize, w: u32, h: u32) -> Vec<u8> {
         let mut px = vec![30u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
