@@ -95,6 +95,13 @@ pub fn token_status() -> TokenStatus {
     config().token.clone()
 }
 
+/// A number that changes every time the token is looked up again: at start-up and after
+/// each Save and Forget. What was read from the site with an earlier number may belong to
+/// another token, so the pages read it again.
+pub fn token_epoch() -> u64 {
+    config().generation
+}
+
 /// Look the token up again on a background thread.
 pub fn refresh_token() {
     std::thread::spawn(refresh_token_now);

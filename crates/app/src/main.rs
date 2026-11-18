@@ -31,6 +31,7 @@ mod tray;
 mod tour;
 mod tour_cards;
 mod tour_view;
+mod tours_ui;
 mod video;
 mod video_editor;
 

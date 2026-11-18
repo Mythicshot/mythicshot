@@ -16,6 +16,7 @@ use crate::home_ui::{self, HomeState};
 use crate::platform::{WindowId, WindowKind};
 use crate::publish_ui::{self, TokenStatus};
 use crate::settings_ui::{self, UiAction};
+use crate::tours_ui::{self, ToursState};
 use crate::tray::Command;
 
 const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
@@ -54,9 +55,8 @@ impl Page {
     /// The one sentence a page that is not built yet shows; `None` for a page that is.
     pub fn coming_soon(self) -> Option<&'static str> {
         match self {
-            Page::Tours => Some("The Tours page is coming in a later update."),
             Page::Workspace => Some("The Workspace page is coming in a later update."),
-            Page::Home | Page::Preferences => None,
+            Page::Home | Page::Tours | Page::Preferences => None,
         }
     }
 }
@@ -173,6 +173,8 @@ pub struct Shared {
     /// The Preferences page: the settings being edited and what the page queued for the app.
     pub prefs: settings_ui::Shared,
     pub home: HomeState,
+    /// The Tours page. Its jobs hold their own handle on it, so they finish when the window is closed.
+    pub tours: ToursState,
     /// A capture a Home tile asked for; the app hides the window, then runs it.
     pub capture: Option<Command>,
     /// A capture or recording is going on: the tiles are greyed out.
@@ -181,7 +183,7 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), capture: None, busy: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), capture: None, busy: false }
     }
 
     /// Drop the Preferences page's unfinished input once the page has been left. Settings
@@ -370,8 +372,9 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
 fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
     match s.nav.page() {
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
-        // Not built yet: Tours (`tours_ui`) and Workspace (`workspace_ui`) replace these two arms.
-        page @ (Page::Tours | Page::Workspace) => placeholder(ui, page),
+        Page::Tours => tours_ui::ui(ui, &mut s.tours, &tours_ui::Conn::current(), out),
+        // Not built yet: Workspace (`workspace_ui`) replaces this arm.
+        page @ Page::Workspace => placeholder(ui, page),
         Page::Preferences => {
             let p = &mut s.prefs;
             let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart };
@@ -603,12 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn the_two_pages_not_built_yet_say_so_in_one_sentence() {
-        for page in [Page::Tours, Page::Workspace] {
+    fn the_page_not_built_yet_says_so_in_one_sentence() {
+        for page in [Page::Workspace] {
             let s = page.coming_soon().expect("a placeholder");
             assert!(s.starts_with(&format!("The {} page", page.label())) && s.ends_with('.') && s.matches('.').count() == 1 && !s.contains('!'), "{s}");
         }
-        assert_eq!((Page::Home.coming_soon(), Page::Preferences.coming_soon()), (None, None));
+        assert_eq!((Page::Home.coming_soon(), Page::Tours.coming_soon(), Page::Preferences.coming_soon()), (None, None, None));
         assert_eq!(Page::ALL.map(Page::label), ["Home", "Tours", "Workspace", "Preferences"]);
     }
 
@@ -653,7 +656,12 @@ mod tests {
         for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
             assert!(home.lines().any(|l| l == word), "Home is missing {word:?} in:\n{home}");
         }
-        for page in [Page::Tours, Page::Workspace] {
+        // No token is saved in a test run, so Tours says it is not connected and asks nothing of any site.
+        s.nav.go(Page::Tours);
+        let tours = drawn(&ctx, &mut s);
+        assert!(tours.lines().any(|l| l == tours_ui::RECORD_A_TOUR) && !tours.contains("Recent"), "{tours}");
+        assert!(tours.contains(tours_ui::NOT_CONNECTED) || tours.contains(tours_ui::CHECKING), "{tours}");
+        for page in [Page::Workspace] {
             s.nav.go(page);
             let text = drawn(&ctx, &mut s);
             assert!(text.contains(page.coming_soon().unwrap()), "{text}");

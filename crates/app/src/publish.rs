@@ -1106,52 +1106,52 @@ fn read_bundle_file(dir: &Path, f: &BundleFile) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
-    const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
+    pub(crate) const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
     const UP: &str = "up_0123456789abcdef01234567";
 
     #[derive(Debug, Clone)]
-    struct Req {
-        line: String,
-        auth: Option<String>,
-        content_type: Option<String>,
-        body: Vec<u8>,
+    pub(crate) struct Req {
+        pub(crate) line: String,
+        pub(crate) auth: Option<String>,
+        pub(crate) content_type: Option<String>,
+        pub(crate) body: Vec<u8>,
     }
 
     /// What the stub does with a request: answer, or drop the connection without a word.
-    enum Answer {
+    pub(crate) enum Answer {
         Reply(u16, String, Vec<(&'static str, String)>),
         Drop,
         Hang,
     }
 
-    fn reply(status: u16, body: &str) -> Answer {
+    pub(crate) fn reply(status: u16, body: &str) -> Answer {
         Answer::Reply(status, body.to_string(), vec![])
     }
 
-    struct Stub {
-        base: String,
+    pub(crate) struct Stub {
+        pub(crate) base: String,
         log: Arc<Mutex<Vec<Req>>>,
     }
 
     impl Stub {
-        fn lines(&self) -> Vec<String> {
+        pub(crate) fn lines(&self) -> Vec<String> {
             self.log.lock().unwrap().iter().map(|r| r.line.clone()).collect()
         }
-        fn requests(&self) -> Vec<Req> {
+        pub(crate) fn requests(&self) -> Vec<Req> {
             self.log.lock().unwrap().clone()
         }
     }
 
     /// A one-thread HTTP server on 127.0.0.1 that records each request and answers with `handler`.
     /// `handler` gets the request and how many earlier requests had the same line.
-    fn stub(handler: impl Fn(&Req, usize) -> Answer + Send + 'static) -> Stub {
+    pub(crate) fn stub(handler: impl Fn(&Req, usize) -> Answer + Send + 'static) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let log = Arc::new(Mutex::new(Vec::new()));
