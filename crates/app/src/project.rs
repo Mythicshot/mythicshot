@@ -11,4 +11,4 @@ mod state;
 mod store;
 
 pub use state::{Blob, FORMAT, ItemEntry, MAX_PROJECT_JSON_BYTES, ParseError, ProjectFile, ProjectKey, Restored, SavedEdit, SavedEvent, SavedItem, Snapshot, from_file, parse, to_file, to_text};
-pub use store::{LoadError, Loaded, OpenGuard, Problem, ProjectInfo, Saved, Store, Totals, epoch};
+pub use store::{LoadError, Loaded, NOT_PUT_BACK, OpenGuard, Problem, ProjectInfo, Saved, Store, Totals, epoch};

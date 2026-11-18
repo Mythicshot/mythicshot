@@ -3,16 +3,22 @@
 //! A project is the folder `<root>/<site>/<tour id>/<chapter id>/`: `project.json`, `recording.json`,
 //! `frames.zst`, the cover logo and `pictures/`. `<site>` is the first 16 hex characters of the
 //! SHA-256 of the site's address. A folder is a project only when it holds `project.json`, which is
-//! written last when a project is saved and removed first when one is removed.
+//! written last when a project is saved and removed first when one is removed, and no `.removing`
+//! mark, which a removal writes before anything else.
 //!
-//! A first save is built in `<root>/.staging-<random>/` and renamed into place. A project that is
-//! open in an editor has its frames file open and cannot be renamed, so a save over it writes the
-//! new pictures beside the old ones and then replaces `project.json` in one rename.
+//! A first save is built in `<root>/.staging-<time>-<random>/` and renamed into place. A project
+//! that is open in an editor has its frames file open and cannot be renamed, so a save over it
+//! writes the new pictures beside the old ones and then replaces `project.json` in one rename. A
+//! project that is replaced whole waits in `<root>/.replaced-<random>/` until the new one is in
+//! place; nothing but [`Store::recover_replaced`] ever takes such a folder away.
 //!
 //! Only files the store itself writes are ever removed: a file somebody else put into a project
 //! folder stays where it is.
+//!
+//! At start-up, in this order: [`Store::recover_replaced`], [`Store::finish_removals`],
+//! [`Store::sweep_staging`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,14 +28,18 @@ use std::time::{Duration, SystemTime};
 use mythicshot_recording::{OpenError, Recording};
 use sha2::Digest;
 
-use super::state::{self, Blob, ItemEntry, MAX_PROJECT_JSON_BYTES, ParseError, ProjectFile, ProjectKey, Restored, SavedShape, Snapshot};
+use super::state::{self, Blob, MAX_PROJECT_JSON_BYTES, ParseError, ProjectFile, ProjectKey, Restored, Snapshot};
 
 const PROJECT_FILE: &str = "project.json";
 const INDEX_FILE: &str = "recording.json";
 const FRAMES_FILE: &str = "frames.zst";
 const PICTURES: &str = "pictures";
-/// A save in progress, and a folder moved out of a new save's way, is `<root>/.staging-<16 hex>`.
+/// In a project folder that is being removed: written first, removed last.
+const REMOVING_FILE: &str = ".removing";
+/// A save in progress is `<root>/.staging-<milliseconds since 1970>-<16 hex>`.
 const STAGING: &str = ".staging-";
+/// A project moved out of a new save's way is `<root>/.replaced-<16 hex>`.
+const REPLACED: &str = ".replaced-";
 const RANDOM_CHARS: usize = 16;
 /// The longest tour or chapter id that is used as a folder name.
 const ID_MAX_CHARS: usize = 64;
@@ -39,10 +49,16 @@ const ID_MAX_CHARS: usize = 64;
 const BUSY_TRIES: u32 = 5;
 const BUSY_WAIT: Duration = Duration::from_millis(120);
 
+/// The error of a save that could not put the project it was replacing back in place. The
+/// wording is proposed and waits for the owner's approval.
+pub const NOT_PUT_BACK: &str = "The earlier saved recording could not be put back in place. It is kept on this computer and is restored the next time Mythicshot starts.";
+
 /// The projects folder of this computer's user.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// [`epoch`]'s counter; a test gives each store its own.
+    epoch: &'static AtomicU64,
 }
 
 /// What the list knows about a project without opening its recording.
@@ -114,14 +130,15 @@ pub enum LoadError {
 pub struct OpenGuard {
     dir: PathBuf,
     name: PathBuf,
+    epoch: &'static AtomicU64,
 }
 
 /// The steps of a save that a test makes fail.
 struct Steps<'a> {
     /// Puts the recording's frames file and index into a folder; the frames file's size.
     keep_frames: &'a dyn Fn(&Recording, &Path) -> Result<u64, String>,
-    /// The rename that makes a save count: a staging folder into place, or the new `project.json`
-    /// over the old one.
+    /// Every rename of a save: a staging folder into place, the project it replaces out of the
+    /// way and back, and the new `project.json` over the old one.
     rename: &'a dyn Fn(&Path, &Path) -> io::Result<()>,
 }
 
@@ -133,27 +150,33 @@ pub fn epoch() -> u64 {
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
-fn bump() {
-    EPOCH.fetch_add(1, Ordering::SeqCst);
-}
-
 impl Store {
     pub fn at(root: PathBuf) -> Store {
-        Store { root }
+        Store { root, epoch: &EPOCH }
     }
 
     /// Where projects live for this user: beside the app's local data, which does not roam. A
     /// debug build with `MYTHICSHOT_CONFIG_DIR` set uses that folder, as the settings file does.
-    pub fn default_root() -> PathBuf {
+    /// None when the user's folder cannot be found; there is no other place to fall back to.
+    pub fn default_root() -> Option<PathBuf> {
         #[cfg(debug_assertions)]
         if let Some(dir) = std::env::var_os("MYTHICSHOT_CONFIG_DIR") {
-            return PathBuf::from(dir).join("projects");
+            return Some(PathBuf::from(dir).join("projects"));
         }
-        directories::ProjectDirs::from("", "", "Mythicshot").map(|d| d.data_local_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("projects")
+        Self::root_in(directories::ProjectDirs::from("", "", "Mythicshot").map(|d| d.data_local_dir().to_path_buf()))
+    }
+
+    /// `projects` in the app's local data folder, and only in a folder with a full path.
+    fn root_in(local_data: Option<PathBuf>) -> Option<PathBuf> {
+        local_data.filter(|dir| dir.is_absolute()).map(|dir| dir.join("projects"))
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn bump(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Save the project for `key`. The error is a sentence that names no folder.
@@ -163,35 +186,35 @@ impl Store {
 
     fn save_with(&self, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Saved, String> {
         let dir = self.project_dir(key).ok_or("this tour's id cannot be used as a folder name.")?;
-        let left_out = {
-            let changing = changing();
-            if dir.join(PROJECT_FILE).is_file() && is_open(&dir) {
-                // Quick: a few pictures and one small file, and the editor that has it open waits for it.
-                save_in_place(&dir, key, snap, steps)?
-            } else {
-                // The frames may have to be copied, which can take long: nothing else waits for that.
-                drop(changing);
-                self.save_whole(&dir, key, snap, steps)?
-            }
+        let open_here = {
+            let _changing = changing();
+            is_project(&dir) && is_open(&dir)
         };
-        bump();
-        let info = read_info(&dir, &site_of(&key.server), &key.tour_id, &key.chapter_id, Some(&key.server)).ok_or("the project could not be read back after it was saved.")?;
+        let in_place = if open_here { save_in_place(&dir, key, snap, steps)? } else { None };
+        let (file, left_out) = match in_place {
+            Some(saved) => saved,
+            None => self.save_whole(&dir, key, snap, steps)?,
+        };
+        self.bump();
+        // Built from what was written: the save is done, whatever a second look at the folder says.
+        let info = ProjectInfo { key: key.clone(), title: file.title, tour_title: file.tour_title, saved_at: file.saved_at, bytes: bytes_in(&dir), dir, problem: None };
         Ok(Saved { info, left_out })
     }
 
     /// Build the whole project in a staging folder and rename it into place. A project already
     /// there, which no editor has open, is moved out of the way first and put back if the new one
     /// cannot take its place.
-    fn save_whole(&self, dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Vec<String>, String> {
+    fn save_whole(&self, dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<(ProjectFile, Vec<String>), String> {
         if matches!(read_project(dir), Err(Unreadable::Newer)) {
             return Err("a newer version of Mythicshot saved this tour's recording, so it is left as it is.".into());
         }
         std::fs::create_dir_all(&self.root).map_err(|e| sentence("the folder for saved recordings could not be made", e))?;
-        let staging = self.root.join(format!("{STAGING}{}", random_name()));
+        let staging = self.root.join(format!("{STAGING}{}-{}", now_ms().max(0), random_name()));
         std::fs::create_dir(&staging).map_err(|e| sentence("the folder for saved recordings could not be written", e))?;
-        let result = fill(&staging, key, snap, steps).and_then(|left_out| {
+        // The frames may have to be copied, which can take long: nothing else waits for that.
+        let result = fill(&staging, key, snap, steps).and_then(|saved| {
             let _changing = changing();
-            self.place(&staging, dir, steps).map(|()| left_out)
+            self.place(&staging, dir, steps).map(|()| saved)
         });
         if result.is_err() {
             // Entirely this call's own: nothing else was ever in it.
@@ -212,17 +235,17 @@ impl Store {
         }
         let aside = match std::fs::symlink_metadata(dir) {
             Ok(_) => {
-                let aside = self.root.join(format!("{STAGING}{}", random_name()));
-                patiently(|| std::fs::rename(dir, &aside)).map_err(|e| sentence("this tour's saved recording is in use and could not be replaced", e))?;
+                let aside = self.root.join(format!("{REPLACED}{}", random_name()));
+                (steps.rename)(dir, &aside).map_err(|e| sentence("this tour's saved recording is in use and could not be replaced", e))?;
                 Some(aside)
             }
             Err(_) => None,
         };
         if let Err(e) = (steps.rename)(staging, dir) {
             match &aside {
-                Some(aside) => {
-                    let _ = patiently(|| std::fs::rename(aside, dir));
-                }
+                // Kept where it is under its own name; the next start puts it back.
+                Some(aside) if (steps.rename)(aside, dir).is_err() => return Err(NOT_PUT_BACK.to_string()),
+                Some(_) => {}
                 // The folders made for it, when nothing else is in them.
                 None => parents.iter().for_each(|parent| {
                     let _ = std::fs::remove_dir(parent);
@@ -231,39 +254,72 @@ impl Store {
             return Err(sentence("the recording could not be put into the folder for saved recordings", e));
         }
         if let Some(aside) = &aside {
-            // The old project's own files go; a file somebody else had put beside them moves along.
-            let _ = remove_files(aside);
-            for entry in std::fs::read_dir(aside).into_iter().flatten().flatten() {
-                let to = dir.join(entry.file_name());
-                if std::fs::symlink_metadata(&to).is_err() {
-                    let _ = std::fs::rename(entry.path(), to);
-                }
-            }
-            let _ = std::fs::remove_dir(aside);
+            retire(aside, dir);
         }
         Ok(())
     }
 
-    /// Every project, of every address.
-    pub fn list(&self) -> Vec<ProjectInfo> {
-        let mut out = Vec::new();
-        for (site, site_dir) in folders_in(&self.root) {
-            if !is_random_name(&site) {
+    /// Finish what a save that replaced a project could not: run at start-up, before
+    /// [`Store::finish_removals`] and [`Store::sweep_staging`]. A `.replaced-` folder whose
+    /// project file names a tour and chapter with no project in place is put back there. When a
+    /// project is in place, the files the store wrote go from the `.replaced-` folder, and the
+    /// folder too once it is empty. One without a readable project file is left alone.
+    pub fn recover_replaced(&self) {
+        let _changing = changing();
+        for (name, aside) in folders_in(&self.root) {
+            if !name.strip_prefix(REPLACED).is_some_and(is_random_name) {
                 continue;
             }
-            for (tour, tour_dir) in folders_in(&site_dir) {
-                if !is_folder_id(&tour) {
-                    continue;
-                }
-                for (chapter, dir) in folders_in(&tour_dir) {
-                    if is_folder_id(&chapter) {
-                        out.extend(read_info(&dir, &site, &tour, &chapter, None));
-                    }
-                }
+            let Some(dir) = named_key(&aside).and_then(|key| self.project_dir(&key)) else { continue };
+            if is_project(&dir) {
+                retire(&aside, &dir);
+                continue;
+            }
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // An empty folder in its place is no reason to keep it out.
+            let _ = std::fs::remove_dir(&dir);
+            if patiently(|| std::fs::rename(&aside, &dir)).is_ok() {
+                self.bump();
             }
         }
-        out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    }
+
+    /// Finish the removals a crash cut off, and those of projects that were open in an editor
+    /// when the app last closed: run at start-up, after [`Store::recover_replaced`]. Every
+    /// project folder that carries the removal mark, and is not open now, is removed.
+    pub fn finish_removals(&self) {
+        let _changing = changing();
+        for (dir, _, _, _) in self.chapter_folders() {
+            if is_removing(&dir) && !is_open(&dir) {
+                let _ = remove_files(&dir);
+                prune_parents(&dir);
+                self.bump();
+            }
+        }
+    }
+
+    /// Every folder `<site>/<tour>/<chapter>` with names the store gives, with those names.
+    fn chapter_folders(&self) -> Vec<(PathBuf, String, String, String)> {
+        let mut out = Vec::new();
+        for (site, site_dir) in folders_in(&self.root).into_iter().filter(|(site, _)| is_random_name(site)) {
+            chapters_of_site(&site_dir, &site, &mut out);
+        }
         out
+    }
+
+    /// Every project, of every address.
+    pub fn list(&self) -> Vec<ProjectInfo> {
+        sorted(self.chapter_folders().into_iter().filter_map(|(dir, site, tour, chapter)| read_info(&dir, &site, &tour, &chapter, None)).collect())
+    }
+
+    /// Every project of one site, read in one walk. `server` is matched exactly.
+    pub fn for_site(&self, server: &str) -> Vec<ProjectInfo> {
+        let site = site_of(server);
+        let mut folders = Vec::new();
+        chapters_of_site(&self.root.join(&site), &site, &mut folders);
+        sorted(folders.into_iter().filter_map(|(dir, site, tour, chapter)| read_info(&dir, &site, &tour, &chapter, Some(server))).collect())
     }
 
     /// The projects of one tour on one site: one per saved chapter. `server` is matched exactly.
@@ -272,9 +328,7 @@ impl Store {
             return Vec::new();
         }
         let site = site_of(server);
-        let mut out: Vec<ProjectInfo> = folders_in(&self.root.join(&site).join(tour_id)).into_iter().filter(|(chapter, _)| is_folder_id(chapter)).filter_map(|(chapter, dir)| read_info(&dir, &site, tour_id, &chapter, Some(server))).collect();
-        out.sort_by(|a, b| a.dir.cmp(&b.dir));
-        out
+        sorted(folders_in(&self.root.join(&site).join(tour_id)).into_iter().filter(|(chapter, _)| is_folder_id(chapter)).filter_map(|(chapter, dir)| read_info(&dir, &site, tour_id, &chapter, Some(server))).collect())
     }
 
     pub fn totals(&self) -> Totals {
@@ -289,10 +343,16 @@ impl Store {
         // that fails drops the guard again.
         let open = {
             let _changing = changing();
-            if !dir.join(PROJECT_FILE).is_file() {
+            if !is_project(&dir) {
                 return Err(LoadError::NotSaved);
             }
-            OpenGuard::register(&dir).ok_or(LoadError::AlreadyOpen)?
+            if is_open(&dir) {
+                return Err(LoadError::AlreadyOpen);
+            }
+            if is_removing(&dir) {
+                return Err(LoadError::NotSaved);
+            }
+            OpenGuard::register(&dir, self.epoch).ok_or(LoadError::AlreadyOpen)?
         };
         let file = read_project(&dir).map_err(|e| match e {
             Unreadable::Newer => LoadError::Newer,
@@ -310,14 +370,19 @@ impl Store {
         if !frames_are(&dir, file.frames_bytes) {
             return Err(LoadError::Damaged("the frames file is not the one the project was saved with".into()));
         }
+        // Pictures are read from the project's own folder and from nowhere a link points to.
+        if std::fs::symlink_metadata(dir.join(PICTURES)).is_ok() && !is_real_folder(&dir.join(PICTURES)) {
+            return Err(LoadError::Damaged("the project's pictures folder is not a folder".into()));
+        }
         let info = read_info(&dir, &site_of(&key.server), &key.tour_id, &key.chapter_id, Some(&key.server)).ok_or(LoadError::NotSaved)?;
         let restored = state::from_file(file, &dir, &rec);
         Ok(Loaded { info, rec: Arc::new(rec), restored, open })
     }
 
     /// Remove the projects of one tour on one site, and say how many. One that is open in an
-    /// editor is counted and removed when that editor closes it. Only files the store wrote are
-    /// removed; a folder that still holds something else is left with it.
+    /// editor is counted, is no longer listed, and is removed when that editor closes it (or by
+    /// [`Store::finish_removals`] at the next start). Only files the store wrote are removed; a
+    /// folder that still holds something else is left with it.
     pub fn remove_tour(&self, server: &str, tour_id: &str) -> Result<usize, String> {
         if !is_folder_id(tour_id) {
             return Ok(0);
@@ -330,14 +395,12 @@ impl Store {
             if !is_folder_id(&chapter) {
                 continue;
             }
-            let is_project = dir.join(PROJECT_FILE).is_file();
-            if remove_when_closed(&dir) {
-                removed += usize::from(is_project);
-                continue;
-            }
+            let was_listed = is_project(&dir) && !is_removing(&dir);
             touched = true;
-            match remove_files(&dir) {
-                Ok(()) => removed += usize::from(is_project),
+            // An open project is only marked: its editor still reads it.
+            let done = if is_open(&dir) { mark_removing(&dir) } else { remove_files(&dir) };
+            match done {
+                Ok(()) => removed += usize::from(was_listed),
                 Err(e) => failed = failed.or(Some(e)),
             }
         }
@@ -345,7 +408,7 @@ impl Store {
         let _ = std::fs::remove_dir(&tour_dir);
         let _ = std::fs::remove_dir(&site_dir);
         if touched {
-            bump();
+            self.bump();
         }
         match failed {
             Some(e) => Err(sentence("a saved recording of this tour could not be removed", e)),
@@ -353,18 +416,18 @@ impl Store {
         }
     }
 
-    /// Remove what a save that was cut off left behind: real folders directly in the projects
-    /// folder named `.staging-` and exactly the random suffix, not changed for `age`.
+    /// Remove what a save that was cut off left behind: run at start-up, last. Real folders
+    /// directly in the projects folder named `.staging-<time>-<random>` exactly, whose time (the
+    /// one the save wrote into the name, not the folder's own) is at least `age` ago.
     pub fn sweep_staging(&self, age: Duration) {
         self.sweep_staging_at(age, SystemTime::now());
     }
 
     fn sweep_staging_at(&self, age: Duration, now: SystemTime) {
         let _changing = changing();
+        let now = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         for (name, dir) in folders_in(&self.root) {
-            let ours = name.strip_prefix(STAGING).is_some_and(is_random_name);
-            let changed = std::fs::symlink_metadata(&dir).and_then(|m| m.modified());
-            if ours && changed.is_ok_and(|at| now.duration_since(at).is_ok_and(|since| since >= age)) {
+            if staging_started(&name).is_some_and(|started| now >= u128::from(started) + age.as_millis()) {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
@@ -378,27 +441,21 @@ impl Store {
 
 impl OpenGuard {
     /// None when the project is already open.
-    fn register(dir: &Path) -> Option<OpenGuard> {
+    fn register(dir: &Path, epoch: &'static AtomicU64) -> Option<OpenGuard> {
         let name = registry_name(dir);
-        let mut open = registry();
-        if open.contains_key(&name) {
-            return None;
-        }
-        open.insert(name.clone(), false);
-        Some(OpenGuard { dir: dir.to_path_buf(), name })
+        registry().insert(name.clone()).then(|| OpenGuard { dir: dir.to_path_buf(), name, epoch })
     }
 }
 
 impl Drop for OpenGuard {
     fn drop(&mut self) {
         let _changing = changing();
-        let remove = registry().remove(&self.name).unwrap_or(false);
-        if remove {
+        registry().remove(&self.name);
+        // Its tour was removed while it was open.
+        if is_removing(&self.dir) {
             let _ = remove_files(&self.dir);
-            for parent in self.dir.ancestors().skip(1).take(2) {
-                let _ = std::fs::remove_dir(parent);
-            }
-            bump();
+            prune_parents(&self.dir);
+            self.epoch.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -409,9 +466,9 @@ fn changing() -> MutexGuard<'static, ()> {
     CHANGING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The projects open in an editor, by folder; true for one that is removed when it is closed.
-fn registry() -> MutexGuard<'static, HashMap<PathBuf, bool>> {
-    static OPEN: std::sync::LazyLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The projects open in an editor, by folder.
+fn registry() -> MutexGuard<'static, HashSet<PathBuf>> {
+    static OPEN: std::sync::LazyLock<Mutex<HashSet<PathBuf>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
     OPEN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -421,27 +478,61 @@ fn registry_name(dir: &Path) -> PathBuf {
 }
 
 fn is_open(dir: &Path) -> bool {
-    registry().contains_key(&registry_name(dir))
+    registry().contains(&registry_name(dir))
 }
 
-/// Mark an open project to be removed when it is closed; false when it is not open.
-fn remove_when_closed(dir: &Path) -> bool {
-    registry().get_mut(&registry_name(dir)).map(|remove| *remove = true).is_some()
+fn is_project(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(PROJECT_FILE)).is_ok_and(|m| m.is_file())
+}
+
+/// Whether the folder carries the mark of a removal that is not finished.
+fn is_removing(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(REMOVING_FILE)).is_ok()
+}
+
+/// Write the removal mark, on the disk.
+fn mark_removing(dir: &Path) -> io::Result<()> {
+    if is_removing(dir) { Ok(()) } else { write_whole(&dir.join(REMOVING_FILE), b"") }
+}
+
+/// The tour's and the site's folder, when nothing is left in them.
+fn prune_parents(dir: &Path) {
+    for parent in dir.ancestors().skip(1).take(2) {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 /// Save over a project that an editor has open. The frames file is that editor's own and is not
 /// written; the new pictures go beside the old ones, the project file is replaced in one rename,
-/// and then what it no longer names is removed. A failure leaves the project as it was.
-fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Vec<String>, String> {
+/// and then what it no longer names is removed. A failure removes the files this call made and
+/// nothing else, so the project is as it was. None when the project was closed meanwhile.
+fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Option<(ProjectFile, Vec<String>)>, String> {
+    // Reading the index and encoding the pictures need no lock: the editor holds the project open.
     let kept = Recording::open_saved(dir).map_err(|_| "the saved recording's frames can no longer be read.".to_string())?;
-    if !same_recording(&kept, snap.rec) {
+    if !kept.same_frames(snap.rec) {
         return Err("this tour's saved recording is open in an editor and belongs to another recording.".into());
     }
     let frames_bytes = std::fs::metadata(dir.join(FRAMES_FILE)).map_err(|e| sentence("the saved recording's frames can no longer be read", e))?.len();
     let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
     let text = project_text(&file)?;
-    let before = read_project(dir).ok().map(|old| named_files(&old));
-    let written = blobs.iter().try_for_each(|blob| write_blob(dir, blob)).and_then(|()| {
+
+    let _changing = changing();
+    if !(is_project(dir) && is_open(dir)) {
+        return Ok(None);
+    }
+    let had_pictures = std::fs::symlink_metadata(dir.join(PICTURES)).is_ok();
+    let mut made = Vec::new();
+    let mut written = Ok(());
+    for blob in &blobs {
+        match write_blob(dir, blob) {
+            Ok(new) => made.extend(new),
+            Err(e) => {
+                written = Err(e);
+                break;
+            }
+        }
+    }
+    let written = written.and_then(|()| {
         let path = dir.join(PROJECT_FILE);
         let tmp = temp_beside(&path);
         write_whole(&tmp, text.as_bytes()).and_then(|()| (steps.rename)(&tmp, &path)).map_err(|e| {
@@ -452,12 +543,14 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
     match written {
         Ok(()) => {
             tidy(dir, &blobs.iter().map(|b| b.name.clone()).collect());
-            Ok(left_out)
+            Ok(Some((file, left_out)))
         }
         Err(e) => {
-            // Take away the pictures this save added; without the old list nothing is removed.
-            if let Some(before) = before {
-                tidy(dir, &before);
+            for path in made {
+                let _ = std::fs::remove_file(path);
+            }
+            if !had_pictures {
+                let _ = std::fs::remove_dir(dir.join(PICTURES));
             }
             Err(e)
         }
@@ -465,13 +558,37 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
 }
 
 /// Put everything a project holds into the new folder `staging`, the project file last.
-fn fill(staging: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Vec<String>, String> {
+fn fill(staging: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<(ProjectFile, Vec<String>), String> {
     let frames_bytes = (steps.keep_frames)(snap.rec, staging).map_err(|e| one_sentence(&e))?;
     let (file, blobs, left_out) = state::to_file(key, snap, now_ms(), frames_bytes);
     let text = project_text(&file)?;
-    blobs.iter().try_for_each(|blob| write_blob(staging, blob))?;
+    for blob in &blobs {
+        write_blob(staging, blob)?;
+    }
     write_whole(&staging.join(PROJECT_FILE), text.as_bytes()).map_err(|e| sentence("the project file could not be written", e))?;
-    Ok(left_out)
+    Ok((file, left_out))
+}
+
+/// Take a replaced project's folder away once the new project is in `dir`: the files the store
+/// wrote go, a file somebody else had put beside them moves along when its name is free, and the
+/// folder goes only when it is empty.
+fn retire(aside: &Path, dir: &Path) {
+    let _ = remove_files(aside);
+    for entry in std::fs::read_dir(aside).into_iter().flatten().flatten() {
+        let to = dir.join(entry.file_name());
+        if std::fs::symlink_metadata(&to).is_err() {
+            let _ = std::fs::rename(entry.path(), to);
+        }
+    }
+    let _ = std::fs::remove_dir(aside);
+}
+
+/// The address, tour and chapter a folder's project file names, also one this version cannot open.
+fn named_key(dir: &Path) -> Option<ProjectKey> {
+    let text = project_file_text(dir).ok()?;
+    let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let word = |name: &str| value.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    Some(ProjectKey { server: word("server")?, tour_id: word("tour_id")?, chapter_id: word("chapter_id")? })
 }
 
 fn project_text(file: &ProjectFile) -> Result<String, String> {
@@ -482,43 +599,33 @@ fn project_text(file: &ProjectFile) -> Result<String, String> {
     Ok(text)
 }
 
-/// Whether two recordings are the same one, as far as their indexes tell.
-fn same_recording(a: &Recording, b: &Recording) -> bool {
-    (a.width, a.height, a.end_ms, a.frames.len()) == (b.width, b.height, b.end_ms, b.frames.len()) && a.frames.iter().zip(&b.frames).all(|(x, y)| (x.t_ms, x.cursor) == (y.t_ms, y.cursor))
-}
-
-/// The pictures and the logo a project file names, as paths inside the project with `/`.
-fn named_files(file: &ProjectFile) -> BTreeSet<String> {
-    let pictures = file.items.iter().filter_map(|entry| match entry {
-        ItemEntry::Item(item) => match &item.shape {
-            SavedShape::Image { picture, .. } => Some(picture.clone()),
-            _ => None,
-        },
-        ItemEntry::Unreadable(_) => None,
-    });
-    pictures.chain(file.edit.tour_doc.logo.clone()).collect()
-}
-
 /// Write one picture or logo: under a temporary name, on the disk, then renamed. A file of that
 /// name is trusted only when it has the right size; one cut short by an earlier save is replaced.
-fn write_blob(dir: &Path, blob: &Blob) -> Result<(), String> {
+/// Returns the file's path when there was no file of that name before.
+fn write_blob(dir: &Path, blob: &Blob) -> Result<Option<PathBuf>, String> {
     let failed = |e: io::Error| sentence("a picture of the project could not be written", e);
     let path = match blob.name.strip_prefix("pictures/") {
-        Some(file) if state::is_picture_name(&blob.name) => dir.join(PICTURES).join(file),
+        Some(file) if state::is_picture_name(&blob.name) => {
+            let pictures = dir.join(PICTURES);
+            if std::fs::symlink_metadata(&pictures).is_ok() && !is_real_folder(&pictures) {
+                return Err("the project's pictures folder is not a folder.".into());
+            }
+            std::fs::create_dir_all(&pictures).map_err(failed)?;
+            pictures.join(file)
+        }
         None if state::is_logo_name(&blob.name) => dir.join(&blob.name),
         _ => return Err("a picture of the project has a name that cannot be used.".into()),
     };
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == blob.bytes.len() as u64) {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed)?;
+    let before = std::fs::symlink_metadata(&path).ok();
+    if before.as_ref().is_some_and(|m| m.is_file() && m.len() == blob.bytes.len() as u64) {
+        return Ok(None);
     }
     let tmp = temp_beside(&path);
     write_whole(&tmp, &blob.bytes).and_then(|()| patiently(|| std::fs::rename(&tmp, &path))).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         failed(e)
-    })
+    })?;
+    Ok(before.is_none().then_some(path))
 }
 
 /// Write the new file `path`, whole and on the disk.
@@ -545,7 +652,7 @@ fn temp_of(name: &str) -> Option<&str> {
 /// A file directly in a project folder that only the store or the recording puts there.
 fn is_top_file(name: &str) -> bool {
     let known = |n: &str| matches!(n, PROJECT_FILE | INDEX_FILE | FRAMES_FILE) || state::is_logo_name(n);
-    known(name) || temp_of(name).is_some_and(known)
+    name == REMOVING_FILE || known(name) || temp_of(name).is_some_and(known)
 }
 
 /// A file in a project's `pictures` folder that only the store puts there.
@@ -554,8 +661,28 @@ fn is_picture_file(name: &str) -> bool {
     known(name) || temp_of(name).is_some_and(known)
 }
 
-/// Remove from a project folder the pictures and logos that are not in `keep`, and temporary
-/// files a cut-off save left. Nothing else is touched, and a file that cannot be removed stays.
+/// The real files in a project's `pictures` folder; none when that is a link and not a folder.
+fn pictures_in(dir: &Path) -> Vec<(String, PathBuf)> {
+    let pictures = dir.join(PICTURES);
+    if is_real_folder(&pictures) { files_in(&pictures) } else { Vec::new() }
+}
+
+/// Remove the `pictures` folder if it is a real folder and empty.
+fn remove_empty_pictures(dir: &Path) {
+    let pictures = dir.join(PICTURES);
+    if is_real_folder(&pictures) {
+        let _ = std::fs::remove_dir(pictures);
+    }
+}
+
+/// A folder, and not a link or a junction to one.
+fn is_real_folder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// After a save over a project: remove the pictures and logos that are not in `keep`, and
+/// temporary files a cut-off save left. Nothing else is touched, and a file that cannot be
+/// removed stays.
 fn tidy(dir: &Path, keep: &BTreeSet<String>) {
     for (name, path) in files_in(dir) {
         let stale = temp_of(&name).is_some() && is_top_file(&name);
@@ -563,25 +690,26 @@ fn tidy(dir: &Path, keep: &BTreeSet<String>) {
             let _ = std::fs::remove_file(path);
         }
     }
-    let pictures = dir.join(PICTURES);
-    for (name, path) in files_in(&pictures) {
+    for (name, path) in pictures_in(dir) {
         if is_picture_file(&name) && !keep.contains(&format!("pictures/{name}")) {
             let _ = std::fs::remove_file(path);
         }
     }
-    let _ = std::fs::remove_dir(&pictures);
+    remove_empty_pictures(dir);
 }
 
-/// Remove a project: its project file first, so that what is left is no project, then every
-/// other file the store wrote, then the folders if they are empty. A file somebody else put
-/// there stays, with its folder, and is not an error.
+/// Remove a project: the removal mark is written, then its project file goes, so that what is
+/// left is no project, then every other file the store wrote, the mark last and only when all of
+/// them went, then the folders if they are empty. A file somebody else put there stays, with its
+/// folder, and is not an error.
 fn remove_files(dir: &Path) -> io::Result<()> {
+    // Without the mark the removal still happens; it only could not be finished after a crash.
+    let _ = mark_removing(dir);
     match patiently(|| std::fs::remove_file(dir.join(PROJECT_FILE))) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let pictures = dir.join(PICTURES);
-    let ours = files_in(dir).into_iter().filter(|(name, _)| is_top_file(name)).chain(files_in(&pictures).into_iter().filter(|(name, _)| is_picture_file(name)));
+    let ours = files_in(dir).into_iter().filter(|(name, _)| is_top_file(name) && name != REMOVING_FILE).chain(pictures_in(dir).into_iter().filter(|(name, _)| is_picture_file(name)));
     let mut failed = None;
     for (_, path) in ours {
         match patiently(|| std::fs::remove_file(&path)) {
@@ -589,9 +717,13 @@ fn remove_files(dir: &Path) -> io::Result<()> {
             _ => {}
         }
     }
-    let _ = std::fs::remove_dir(&pictures);
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    remove_empty_pictures(dir);
+    let _ = std::fs::remove_file(dir.join(REMOVING_FILE));
     let _ = std::fs::remove_dir(dir);
-    failed.map_or(Ok(()), Err)
+    Ok(())
 }
 
 /// The real files directly in `dir`, by name. A link is not followed.
@@ -609,9 +741,23 @@ fn entries_in(dir: &Path, wanted: impl Fn(&std::fs::FileType) -> bool) -> Vec<(S
     entries.flatten().filter(|e| e.file_type().is_ok_and(|kind| wanted(&kind))).filter_map(|e| Some((e.file_name().into_string().ok()?, e.path()))).collect()
 }
 
+/// The chapter folders of the site folder `site_dir`, added to `out` with their names.
+fn chapters_of_site(site_dir: &Path, site: &str, out: &mut Vec<(PathBuf, String, String, String)>) {
+    for (tour, tour_dir) in folders_in(site_dir).into_iter().filter(|(tour, _)| is_folder_id(tour)) {
+        for (chapter, dir) in folders_in(&tour_dir).into_iter().filter(|(chapter, _)| is_folder_id(chapter)) {
+            out.push((dir, site.to_string(), tour.clone(), chapter));
+        }
+    }
+}
+
+fn sorted(mut list: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+    list.sort_by(|a, b| a.dir.cmp(&b.dir));
+    list
+}
+
 /// The size of a project's files together.
 fn bytes_in(dir: &Path) -> u64 {
-    files_in(dir).into_iter().chain(files_in(&dir.join(PICTURES))).filter_map(|(_, path)| std::fs::symlink_metadata(path).ok()).map(|m| m.len()).sum()
+    files_in(dir).into_iter().chain(pictures_in(dir)).filter_map(|(_, path)| std::fs::symlink_metadata(path).ok()).map(|m| m.len()).sum()
 }
 
 /// Whether the frames file is a file of this many bytes.
@@ -647,9 +793,13 @@ fn read_project(dir: &Path) -> Result<ProjectFile, Unreadable> {
 }
 
 /// What the list shows for the project in `dir`, the folder `<site>/<tour>/<chapter>`; None when
-/// the folder holds no project file. The cheap check: the project file parses, its address, tour
-/// and chapter are the folder's, and the frames file is there at the size it was saved with.
+/// the folder holds no project file, or is being removed. The cheap check: the project file
+/// parses, its address, tour and chapter are the folder's, and the frames file is there at the
+/// size it was saved with.
 fn read_info(dir: &Path, site: &str, tour: &str, chapter: &str, server: Option<&str>) -> Option<ProjectInfo> {
+    if is_removing(dir) {
+        return None;
+    }
     let text = match project_file_text(dir) {
         Err(Unreadable::NotThere) => return None,
         other => other.ok(),
@@ -691,7 +841,8 @@ fn hex16(bytes: &[u8]) -> String {
     hex[..RANDOM_CHARS].to_string()
 }
 
-/// Sixteen hex characters no other call gets: the name of a staging folder or a temporary file.
+/// Sixteen hex characters no other call gets: part of the name of a staging folder, a replaced
+/// project's folder or a temporary file.
 fn random_name() -> String {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -700,6 +851,13 @@ fn random_name() -> String {
 
 fn is_random_name(s: &str) -> bool {
     s.len() == RANDOM_CHARS && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// When the save that made the staging folder `name` started, in milliseconds since 1970; None
+/// for any name but `.staging-<1 to 15 digits>-<16 hex>`.
+fn staging_started(name: &str) -> Option<u64> {
+    let (started, random) = name.strip_prefix(STAGING)?.split_once('-')?;
+    ((1..=15).contains(&started.len()) && started.bytes().all(|b| b.is_ascii_digit()) && is_random_name(random)).then(|| started.parse().ok()).flatten()
 }
 
 /// Whether a tour or chapter id can be a folder's name as it is: lower-case letters, digits, `_`
@@ -765,9 +923,14 @@ mod tests {
     /// The bytes of a frames file of `n` frames, and the index that describes it. The store never
     /// decodes a frame, so the frames are not pictures.
     fn frames_and_index(n: usize) -> (Vec<u8>, String) {
+        frames_and_index_of(n, 0)
+    }
+
+    /// The same times and no pointer, and every frame `longer` bytes longer.
+    fn frames_and_index_of(n: usize, longer: usize) -> (Vec<u8>, String) {
         let (mut bytes, mut rows) = (Vec::new(), Vec::new());
         for i in 0..n {
-            let frame = vec![i as u8 + 1; 20 + i];
+            let frame = vec![i as u8 + 1; 20 + i + longer];
             rows.push(serde_json::json!([bytes.len(), frame.len(), i == 0, i * 100, null, null]));
             bytes.extend(frame);
         }
@@ -776,9 +939,13 @@ mod tests {
 
     /// A recording of `n` frames of 100 x 80 in the folder `<root>/<name>`, as an editor has one.
     fn recorded(root: &Path, name: &str, n: usize) -> Recording {
+        recorded_of(root, name, n, 0)
+    }
+
+    fn recorded_of(root: &Path, name: &str, n: usize, longer: usize) -> Recording {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let (bytes, index) = frames_and_index(n);
+        let (bytes, index) = frames_and_index_of(n, longer);
         std::fs::write(dir.join(FRAMES_FILE), bytes).unwrap();
         std::fs::write(dir.join(INDEX_FILE), index).unwrap();
         Recording::open_saved(&dir).unwrap()
@@ -799,7 +966,7 @@ mod tests {
     impl World {
         fn new() -> World {
             let tmp = tempfile::tempdir().unwrap();
-            let store = Store::at(tmp.path().join("projects"));
+            let store = own_store(tmp.path().join("projects"));
             let rec = recorded(tmp.path(), "rec", FRAMES);
             let (logo_dir, logo) = logo_source();
             let edit = edit(&rec, Some(&logo));
@@ -817,6 +984,31 @@ mod tests {
         fn dir(&self, key: &ProjectKey) -> PathBuf {
             self.store.root().join(site_of(&key.server)).join(&key.tour_id).join(&key.chapter_id)
         }
+    }
+
+    /// A store with a change counter of its own, so that what another test saves is not counted.
+    fn own_store(root: PathBuf) -> Store {
+        Store { root, epoch: Box::leak(Box::new(AtomicU64::new(0))) }
+    }
+
+    fn changes(store: &Store) -> u64 {
+        store.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Whether a path's last part starts with `start`.
+    fn named(path: &Path, start: &str) -> bool {
+        path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(start))
+    }
+
+    /// The folders directly in the projects folder whose names start with `start`.
+    fn in_root(store: &Store, start: &str) -> Vec<PathBuf> {
+        folders_in(store.root()).into_iter().filter(|(name, _)| name.starts_with(start)).map(|(_, path)| path).collect()
+    }
+
+    /// As after a crash and a new start: the project is not open any more, and its guard never ran.
+    fn forget_open(loaded: Loaded) {
+        registry().remove(&loaded.open.name);
+        std::mem::forget(loaded.open);
     }
 
     fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
@@ -876,16 +1068,25 @@ mod tests {
     }
 
     #[test]
-    fn the_default_folder_is_called_projects() {
-        assert!(Store::default_root().ends_with("projects"));
+    fn the_default_folder_is_projects_in_the_users_folder_or_nothing() {
+        let local = std::env::temp_dir().join("Mythicshot").join("data");
+        assert!(local.is_absolute());
+        assert_eq!(Store::root_in(Some(local.clone())), Some(local.join("projects")));
+        // No folder of the user's, or one without a full path: no store, never the folder the app runs in.
+        assert_eq!(Store::root_in(None), None);
+        assert_eq!(Store::root_in(Some(PathBuf::from("."))), None);
+        assert_eq!(Store::root_in(Some(PathBuf::from("Mythicshot/data"))), None);
+        if let Some(root) = Store::default_root() {
+            assert!(root.is_absolute() && root.ends_with("projects"), "{root:?}");
+        }
     }
 
     #[test]
     fn a_saved_project_loads_back_exactly_as_it_was_saved() {
         let w = World::new();
-        let before = epoch();
+        assert_eq!(changes(&w.store), 0);
         let saved = w.save(&key_1());
-        assert!(epoch() > before, "a save tells the pages to read the list again");
+        assert_eq!(changes(&w.store), 1, "a save tells the pages to read the list again");
         let dir = w.dir(&key_1());
         assert_eq!(saved.left_out, Vec::<String>::new());
         assert_eq!((saved.info.key.clone(), saved.info.title.as_str(), saved.info.tour_title.as_str(), saved.info.problem), (key_1(), "Chapter one", "Customer onboarding", None));
@@ -934,6 +1135,7 @@ mod tests {
         };
         let err = w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &full_disk, rename: &real_rename }).unwrap_err();
         assert!(err.contains("not enough space"), "{err}");
+        assert_eq!(changes(&w.store), 0, "a save that failed is no change");
         assert!(err.ends_with('.') && !err.contains(&*w.tmp.path().to_string_lossy()) && !err.contains(STAGING), "{err}");
         assert_eq!(tree(w.store.root()), Vec::<String>::new());
         assert_eq!(w.store.list(), vec![]);
@@ -997,10 +1199,10 @@ mod tests {
             std::fs::write(dir.join(stale), b"cut off").unwrap();
         }
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
-        let before = epoch();
+        let before = changes(&w.store);
         let snap = Snapshot { rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &items };
         let second = w.store.save(&key_1(), &snap).unwrap();
-        assert!(epoch() > before);
+        assert_eq!(changes(&w.store), before + 1);
         assert_eq!((second.info.title.as_str(), second.info.problem, second.info.dir.clone()), ("Chapter one, again", None, first.info.dir.clone()));
         assert!(second.info.saved_at >= first.info.saved_at);
 
@@ -1027,6 +1229,8 @@ mod tests {
         let w = World::new();
         w.save(&key_1());
         let dir = w.dir(&key_1());
+        // A picture file the project does not name, which this save does not write either.
+        std::fs::write(dir.join(PICTURES).join("00112233aabbccdd.png"), b"not this save's").unwrap();
         let whole = contents(&dir);
         let l = loaded(&w.store, &key_1());
         let (edit, items) = edited(&w);
@@ -1038,7 +1242,8 @@ mod tests {
         };
         let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
         assert!(err.contains("the rename was refused") && !err.contains(&*w.tmp.path().to_string_lossy()), "{err}");
-        assert_eq!(contents(&dir), whole, "every file is as the first save left it, and no new one is beside them");
+        assert_eq!(contents(&dir), whole, "the files this save made are gone, and no other file is touched");
+        assert_eq!(changes(&w.store), 1);
         drop(l);
         let again = loaded(&w.store, &key_1());
         let mut want = w.edit.clone();
@@ -1062,14 +1267,20 @@ mod tests {
         let refuse = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("the rename was refused")) };
         w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
         assert_eq!(contents(&dir), whole);
-        assert_eq!(tree(w.store.root()).iter().filter(|n| n.contains(STAGING)).count(), 0);
+        // The old one moves out of the way, the new one cannot move in, and the old one is put back.
+        let no_way_in = |from: &Path, to: &Path| if named(from, STAGING) { Err(io::Error::other("the rename was refused")) } else { std::fs::rename(from, to) };
+        let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &no_way_in }).unwrap_err();
+        assert!(err.contains("the rename was refused") && err != NOT_PUT_BACK, "{err}");
+        assert_eq!(contents(&dir), whole);
+        assert_eq!((in_root(&w.store, STAGING), in_root(&w.store, REPLACED)), (vec![], vec![]));
+        assert_eq!(changes(&w.store), 1);
         assert_eq!(loaded(&w.store, &key_1()).restored.title, "Chapter one");
 
         let saved = w.store.save(&key_1(), &snap).unwrap();
         assert_eq!((saved.info.title.as_str(), saved.info.problem), ("Shorter", None));
         assert_eq!(tree(&dir), vec![FRAMES_FILE.to_string(), "notes.txt".to_string(), PROJECT_FILE.to_string(), INDEX_FILE.to_string()], "the old project's files are gone, and a file that was nobody's is kept");
         assert_eq!(std::fs::read(dir.join(FRAMES_FILE)).unwrap(), frames_and_index(4).0);
-        assert_eq!(tree(w.store.root()).iter().filter(|n| n.contains(STAGING)).count(), 0);
+        assert_eq!((in_root(&w.store, STAGING), in_root(&w.store, REPLACED)), (vec![], vec![]));
         assert_eq!(loaded(&w.store, &key_1()).rec.frames.len(), 4);
     }
 
@@ -1107,6 +1318,13 @@ mod tests {
         let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         let err = w.store.save(&key_1(), &snap).unwrap_err();
         assert!(err.ends_with('.'), "{err}");
+        assert_eq!(contents(&dir), whole);
+        // As many frames at the same times, with no pointer, and still not the same frames.
+        let alike = recorded_of(w.tmp.path(), "alike", FRAMES, 3);
+        assert_eq!(alike.frames.iter().map(|m| (m.t_ms, m.cursor)).collect::<Vec<_>>(), l.rec.frames.iter().map(|m| (m.t_ms, m.cursor)).collect::<Vec<_>>());
+        let snap = Snapshot { rec: &alike, title: "Alike", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+        let err = w.store.save(&key_1(), &snap).unwrap_err();
+        assert!(err.contains("another recording"), "{err}");
         assert_eq!(contents(&dir), whole);
         drop(l);
     }
@@ -1152,6 +1370,13 @@ mod tests {
         assert_eq!(keys(&w.store.for_tour(SITE_B, TOUR_1)), vec![key(SITE_B, TOUR_1, CH_2)]);
         assert_eq!(w.store.for_tour(SITE_A, TOUR_2), vec![]);
         assert_eq!(w.store.for_tour("https://tours.example.com/", TOUR_1), vec![], "the address is matched exactly");
+        // A whole site in one walk gives the same rows as asking tour by tour.
+        w.save(&key(SITE_A, TOUR_2, CH_1));
+        let site = w.store.for_site(SITE_A);
+        assert_eq!(keys(&site), vec![key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_2, CH_1)]);
+        assert_eq!(site, [w.store.for_tour(SITE_A, TOUR_1), w.store.for_tour(SITE_A, TOUR_2)].concat());
+        assert_eq!(w.store.for_site("https://tours.example.com/"), vec![]);
+        assert_eq!(w.store.remove_tour(SITE_A, TOUR_2), Ok(1));
         assert_eq!(w.store.for_tour("https://third.example.com", TOUR_1), vec![]);
         assert_eq!(load_err(&w.store, &key(SITE_A, TOUR_1, CH_2)), LoadError::NotSaved);
         assert_eq!(load_err(&w.store, &key(SITE_B, TOUR_1, CH_1)), LoadError::NotSaved);
@@ -1286,9 +1511,9 @@ mod tests {
         // Somebody's own file inside a project folder, and a project half removed earlier.
         std::fs::write(w.dir(&key(SITE_A, TOUR_1, CH_1)).join("notes.txt"), b"mine").unwrap();
         std::fs::remove_file(w.dir(&key(SITE_A, TOUR_1, CH_2)).join(PROJECT_FILE)).unwrap();
-        let before = epoch();
+        let before = changes(&w.store);
         assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(1), "one project was there to remove");
-        assert!(epoch() > before);
+        assert_eq!(changes(&w.store), before + 1);
         assert_eq!(keys(&w.store.list()), {
             let mut left = vec![key(SITE_A, TOUR_2, CH_1), key(SITE_B, TOUR_1, CH_1)];
             left.sort_by_key(|k| w.dir(k));
@@ -1314,17 +1539,77 @@ mod tests {
         w.save(&key(SITE_A, TOUR_1, CH_1));
         w.save(&key(SITE_A, TOUR_1, CH_2));
         let open = loaded(&w.store, &key(SITE_A, TOUR_1, CH_1));
+        let before = changes(&w.store);
         assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(2));
-        // The open one is whole until its editor closes; the other is gone at once.
-        assert_eq!(keys(&w.store.list()), vec![key(SITE_A, TOUR_1, CH_1)]);
-        assert_eq!(std::fs::read(open.info.dir.join(FRAMES_FILE)).unwrap(), frames_and_index(FRAMES).0);
-        assert_eq!(load_err(&w.store, &key(SITE_A, TOUR_1, CH_1)), LoadError::AlreadyOpen);
-        let before = epoch();
-        drop(open);
-        assert!(epoch() > before);
+        assert_eq!(changes(&w.store), before + 1);
+        // Neither is listed or counted any more; the open one's files are whole until its editor closes.
         assert_eq!(w.store.list(), vec![]);
+        assert_eq!(w.store.for_tour(SITE_A, TOUR_1), vec![]);
+        assert_eq!(w.store.totals(), Totals::default());
+        assert_eq!(std::fs::read(open.info.dir.join(FRAMES_FILE)).unwrap(), frames_and_index(FRAMES).0);
+        assert!(open.info.dir.join(PROJECT_FILE).is_file() && open.info.dir.join(REMOVING_FILE).is_file());
+        assert_eq!(load_err(&w.store, &key(SITE_A, TOUR_1, CH_1)), LoadError::AlreadyOpen);
+        // Removing it again counts nothing, and start-up housekeeping leaves an open project alone.
+        assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(0));
+        w.store.finish_removals();
+        assert!(open.info.dir.join(FRAMES_FILE).is_file());
+        // Its editor can still save; the save is reported from what was written, and stays unlisted.
+        let snap = Snapshot { rec: &open.rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+        let saved = w.store.save(&key(SITE_A, TOUR_1, CH_1), &snap).unwrap();
+        assert_eq!((saved.info.title.as_str(), saved.info.key.clone(), saved.info.problem), ("Late", key(SITE_A, TOUR_1, CH_1), None));
+        assert!(saved.info.bytes > frames_and_index(FRAMES).0.len() as u64);
+        assert_eq!(w.store.list(), vec![]);
+        let before = changes(&w.store);
+        drop(open);
+        assert_eq!(changes(&w.store), before + 1);
         assert_eq!(tree(w.store.root()), Vec::<String>::new());
         assert_eq!(load_err(&w.store, &key(SITE_A, TOUR_1, CH_1)), LoadError::NotSaved);
+    }
+
+    #[test]
+    fn a_removal_cut_off_by_a_crash_is_finished_at_the_next_start() {
+        let w = World::new();
+        w.save(&key(SITE_A, TOUR_1, CH_1));
+        w.save(&key(SITE_A, TOUR_2, CH_1));
+        std::fs::write(w.dir(&key(SITE_A, TOUR_1, CH_1)).join("notes.txt"), b"mine").unwrap();
+        let open = loaded(&w.store, &key(SITE_A, TOUR_1, CH_1));
+        assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(1));
+        // The app dies with the editor open: the guard never runs.
+        forget_open(open);
+        let dir = w.dir(&key(SITE_A, TOUR_1, CH_1));
+        assert!(dir.join(PROJECT_FILE).is_file() && dir.join(FRAMES_FILE).is_file(), "the files are still there");
+        // The delete the user asked for holds across the restart: not listed, not counted, not opened.
+        assert_eq!(keys(&w.store.list()), vec![key(SITE_A, TOUR_2, CH_1)]);
+        assert_eq!(w.store.totals().count, 1);
+        assert_eq!(load_err(&w.store, &key(SITE_A, TOUR_1, CH_1)), LoadError::NotSaved);
+        assert!(dir.join(FRAMES_FILE).is_file(), "looking at it removes nothing");
+        let before = changes(&w.store);
+        w.store.finish_removals();
+        assert_eq!(changes(&w.store), before + 1);
+        assert_eq!(tree(&w.store.root().join(site_of(SITE_A)).join(TOUR_1)), vec![format!("{CH_1}/"), format!("{CH_1}/notes.txt")], "what the store wrote is gone, and nothing else");
+        assert_eq!(keys(&w.store.list()), vec![key(SITE_A, TOUR_2, CH_1)]);
+        loaded(&w.store, &key(SITE_A, TOUR_2, CH_1));
+        // Nothing left to finish: nothing changes.
+        w.store.finish_removals();
+        assert_eq!(changes(&w.store), before + 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_that_cannot_take_every_file_keeps_its_mark_and_is_finished_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        // Another program has the frames file open and does not let it be deleted.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(dir.join(FRAMES_FILE)).unwrap();
+        let err = w.store.remove_tour(SITE_A, TOUR_1).unwrap_err();
+        assert!(err.ends_with('.') && !err.contains(&*w.tmp.path().to_string_lossy()), "{err}");
+        assert!(!dir.join(PROJECT_FILE).exists() && dir.join(REMOVING_FILE).is_file() && dir.join(FRAMES_FILE).is_file());
+        assert_eq!(w.store.list(), vec![]);
+        drop(held);
+        w.store.finish_removals();
+        assert_eq!(tree(w.store.root()), Vec::<String>::new());
     }
 
     #[test]
@@ -1336,8 +1621,10 @@ mod tests {
         assert!(sizes.iter().all(|b| *b > frames_and_index(FRAMES).0.len() as u64));
         assert_eq!(w.store.totals(), Totals { count: 3, bytes: sizes.iter().sum() });
         // A staging folder and a stray file are not projects.
-        std::fs::create_dir(w.store.root().join(".staging-0123456789abcdef")).unwrap();
-        std::fs::write(w.store.root().join(".staging-0123456789abcdef").join(PROJECT_FILE), b"{}").unwrap();
+        for not_a_site in [".staging-1763460000000-0123456789abcdef", ".replaced-0123456789abcdef"] {
+            std::fs::create_dir_all(w.store.root().join(not_a_site).join(TOUR_1).join(CH_1)).unwrap();
+            std::fs::copy(w.dir(&key(SITE_A, TOUR_1, CH_1)).join(PROJECT_FILE), w.store.root().join(not_a_site).join(TOUR_1).join(CH_1).join(PROJECT_FILE)).unwrap();
+        }
         std::fs::write(w.store.root().join("readme.txt"), b"hello").unwrap();
         assert_eq!(w.store.totals().count, 3);
     }
@@ -1357,39 +1644,235 @@ mod tests {
         assert_eq!(tree(w.tmp.path()).iter().filter(|n| !n.starts_with("rec/")).collect::<Vec<_>>(), Vec::<&String>::new());
     }
 
+    fn since_1970(t: SystemTime) -> u128 {
+        t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis()
+    }
+
+    const DAY: Duration = Duration::from_secs(86_400);
+    const HOUR: Duration = Duration::from_secs(3_600);
+
     #[test]
     fn only_old_staging_folders_with_the_exact_name_are_swept() {
         let w = World::new();
         w.save(&key_1());
         let root = w.store.root().to_path_buf();
-        let cut_off = root.join(".staging-0123456789abcdef");
+        let now = SystemTime::now();
+        let started = since_1970(now);
+        let cut_off = root.join(format!(".staging-{started}-0123456789abcdef"));
         std::fs::create_dir_all(cut_off.join(PICTURES)).unwrap();
         std::fs::write(cut_off.join(FRAMES_FILE), b"half").unwrap();
-        let not_ours = [".staging-", ".staging-0123456789abcde", ".staging-0123456789abcdef0", ".staging-0A1B2C3D4E5F6A7B", ".staging-0123456789abcdeg", "staging-0123456789abcdef", ".staging-0123456789abcdef.bak"];
-        for name in not_ours {
+        let not_ours = [
+            ".staging-".to_string(),
+            ".staging-0123456789abcdef".to_string(),
+            format!(".staging-{started}-0123456789abcde"),
+            format!(".staging-{started}-0123456789abcdef0"),
+            format!(".staging-{started}-0A1B2C3D4E5F6A7B"),
+            format!(".staging-{started}-0123456789abcdeg"),
+            format!(".staging--{started}-1123456789abcdef"),
+            format!(".staging-x{started}-2123456789abcdef"),
+            format!(".staging-{started}0000-3123456789abcdef"),
+            format!("staging-{started}-0123456789abcdef"),
+            format!(".staging-{started}-0123456789abcdef.bak"),
+            ".replaced-0123456789abcdef".to_string(),
+            format!(".replaced-{started}-0123456789abcdef"),
+        ];
+        for name in &not_ours {
             std::fs::create_dir(root.join(name)).unwrap();
             std::fs::write(root.join(name).join("kept.txt"), b"x").unwrap();
         }
         // A file with the exact name, and a folder with it one level down.
-        std::fs::write(root.join(".staging-fedcba9876543210"), b"a file").unwrap();
-        let deeper = root.join(site_of(SITE_A)).join(".staging-0123456789abcdef");
-        std::fs::create_dir(&deeper).unwrap();
+        std::fs::write(root.join(format!(".staging-{started}-fedcba9876543210")), b"a file").unwrap();
+        std::fs::create_dir(root.join(site_of(SITE_A)).join(format!(".staging-{started}-0123456789abcdef"))).unwrap();
         let everything = tree(&root);
 
         // Not old enough yet: a save may still be writing it.
-        w.store.sweep_staging(Duration::from_secs(86_400));
+        w.store.sweep_staging(DAY);
+        w.store.sweep_staging_at(DAY, now + 23 * HOUR);
         assert_eq!(tree(&root), everything);
-        // A day and an hour later.
-        let before = epoch();
-        w.store.sweep_staging_at(Duration::from_secs(86_400), SystemTime::now() + Duration::from_secs(90_000));
-        let left = tree(&root);
+        // The age is the one in the name: a folder made this moment whose name says two days ago goes.
+        let long_ago = root.join(format!(".staging-{}-aaaaaaaaaaaaaaaa", started - 2 * DAY.as_millis()));
+        std::fs::create_dir(&long_ago).unwrap();
+        std::fs::write(long_ago.join(FRAMES_FILE), b"half").unwrap();
+        w.store.sweep_staging(DAY);
+        assert!(!long_ago.exists());
+        assert_eq!(tree(&root), everything);
+        // A day and an hour later the cut-off save goes, and only that.
+        w.store.sweep_staging_at(DAY, now + 25 * HOUR);
         assert!(!cut_off.exists());
-        assert_eq!(left, everything.into_iter().filter(|n| !n.starts_with(".staging-0123456789abcdef/")).collect::<Vec<_>>(), "only the cut-off save is gone");
-        assert_eq!(epoch(), before.max(epoch()), "sweeping is not a change to the list");
+        let gone = format!(".staging-{started}-0123456789abcdef/");
+        assert_eq!(tree(&root), everything.into_iter().filter(|n| !n.starts_with(&gone)).collect::<Vec<_>>());
+        assert_eq!(changes(&w.store), 1, "sweeping is not a change to the list");
         assert_eq!(keys(&w.store.list()), vec![key_1()]);
         loaded(&w.store, &key_1());
         // A projects folder that does not exist is nothing to sweep.
         Store::at(w.tmp.path().join("never made")).sweep_staging(Duration::ZERO);
         assert!(!w.tmp.path().join("never made").exists());
+    }
+
+    #[test]
+    fn a_save_in_progress_is_named_by_the_time_it_started() {
+        let w = World::new();
+        let seen = std::cell::RefCell::new(None);
+        let look = |rec: &Recording, to: &Path| {
+            *seen.borrow_mut() = to.file_name().and_then(|n| n.to_str()).map(str::to_string);
+            rec.save_into(to)
+        };
+        let before = since_1970(SystemTime::now());
+        w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &look, rename: &real_rename }).unwrap();
+        let name = seen.borrow().clone().unwrap();
+        let started = u128::from(staging_started(&name).unwrap_or_else(|| panic!("{name} is not a name the sweep knows")));
+        assert!((before..=since_1970(SystemTime::now())).contains(&started), "{name}");
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        for (name, bytes) in contents(from) {
+            let path = to.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    const FAR: Duration = Duration::from_secs(10 * 365 * 86_400);
+
+    #[test]
+    fn an_old_project_that_cannot_be_put_back_is_never_swept() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        let whole = contents(&dir);
+        let other = recorded(w.tmp.path(), "other", 4);
+        let edit = Edit::new(&other, Default::default());
+        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        // The old project moves out of the way, and then nothing can be moved into its place:
+        // not the new one, and not the old one back.
+        let stuck = |from: &Path, to: &Path| if to == dir { Err(io::Error::other("the rename was refused")) } else { std::fs::rename(from, to) };
+        let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &stuck }).unwrap_err();
+        assert_eq!(err, NOT_PUT_BACK);
+        assert!(!dir.exists());
+        let aside = in_root(&w.store, REPLACED);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(contents(&aside[0]), whole, "the only copy is whole, under a name of its own");
+        assert_eq!(in_root(&w.store, STAGING), Vec::<PathBuf>::new());
+        assert_eq!((w.store.list(), w.store.totals()), (vec![], Totals::default()));
+        assert_eq!(load_err(&w.store, &key_1()), LoadError::NotSaved);
+        // No sweep takes it, however old it is said to be.
+        w.store.sweep_staging(Duration::ZERO);
+        w.store.sweep_staging_at(Duration::ZERO, SystemTime::now() + FAR);
+        w.store.finish_removals();
+        assert_eq!(contents(&aside[0]), whole);
+
+        // The next start puts it back where it was.
+        let before = changes(&w.store);
+        w.store.recover_replaced();
+        assert_eq!(changes(&w.store), before + 1);
+        assert_eq!(contents(&dir), whole);
+        assert_eq!(in_root(&w.store, REPLACED), Vec::<PathBuf>::new());
+        assert_eq!(keys(&w.store.list()), vec![key_1()]);
+        assert_eq!(loaded(&w.store, &key_1()).restored.title, "Chapter one");
+        w.store.recover_replaced();
+        assert_eq!(changes(&w.store), before + 1);
+    }
+
+    #[test]
+    fn at_the_next_start_what_a_replaced_project_left_is_cleared_and_nothing_else() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        let root = w.store.root().to_path_buf();
+        // The app died after the new project was in place and before the old one was cleared away.
+        let aside = root.join(".replaced-0123456789abcdef");
+        copy_tree(&dir, &aside);
+        std::fs::write(aside.join("notes.txt"), b"mine").unwrap();
+        std::fs::write(aside.join(PICTURES).join("mine.txt"), b"mine too").unwrap();
+        // Replaced folders the store cannot tell the place of, and a folder that only looks like one.
+        let (bare, broken, misnamed) = (root.join(".replaced-1111111111111111"), root.join(".replaced-2222222222222222"), root.join(".replaced-xyz"));
+        copy_tree(&dir, &bare);
+        std::fs::remove_file(bare.join(PROJECT_FILE)).unwrap();
+        copy_tree(&dir, &broken);
+        std::fs::write(broken.join(PROJECT_FILE), b"{\"format\": 1, \"server\"").unwrap();
+        copy_tree(&dir, &misnamed);
+        let whole = contents(&dir);
+        let left_alone: Vec<_> = [&bare, &broken, &misnamed].iter().map(|d| contents(d)).collect();
+
+        w.store.recover_replaced();
+        // The project in place is as it was; the note moved along with it, since its name was free.
+        let mut want = whole.clone();
+        want.push(("notes.txt".to_string(), b"mine".to_vec()));
+        want.sort();
+        assert_eq!(contents(&dir), want);
+        assert_eq!(contents(&aside), vec![("pictures/mine.txt".to_string(), b"mine too".to_vec())], "the store's files are gone; a file that is not the store's stays");
+        assert_eq!([&bare, &broken, &misnamed].iter().map(|d| contents(d)).collect::<Vec<_>>(), left_alone);
+        assert_eq!(changes(&w.store), 1, "the list did not change");
+        // None of it is ever swept.
+        w.store.finish_removals();
+        w.store.sweep_staging_at(Duration::ZERO, SystemTime::now() + FAR);
+        assert_eq!(contents(&aside), vec![("pictures/mine.txt".to_string(), b"mine too".to_vec())]);
+        assert_eq!([&bare, &broken, &misnamed].iter().map(|d| contents(d)).collect::<Vec<_>>(), left_alone);
+        assert_eq!(keys(&w.store.list()), vec![key_1()]);
+    }
+
+    #[test]
+    fn a_file_somebody_put_into_a_replaced_folder_is_never_deleted() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        // The project had a note beside it, was replaced whole, and the new one got a note of the same name.
+        std::fs::write(dir.join("notes.txt"), b"old note").unwrap();
+        let other = recorded(w.tmp.path(), "other", 4);
+        let edit = Edit::new(&other, Default::default());
+        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        // The new project arrives with a file of that name already in it.
+        let with_a_note = |rec: &Recording, to: &Path| {
+            std::fs::write(to.join("notes.txt"), b"new note").unwrap();
+            rec.save_into(to)
+        };
+        w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &with_a_note, rename: &real_rename }).unwrap();
+        assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"new note");
+        let aside = in_root(&w.store, REPLACED);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(contents(&aside[0]), vec![("notes.txt".to_string(), b"old note".to_vec())], "only the note is left of the old project, and it is kept");
+        // Start-up housekeeping, any number of times, leaves it.
+        for _ in 0..2 {
+            w.store.recover_replaced();
+            w.store.finish_removals();
+            w.store.sweep_staging_at(Duration::ZERO, SystemTime::now() + FAR);
+        }
+        assert_eq!(contents(&aside[0]), vec![("notes.txt".to_string(), b"old note".to_vec())]);
+        assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"new note");
+        assert_eq!(loaded(&w.store, &key_1()).restored.title, "Shorter");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pictures_folder_that_is_a_link_is_never_read_or_emptied() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        // The pictures folder is moved elsewhere and a link to it is left in its place.
+        let outside = w.tmp.path().join("outside");
+        std::fs::rename(dir.join(PICTURES), &outside).unwrap();
+        let link = dir.join(PICTURES);
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok() || std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().is_ok_and(|o| o.status.success());
+        assert!(linked, "neither a folder link nor a junction could be made on this computer");
+        assert!(link.join(&picture_names(&dir)[0]).is_file(), "the link leads to the picture");
+        let kept = contents(&outside);
+        assert_eq!(kept.len(), 1);
+
+        let top: u64 = files_in(&dir).iter().map(|(_, path)| std::fs::metadata(path).unwrap().len()).sum();
+        assert_eq!(w.store.list()[0].bytes, top, "what the link leads to is not counted");
+        assert!(matches!(load_err(&w.store, &key_1()), LoadError::Damaged(_)));
+        // A save over it does not write through the link, and a removal does not reach through it.
+        let other = recorded(w.tmp.path(), "other", 4);
+        let edit = Edit::new(&other, Default::default());
+        w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+        assert_eq!(contents(&outside), kept);
+        assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(1));
+        assert_eq!(contents(&outside), kept, "the picture behind the link is still there");
+        for _ in 0..2 {
+            w.store.recover_replaced();
+            w.store.finish_removals();
+        }
+        assert_eq!(contents(&outside), kept);
     }
 }
