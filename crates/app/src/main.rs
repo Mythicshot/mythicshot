@@ -22,6 +22,7 @@ mod publish_ui;
 mod recorder_ui;
 mod settings;
 mod settings_ui;
+mod site;
 mod tray;
 mod tour;
 mod tour_cards;

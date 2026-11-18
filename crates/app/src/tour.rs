@@ -177,6 +177,12 @@ pub fn tour_title(title: &str) -> String {
     if t.is_empty() { "Untitled tour".to_string() } else { t }
 }
 
+/// One line of text cleaned like the tour's title and capped at `max` code points; empty when nothing is left.
+#[cfg_attr(not(test), expect(dead_code, reason = "used by the site export, whose dialog is not built yet"))]
+pub fn clean_line(text: &str, max: usize) -> String {
+    doc::clean(text, max, false)
+}
+
 /// Refuse a tour with more steps, or a step with more notes, than the server takes.
 fn check_counts(steps: &[ManifestStep]) -> Result<(), String> {
     if steps.len() > MAX_STEPS {
