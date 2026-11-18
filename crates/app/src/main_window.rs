@@ -286,18 +286,13 @@ pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
 
 /// The host name for the "Connected to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
-pub fn connected_host(server: &str, token: &TokenStatus) -> Option<String> {
-    if *token != TokenStatus::Saved {
+/// `bound` is the address the token was saved for: with another address set, the token is not
+/// used there, so that is not a connection.
+pub fn connected_host(server: &str, token: &TokenStatus, bound: Option<&str>) -> Option<String> {
+    if *token != TokenStatus::Saved || publish_ui::binding_problem(bound, server).is_some() {
         return None;
     }
-    let url = crate::publish::check_server(server).ok()?;
-    let authority = url.split_once("://")?.1.split('/').next()?;
-    let host = match authority.strip_prefix('[') {
-        // An IPv6 address keeps its brackets.
-        Some(rest) => &authority[..rest.find(']')? + 2],
-        None => authority.rsplit_once(':').map_or(authority, |(host, _port)| host),
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    crate::publish::host_of(server)
 }
 
 pub fn viewport_id() -> egui::ViewportId {
@@ -334,7 +329,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || !s.prefs.actions.is_empty() {
+        if !s.nav.is_open() || s.capture.is_some() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -366,7 +361,7 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
     if token == TokenStatus::Checking {
         ui.ctx().request_repaint_after(Duration::from_millis(200));
     }
-    let host = connected_host(&publish_ui::server(), &token);
+    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         ui.add_space(8.0);
         match host {
@@ -612,7 +607,13 @@ mod tests {
 
     #[test]
     fn the_connection_line_names_the_host_only_when_a_server_and_token_are_saved() {
+        // The token saved for the very address that is asked about.
+        let connected_host = |server: &str, token: &TokenStatus| super::connected_host(server, token, crate::publish::check_server(server).ok().as_deref());
         let saved = TokenStatus::Saved;
+        // A token saved for another address, or for none, is not a connection to this one.
+        assert_eq!(super::connected_host("https://tours.example.co", &saved, Some("https://tours.example.com")), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, None), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, Some("https://tours.example.com")).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host("https://tours.example.com", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host(" https://Tours.Example.com/demo/ ", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host("http://localhost:8787", &saved).as_deref(), Some("localhost"));
@@ -780,7 +781,6 @@ mod tests {
 
             let mut s = shared(tmp.path());
             s.nav.request(Page::Preferences);
-            s.workspace.type_token_for_test("dp_0123456789abcdef0123456789abcdef01234567");
             s.settle(&ctx);
             assert!(s.prefs.actions.is_empty());
             leave(&mut s.nav);

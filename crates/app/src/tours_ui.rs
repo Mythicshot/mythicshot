@@ -13,6 +13,10 @@
 //!   an open confirmation closes it instead of leaving it pointing somewhere new.
 //! - One job per tour at a time. While it runs, that tour's buttons are gone, so a second
 //!   click has nothing to press; the other tours stay usable.
+//! - A delete that removed the tour but not all of its files is written down (site, tour id
+//!   and title, in the settings) until the site says nothing is left: the tour is gone from
+//!   the list by then, so that note is the only way back to it. It has its own block on the
+//!   page, which no refresh, other message, page switch or restart takes away.
 //! - A job runs against the site the list came from. When the site or the token changes
 //!   (Forget included), the list is dropped and a job still running only finishes: its
 //!   result is not shown on a page that now belongs to another site.
@@ -27,6 +31,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, 
 use crate::main_window::{Page, PageOut};
 use crate::publish::{self, Images, RemoteTour};
 use crate::publish_ui::{self, TITLE_MAX, TokenStatus};
+use crate::settings::UnfinishedDelete;
 
 const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 const ERROR: Color32 = Color32::from_rgb(255, 140, 140);
@@ -47,6 +52,12 @@ pub const RECORD_A_TOUR: &str = "Record a tour";
 pub const RENAME_NOTE: &str = "The link stays the same after a rename.";
 pub const LINK_COPIED: &str = "Link copied";
 pub const LIST_CHANGED: &str = "The tour list changed, so nothing was deleted. Check the list and choose Delete again.";
+
+pub const FINISH_DELETING: &str = "Finish deleting";
+pub const JOB_BROKE: &str = "That did not finish because of an unexpected error in Mythicshot. The list is read again to show where the tour stands.";
+const LOAD_BROKE: &str = "Could not list the tours: an unexpected error in Mythicshot stopped it.";
+/// Most unfinished deletes kept; the oldest go first.
+const MAX_UNFINISHED: usize = 200;
 
 /// How long "Link copied" shows.
 const COPIED_FOR: Duration = Duration::from_secs(2);
@@ -74,13 +85,14 @@ where
 }
 
 /// The muted line under a title: "2 chapters · 22 steps · published 18 Nov", or for a draft
-/// "… · uploaded 18 Nov". A site that gives no date (an older one) gets the line without it.
+/// "… · updated 18 Nov" (the site's date for a draft moves with every change, a rename
+/// included). A site that gives no date (an older one) gets the line without it.
 pub fn detail_line<Tz: TimeZone>(t: &RemoteTour, now: &DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
     let mut line = format!("{} · {}", count(t.chapters.into(), "chapter", "chapters"), count(t.steps.into(), "step", "steps"));
-    let dated = if t.is_public() { t.published_at.map(|ms| ("published", ms)) } else { t.updated_at.map(|ms| ("uploaded", ms)) };
+    let dated = if t.is_public() { t.published_at.map(|ms| ("published", ms)) } else { t.updated_at.map(|ms| ("updated", ms)) };
     if let Some((word, day)) = dated.and_then(|(word, ms)| Some((word, day_label(ms, now)?))) {
         line.push_str(&format!(" · {word} {day}"));
     }
@@ -132,6 +144,11 @@ pub fn footer(tours: usize) -> String {
     format!("{} in this workspace", count(tours as u64, "tour", "tours"))
 }
 
+/// What the block for an unfinished delete says.
+pub fn unfinished_sentence(title: &str) -> String {
+    format!("Deleting \"{}\" did not finish. Its remaining files are still on the site.", publish_ui::short_title(title, 60))
+}
+
 /// What a job on a tour is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
@@ -162,16 +179,26 @@ pub struct Conn {
     pub server: String,
     pub token: TokenStatus,
     pub epoch: u64,
+    /// The address the saved token belongs to. It is sent to no other.
+    pub bound: Option<String>,
 }
 
 impl Conn {
     pub fn current() -> Conn {
-        Conn { server: publish_ui::server(), token: publish_ui::token_status(), epoch: publish_ui::token_epoch() }
+        Conn { server: publish_ui::server(), token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), bound: publish_ui::token_site() }
     }
 
-    /// The site to talk to: only with a usable address and a saved token.
-    pub fn site(&self) -> Option<Site> {
+    /// Why the saved token may not go to the configured address, when it may not.
+    pub fn binding_problem(&self) -> Option<String> {
         if self.token != TokenStatus::Saved {
+            return None;
+        }
+        publish_ui::binding_problem(self.bound.as_deref(), &self.server)
+    }
+
+    /// The site to talk to: only with a usable address and a token saved for that address.
+    pub fn site(&self) -> Option<Site> {
+        if self.token != TokenStatus::Saved || self.binding_problem().is_some() {
             return None;
         }
         Some(Site { server: publish::check_server(&self.server).ok()?, epoch: self.epoch })
@@ -211,6 +238,8 @@ pub enum Job {
 pub struct Started {
     pub site: Site,
     pub id: String,
+    /// The tour's title when the job started, to name it should its delete not finish.
+    pub title: String,
     pub job: Job,
 }
 
@@ -238,8 +267,6 @@ pub enum Failure {
 pub struct Notice {
     pub text: String,
     pub error: bool,
-    /// The tour whose delete can be carried on from here.
-    pub finish_delete: Option<String>,
 }
 
 /// What the page shows.
@@ -346,7 +373,10 @@ impl Model {
             return match &conn.token {
                 TokenStatus::Checking => View::Checking,
                 TokenStatus::Unavailable(e) => View::NotConnected(e.clone()),
-                _ => View::NotConnected(NOT_CONNECTED.to_string()),
+                _ => View::NotConnected(match conn.binding_problem() {
+                    Some(problem) => format!("{problem} {}", publish_ui::FIX_ON_WORKSPACE),
+                    None => NOT_CONNECTED.to_string(),
+                }),
             };
         }
         match &self.listing {
@@ -421,13 +451,13 @@ impl Model {
                 };
                 if !(same_rows && same_tour) {
                     self.edit = Edit::None;
-                    self.notice = Some(Notice { text: LIST_CHANGED.to_string(), error: false, finish_delete: None });
+                    self.notice = Some(Notice { text: LIST_CHANGED.to_string(), error: false });
                 }
             }
             Edit::Renaming { id, .. } => {
                 if !tours.iter().any(|t| &t.id == id) {
                     self.edit = Edit::None;
-                    self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false, finish_delete: None });
+                    self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false });
                 }
             }
             Edit::None => {}
@@ -520,17 +550,17 @@ impl Model {
         self.begin(id, Work::Unpublishing, Job::Unpublish)
     }
 
-    /// Carry on a delete that removed the tour but not all its files, from the notice that
-    /// says so. The tour is no longer in the list, so this is the only way to name it.
-    pub fn finish_delete(&mut self) -> Option<Started> {
+    /// "Finish deleting" on an unfinished delete's block: send the delete for that tour again.
+    /// The entry must be one of this site's, and its tour must not be in the list any more
+    /// (a tour that is there is deleted through its own confirmation, never from here).
+    pub fn finish_delete(&mut self, entry: &UnfinishedDelete) -> Option<Started> {
         let site = self.site.clone()?;
-        let id = self.notice.as_ref()?.finish_delete.clone()?;
-        if self.working.contains_key(&id) {
+        let id = entry.tour_id.as_str();
+        if entry.server != site.server || !publish::is_tour_id(id) || self.tour(id).is_some() || self.working.contains_key(id) {
             return None;
         }
-        self.notice = None;
-        self.working.insert(id.clone(), Work::Deleting(None));
-        Some(Started { site, id, job: Job::Delete })
+        self.working.insert(id.to_string(), Work::Deleting(None));
+        Some(Started { site, id: id.to_string(), title: entry.title.clone(), job: Job::Delete })
     }
 
     fn begin(&mut self, id: &str, work: Work, job: Job) -> Option<Started> {
@@ -541,7 +571,8 @@ impl Model {
         }
         self.errors.remove(id);
         self.working.insert(id.to_string(), work);
-        Some(Started { site, id: id.to_string(), job })
+        let title = self.tour(id).map(|t| t.title.clone()).unwrap_or_default();
+        Some(Started { site, id: id.to_string(), title, job })
     }
 
     /// A running job's progress.
@@ -551,9 +582,10 @@ impl Model {
         }
     }
 
-    /// The delete that is being carried on from a notice, if one runs: a job on a tour that is not in the list.
-    pub fn detached_work(&self) -> Option<Work> {
-        self.working.iter().find(|(id, _)| self.tour(id).is_none()).map(|(_, w)| *w)
+    /// Whether an unfinished delete has its block: once its tour is out of the list. While
+    /// the row is still there, the row itself says what is going on.
+    pub fn shows_unfinished(&self, entry: &UnfinishedDelete) -> bool {
+        self.site.as_ref().is_some_and(|s| s.server == entry.server) && self.tour(&entry.tour_id).is_none()
     }
 
     /// A job ended. The list is changed to what the job did and read again, so the page
@@ -598,17 +630,18 @@ impl Model {
             Ok(Done::Deleted) => removed(self),
             Err(Failure::Gone) => {
                 removed(self);
-                self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false, finish_delete: None });
+                self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false });
             }
             Err(Failure::DeleteUnfinished(text)) => {
+                // The way back to it is its own block, which this message cannot replace or lose.
                 removed(self);
-                self.notice = Some(Notice { text, error: true, finish_delete: Some(id.to_string()) });
+                self.notice = Some(Notice { text, error: true });
             }
             Err(Failure::Message(text)) => {
                 if self.tour(id).is_some() {
                     self.errors.insert(id.to_string(), text);
                 } else {
-                    self.notice = Some(Notice { text, error: true, finish_delete: None });
+                    self.notice = Some(Notice { text, error: true });
                 }
             }
         }
@@ -629,19 +662,87 @@ impl Model {
     }
 }
 
+// ---- Deletes that did not finish ----
+
+/// The deletes that removed a tour but not yet all of its files. One list, shared by the
+/// page, its jobs and the app: a job writes into it the moment it knows, and the app
+/// copies every change into the settings file, from where it is read back at start-up.
+/// Entries of other sites than the configured one are kept, and shown when that site is
+/// configured again.
+#[derive(Clone, Default)]
+pub struct Unfinished(Arc<Mutex<UnfinishedList>>);
+
+#[derive(Default)]
+struct UnfinishedList {
+    list: Vec<UnfinishedDelete>,
+    /// The settings file does not hold this list yet.
+    changed: bool,
+}
+
+impl Unfinished {
+    fn lock(&self) -> MutexGuard<'_, UnfinishedList> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// At start-up: the list as the settings file holds it.
+    pub fn load(&self, list: Vec<UnfinishedDelete>) {
+        let mut l = self.lock();
+        l.list = list;
+        l.changed = false;
+    }
+
+    /// Note that the delete of this tour on `server` (an address as the address rule writes it) is unfinished.
+    pub fn add(&self, server: &str, tour_id: &str, title: &str) {
+        let mut l = self.lock();
+        if l.list.iter().any(|e| e.server == server && e.tour_id == tour_id) {
+            return;
+        }
+        let title = if title.trim().is_empty() { "Untitled tour".to_string() } else { title.chars().take(TITLE_MAX).collect() };
+        l.list.push(UnfinishedDelete { server: server.to_string(), tour_id: tour_id.to_string(), title });
+        let extra = l.list.len().saturating_sub(MAX_UNFINISHED);
+        l.list.drain(..extra);
+        l.changed = true;
+    }
+
+    /// The site said nothing of this tour is left.
+    pub fn remove(&self, server: &str, tour_id: &str) {
+        let mut l = self.lock();
+        let before = l.list.len();
+        l.list.retain(|e| !(e.server == server && e.tour_id == tour_id));
+        l.changed |= l.list.len() != before;
+    }
+
+    /// The entries of the site at `server`, oldest first. An entry that does not name a tour id is never offered.
+    pub fn for_site(&self, server: &str) -> Vec<UnfinishedDelete> {
+        self.lock().list.iter().filter(|e| e.server == server && publish::is_tour_id(&e.tour_id)).cloned().collect()
+    }
+
+    /// The whole list, once, when it changed since the last call: what the settings file should hold now.
+    pub fn take_changed(&self) -> Option<Vec<UnfinishedDelete>> {
+        let mut l = self.lock();
+        std::mem::take(&mut l.changed).then(|| l.list.clone())
+    }
+
+    pub fn is_changed(&self) -> bool {
+        self.lock().changed
+    }
+}
+
 // ---- Running it ----
 
-type TokenSource = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+/// Where a job gets the token for the site address it is about to use.
+type TokenSource = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
-/// The page's state: the model, shared with the jobs, and where a job gets the token.
+/// The page's state: the model, shared with the jobs, the unfinished deletes, and where a job gets the token.
 pub struct ToursState {
     model: Arc<Mutex<Model>>,
     token: TokenSource,
+    unfinished: Unfinished,
 }
 
 impl Default for ToursState {
     fn default() -> Self {
-        Self { model: Arc::default(), token: Arc::new(publish_ui::token_for_job) }
+        Self { model: Arc::default(), token: Arc::new(publish_ui::token_for), unfinished: Unfinished::default() }
     }
 }
 
@@ -654,39 +755,105 @@ fn failure(e: String) -> Failure {
     if publish::is_gone(&e) { Failure::Gone } else { Failure::Message(e) }
 }
 
+/// Ends a list request that never reported back (its thread panicked), so the page does not wait for ever.
+struct LoadGuard {
+    model: Arc<Mutex<Model>>,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            lock(&self.model).finish_load(self.generation, Err(LOAD_BROKE.to_string()), Instant::now());
+        }
+    }
+}
+
+/// The same for a job: its tour is released and gets a sentence.
+struct JobGuard {
+    model: Arc<Mutex<Model>>,
+    started: Started,
+    armed: bool,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            lock(&self.model).finish(&self.started, Err(Failure::Message(JOB_BROKE.to_string())));
+        }
+    }
+}
+
+/// Do the job's requests. A delete is noted as unfinished from the moment the site has
+/// begun it, and the note goes when the site says nothing is left (a tour that is already
+/// gone included). Any other end leaves the note: files may still be there.
+fn run_job(model: &Mutex<Model>, token: &TokenSource, unfinished: &Unfinished, started: &Started) -> Result<Done, Failure> {
+    let (server, id) = (started.site.server.as_str(), started.id.as_str());
+    let token = token(server).map_err(Failure::Message)?;
+    match &started.job {
+        Job::Rename(title) => publish::rename_tour(server, &token, id, title).map(Done::Renamed).map_err(failure),
+        Job::Unpublish => publish::unpublish_tour(server, &token, id).map(|()| Done::Unpublished).map_err(failure),
+        Job::Publish => publish::publish_tour(server, &token, id, |images| {
+            lock(model).progress(id, Work::Publishing(images));
+            true
+        })
+        .map(|live| Done::Published(live.url))
+        .map_err(failure),
+        Job::Delete => {
+            let mut reports = 0u32;
+            let result = publish::delete_tour(server, &token, id, |files| {
+                // The second report: the site answered that the delete is under way.
+                reports += 1;
+                if reports == 2 {
+                    unfinished.add(server, id, &started.title);
+                }
+                lock(model).progress(id, Work::Deleting(files));
+            });
+            match result {
+                Ok(()) => {
+                    unfinished.remove(server, id);
+                    Ok(Done::Deleted)
+                }
+                Err(f) if f.unfinished => {
+                    unfinished.add(server, id, &started.title);
+                    Err(Failure::DeleteUnfinished(f.message))
+                }
+                Err(f) => Err(Failure::Message(f.message)),
+            }
+        }
+    }
+}
+
 impl ToursState {
     /// A page whose jobs get the token from `token` instead of the credential store.
     #[cfg(test)]
-    fn with_token(token: impl Fn() -> Result<String, String> + Send + Sync + 'static) -> Self {
-        Self { model: Arc::default(), token: Arc::new(token) }
+    fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
+        Self { model: Arc::default(), token: Arc::new(token), unfinished: Unfinished::default() }
+    }
+
+    /// The unfinished deletes, for the app to load at start-up and to write to the settings file.
+    pub fn unfinished(&self) -> Unfinished {
+        self.unfinished.clone()
     }
 
     fn spawn_load(&self, (generation, site): (u64, Site)) {
         let (model, token) = (self.model.clone(), self.token.clone());
         std::thread::spawn(move || {
-            let result = token().and_then(|token| publish::list_tours(&site.server, &token));
-            lock(&model).finish_load(generation, result, Instant::now());
+            let mut guard = LoadGuard { model, generation, armed: true };
+            let result = token(&site.server).and_then(|token| publish::list_tours(&site.server, &token));
+            guard.armed = false;
+            lock(&guard.model).finish_load(generation, result, Instant::now());
         });
     }
 
     fn spawn_job(&self, started: Started) {
-        let (model, token) = (self.model.clone(), self.token.clone());
+        let (model, token, unfinished) = (self.model.clone(), self.token.clone(), self.unfinished.clone());
         std::thread::spawn(move || {
-            let (server, id) = (started.site.server.as_str(), started.id.as_str());
-            let result = token().map_err(Failure::Message).and_then(|token| match &started.job {
-                Job::Rename(title) => publish::rename_tour(server, &token, id, title).map(Done::Renamed).map_err(failure),
-                Job::Unpublish => publish::unpublish_tour(server, &token, id).map(|()| Done::Unpublished).map_err(failure),
-                Job::Publish => publish::publish_tour(server, &token, id, |images| {
-                    lock(&model).progress(id, Work::Publishing(images));
-                    true
-                })
-                .map(|live| Done::Published(live.url))
-                .map_err(failure),
-                Job::Delete => publish::delete_tour(server, &token, id, |files| lock(&model).progress(id, Work::Deleting(files)))
-                    .map(|()| Done::Deleted)
-                    .map_err(|f| if f.unfinished { Failure::DeleteUnfinished(f.message) } else { Failure::Message(f.message) }),
-            });
-            lock(&model).finish(&started, result);
+            let mut guard = JobGuard { model, started, armed: true };
+            let result = run_job(&guard.model, &token, &unfinished, &guard.started);
+            guard.armed = false;
+            lock(&guard.model).finish(&guard.started, result);
         });
     }
 }
@@ -700,7 +867,7 @@ enum Click {
     SaveRename,
     CancelEdit,
     DeleteTour(String),
-    FinishDelete,
+    FinishDelete(UnfinishedDelete),
     DismissNotice,
 }
 
@@ -737,12 +904,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     if let Some(notice) = m.notice().cloned() {
         notice_ui(ui, &notice, &mut clicks);
     }
-    if let Some(work) = m.detached_work() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(14.0));
-            ui.label(RichText::new(work_message(work)).color(MUTED));
-        });
-        ui.add_space(6.0);
+    // Deletes that did not finish on this site: always shown, whatever else the page says.
+    if let Some(site) = m.site.clone() {
+        for entry in state.unfinished.for_site(&site.server).into_iter().filter(|e| m.shows_unfinished(e)) {
+            unfinished_ui(ui, &entry, m.work(&entry.tour_id), &mut clicks);
+        }
     }
 
     match view {
@@ -835,8 +1001,8 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                     state.spawn_job(job);
                 }
             }
-            Click::FinishDelete => {
-                if let Some(job) = m.finish_delete() {
+            Click::FinishDelete(entry) => {
+                if let Some(job) = m.finish_delete(&entry) {
                     state.spawn_job(job);
                 }
             }
@@ -853,14 +1019,31 @@ fn notice_ui(ui: &mut egui::Ui, notice: &Notice, clicks: &mut Vec<Click>) {
     egui::Frame::new().fill(if notice.error { DANGER_TINT } else { CARD }).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(RichText::new(&notice.text).color(if notice.error { ERROR } else { MUTED })).wrap());
-        ui.horizontal(|ui| {
-            if notice.finish_delete.is_some() && ui.button("Finish deleting").clicked() {
-                clicks.push(Click::FinishDelete);
+        if ui.button("Dismiss").clicked() {
+            clicks.push(Click::DismissNotice);
+        }
+    });
+    ui.add_space(8.0);
+}
+
+/// The block of one unfinished delete: what is left, and the button that carries on, or its progress.
+fn unfinished_ui(ui: &mut egui::Ui, entry: &UnfinishedDelete, work: Option<Work>, clicks: &mut Vec<Click>) {
+    egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(egui::Label::new(RichText::new(unfinished_sentence(&entry.title)).color(ERROR)).wrap());
+        match work {
+            Some(work) => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(RichText::new(work_message(work)).color(MUTED));
+                });
             }
-            if ui.button("Dismiss").clicked() {
-                clicks.push(Click::DismissNotice);
+            None => {
+                if ui.button(FINISH_DELETING).clicked() {
+                    clicks.push(Click::FinishDelete(entry.clone()));
+                }
             }
-        });
+        }
     });
     ui.add_space(8.0);
 }
@@ -994,7 +1177,7 @@ mod tests {
     }
 
     fn conn(token: TokenStatus) -> Conn {
-        Conn { server: "https://tours.example.com".into(), token, epoch: 1 }
+        Conn { server: "https://tours.example.com".into(), token, epoch: 1, bound: Some("https://tours.example.com".into()) }
     }
 
     /// A model with a loaded list.
@@ -1026,9 +1209,9 @@ mod tests {
         let mut d = tour(B, "Testing", false, 9);
         d.chapters = 1;
         d.updated_at = Some(Utc.with_ymd_and_hms(2026, 11, 3, 8, 0, 0).unwrap().timestamp_millis());
-        assert_eq!(detail_line(&d, &now), "1 chapter · 9 steps · uploaded 3 Nov");
+        assert_eq!(detail_line(&d, &now), "1 chapter · 9 steps · updated 3 Nov");
         d.steps = 1;
-        assert_eq!(detail_line(&d, &now), "1 chapter · 1 step · uploaded 3 Nov");
+        assert_eq!(detail_line(&d, &now), "1 chapter · 1 step · updated 3 Nov");
         // Another year is named.
         t.published_at = Some(Utc.with_ymd_and_hms(2025, 12, 31, 8, 0, 0).unwrap().timestamp_millis());
         assert_eq!(detail_line(&t, &now), "2 chapters · 22 steps · published 31 Dec 2025");
@@ -1099,8 +1282,8 @@ mod tests {
         assert_eq!(m.view(&conn(TokenStatus::Unavailable("The credential store is locked.".into()))), View::NotConnected("The credential store is locked.".into()));
         assert!(!m.wants_load(Instant::now()) && m.begin_load().is_none(), "nothing is asked of a site that is not set up");
         // A connection with a bad address or no token is no site.
-        assert_eq!(Conn { server: "http://tours.example.com".into(), token: TokenStatus::Saved, epoch: 1 }.site(), None);
-        assert_eq!(Conn { server: String::new(), token: TokenStatus::Saved, epoch: 1 }.site(), None);
+        assert_eq!(Conn { server: "http://tours.example.com".into(), ..conn(TokenStatus::Saved) }.site(), None);
+        assert_eq!(Conn { server: String::new(), ..conn(TokenStatus::Saved) }.site(), None);
         assert_eq!(conn(TokenStatus::Missing).site(), None);
         assert_eq!(conn(TokenStatus::Saved).site(), Some(site()));
 
@@ -1182,7 +1365,7 @@ mod tests {
         m.start_rename(B);
         *m.rename_text().unwrap() = "  Trial run ".into();
         let job = m.save_rename().unwrap();
-        assert_eq!(job, Started { site: site(), id: B.into(), job: Job::Rename("Trial run".into()) });
+        assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Rename("Trial run".into()) });
         assert_eq!(m.work(B), Some(Work::Renaming));
         assert_eq!(m.edit(), &Edit::None);
         assert_eq!(m.save_rename(), None, "a second Save has nothing to save");
@@ -1221,7 +1404,7 @@ mod tests {
         m.ask_delete(A);
         assert_eq!(m.confirm_delete(B), None);
         let job = m.confirm_delete(A).unwrap();
-        assert_eq!(job, Started { site: site(), id: A.into(), job: Job::Delete });
+        assert_eq!(job, Started { site: site(), id: A.into(), title: "Customer onboarding".into(), job: Job::Delete });
         assert_eq!(m.work(A), Some(Work::Deleting(None)));
     }
 
@@ -1320,7 +1503,7 @@ mod tests {
             let mut m = loaded(two());
             let job = start(&mut m).unwrap();
             m.finish(&job, Err(Failure::Gone));
-            assert_eq!(m.notice(), Some(&Notice { text: publish::TOUR_GONE.into(), error: false, finish_delete: None }));
+            assert_eq!(m.notice(), Some(&Notice { text: publish::TOUR_GONE.into(), error: false }));
             assert_eq!(m.tours().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [A], "the row is gone");
             assert!(m.wants_load(Instant::now()));
             assert_eq!(m.error(B), None);
@@ -1370,28 +1553,146 @@ mod tests {
         assert_eq!(m.error(A), None);
     }
 
+    fn entry(server: &str, id: &str, title: &str) -> UnfinishedDelete {
+        UnfinishedDelete { server: server.into(), tour_id: id.into(), title: title.into() }
+    }
+
     #[test]
-    fn a_delete_that_left_files_behind_can_be_carried_on_once() {
+    fn a_delete_that_left_files_behind_can_be_carried_on_from_its_own_block() {
         let mut m = loaded(two());
+        let here = entry(&site().server, B, "Testing");
+        assert!(!m.shows_unfinished(&here), "while its row is in the list, the row speaks for it");
+        assert_eq!(m.finish_delete(&here), None, "a tour that is in the list is deleted through its confirmation only");
         m.ask_delete(B);
         let job = m.confirm_delete(B).unwrap();
         m.finish(&job, Err(Failure::DeleteUnfinished("Could not delete the tour completely: the site stopped making progress at 250 of 601 files.".into())));
         assert_eq!(m.tours().len(), 1, "the tour itself is gone");
-        let notice = m.notice().unwrap().clone();
-        assert!(notice.error && notice.finish_delete.as_deref() == Some(B));
-        let again = m.finish_delete().unwrap();
-        assert_eq!(again, Started { site: site(), id: B.into(), job: Job::Delete });
-        assert_eq!(m.finish_delete(), None, "a second click sends nothing");
-        assert_eq!(m.detached_work(), Some(Work::Deleting(None)));
+        assert!(m.notice().unwrap().error);
+        assert!(m.shows_unfinished(&here));
+        let again = m.finish_delete(&here).unwrap();
+        assert_eq!(again, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Delete });
+        assert_eq!(m.finish_delete(&here), None, "a second click sends nothing");
+        assert_eq!(m.work(B), Some(Work::Deleting(None)));
         m.finish(&again, Ok(Done::Deleted));
-        assert_eq!((m.detached_work(), m.notice()), (None, None));
-        // A plain notice has nothing to carry on.
+        assert_eq!(m.work(B), None);
+        // Only this site's entries, and only ones that name a tour.
+        assert_eq!(m.finish_delete(&entry("https://other.example.com", C, "Elsewhere")), None);
+        assert!(!m.shows_unfinished(&entry("https://other.example.com", C, "Elsewhere")));
+        assert_eq!(m.finish_delete(&entry(&site().server, "../uploads/x", "Odd")), None);
+        // Not connected: nothing can be sent.
+        m.set_site(None);
+        assert_eq!(m.finish_delete(&here), None);
+        assert!(!m.shows_unfinished(&here));
+    }
+
+    #[test]
+    fn nothing_the_page_does_takes_an_unfinished_delete_away() {
         let mut m = loaded(two());
-        let job = m.start_publish(B).unwrap();
-        m.finish(&job, Err(Failure::Gone));
-        assert_eq!(m.finish_delete(), None);
-        m.dismiss_notice();
+        let here = entry(&site().server, B, "Testing");
+        m.ask_delete(B);
+        let job = m.confirm_delete(B).unwrap();
+        m.finish(&job, Err(Failure::DeleteUnfinished("Could not delete the tour completely.".into())));
+        // Refresh, which drops messages.
+        let (generation, _) = m.refresh().unwrap();
+        m.finish_load(generation, Ok(vec![two()[0].clone()]), Instant::now());
         assert_eq!(m.notice(), None);
+        assert!(m.shows_unfinished(&here));
+        // Other notices taking the one slot.
+        let other = m.start_unpublish(A).unwrap();
+        m.finish(&other, Err(Failure::Gone));
+        assert_eq!(m.notice().map(|n| n.text.as_str()), Some(publish::TOUR_GONE));
+        assert!(m.shows_unfinished(&here));
+        m.dismiss_notice();
+        assert!(m.shows_unfinished(&here));
+        // A list that cannot be read.
+        let (generation, _) = m.refresh().unwrap();
+        m.finish_load(generation, Err("Could not list the tours: the server answered HTTP 503.".into()), Instant::now());
+        assert!(m.shows_unfinished(&here));
+        // Another site, then this one again (a token saved anew counts as that).
+        m.set_site(Some(Site { server: "https://other.example.com".into(), epoch: 1 }));
+        assert!(!m.shows_unfinished(&here));
+        m.set_site(Some(Site { epoch: 2, ..site() }));
+        assert!(m.shows_unfinished(&here));
+        assert!(m.finish_delete(&here).is_some());
+    }
+
+    #[test]
+    fn the_unfinished_list_keeps_every_site_and_shows_one() {
+        let u = Unfinished::default();
+        assert_eq!(u.take_changed(), None);
+        u.add("https://tours.example.com", B, "Testing");
+        assert!(u.is_changed());
+        // The same tour twice is one entry.
+        u.add("https://tours.example.com", B, "Testing");
+        u.add("https://other.example.com", C, "Elsewhere");
+        u.add("https://tours.example.com", A, "  ");
+        assert_eq!(u.for_site("https://tours.example.com"), [entry("https://tours.example.com", B, "Testing"), entry("https://tours.example.com", A, "Untitled tour")]);
+        assert_eq!(u.for_site("https://other.example.com"), [entry("https://other.example.com", C, "Elsewhere")]);
+        assert!(u.for_site("https://third.example.com").is_empty());
+        assert_eq!(u.take_changed().map(|l| l.len()), Some(3));
+        assert_eq!(u.take_changed(), None, "a change is written once");
+        // Removing what is not there changes nothing; removing one site's entry leaves the other's.
+        u.remove("https://other.example.com", B);
+        assert!(!u.is_changed());
+        u.remove("https://tours.example.com", B);
+        assert_eq!(u.take_changed(), Some(vec![entry("https://other.example.com", C, "Elsewhere"), entry("https://tours.example.com", A, "Untitled tour")]));
+        // Something in the file that is not a tour id is never offered.
+        u.load(vec![entry("https://tours.example.com", "../uploads/x", "Odd"), entry("https://tours.example.com", B, "Testing")]);
+        assert!(!u.is_changed(), "what was read from the file is not a change");
+        assert_eq!(u.for_site("https://tours.example.com"), [entry("https://tours.example.com", B, "Testing")]);
+        // The list cannot grow without end, and a title is kept short.
+        let u = Unfinished::default();
+        for i in 0..MAX_UNFINISHED + 5 {
+            u.add("https://tours.example.com", &format!("tour_{i:024x}"), &"x".repeat(500));
+        }
+        let all = u.take_changed().unwrap();
+        assert_eq!(all.len(), MAX_UNFINISHED);
+        assert_eq!(all[0].tour_id, format!("tour_{:024x}", 5));
+        assert_eq!(all[0].title.chars().count(), TITLE_MAX);
+    }
+
+    #[test]
+    fn unfinished_deletes_survive_a_restart_through_the_settings_file() {
+        let u = Unfinished::default();
+        u.add("https://tours.example.com", B, "Testing \"quoted\" · café");
+        u.add("https://other.example.com", C, "Elsewhere");
+        // What the app does with a change: into the settings, and the settings to disk.
+        let mut settings = crate::settings::Settings::default();
+        settings.unfinished_deletes = u.take_changed().unwrap();
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("token") && !text.contains("dp_"), "nothing secret is written:\n{text}");
+        // The next start.
+        let read: crate::settings::Settings = toml::from_str(&text).unwrap();
+        let after = Unfinished::default();
+        after.load(read.unfinished_deletes);
+        assert_eq!(after.for_site("https://tours.example.com"), [entry("https://tours.example.com", B, "Testing \"quoted\" · café")]);
+        assert_eq!(after.for_site("https://other.example.com").len(), 1, "the other site's entry is kept for when that site is configured");
+        assert!(!after.is_changed());
+        // A settings file from before this existed has none.
+        let old: crate::settings::Settings = toml::from_str("publish_server = \"https://tours.example.com\"\n").unwrap();
+        assert!(old.unfinished_deletes.is_empty() && old.publish_saved_for.is_none());
+        assert_eq!(unfinished_sentence("Testing"), "Deleting \"Testing\" did not finish. Its remaining files are still on the site.");
+    }
+
+    #[test]
+    fn a_token_saved_for_another_address_is_no_connection() {
+        let mut c = conn(TokenStatus::Saved);
+        assert_eq!((c.binding_problem(), c.site()), (None, Some(site())));
+        // The address was changed (a typo, a new host): the token stays home.
+        c.server = "https://tours.example.co".into();
+        assert_eq!(c.site(), None);
+        let m = Model::default();
+        let View::NotConnected(why) = m.view(&c) else { panic!("connected") };
+        assert_eq!(why, format!("The saved token belongs to tours.example.com, so it is not sent to this address. {}", publish_ui::FIX_ON_WORKSPACE));
+        // A token tied to no address yet.
+        let unbound = Conn { bound: None, ..conn(TokenStatus::Saved) };
+        assert_eq!(unbound.site(), None);
+        assert!(matches!(m.view(&unbound), View::NotConnected(why) if why.starts_with("The saved token is not tied to a site address yet")));
+        // The same address written another way is the same site.
+        let same = Conn { server: " https://Tours.Example.com/ ".into(), ..conn(TokenStatus::Saved) };
+        assert_eq!(same.site(), Some(site()));
+        // Without a token the plain sentence stands.
+        assert_eq!(m.view(&Conn { server: "https://tours.example.co".into(), ..conn(TokenStatus::Missing) }), View::NotConnected(NOT_CONNECTED.into()));
     }
 
     #[test]
@@ -1439,11 +1740,11 @@ mod tests {
     const NO_TOUR: &str = r#"{"error":"not_found","detail":"no such tour"}"#;
 
     fn page() -> ToursState {
-        ToursState::with_token(|| Ok(TOKEN.to_string()))
+        ToursState::with_token(|_| Ok(TOKEN.to_string()))
     }
 
     fn stub_conn(stub: &Stub) -> Conn {
-        Conn { server: stub.base.clone(), token: TokenStatus::Saved, epoch: 1 }
+        Conn { server: stub.base.clone(), token: TokenStatus::Saved, epoch: 1, bound: Some(stub.base.clone()) }
     }
 
     /// Every piece of text one frame of the page draws.
@@ -1493,7 +1794,7 @@ mod tests {
         for word in ["Tours", RECORD_A_TOUR, "Customer onboarding", "Public", "Testing", "Draft", "Copy link", "Open", "Rename", "Unpublish", "Delete", "Publish", "2 tours in this workspace"] {
             assert!(has_line(&text, word), "the page is missing {word:?} in:\n{text}");
         }
-        assert!(text.contains("2 chapters · 22 steps · published ") && text.contains("1 chapter · 9 steps · uploaded "), "{text}");
+        assert!(text.contains("2 chapters · 22 steps · published ") && text.contains("1 chapter · 9 steps · updated "), "{text}");
         assert_eq!(text.lines().filter(|l| *l == "Rename").count(), 2);
         assert_eq!(text.lines().filter(|l| *l == "Delete").count(), 2);
         assert!(!text.contains("Keep it") && !text.contains(RENAME_NOTE));
@@ -1543,7 +1844,7 @@ mod tests {
         }
         assert_eq!(s.lines().len(), 1);
         // A token that cannot be read is a sentence too, never a panic.
-        let mut state = ToursState::with_token(|| Err("Could not use the credential store: the credential store is locked or not reachable.".into()));
+        let mut state = ToursState::with_token(|_| Err("Could not use the credential store: the credential store is locked or not reachable.".into()));
         let text = until(&ctx, &mut state, &c, |m, _| !m.is_loading());
         assert!(text.replace('\n', " ").contains("the credential store is locked") && has_line(&text, "Retry"), "{text}");
     }
@@ -1622,6 +1923,146 @@ mod tests {
         assert_eq!(s.lines().iter().filter(|l| l.starts_with("DELETE")).count(), 1, "the delete went through, once");
         let m = lock(&model);
         assert!(m.tours().is_empty() && m.notice().is_none());
+    }
+
+    #[test]
+    fn an_unfinished_delete_is_written_down_and_can_be_finished_after_a_restart() {
+        // The site starts the delete, then stops making progress; later it finishes.
+        let s = stub(|req, seen| match req.line.as_str() {
+            "GET /api/v1/tours" => reply(200, if seen == 0 { LIST } else { ONLY_A }),
+            "DELETE /api/v1/tours/tour_bbbbbbbbbbbbbbbbbbbbbbbb" => {
+                if seen < 4 { reply(202, r#"{"status":"in_progress","done":5,"total":10}"#) } else { reply(200, r#"{"deleted":true}"#) }
+            }
+            _ => reply(500, r#"{"error":"unexpected"}"#),
+        });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let store = state.unfinished();
+        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+        let job = {
+            let mut m = lock(&state.model);
+            m.ask_delete(B);
+            m.confirm_delete(B).unwrap()
+        };
+        state.spawn_job(job);
+        // It is written down while the job still runs: from the site's first "in progress".
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while store.for_site(&s.base).is_empty() {
+            assert!(Instant::now() < deadline, "the delete was never noted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lock(&state.model).work(B).is_some(), "noted before the loop gave up");
+        let sentence = unfinished_sentence("Testing");
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading() && m.tours().len() == 1);
+        let flat = text.replace('\n', " ");
+        assert!(flat.contains(&sentence) && has_line(&text, FINISH_DELETING) && flat.contains("Use Finish deleting on the Tours page"), "{text}");
+        // Refresh and Dismiss leave the block.
+        let load = lock(&state.model).refresh().unwrap();
+        state.spawn_load(load);
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.notice().is_none());
+        assert!(text.replace('\n', " ").contains(&sentence) && has_line(&text, FINISH_DELETING), "{text}");
+        // With another site configured it is not offered, and it stays stored.
+        let elsewhere = Conn { server: "https://other.example.com".into(), bound: Some("https://other.example.com".into()), ..conn.clone() };
+        lock(&state.model).set_site(elsewhere.site());
+        let shown = lock(&state.model).shows_unfinished(&store.for_site(&s.base)[0]);
+        assert!(!shown);
+        assert_eq!(store.for_site(&s.base).len(), 1);
+
+        // The app writes the change to the settings; the next start reads it back.
+        let mut settings = crate::settings::Settings::default();
+        settings.unfinished_deletes = store.take_changed().expect("a change to write");
+        let read: crate::settings::Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        drop(state);
+        let mut state = page();
+        let store = state.unfinished();
+        store.load(read.unfinished_deletes);
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        assert!(text.replace('\n', " ").contains(&sentence) && has_line(&text, FINISH_DELETING), "after a restart:\n{text}");
+        // "Finish deleting": the same tour is deleted again, and the entry goes when the site is done.
+        let entry = store.for_site(&s.base).remove(0);
+        let job = lock(&state.model).finish_delete(&entry).unwrap();
+        state.spawn_job(job);
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading());
+        assert!(!text.contains("did not finish") && !has_line(&text, FINISH_DELETING), "{text}");
+        assert!(store.for_site(&s.base).is_empty());
+        assert_eq!(store.take_changed(), Some(vec![]), "the settings file is told to forget it");
+        assert!(s.lines().iter().filter(|l| l.starts_with("DELETE")).all(|l| l.ends_with(B)));
+    }
+
+    #[test]
+    fn an_unfinished_delete_whose_tour_is_gone_by_now_is_simply_forgotten() {
+        let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, ONLY_A) } else { reply(404, NO_TOUR) });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let store = state.unfinished();
+        store.load(vec![
+            UnfinishedDelete { server: s.base.clone(), tour_id: B.into(), title: "Testing".into() },
+            UnfinishedDelete { server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() },
+        ]);
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        let flat = text.replace('\n', " ");
+        assert!(flat.contains(&unfinished_sentence("Testing")) && !flat.contains("Elsewhere"), "only this site's entry shows:\n{text}");
+        assert_eq!(text.lines().filter(|l| *l == FINISH_DELETING).count(), 1);
+        let entry = store.for_site(&s.base).remove(0);
+        let job = lock(&state.model).finish_delete(&entry).unwrap();
+        state.spawn_job(job);
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading());
+        assert!(!text.contains("did not finish"), "{text}");
+        // The other site's entry is still stored.
+        assert_eq!(store.take_changed(), Some(vec![UnfinishedDelete { server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() }]));
+    }
+
+    #[test]
+    fn a_delete_that_fails_before_the_site_began_is_not_written_down() {
+        let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(409, r#"{"error":"publish_busy"}"#) });
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+        let job = {
+            let mut m = lock(&state.model);
+            m.ask_delete(B);
+            m.confirm_delete(B).unwrap()
+        };
+        state.spawn_job(job);
+        until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && m.error(B).is_some());
+        assert!(state.unfinished().for_site(&s.base).is_empty() && !state.unfinished().is_changed());
+    }
+
+    #[test]
+    fn a_job_that_panics_releases_its_tour_and_says_so() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let s = stub(|_, _| reply(200, LIST));
+        let broken = Arc::new(AtomicBool::new(false));
+        let flag = broken.clone();
+        let mut state = ToursState::with_token(move |_| {
+            assert!(!flag.load(Ordering::SeqCst), "a job thread panics (this message is part of the test)");
+            Ok(TOKEN.to_string())
+        });
+        let (ctx, conn) = (egui::Context::default(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
+        broken.store(true, Ordering::SeqCst);
+        let job = lock(&state.model).start_publish(B).unwrap();
+        state.spawn_job(job);
+        let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && m.error(B).is_some());
+        assert_eq!(lock(&state.model).error(B), Some(JOB_BROKE));
+        assert!(has_line(&text, "Publish") || text.contains("Could not list"), "the row has its buttons back, or the page says the list failed:\n{text}");
+        // A list request that panics ends as a failure with Retry, not as an endless spinner.
+        let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && !m.wants_load(Instant::now()));
+        assert!(text.replace('\n', " ").contains(LOAD_BROKE) && has_line(&text, "Retry"), "{text}");
+        // And the page works again afterwards.
+        broken.store(false, Ordering::SeqCst);
+        let load = lock(&state.model).refresh().unwrap();
+        state.spawn_load(load);
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
+    }
+
+    #[test]
+    fn a_page_whose_token_belongs_to_another_address_sends_nothing() {
+        let s = stub(|_, _| reply(200, LIST));
+        let (ctx, mut state) = (egui::Context::default(), page());
+        let conn = Conn { bound: Some("https://tours.example.com".into()), ..stub_conn(&s) };
+        let text = drawn(&ctx, &mut state, &conn).0.replace('\n', " ");
+        assert!(text.contains("The saved token belongs to tours.example.com, so it is not sent to this address.") && text.contains(OPEN_WORKSPACE), "{text}");
+        std::thread::sleep(Duration::from_millis(50));
+        drawn(&ctx, &mut state, &conn);
+        assert!(s.lines().is_empty(), "the other address got a request: {:?}", s.lines());
     }
 
     #[test]

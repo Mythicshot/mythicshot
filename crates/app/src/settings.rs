@@ -79,6 +79,13 @@ pub struct Settings {
     /// What a left-click on the tray icon does. Files from before the main window have no such key
     /// and read as `OpenApp`.
     pub tray_left_click: TrayLeftClick,
+    /// The site address the saved API credential was saved for; it is never sent to any other
+    /// address. An empty string means it is tied to none. No key at all is a file from before
+    /// this existed: the address configured then is adopted once, at the next start.
+    pub publish_saved_for: Option<String>,
+    /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
+    /// says nothing is left, so the delete can be finished after a restart.
+    pub unfinished_deletes: Vec<UnfinishedDelete>,
     /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
     #[serde(skip)]
     pub load_problem: Option<LoadProblem>,
@@ -90,6 +97,14 @@ pub struct Settings {
     save_to_file: Option<bool>,
     #[serde(skip_serializing)]
     copy_to_clipboard: Option<bool>,
+}
+
+/// A delete to finish: which site, which tour, and the title to show for it. No secret is in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfinishedDelete {
+    pub server: String,
+    pub tour_id: String,
+    pub title: String,
 }
 
 /// The settings file was there at start-up but could not be used as it was.
@@ -320,6 +335,8 @@ impl Default for Settings {
             editor_keys_version: EDITOR_KEYS_VERSION,
             publish_server: String::new(),
             tray_left_click: TrayLeftClick::default(),
+            publish_saved_for: None,
+            unfinished_deletes: Vec::new(),
             load_problem: None,
             open_editor: None,
             save_to_file: None,

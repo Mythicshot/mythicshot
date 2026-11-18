@@ -54,9 +54,13 @@ struct Config {
     test_server: Option<String>,
     token: TokenStatus,
     generation: u64,
+    /// The site address the saved token belongs to (as the address rule writes it); None when it is tied to none.
+    saved_for: Option<String>,
+    /// A new value of `saved_for` the settings file does not hold yet ("" for none).
+    saved_for_change: Option<String>,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0 });
+static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None });
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -72,7 +76,19 @@ pub fn init(settings: &crate::settings::Settings) {
         config().test_server = Some(server);
     }
     set_server(&settings.publish_server);
-    refresh_token();
+    config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
+    let recorded = settings.publish_saved_for.clone();
+    std::thread::spawn(move || {
+        refresh_token_now();
+        // A settings file from before the token was tied to an address: tie it once.
+        let (token, server) = {
+            let c = config();
+            (c.token.clone(), c.server.clone())
+        };
+        if let Some(site) = first_binding(recorded.as_deref(), &token, &server) {
+            bind_token(site);
+        }
+    });
     std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
 }
 
@@ -102,11 +118,6 @@ pub fn token_epoch() -> u64 {
     config().generation
 }
 
-/// Look the token up again on a background thread.
-pub fn refresh_token() {
-    std::thread::spawn(refresh_token_now);
-}
-
 /// Look the token up on this thread; never call it on the UI thread.
 pub fn refresh_token_now() {
     let generation = {
@@ -126,9 +137,80 @@ pub fn refresh_token_now() {
     }
 }
 
+// ---- The token belongs to one site ----
+
+/// Where to sort out a token that belongs to another address.
+pub const FIX_ON_WORKSPACE: &str = "Choose on the Workspace page whether to use it for this address or replace it.";
+pub const USE_IT_HERE: &str = "Use it for this address too";
+
+/// Why the saved token may not be sent to `server`, when it may not: it was saved for
+/// another address, or for none. None when it may, and for an address that is not one (the
+/// address rule reports that itself). `bound` is the address the token belongs to.
+pub fn binding_problem(bound: Option<&str>, server: &str) -> Option<String> {
+    let server = publish::check_server(server).ok()?;
+    match bound.and_then(|b| publish::check_server(b).ok()) {
+        Some(b) if b == server => None,
+        Some(b) => Some(match publish::host_of(&b) {
+            Some(host) if publish::host_of(&server).as_deref() != Some(host.as_str()) => format!("The saved token belongs to {host}, so it is not sent to this address."),
+            _ => format!("The saved token belongs to {b}, so it is not sent to this address."),
+        }),
+        None => Some("The saved token is not tied to a site address yet, so it is not sent anywhere.".to_string()),
+    }
+}
+
+/// What a settings file without a recorded address gets at start-up, once: the configured
+/// address when a token is saved and the address is usable, none otherwise. None when
+/// nothing is decided: the file already records one, or the token state is not known.
+pub fn first_binding(recorded: Option<&str>, token: &TokenStatus, server: &str) -> Option<Option<String>> {
+    if recorded.is_some() {
+        return None;
+    }
+    match token {
+        TokenStatus::Saved => Some(publish::check_server(server).ok()),
+        TokenStatus::Missing => Some(None),
+        TokenStatus::Checking | TokenStatus::Unavailable(_) => None,
+    }
+}
+
+/// The address the saved token belongs to. In a debug build run with the test hook, that is
+/// the hook's address: it was named on purpose for this run.
+pub fn token_site() -> Option<String> {
+    let c = config();
+    match &c.test_server {
+        Some(test) => publish::check_server(test).ok(),
+        None => c.saved_for.clone(),
+    }
+}
+
+/// Tie the saved token to `site` (None: to no address). Called when a token is saved or
+/// forgotten, and for "Use it for this address too". The app writes it to the settings.
+pub fn bind_token(site: Option<String>) {
+    let mut c = config();
+    c.saved_for = site.clone();
+    c.saved_for_change = Some(site.unwrap_or_default());
+}
+
+/// A new binding the settings file does not hold yet, once.
+pub fn take_token_site_change() -> Option<String> {
+    config().saved_for_change.take()
+}
+
+pub fn has_token_site_change() -> bool {
+    config().saved_for_change.is_some()
+}
+
+/// The saved token for a job that is about to send it to `server`, and to nowhere else: a
+/// token saved for another address is refused here, whatever the caller checked.
+pub fn token_for(server: &str) -> Result<String, String> {
+    if let Some(problem) = binding_problem(token_site().as_deref(), server) {
+        return Err(format!("{problem} {FIX_ON_WORKSPACE}"));
+    }
+    token_for_job()
+}
+
 /// The saved token, for a background job that is about to use it. A missing token and
 /// an unusable store are both errors, each with its own message.
-pub fn token_for_job() -> Result<String, String> {
+fn token_for_job() -> Result<String, String> {
     match publish::load_token() {
         Ok(Some(t)) => Ok(t),
         Ok(None) => Err(ADD_SERVER_AND_TOKEN.to_string()),
@@ -267,12 +349,15 @@ pub enum Blocked {
     NoToken,
     Checking,
     Store(String),
+    /// The saved token belongs to another address than the configured one.
+    OtherSite(String),
 }
 
 pub const ADD_SERVER_AND_TOKEN: &str = "Add a site address and a token on the Workspace page of the main window to publish.";
 
 /// What stops a publish, in the order the user would fix it; None when it can start.
-pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus) -> Option<Blocked> {
+/// `bound` is the address the saved token belongs to ([`token_site`]).
+pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus, bound: Option<&str>) -> Option<Blocked> {
     if exporting {
         return Some(Blocked::Exporting);
     }
@@ -286,7 +371,7 @@ pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &T
         return Some(Blocked::BadServer(e));
     }
     match token {
-        TokenStatus::Saved => None,
+        TokenStatus::Saved => binding_problem(bound, server).map(|p| Blocked::OtherSite(format!("{p} {FIX_ON_WORKSPACE}"))),
         TokenStatus::Missing => Some(Blocked::NoToken),
         TokenStatus::Checking => Some(Blocked::Checking),
         TokenStatus::Unavailable(e) => Some(Blocked::Store(e.clone())),
@@ -300,7 +385,7 @@ impl Blocked {
         match self {
             Blocked::Exporting | Blocked::NoSteps => None,
             Blocked::NoServer | Blocked::NoToken => Some(ADD_SERVER_AND_TOKEN.to_string()),
-            Blocked::BadServer(e) | Blocked::Store(e) => Some(e.clone()),
+            Blocked::BadServer(e) | Blocked::Store(e) | Blocked::OtherSite(e) => Some(e.clone()),
             Blocked::Checking => Some("Checking for a saved token…".to_string()),
         }
     }
@@ -682,7 +767,7 @@ impl Picker {
         }
         let (list, server) = (self.list.clone(), self.server.clone());
         std::thread::spawn(move || {
-            let result = token_for_job().and_then(|token| publish::list_tours(&server, &token));
+            let result = token_for(&server).and_then(|token| publish::list_tours(&server, &token));
             let state = match result {
                 Ok(tours) => ListState::Loaded(tours),
                 Err(e) => ListState::Failed(e),
@@ -846,39 +931,111 @@ impl Picker {
 mod tests {
     use super::*;
 
+    /// `publish_blocked` with the token saved for the very address that is asked about.
+    fn blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus) -> Option<Blocked> {
+        publish_blocked(exporting, has_steps, server, token, publish::check_server(server).ok().as_deref())
+    }
+
+    #[test]
+    fn the_token_is_only_for_the_address_it_was_saved_for() {
+        let home = Some("https://tours.example.com");
+        assert_eq!(binding_problem(home, "https://tours.example.com"), None);
+        assert_eq!(binding_problem(home, " https://Tours.Example.com/ "), None, "the same address written another way");
+        // Another host: a typo in the top-level domain, a look-alike, a new server.
+        for other in ["https://tours.example.co", "https://tours.exarnple.com", "https://example.com", "http://localhost:8787"] {
+            assert_eq!(binding_problem(home, other).as_deref(), Some("The saved token belongs to tours.example.com, so it is not sent to this address."), "{other}");
+        }
+        // The same host at another port or path is another address too, and is named in full.
+        assert_eq!(binding_problem(home, "https://tours.example.com:8443").as_deref(), Some("The saved token belongs to https://tours.example.com, so it is not sent to this address."));
+        assert!(binding_problem(home, "https://tours.example.com/demo").is_some());
+        // Tied to nothing, or to something that is not an address.
+        for unbound in [None, Some(""), Some("tours.example.com")] {
+            assert_eq!(binding_problem(unbound, "https://tours.example.com").as_deref(), Some("The saved token is not tied to a site address yet, so it is not sent anywhere."), "{unbound:?}");
+        }
+        // An address that is not one is the address rule's to report.
+        assert_eq!(binding_problem(home, "tours.example"), None);
+        assert_eq!(binding_problem(home, ""), None);
+        for s in [FIX_ON_WORKSPACE, &binding_problem(None, "https://a.example.com").unwrap()] {
+            assert!(s.ends_with('.') && !s.contains('!'), "{s}");
+        }
+    }
+
+    #[test]
+    fn publishing_is_blocked_while_the_token_belongs_to_another_address() {
+        let saved = TokenStatus::Saved;
+        let b = publish_blocked(false, true, "https://tours.example.co", &saved, Some("https://tours.example.com")).expect("blocked");
+        assert_eq!(b, Blocked::OtherSite(format!("The saved token belongs to tours.example.com, so it is not sent to this address. {FIX_ON_WORKSPACE}")));
+        assert_eq!(b.reason(), Some(b.refusal()));
+        assert!(b.refusal().contains("Workspace page"));
+        assert!(matches!(publish_blocked(false, true, "https://tours.example.com", &saved, None), Some(Blocked::OtherSite(_))));
+        assert_eq!(publish_blocked(false, true, "https://tours.example.com", &saved, Some("https://tours.example.com")), None);
+        // What comes first is still said first.
+        assert_eq!(publish_blocked(true, true, "https://tours.example.co", &saved, Some("https://tours.example.com")), Some(Blocked::Exporting));
+        assert_eq!(publish_blocked(false, true, "https://tours.example.co", &TokenStatus::Missing, Some("https://tours.example.com")), Some(Blocked::NoToken));
+    }
+
+    #[test]
+    fn an_install_from_before_the_tie_adopts_the_configured_address_once() {
+        let saved = TokenStatus::Saved;
+        // No record in the settings file, a token saved, a usable address: that address.
+        assert_eq!(first_binding(None, &saved, " https://Tours.Example.com/ "), Some(Some("https://tours.example.com".into())));
+        // No usable address: tied to none, and that is recorded, so no later address is adopted silently.
+        assert_eq!(first_binding(None, &saved, ""), Some(None));
+        assert_eq!(first_binding(None, &saved, "http://tours.example.com"), Some(None));
+        // No token: nothing to tie; recorded too.
+        assert_eq!(first_binding(None, &TokenStatus::Missing, "https://tours.example.com"), Some(None));
+        // Not known yet: decided at a later start.
+        assert_eq!(first_binding(None, &TokenStatus::Checking, "https://tours.example.com"), None);
+        assert_eq!(first_binding(None, &TokenStatus::Unavailable("locked".into()), "https://tours.example.com"), None);
+        // Once there is a record, even an empty one, nothing is adopted again.
+        for recorded in ["", "https://tours.example.com", "https://old.example.com"] {
+            assert_eq!(first_binding(Some(recorded), &saved, "https://new.example.com"), None, "{recorded:?}");
+        }
+        // The record survives the settings file, and holds no token.
+        let mut settings = crate::settings::Settings::default();
+        settings.publish_saved_for = Some("https://tours.example.com".into());
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("token"), "{text}");
+        let read: crate::settings::Settings = toml::from_str(&text).unwrap();
+        assert_eq!(read.publish_saved_for.as_deref(), Some("https://tours.example.com"));
+        settings.publish_saved_for = Some(String::new());
+        let read: crate::settings::Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(read.publish_saved_for.as_deref(), Some(""), "tied to none is a record too");
+    }
+
     fn tour(title: &str, chapters: u32, steps: u32, status: &str) -> RemoteTour {
         RemoteTour { id: "t1".into(), title: title.into(), status: status.into(), chapters, steps, link: None, updated_at: None, published_at: None }
     }
 
     #[test]
     fn publish_is_ready_with_steps_a_server_and_a_saved_token() {
-        assert_eq!(publish_blocked(false, true, "https://tours.example.com", &TokenStatus::Saved), None);
-        assert_eq!(publish_blocked(false, true, "http://localhost:8787/", &TokenStatus::Saved), None);
+        assert_eq!(blocked(false, true, "https://tours.example.com", &TokenStatus::Saved), None);
+        assert_eq!(blocked(false, true, "http://localhost:8787/", &TokenStatus::Saved), None);
     }
 
     #[test]
     fn each_missing_piece_has_its_own_disabled_reason() {
         let ok = "https://tours.example.com";
         // A running export or no steps: disabled, with no extra line (the status bar and the tour line say why).
-        assert_eq!(publish_blocked(true, true, ok, &TokenStatus::Saved), Some(Blocked::Exporting));
+        assert_eq!(blocked(true, true, ok, &TokenStatus::Saved), Some(Blocked::Exporting));
         assert_eq!(Blocked::Exporting.reason(), None);
-        assert_eq!(publish_blocked(false, false, ok, &TokenStatus::Saved), Some(Blocked::NoSteps));
+        assert_eq!(blocked(false, false, ok, &TokenStatus::Saved), Some(Blocked::NoSteps));
         assert_eq!(Blocked::NoSteps.reason(), None);
         // No server, or no token: the approved line.
-        assert_eq!(publish_blocked(false, true, "  ", &TokenStatus::Saved), Some(Blocked::NoServer));
-        assert_eq!(publish_blocked(false, true, "", &TokenStatus::Missing), Some(Blocked::NoServer));
+        assert_eq!(blocked(false, true, "  ", &TokenStatus::Saved), Some(Blocked::NoServer));
+        assert_eq!(blocked(false, true, "", &TokenStatus::Missing), Some(Blocked::NoServer));
         assert_eq!(Blocked::NoServer.reason().as_deref(), Some(ADD_SERVER_AND_TOKEN));
-        assert_eq!(publish_blocked(false, true, ok, &TokenStatus::Missing), Some(Blocked::NoToken));
+        assert_eq!(blocked(false, true, ok, &TokenStatus::Missing), Some(Blocked::NoToken));
         assert_eq!(Blocked::NoToken.reason().as_deref(), Some(ADD_SERVER_AND_TOKEN));
         // A server address that cannot be used says what is wrong with it.
-        let bad = publish_blocked(false, true, "http://tours.example.com", &TokenStatus::Saved);
+        let bad = blocked(false, true, "http://tours.example.com", &TokenStatus::Saved);
         assert!(matches!(&bad, Some(Blocked::BadServer(e)) if e.contains("https://")), "{bad:?}");
         assert!(bad.unwrap().reason().unwrap().contains("https://"));
         // A token still being looked up, and a locked store, which is not "no token".
-        assert_eq!(publish_blocked(false, true, ok, &TokenStatus::Checking), Some(Blocked::Checking));
+        assert_eq!(blocked(false, true, ok, &TokenStatus::Checking), Some(Blocked::Checking));
         assert_eq!(Blocked::Checking.reason().as_deref(), Some("Checking for a saved token…"));
         let locked = "Could not use the credential store: the credential store is locked or not reachable.";
-        let b = publish_blocked(false, true, ok, &TokenStatus::Unavailable(locked.into()));
+        let b = blocked(false, true, ok, &TokenStatus::Unavailable(locked.into()));
         assert_eq!(b, Some(Blocked::Store(locked.into())));
         assert_eq!(b.unwrap().reason().as_deref(), Some(locked));
     }

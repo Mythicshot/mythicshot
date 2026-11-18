@@ -173,6 +173,10 @@ impl App {
             state: SettingsState::default(),
             actions: Vec::new(),
         })));
+        // Deletes a past run could not finish: the Tours page offers to carry them on.
+        if let Ok(s) = window.lock() {
+            s.tours.unfinished().load(settings.unfinished_deletes.clone());
+        }
 
         let mut app = Self {
             settings,
@@ -706,6 +710,24 @@ impl App {
         self.toast.post(msg, None);
     }
 
+    /// Write to the settings file what the tour pages and their background jobs noted since the
+    /// last look: a delete that did not finish (or one that now has), and the address the saved
+    /// token belongs to. Neither is a secret, and neither is edited on the Preferences page.
+    fn save_publish_state(&mut self) {
+        let unfinished = self.window.lock().map(|s| s.tours.unfinished()).ok().and_then(|u| u.take_changed());
+        let saved_for = publish_ui::take_token_site_change();
+        if unfinished.is_none() && saved_for.is_none() {
+            return;
+        }
+        if let Some(list) = unfinished {
+            self.settings.unfinished_deletes = list;
+        }
+        if let Some(site) = saved_for {
+            self.settings.publish_saved_for = Some(site);
+        }
+        self.settings.save();
+    }
+
     fn settings_changed(&mut self) {
         self.settings.save();
         publish_ui::set_server(&self.settings.publish_server);
@@ -850,6 +872,7 @@ impl App {
     /// Each frame: apply what the main window queued, start a capture it asked for once it is
     /// hidden, and keep it drawn while it is open.
     fn main_window(&mut self, ctx: &egui::Context) {
+        self.save_publish_state();
         // Pull what the window did since our last frame.
         let (actions, edited, tab, capture) = {
             let mut s = self.window.lock().expect("main window state");
@@ -969,6 +992,8 @@ impl eframe::App for App {
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         publish_ui::shutdown(std::time::Duration::from_secs(5));
+        // A delete that was noted as unfinished in the last moments is on disk before the app is gone.
+        self.save_publish_state();
         // An add to a site was cancelled above; one already swapping its tour in finishes or rolls back first.
         site::wait_for_adds(std::time::Duration::from_secs(30));
     }

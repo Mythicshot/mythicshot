@@ -7,6 +7,10 @@
 //! new id (dropping its undo history) on Save, on Forget, on Cancel and when the page is
 //! left or the window closes, and a saved token is never read back into it.
 //!
+//! The token belongs to the address it was saved for, and is sent to no other. With another
+//! address in the field the page says whose token it is and offers to use it here too (an
+//! explicit click) or to replace it; until then nothing is sent.
+//!
 //! The site is asked on its own only when the page is opened and after a token is saved,
 //! and only at the address as it stood then. While the address is being typed nothing is
 //! sent: every half-typed address would otherwise be handed the token. An edited address
@@ -44,16 +48,26 @@ pub struct Conn {
     pub epoch: u64,
     /// Debug builds: the address from `MYTHICSHOT_TEST_PUBLISH`, shown instead of the saved one.
     pub test_server: Option<String>,
+    /// The address the saved token belongs to. It is sent to no other.
+    pub bound: Option<String>,
 }
 
 impl Conn {
     pub fn current() -> Conn {
-        Conn { token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), test_server: publish_ui::test_server() }
+        Conn { token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), test_server: publish_ui::test_server(), bound: publish_ui::token_site() }
     }
 
-    /// The site at `address`: only with a usable address and a saved token.
-    fn site(&self, address: &str) -> Option<Site> {
+    /// Why the saved token may not go to `address`, when it may not.
+    fn binding_problem(&self, address: &str) -> Option<String> {
         if self.token != TokenStatus::Saved {
+            return None;
+        }
+        publish_ui::binding_problem(self.bound.as_deref(), address)
+    }
+
+    /// The site at `address`: only with a usable address and a token saved for that address.
+    fn site(&self, address: &str) -> Option<Site> {
+        if self.token != TokenStatus::Saved || self.binding_problem(address).is_some() {
             return None;
         }
         Some(Site { server: publish::check_server(address).ok()?, epoch: self.epoch })
@@ -171,7 +185,25 @@ impl Check {
     }
 }
 
-type TokenSource = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+/// Where a check gets the token for the address it is about to ask.
+type TokenSource = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+/// Ties the saved token to an address (None: to none).
+type Bind = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
+/// What Save shows, and what it ties the token to: the address in the field when the
+/// token was stored, and nothing when it was not. A failed save changes no tie.
+fn after_save(stored: Result<(), String>, site: Option<String>, bind: &Bind) -> Result<String, String> {
+    stored?;
+    bind(site);
+    Ok("Token saved.".to_string())
+}
+
+/// The same for Forget: with no token, there is nothing to tie.
+fn after_forget(forgotten: Result<(), String>, bind: &Bind) -> Result<String, String> {
+    forgotten?;
+    bind(None);
+    Ok("Token removed from Windows Credential Manager.".to_string())
+}
 
 /// The page's own state.
 pub struct WorkspaceState {
@@ -190,6 +222,7 @@ pub struct WorkspaceState {
     /// The site that was last asked without a click, or whose address was typed: it is not asked again on its own.
     auto: Option<Site>,
     token: TokenSource,
+    bind: Bind,
 }
 
 impl Default for WorkspaceState {
@@ -203,7 +236,8 @@ impl Default for WorkspaceState {
             busy: Arc::default(),
             check: Arc::default(),
             auto: None,
-            token: Arc::new(publish_ui::token_for_job),
+            token: Arc::new(publish_ui::token_for),
+            bind: Arc::new(publish_ui::bind_token),
         }
     }
 }
@@ -232,7 +266,7 @@ fn ask(server: &str, token: &str) -> Result<Info, String> {
 impl WorkspaceState {
     /// A page whose checks get the token from `token` instead of the credential store.
     #[cfg(test)]
-    fn with_token(token: impl Fn() -> Result<String, String> + Send + Sync + 'static) -> Self {
+    fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
         Self { token: Arc::new(token), ..Default::default() }
     }
 
@@ -287,7 +321,7 @@ impl WorkspaceState {
         let generation = lock(&self.check).begin();
         let (check, token) = (self.check.clone(), self.token.clone());
         let work = move || {
-            let result = token().and_then(|token| ask(&site.server, &token));
+            let result = token(&site.server).and_then(|token| ask(&site.server, &token));
             lock(&check).finish(generation, site, result.clone());
             result.map(|info| format!("Connected to workspace \"{}\"", info.workspace))
         };
@@ -344,6 +378,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     // The address this page works with: the test hook's when set, else the saved one.
     let effective = conn.test_server.clone().unwrap_or_else(|| server.clone());
     let site = conn.site(&effective);
+    let problem = conn.binding_problem(&effective);
 
     // On opening the page, and after a token was saved: ask the site once, without a click.
     if let Some(site) = &site
@@ -410,7 +445,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         ui.end_row();
 
         row(ui, "Token");
-        ui.vertical(|ui| token_ui(ui, p, conn, busy));
+        ui.vertical(|ui| token_ui(ui, p, conn, &effective, busy));
         ui.end_row();
 
         row(ui, "Tours");
@@ -422,11 +457,25 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         ui.end_row();
     });
 
+    // The token was saved for another address: say so, and send nothing until the user decides.
+    if let Some(problem) = &problem {
+        ui.add_space(10.0);
+        ui.add(egui::Label::new(RichText::new(problem).color(WARN_TEXT)).wrap());
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, egui::Button::new(publish_ui::USE_IT_HERE)).clicked() {
+                (p.bind)(publish::check_server(&effective).ok());
+                p.clear_message();
+            }
+            ui.label(RichText::new("Or replace the token above.").color(MUTED).size(12.0));
+        });
+    }
+
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.add_enabled(!busy && !checking, egui::Button::new("Test connection")).clicked() {
             let tested = effective.clone();
             match publish::check_server(&tested) {
+                Ok(_) if problem.is_some() => *lock(&p.message) = Some(Outcome { text: problem.clone().unwrap_or_default(), ok: false, server: Some(tested) }),
                 Ok(checked) => {
                     let site = Site { server: checked, epoch: conn.epoch };
                     p.auto = Some(site.clone());
@@ -456,15 +505,16 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
 }
 
 /// The "Token" row: what is saved, or the field to paste one into.
-fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, busy: bool) {
+fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, address: &str, busy: bool) {
     let forget = |ui: &mut egui::Ui, p: &mut WorkspaceState| {
         if ui.add_enabled(!busy, egui::Button::new("Forget")).clicked() {
             p.clear_token_field(ui.ctx());
             p.replacing = false;
-            p.run(None, || {
-                let forgotten = publish::forget_token();
+            let bind = p.bind.clone();
+            p.run(None, move || {
+                let result = after_forget(publish::forget_token(), &bind);
                 publish_ui::refresh_token_now();
-                forgotten.map(|()| "Token removed from Windows Credential Manager.".to_string())
+                result
             });
         }
     };
@@ -474,11 +524,13 @@ fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, busy: bool) 
             // The field is emptied now; the token goes to the background thread and nowhere else.
             let mut entered = p.take_for_save(ui.ctx());
             p.replacing = false;
+            // The token belongs to the address that is in the field now.
+            let (bind, site) = (p.bind.clone(), publish::check_server(address).ok());
             p.run(None, move || {
-                let saved = publish::store_token(&entered);
+                let result = after_save(publish::store_token(&entered), site, &bind);
                 publish_ui::wipe(&mut entered);
                 publish_ui::refresh_token_now();
-                saved.map(|()| "Token saved.".to_string())
+                result
             });
         }
     };
@@ -620,8 +672,13 @@ mod tests {
         Site { server: server.into(), epoch: 1 }
     }
 
+    /// A connection whose token belongs to whatever address the page holds: the tie is not what these tests are about.
     fn conn(token: TokenStatus) -> Conn {
-        Conn { token, epoch: 1, test_server: None }
+        Conn { token, epoch: 1, test_server: None, bound: None }
+    }
+
+    fn bound_to(stub: &Stub, token: TokenStatus) -> Conn {
+        Conn { bound: Some(stub.base.clone()), ..conn(token) }
     }
 
     #[test]
@@ -731,7 +788,7 @@ mod tests {
     }
 
     fn page() -> WorkspaceState {
-        WorkspaceState::with_token(|| Ok(TOKEN.to_string()))
+        WorkspaceState::with_token(|_| Ok(TOKEN.to_string()))
     }
 
     const LIST: &str = r#"{"tours":[{"id":"tour_a","title":"A","status":"published","slug":"abc","url":"/t/abc","chapters":2,"steps":22,"updated_at":1,"published_at":2},{"id":"tour_b","title":"B","status":"draft","slug":"def","url":null,"chapters":1,"steps":9,"updated_at":1,"published_at":null}]}"#;
@@ -747,7 +804,7 @@ mod tests {
     #[test]
     fn a_connected_page_shows_the_workspace_the_tours_and_the_version() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), String::new(), conn(TokenStatus::Saved));
+        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), String::new(), bound_to(&s, TokenStatus::Saved));
         server.clone_from(&s.base);
         // Opening the page asks the site without a click.
         let first = drawn(&ctx, &mut p, &mut server, &c);
@@ -776,7 +833,7 @@ mod tests {
     #[test]
     fn an_older_site_is_connected_with_its_version_unknown() {
         let s = site_stub(r#"{"workspace":"Acme"}"#);
-        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), s.base.clone(), conn(TokenStatus::Saved));
+        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
         let text = until(&ctx, &mut p, &mut server, &c, |t| has_line(t, CONNECTED));
         assert!(has_line(&text, "Acme") && has_line(&text, "unknown") && has_line(&text, "2 (1 public, 1 draft)"), "{text}");
     }
@@ -803,7 +860,7 @@ mod tests {
 
         // A site that refuses the token: not connected, no rows filled, and no request loop.
         let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
-        let (mut p, mut server, c) = (page(), s.base.clone(), conn(TokenStatus::Saved));
+        let (mut p, mut server, c) = (page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
         drawn(&ctx, &mut p, &mut server, &c);
         let text = until(&ctx, &mut p, &mut server, &c, |t| has_line(t, NOT_CONNECTED));
         assert!(!has_line(&text, "unknown") && !has_line(&text, PRESS_TEST), "{text}");
@@ -813,7 +870,7 @@ mod tests {
         assert_eq!(s.lines(), ["GET /api/v1/me"]);
         // A tour list that cannot be read leaves the count open; the connection stands.
         let s = stub(|req, _| if req.line == "GET /api/v1/me" { reply(200, r#"{"workspace":"Acme","version":"0.1.1"}"#) } else { reply(503, "") });
-        let (mut p, mut server) = (page(), s.base.clone());
+        let (mut p, mut server, c) = (page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
         let text = until(&ctx, &mut p, &mut server, &c, |t| has_line(t, CONNECTED));
         assert!(has_line(&text, "Acme") && !text.contains("public"), "{text}");
     }
@@ -821,18 +878,14 @@ mod tests {
     #[test]
     fn an_address_being_typed_is_never_asked_on_its_own() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, c) = (egui::Context::default(), page(), conn(TokenStatus::Saved));
-        // The page was opened on another address and has asked it.
-        let other = site_stub(r#"{"workspace":"Other"}"#);
-        let mut server = other.base.clone();
-        until(&ctx, &mut p, &mut server, &c, |t| has_line(t, CONNECTED));
-        // Typing: what the field's change handler does for each new text.
-        server.clone_from(&s.base);
+        let (ctx, mut p, c) = (egui::Context::default(), page(), bound_to(&s, TokenStatus::Saved));
+        // The address in the field is the token's own, typed just now: what the field's change handler does.
+        let mut server = s.base.clone();
         if let Some(typed) = c.site(&server) {
             p.auto = Some(typed);
         }
         let text = drawn(&ctx, &mut p, &mut server, &c);
-        assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, PRESS_TEST) && !has_line(&text, "Other"), "the old site's answer is not shown for the new address:\n{text}");
+        assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, PRESS_TEST), "{text}");
         std::thread::sleep(Duration::from_millis(50));
         drawn(&ctx, &mut p, &mut server, &c);
         assert!(s.lines().is_empty(), "the typed address got a request: {:?}", s.lines());
@@ -844,9 +897,69 @@ mod tests {
     }
 
     #[test]
+    fn a_token_saved_for_another_address_is_not_sent_until_the_user_says_so() {
+        let home = site_stub(r#"{"workspace":"Home"}"#);
+        let typo = site_stub(r#"{"workspace":"Somebody else"}"#);
+        let ctx = egui::Context::default();
+        // Which address the token is tied to, as the page's button would set it.
+        let bound = Arc::new(Mutex::new(Some(home.base.clone())));
+        let record = bound.clone();
+        let mut p = WorkspaceState { bind: Arc::new(move |site| *record.lock().unwrap() = site), ..page() };
+        let c = |bound: &Mutex<Option<String>>| Conn { bound: bound.lock().unwrap().clone(), ..conn(TokenStatus::Saved) };
+        let mut server = home.base.clone();
+        until(&ctx, &mut p, &mut server, &c(&bound), |t| has_line(t, CONNECTED));
+        // The address changes to another host. Opening the page again must not hand it the token.
+        server.clone_from(&typo.base);
+        p.leave(&ctx);
+        let text = drawn(&ctx, &mut p, &mut server, &c(&bound));
+        let flat = text.replace('\n', " ");
+        assert!(has_line(&text, NOT_CONNECTED) && flat.contains("The saved token belongs to ") && flat.contains("so it is not sent to this address."), "{text}");
+        assert!(has_line(&text, publish_ui::USE_IT_HERE) && has_line(&text, "Replace") && !has_line(&text, "Home") && !has_line(&text, PRESS_TEST), "{text}");
+        for _ in 0..5 {
+            drawn(&ctx, &mut p, &mut server, &c(&bound));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(typo.lines().is_empty(), "the other address got a request: {:?}", typo.lines());
+        assert_eq!(c(&bound).site(&server), None);
+        assert_eq!(c(&bound).binding_problem(&home.base), None);
+        // A token tied to nothing is not sent either.
+        let unbound = conn(TokenStatus::Saved);
+        let text = drawn(&ctx, &mut p, &mut server, &unbound).replace('\n', " ");
+        assert!(text.contains("The saved token is not tied to a site address yet") && text.contains(publish_ui::USE_IT_HERE), "{text}");
+        assert!(typo.lines().is_empty());
+        // "Use it for this address too": the tie moves, and only then is the site asked.
+        (p.bind)(publish::check_server(&server).ok());
+        assert_eq!(bound.lock().unwrap().as_deref(), Some(typo.base.as_str()));
+        let text = until(&ctx, &mut p, &mut server, &c(&bound), |t| has_line(t, CONNECTED));
+        assert!(has_line(&text, "Somebody else") && !has_line(&text, publish_ui::USE_IT_HERE), "{text}");
+        assert_eq!(home.lines().len(), 2, "the first site was asked once, when the page opened");
+    }
+
+    #[test]
+    fn saving_ties_the_token_to_the_address_and_a_failed_save_ties_nothing() {
+        let ties: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let record = ties.clone();
+        let bind: Bind = Arc::new(move |site| record.lock().unwrap().push(site));
+        assert_eq!(after_save(Ok(()), Some("https://tours.example.com".into()), &bind), Ok("Token saved.".into()));
+        assert_eq!(*ties.lock().unwrap(), [Some("https://tours.example.com".to_string())]);
+        // Saved with no usable address in the field: tied to none, so it goes nowhere yet.
+        assert!(after_save(Ok(()), None, &bind).is_ok());
+        assert_eq!(ties.lock().unwrap().last(), Some(&None));
+        // The store refused it: the token that was saved before keeps its own address.
+        let refused = Err("That is not an API token. A token starts with dp_ and comes from the server's setup page.".to_string());
+        assert_eq!(after_save(refused.clone(), Some("https://other.example.com".into()), &bind), refused.map(|()| String::new()));
+        assert_eq!(ties.lock().unwrap().len(), 2);
+        // Forget unties; a Forget that failed leaves the tie.
+        assert!(after_forget(Err("Could not use the credential store: the credential store is locked or not reachable.".into()), &bind).is_err());
+        assert_eq!(ties.lock().unwrap().len(), 2);
+        assert_eq!(after_forget(Ok(()), &bind), Ok("Token removed from Windows Credential Manager.".into()));
+        assert_eq!(ties.lock().unwrap().last(), Some(&None));
+    }
+
+    #[test]
     fn typing_in_the_address_field_reports_a_change_and_sends_nothing() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, c) = (egui::Context::default(), page(), conn(TokenStatus::Saved));
+        let (ctx, mut p, c) = (egui::Context::default(), page(), bound_to(&s, TokenStatus::Saved));
         let mut server = String::new();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 520.0));
         let run = |p: &mut WorkspaceState, server: &mut String, events: Vec<egui::Event>| {

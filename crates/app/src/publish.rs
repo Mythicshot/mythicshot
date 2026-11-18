@@ -72,6 +72,9 @@ const NO_SUCH_TOUR: &str = "no such tour";
 const GONE: &str = "that tour no longer exists.";
 /// The sentence the Tours page shows for such an error.
 pub const TOUR_GONE: &str = "That tour no longer exists.";
+/// What a delete's error ends with when the tour is gone but files are left. The tour is no
+/// longer in the list then, so the way back is the Tours page's own block for it.
+const UNFINISHED_TRAILER: &str = " The tour itself is gone from the site, but some of its files remain. Use Finish deleting on the Tours page to remove them.";
 /// What rename and delete say to a site that does not have those routes yet.
 const NEEDS_UPDATE: &str = "the site needs an update to version 0.1.1 or newer.";
 
@@ -208,6 +211,22 @@ fn safe_link(url: &str) -> Option<String> {
     (url.len() <= MAX_URL_CHARS && mythicshot_destinations::is_web_link(url) && check_server(url).is_ok()).then(|| url.to_string())
 }
 
+/// The host name of a site address the address rule accepts, in lower case; an IPv6 address keeps its brackets.
+pub fn host_of(address: &str) -> Option<String> {
+    let url = check_server(address).ok()?;
+    let authority = url.split_once("://")?.1.split('/').next()?;
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => &authority[..rest.find(']')? + 2],
+        None => authority.rsplit_once(':').map_or(authority, |(host, _port)| host),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether `id` has the form of a tour id.
+pub fn is_tour_id(id: &str) -> bool {
+    is_id(id, "tour_")
+}
+
 /// Accepts https URLs, and http only for localhost and 127.0.0.1. Returns the URL without a trailing slash.
 pub fn check_server(url: &str) -> Result<String, String> {
     let url = url.trim();
@@ -287,7 +306,9 @@ pub fn rename_tour(server: &str, token: &str, tour_id: &str, title: &str) -> Res
 }
 
 /// Deletes the tour: calls the delete route until the site says nothing of it is left.
-/// `progress` gets the files removed so far, when the site says. A tour that is already
+/// `progress` is called once before every request, with the files removed so far when the
+/// site says. A second call of it therefore means the site has begun: the tour itself is
+/// gone and only files remain, which is the moment to note the delete as unfinished. A tour that is already
 /// gone is a success. There is no cancel: the first call removes the tour, the rest only
 /// its files, and stopping half-way would leave files nobody can find again. Blocks like
 /// [`publish_tour`].
@@ -817,7 +838,7 @@ impl Client {
     fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
         let what = "Could not delete the tour";
         let failed = |message: String, unfinished: bool| {
-            let message = if unfinished { format!("{message} The tour itself is gone from the site; delete it again to remove the rest of its files.") } else { message };
+            let message = if unfinished { format!("{message}{UNFINISHED_TRAILER}") } else { message };
             DeleteFailed { message, unfinished }
         };
         if !is_id(tour_id, "tour_") {
@@ -838,8 +859,10 @@ impl Client {
             if Self::says_no_such_tour(&reply) {
                 return Ok(());
             }
+            // Never with the "files remain" ending: half-way through, a 404 that is not the
+            // site's own (a proxy's page) says nothing about the tour either way.
             if Self::says_no_such_route(&reply) {
-                return Err(failed(format!("{what}: {NEEDS_UPDATE}"), unfinished));
+                return Err(failed(format!("{what}: {NEEDS_UPDATE}"), false));
             }
             if reply.status == 409 && reply.error_code().as_deref() == Some("publish_busy") {
                 return Err(failed(format!("{what}: a publish of this tour is in progress. Wait for it to finish, or unpublish the tour, then delete it again."), unfinished));
@@ -2038,7 +2061,7 @@ pub(crate) mod tests {
     const NO_TOUR: &str = r#"{"error":"not_found","detail":"no such tour"}"#;
     const NO_ROUTE: &str = r#"{"error":"not_found"}"#;
     const CLEANUP_PENDING: &str = r#"{"error":"cleanup_pending","detail":"the tour is deleted, but some of its files could not be removed yet; delete it again to retry"}"#;
-    const GONE_TRAILER: &str = " The tour itself is gone from the site; delete it again to remove the rest of its files.";
+    const GONE_TRAILER: &str = " The tour itself is gone from the site, but some of its files remain. Use Finish deleting on the Tours page to remove them.";
 
     fn deleting(done: u32, total: u32) -> Answer {
         reply(202, &format!(r#"{{"status":"in_progress","done":{done},"total":{total}}}"#))
@@ -2247,6 +2270,27 @@ pub(crate) mod tests {
         assert_eq!(e.message, format!("Could not delete the tour: the server answered HTTP 503.{GONE_TRAILER}"));
         assert!(e.unfinished);
         assert_eq!(s.lines().len(), 2, "a failure that is not cleanup_pending is not sent again");
+    }
+
+    #[test]
+    fn a_web_page_404_in_the_middle_of_a_delete_does_not_claim_the_tour_is_gone() {
+        for (status, body) in [(404, "<html>Not Found</html>"), (404, NO_ROUTE), (405, "")] {
+            let s = stub(move |_, seen| if seen == 0 { deleting(250, 601) } else { reply(status, body) });
+            let e = delete(&s).0.unwrap_err();
+            assert_eq!(e, DeleteFailed { message: "Could not delete the tour: the site needs an update to version 0.1.1 or newer.".into(), unfinished: false }, "{status} {body}");
+            assert!(!e.message.contains("gone from the site"));
+            assert_eq!(s.lines().len(), 2);
+        }
+        // The sentence for a real unfinished delete names something the user can do.
+        assert!(GONE_TRAILER.contains("Finish deleting on the Tours page") && !GONE_TRAILER.contains("delete it again"));
+    }
+
+    #[test]
+    fn the_host_of_a_site_address_is_its_name_only() {
+        assert_eq!(host_of(" https://Tours.Example.com/demo/ ").as_deref(), Some("tours.example.com"));
+        assert_eq!(host_of("http://localhost:8787").as_deref(), Some("localhost"));
+        assert_eq!(host_of("http://tours.example.com"), None);
+        assert!(is_tour_id(TOUR) && !is_tour_id("tour_1") && !is_tour_id("../x"));
     }
 
     #[test]
