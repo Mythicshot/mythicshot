@@ -14,6 +14,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::home_ui::{self, HomeState};
 use crate::platform::{WindowId, WindowKind};
+use crate::project::ProjectKey;
 use crate::publish_ui::{self, TokenStatus};
 use crate::settings_ui::{self, UiAction};
 use crate::tours_ui::{self, ToursState};
@@ -174,6 +175,8 @@ pub struct PageOut {
     pub go_to: Option<Page>,
     /// Hide the window, then run this capture command.
     pub capture: Option<Command>,
+    /// Open this saved recording in an editor: Edit on the Tours page.
+    pub edit_project: Option<ProjectKey>,
 }
 
 /// State shared between the app and the window.
@@ -188,13 +191,29 @@ pub struct Shared {
     pub workspace: WorkspaceState,
     /// A capture a Home tile asked for; the app hides the window, then runs it.
     pub capture: Option<Command>,
+    /// A saved recording the Tours page asked to edit; the app opens it in an editor.
+    pub edit_project: Option<ProjectKey>,
     /// A capture or recording is going on: the tiles are greyed out.
     pub busy: bool,
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, busy: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false }
+    }
+
+    /// Keep what a page asked of the window or the app in this frame. A frame that asks for
+    /// nothing leaves an earlier request waiting for the app.
+    fn take(&mut self, out: PageOut) {
+        if let Some(page) = out.go_to {
+            self.nav.go(page);
+        }
+        if out.capture.is_some() {
+            self.capture = out.capture;
+        }
+        if out.edit_project.is_some() {
+            self.edit_project = out.edit_project;
+        }
     }
 
     /// Drop a page's unfinished input once the page has been left. Settings themselves are
@@ -329,7 +348,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -341,12 +360,7 @@ pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
     let mut out = PageOut::default();
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
     egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, &mut out));
-    if let Some(page) = out.go_to {
-        s.nav.go(page);
-    }
-    if out.capture.is_some() {
-        s.capture = out.capture;
-    }
+    s.take(out);
 }
 
 fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
@@ -405,6 +419,29 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
 mod tests {
     use super::*;
     use crate::settings::Settings;
+
+    #[test]
+    fn an_edit_request_reaches_the_app_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Tours);
+        let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: "ch_aaaaaaaaaaaaaaaaaaaaaaaa".into() };
+        assert_eq!(s.edit_project, None);
+        // The Tours page asks in one frame.
+        s.take(PageOut { edit_project: Some(key.clone()), ..Default::default() });
+        assert_eq!(s.edit_project, Some(key.clone()));
+        assert_eq!((s.nav.page(), s.capture), (Page::Tours, None), "nothing else is asked for, and the window stays on its page");
+        // Frames that ask for nothing do not take it away before the app has seen it.
+        s.take(PageOut::default());
+        let ctx = egui::Context::default();
+        drawn(&ctx, &mut s);
+        assert_eq!(s.edit_project, Some(key.clone()));
+        // The app takes it, as it takes a capture: once.
+        assert_eq!(s.edit_project.take(), Some(key));
+        s.take(PageOut::default());
+        drawn(&ctx, &mut s);
+        assert_eq!(s.edit_project.take(), None);
+    }
 
     #[test]
     fn opening_an_open_window_focuses_it_and_switches_page() {

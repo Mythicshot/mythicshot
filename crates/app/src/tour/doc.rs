@@ -72,7 +72,6 @@ pub enum Anchor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(not(test), expect(dead_code, reason = "the Tour view always places cards by the shared rule; the sides are for a manifest that asks for one"))]
 pub enum Placement {
     #[default]
     Auto,
