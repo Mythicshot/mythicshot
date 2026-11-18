@@ -18,7 +18,7 @@ Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Li
 
 A tour bundle turns a recording into a click-through walkthrough: one image per left click, with the place you clicked marked as a hotspot, plus the last frame as a closing step.
 
-To export one, open the recording editor's export panel, choose "Export tour" › "As a folder…" and pick a folder; the bundle goes into a new subfolder named like a normal export with `-tour` added. Trim, deleted frames, crop and annotations apply; the pointer, click and key overlays, speed, reverse and scale do not.
+To export one, open the recording editor's export panel, choose "Export tour" › "As a folder…" and pick a folder; the bundle goes into a new subfolder named like a normal export with `-tour` added. Trim, deleted frames, crop and annotations apply; the pointer, click and key overlays, speed, reverse and scale do not. While a tour export runs, "Cancel export" in the export panel stops it and removes what it had written; quitting Mythicshot does the same.
 
 The folder holds the step images (`step-001.png` and so on, JPEG when a PNG would be too large), `tour.json` (the manifest: title, image names and sizes, click positions as percentages; never key presses) and `index.html` (a preview page).
 
@@ -26,7 +26,7 @@ The preview page is local only: it opens in your browser from the folder, loads 
 
 ### Single-file export
 
-"Export tour" › "As a single file…" saves the same tour as one `.html` file, for sending to someone by mail or chat when you do not want to publish it: the same page as the folder export, with every step image and the cover logo inside the file, so it opens from disk in any browser with nothing else beside it. The file contains the screenshots, so anything visible in them is shared with whoever gets it. Viewing it leaves no data anywhere: the page loads nothing from the network, sends nothing and stores nothing.
+"Export tour" › "As a single file…" saves the same tour as one `.html` file, for sending to someone by mail or chat when you do not want to publish it: the same page as the folder export, with every step image and the cover logo inside the file, so it opens from disk in any browser with nothing else beside it. The file contains the screenshots, so anything visible in them is shared with whoever gets it. Viewing it leaves no data anywhere: the page loads nothing from the network, sends nothing and stores nothing; only a button link you put on a card or the end card opens the web address it names when clicked. A file over 25 MB is still saved, with a warning that it may be slow to open and too big to send; one over 200 MB is refused, so export such a tour as a folder.
 
 ## Tour view
 

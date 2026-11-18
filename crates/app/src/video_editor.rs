@@ -117,7 +117,8 @@ enum TourOutput {
 /// file, or a tour being published, with the flag that cancels it.
 enum ExportJob {
     File(EncodeJob),
-    Tour(EncodeJob<TourSummary>, TourOutput),
+    /// A tour export, with the run that cancels it and that quitting waits for.
+    Tour(EncodeJob<TourSummary>, TourOutput, Arc<Run>),
     Publish(EncodeJob<Published>, Arc<Run>),
 }
 
@@ -137,7 +138,7 @@ impl ExportJob {
     fn progress(&self) -> f32 {
         match self {
             ExportJob::File(j) => j.progress(),
-            ExportJob::Tour(j, _) => j.progress(),
+            ExportJob::Tour(j, ..) => j.progress(),
             ExportJob::Publish(j, _) => j.progress(),
         }
     }
@@ -146,7 +147,7 @@ impl ExportJob {
     fn take_result(&self) -> Option<Result<Exported, String>> {
         match self {
             ExportJob::File(j) => j.take_result().map(|r| r.map(|(path, size)| Exported::File(path, size))),
-            ExportJob::Tour(j, out) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
+            ExportJob::Tour(j, out, _) => j.take_result().map(|r| r.map(|t| Exported::Tour(t, *out))),
             ExportJob::Publish(j, _) => j.take_result().map(|r| r.map(Exported::Published)),
         }
     }
@@ -158,12 +159,22 @@ impl ExportJob {
             _ => None,
         }
     }
+
+    /// For a tour export: whether cancel was asked for (None for any other export).
+    fn tour_cancelling(&self) -> Option<bool> {
+        match self {
+            ExportJob::Tour(_, _, run) => Some(run.is_cancelled()),
+            _ => None,
+        }
+    }
 }
 
-/// The notification while an export runs.
-fn progress_message(is_tour: bool, cancelling: Option<bool>, progress: f32) -> String {
+/// The notification while an export runs. `cancelling` is a publish's cancel state, `tour_cancelling`
+/// whether a tour export was asked to stop.
+fn progress_message(is_tour: bool, cancelling: Option<bool>, tour_cancelling: bool, progress: f32) -> String {
     match cancelling {
         Some(true) => "Cancelling…".to_string(),
+        None if tour_cancelling => "Cancelling…".to_string(),
         Some(false) => format!("Publishing tour… {:.0}%", progress * 100.0),
         None if is_tour => format!("Exporting tour… {:.0}%", progress * 100.0),
         None => format!("Exporting… {:.0}%", progress * 100.0),
@@ -176,7 +187,12 @@ const PUBLISH_WRITE_SHARE: f32 = 0.3;
 /// Run a publish's work so that it always ends: a panic becomes a failed publish, and
 /// the run is marked finished either way.
 fn guarded<T>(run: &Arc<Run>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| Err("Publishing failed because of an internal error.".to_string()));
+    guarded_as(run, "Publishing failed because of an internal error.", work)
+}
+
+/// [`guarded`] with the message a panic becomes.
+fn guarded_as<T>(run: &Arc<Run>, failed: &str, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| Err(failed.to_string()));
     run.finish();
     result
 }
@@ -231,9 +247,22 @@ fn tour_file_name(stem: &str) -> String {
     format!("{stem}-tour.html")
 }
 
+/// A file size for the status bar: KB under a megabyte, else MB with one decimal.
+fn size_label(bytes: u64) -> String {
+    if bytes < 1_048_576 { format!("{} KB", (bytes + 512) / 1024) } else { format!("{:.1} MB", bytes as f64 / 1_048_576.0) }
+}
+
 /// The status message after a single-file tour export; the status bar adds "· Show in folder".
 fn tour_file_message(steps: usize, bytes: u64) -> String {
-    format!("Tour exported as one file: {} · {:.1} MB", step_count(steps), bytes as f64 / 1_048_576.0)
+    format!("Tour exported as one file: {} · {}", step_count(steps), size_label(bytes))
+}
+
+/// The sentences a tour export's status adds after its message: a single file over
+/// [`tour::LARGE_FILE_BYTES`] (`file_bytes` is None for a folder) and pictures saved at lower quality.
+fn tour_more(file_bytes: Option<u64>, squeezed: Option<String>) -> Option<String> {
+    let large = file_bytes.filter(|&b| b > tour::LARGE_FILE_BYTES).map(|_| "Large file: it may be slow to open and too big to send.".to_string());
+    let parts: Vec<String> = large.into_iter().chain(squeezed).collect();
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
 /// One item of the "Export tour" menu: what it does, with a quieter line saying what you get.
@@ -498,6 +527,7 @@ impl Editor {
         let progress = v.job.as_ref().map(|j| j.progress());
         let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
         let cancelling = v.job.as_ref().and_then(|j| j.cancelling());
+        let tour_cancelling = v.job.as_ref().and_then(|j| j.tour_cancelling()) == Some(true);
         if let Some(r) = finished {
             v.job = None;
             let next = after_export(is_tour, r.is_ok(), v.close_after_export);
@@ -513,20 +543,22 @@ impl Editor {
                         }
                         Exported::Tour(tour, TourOutput::Folder) => {
                             let mut msg = format!("Tour exported: {}", step_count(tour.steps));
-                            if let Some(note) = tour.squeezed_note() {
-                                msg = format!("{msg} · {note}");
+                            if let Some(more) = tour_more(None, tour.squeezed_note()) {
+                                msg = format!("{msg}. {more}");
                             }
                             eprintln!("{msg} ({:.1} MB) in {}", tour.bytes as f64 / 1_048_576.0, tour.path.display());
                             self.notify(msg);
                             crate::platform::open_path(&tour.path.join("index.html"));
                         }
-                        // A single file is for sending on: it is not opened, and the status bar offers to show it.
+                        // A single file is for sending on: it is not opened, and the status bar offers to show it,
+                        // followed by any warning.
                         Exported::Tour(tour, TourOutput::File) => {
                             let msg = tour_file_message(tour.steps, tour.bytes);
-                            let note = tour.squeezed_note().map(|n| format!(" ({n})")).unwrap_or_default();
-                            eprintln!("{msg}{note} at {}", tour.path.display());
+                            let more = tour_more(Some(tour.bytes), tour.squeezed_note());
+                            eprintln!("{msg} {} at {}", more.as_deref().unwrap_or(""), tour.path.display());
                             self.notify(msg);
                             self.status_reveal = Some(tour.path);
+                            self.status_more = more;
                         }
                         Exported::Published(p) => {
                             let msg = format!("Tour uploaded as a draft: {}", step_count(p.steps));
@@ -541,8 +573,9 @@ impl Editor {
                     self.notify(msg);
                 }
                 Err(e) if is_tour => {
-                    eprintln!("Tour export failed: {e}");
-                    self.notify(e);
+                    let msg = if e == "cancelled" { "Tour export cancelled".to_string() } else { e };
+                    eprintln!("Tour export: {msg}");
+                    self.notify(msg);
                 }
                 Err(e) => {
                     eprintln!("Export failed: {e}");
@@ -555,7 +588,7 @@ impl Editor {
                 AfterExport::Close => self.closed = true,
             }
         } else if let Some(p) = progress {
-            self.notify(progress_message(is_tour, cancelling, p));
+            self.notify(progress_message(is_tour, cancelling, tour_cancelling, p));
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         self.sync_frame();
@@ -600,19 +633,47 @@ impl Editor {
             return;
         }
         let dir = tour_dir(parent, &tour_stem(&self.dest, chrono::Local::now()));
+        self.spawn_tour(TourOutput::Folder, move |rec, items, events, edit, title, frame, progress| tour::write_bundle(rec, items, events, edit, title, &dir, frame, progress));
+    }
+
+    /// Run a tour export in the background with a cancel flag that "Cancel export" and quitting set.
+    /// A cancelled export removes what it wrote: the bundle's folder, or the single file's temporary file.
+    #[allow(clippy::type_complexity)]
+    fn spawn_tour(
+        &mut self,
+        out: TourOutput,
+        write: impl FnOnce(&mythicshot_recording::Recording, &[mythicshot_editor::Item], &[InputEvent], &Edit, &str, &mut dyn FnMut(usize) -> Result<mythicshot_editor::RgbaImage, String>, &mut dyn FnMut(f32) -> bool) -> Result<TourSummary, String> + Send + 'static,
+    ) {
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
         let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
+        let run = Run::begin();
+        let worker = run.clone();
         let job = EncodeJob::spawn(move |progress| {
-            // The editor's reader stays on the UI thread; this one belongs to the export.
-            let mut reader = FrameReader::new(rec.clone())?;
-            tour::write_bundle(&rec, &items, &events, &edit, &title, &dir, |i| reader.get(i), |f| {
-                progress(f);
-                true
+            guarded_as(&worker, "The tour export failed because of an internal error.", || {
+                // The editor's reader stays on the UI thread; this one belongs to the export.
+                let mut reader = FrameReader::new(rec.clone())?;
+                write(&rec, &items, &events, &edit, &title, &mut |i| reader.get(i), &mut |f| {
+                    progress(f);
+                    !worker.is_cancelled()
+                })
             })
         });
         if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Tour(job, TourOutput::Folder));
+            v.job = Some(ExportJob::Tour(job, out, run));
         }
         self.notify("Exporting tour… 0%");
+    }
+
+    /// Ask a running tour export to stop; it stops before its next picture.
+    pub(crate) fn cancel_tour_export(&mut self) {
+        let Some(v) = self.video.as_ref() else { return };
+        if let Some(ExportJob::Tour(_, _, run)) = &v.job {
+            run.cancel();
+            self.notify("Cancelling…");
+        }
     }
 
     /// Ask where to save, then export the tour as one HTML file. The save dialog asks before
@@ -626,23 +687,7 @@ impl Editor {
 
     /// Export the tour as one self-contained HTML file at `path`, replacing it only once finished.
     fn start_tour_file(&mut self, path: PathBuf) {
-        let Some(v) = self.video.as_ref() else { return };
-        if v.job.is_some() {
-            return;
-        }
-        let (rec, items, events, edit, title) = (v.rec.clone(), self.doc.items().to_vec(), v.events.clone(), v.edit.clone(), self.title().to_string());
-        let job = EncodeJob::spawn(move |progress| {
-            // The editor's reader stays on the UI thread; this one belongs to the export.
-            let mut reader = FrameReader::new(rec.clone())?;
-            tour::write_single_file(&rec, &items, &events, &edit, &title, &path, |i| reader.get(i), |f| {
-                progress(f);
-                true
-            })
-        });
-        if let Some(v) = self.video.as_mut() {
-            v.job = Some(ExportJob::Tour(job, TourOutput::File));
-        }
-        self.notify("Exporting tour… 0%");
+        self.spawn_tour(TourOutput::File, move |rec, items, events, edit, title, frame, progress| tour::write_single_file(rec, items, events, edit, title, &path, frame, progress));
     }
 
     /// Open the "Publish tour" dialog, unless an export is running.
@@ -793,6 +838,7 @@ impl Editor {
         ui.label(RichText::new("Tour").strong());
         ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
         let publishing = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.cancelling());
+        let tour_running = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.tour_cancelling());
         let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status());
         let mut chosen = None;
         ui.horizontal(|ui| {
@@ -830,6 +876,17 @@ impl Editor {
             Some(false) => {
                 if ui.button("Cancel publishing").clicked() {
                     self.cancel_publish();
+                }
+            }
+            Some(true) => {
+                ui.add_enabled(false, egui::Button::new("Cancelling…"));
+            }
+            None => {}
+        }
+        match tour_running {
+            Some(false) => {
+                if ui.button("Cancel export").clicked() {
+                    self.cancel_tour_export();
                 }
             }
             Some(true) => {
@@ -1178,10 +1235,11 @@ mod tests {
 
     #[test]
     fn publishing_shows_its_progress_and_then_cancelling() {
-        assert_eq!(progress_message(true, Some(false), 0.4), "Publishing tour… 40%");
-        assert_eq!(progress_message(true, Some(true), 0.4), "Cancelling…");
-        assert_eq!(progress_message(true, None, 0.25), "Exporting tour… 25%");
-        assert_eq!(progress_message(false, None, 0.5), "Exporting… 50%");
+        assert_eq!(progress_message(true, Some(false), false, 0.4), "Publishing tour… 40%");
+        assert_eq!(progress_message(true, Some(true), false, 0.4), "Cancelling…");
+        assert_eq!(progress_message(true, None, false, 0.25), "Exporting tour… 25%");
+        assert_eq!(progress_message(true, None, true, 0.25), "Cancelling…", "a tour export being cancelled");
+        assert_eq!(progress_message(false, None, false, 0.5), "Exporting… 50%");
     }
 
     #[test]
@@ -1209,7 +1267,20 @@ mod tests {
     fn a_single_file_tour_is_named_like_the_folder_and_reported_with_its_size() {
         assert_eq!(tour_file_name("shot-01"), "shot-01-tour.html");
         assert_eq!(tour_file_message(3, 2_516_582), "Tour exported as one file: 3 steps · 2.4 MB");
-        assert_eq!(tour_file_message(1, 50_000), "Tour exported as one file: 1 step · 0.0 MB");
+        assert_eq!(tour_file_message(1, 50_000), "Tour exported as one file: 1 step · 49 KB");
+        assert_eq!(tour_file_message(2, 655_360), "Tour exported as one file: 2 steps · 640 KB");
+        assert_eq!((size_label(0), size_label(1_048_575), size_label(1_048_576)), ("0 KB".to_string(), "1024 KB".to_string(), "1.0 MB".to_string()));
+    }
+
+    #[test]
+    fn a_tour_status_adds_a_large_file_warning_and_squeezed_pictures_after_its_message() {
+        let squeezed = Some("2 pictures were saved at lower quality to fit.".to_string());
+        assert_eq!(tour_more(Some(tour::LARGE_FILE_BYTES), None), None, "25 MB exactly is not large");
+        assert_eq!(tour_more(Some(tour::LARGE_FILE_BYTES + 1), None).unwrap(), "Large file: it may be slow to open and too big to send.");
+        assert_eq!(tour_more(Some(30 * 1_048_576), squeezed.clone()).unwrap(), "Large file: it may be slow to open and too big to send. 2 pictures were saved at lower quality to fit.");
+        // A folder is never called large.
+        assert_eq!(tour_more(None, squeezed.clone()), squeezed);
+        assert_eq!(tour_more(None, None), None);
     }
 
     #[test]
