@@ -5,6 +5,10 @@
 
 #![cfg_attr(not(test), expect(dead_code, reason = "used by the Add to site dialog, which is not built yet"))]
 
+mod pages;
+
+pub use pages::*;
+
 use std::path::Path;
 
 use crate::tour::{clean_line, tour_title};
