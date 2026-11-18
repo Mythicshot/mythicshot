@@ -1,0 +1,649 @@
+{
+  "format": 1,
+  "app": "0.2.5",
+  "saved_at": 1763460000000,
+  "server": "https://tours.example.com",
+  "tour_id": "tour_0123456789abcdef01234567",
+  "chapter_id": "ch_0123456789abcdef01234567",
+  "tour_title": "Customer onboarding",
+  "title": "Chapter one",
+  "steps": 3,
+  "frames_bytes": 123456,
+  "edit": {
+    "trim": [
+      1,
+      8
+    ],
+    "deleted": [
+      3,
+      4
+    ],
+    "speed": 1.5,
+    "reverse": true,
+    "crop": [
+      10.0,
+      5.0,
+      90.0,
+      70.0
+    ],
+    "scale": 75,
+    "overlays": {
+      "keys": "chips",
+      "clicks": "both",
+      "halo": true,
+      "pointer": false
+    },
+    "tour_removed": [
+      6
+    ],
+    "tour_doc": {
+      "theme": {
+        "card_style": "light",
+        "accent": "#ff8800",
+        "hotspot": "dot",
+        "progress_bar": false,
+        "backdrop": "#101418",
+        "spotlight_soft": false
+      },
+      "zoom": {
+        "enabled": false,
+        "percent": 125
+      },
+      "cover": {
+        "title": "A quick tour",
+        "body": "Two minutes,\na few clicks.",
+        "button": "Begin"
+      },
+      "logo": "logo-01c1a722e03565f1.png",
+      "cta": {
+        "label": "Book a demo",
+        "url": "https://tours.example.com/book"
+      },
+      "end": {
+        "text": "That is all.",
+        "primary": {
+          "label": "Sign up",
+          "url": "https://example.com/signup"
+        },
+        "secondary": {
+          "label": "Read more",
+          "url": "https://example.com/docs"
+        },
+        "replay": false
+      },
+      "autoplay": {
+        "enabled": true,
+        "seconds": 8
+      },
+      "steps": {
+        "2": {
+          "card": {
+            "title": "Open the menu",
+            "body": "It is **here**.",
+            "next_label": "Go on",
+            "anchor": "point",
+            "point": [
+              40.0,
+              30.5
+            ],
+            "placement": "top"
+          },
+          "advance": "anywhere",
+          "zoom": false
+        },
+        "5": {
+          "card": {
+            "title": "Save",
+            "body": "",
+            "next_label": "",
+            "anchor": "hotspot",
+            "point": null,
+            "placement": "auto"
+          },
+          "advance": "hotspot",
+          "zoom": null
+        }
+      }
+    }
+  },
+  "events": [
+    {
+      "t_ms": 150,
+      "kind": "down",
+      "button": "left",
+      "x": 50,
+      "y": 40
+    },
+    {
+      "t_ms": 210,
+      "kind": "up",
+      "button": "left",
+      "x": 50,
+      "y": 40
+    },
+    {
+      "t_ms": 480,
+      "kind": "down",
+      "button": "right",
+      "x": 75,
+      "y": -3
+    },
+    {
+      "t_ms": 520,
+      "kind": "up",
+      "button": "middle",
+      "x": 75,
+      "y": 41
+    }
+  ],
+  "items": [
+    {
+      "shape": {
+        "kind": "rect",
+        "rect": [
+          1.0,
+          2.0,
+          30.0,
+          40.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": [
+        2,
+        6
+      ],
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "ellipse",
+        "rect": [
+          5.5,
+          6.25,
+          50.0,
+          60.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          255,
+          230,
+          0,
+          255
+        ],
+        "fill": [
+          10,
+          20,
+          30,
+          128
+        ],
+        "width": 5.5,
+        "font_size": 28.0,
+        "shadow": false
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "line",
+        "from": [
+          0.0,
+          0.0
+        ],
+        "to": [
+          10.0,
+          20.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "arrow",
+        "from": [
+          90.0,
+          70.0
+        ],
+        "to": [
+          10.0,
+          20.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "freehand",
+        "points": [
+          [
+            1.0,
+            1.0
+          ],
+          [
+            2.5,
+            3.5
+          ],
+          [
+            4.0,
+            2.0
+          ]
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "text",
+        "at": [
+          12.0,
+          14.0
+        ],
+        "text": "Click \"Save\"\nthen wait"
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": 5
+    },
+    {
+      "shape": {
+        "kind": "bubble",
+        "rect": [
+          20.0,
+          20.0,
+          70.0,
+          50.0
+        ],
+        "tail": [
+          80.0,
+          75.0
+        ],
+        "text": "Hello"
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "step",
+        "center": [
+          33.0,
+          44.0
+        ],
+        "number": 7
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "highlight",
+        "rect": [
+          0.0,
+          10.0,
+          100.0,
+          20.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "obfuscate",
+        "rect": [
+          60.0,
+          5.0,
+          95.0,
+          15.0
+        ],
+        "mode": "blur"
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "image",
+        "rect": [
+          10.0,
+          10.0,
+          40.0,
+          40.0
+        ],
+        "picture": "pictures/00112233aabbccdd.png"
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": [
+        0,
+        9
+      ],
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "circle",
+        "rect": [
+          1.0,
+          1.0,
+          9.0,
+          9.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "group",
+        "rect": [
+          2.0,
+          2.0,
+          8.0,
+          8.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "donut",
+        "rect": [
+          3.0,
+          3.0,
+          7.0,
+          7.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "cross",
+        "rect": [
+          4.0,
+          4.0,
+          6.0,
+          6.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "asterisk",
+        "rect": [
+          5.0,
+          5.0,
+          15.0,
+          15.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "cone",
+        "from": [
+          50.0,
+          40.0
+        ],
+        "to": [
+          60.0,
+          10.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "slice",
+        "from": [
+          50.0,
+          40.0
+        ],
+        "to": [
+          20.0,
+          70.0
+        ]
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    },
+    {
+      "shape": {
+        "kind": "spotlight",
+        "rect": [
+          25.0,
+          20.0,
+          75.0,
+          60.0
+        ],
+        "dim": 45
+      },
+      "style": {
+        "stroke": [
+          229,
+          72,
+          77,
+          255
+        ],
+        "fill": null,
+        "width": 3.0,
+        "font_size": 20.0,
+        "shadow": true
+      },
+      "frames": null,
+      "pin": null
+    }
+  ]
+}

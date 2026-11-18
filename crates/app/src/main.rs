@@ -20,6 +20,7 @@ mod overlay;
 mod password;
 mod platform;
 mod popups;
+mod project;
 mod publish;
 mod publish_ui;
 mod recorder_ui;
