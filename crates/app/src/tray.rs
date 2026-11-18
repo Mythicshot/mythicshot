@@ -238,38 +238,9 @@ impl Tray {
     }
 }
 
-/// A 32×32 icon drawn in code: a green rounded square with a white lens.
+/// The tray icon, at the size the screen's scaling shows it.
 pub fn app_icon() -> Icon {
-    let (rgba, size) = icon_rgba(32);
-    Icon::from_rgba(rgba, size, size).expect("valid icon")
-}
-
-pub fn icon_rgba(size: u32) -> (Vec<u8>, u32) {
-    let mut px = vec![0u8; (size * size * 4) as usize];
-    let s = size as f32;
-    let radius = s * 0.22;
-    let c = s / 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let dx = (radius - fx).max(fx - (s - radius)).max(0.0);
-            let dy = (radius - fy).max(fy - (s - radius)).max(0.0);
-            let inside = (dx * dx + dy * dy).sqrt() <= radius;
-            let d = ((fx - c).powi(2) + (fy - c).powi(2)).sqrt();
-            let i = ((y * size + x) * 4) as usize;
-            let color: [u8; 4] = if !inside {
-                [0, 0, 0, 0]
-            } else if d < s * 0.16 {
-                [46, 125, 91, 255]
-            } else if d < s * 0.30 {
-                [255, 255, 255, 255]
-            } else {
-                [46, 125, 91, 255]
-            };
-            px[i..i + 4].copy_from_slice(&color);
-        }
-    }
-    (px, size)
+    crate::app_icon::tray()
 }
 
 #[cfg(test)]

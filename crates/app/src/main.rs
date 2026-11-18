@@ -8,6 +8,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_icon;
 mod editor_ui;
 mod home_ui;
 mod hotkeys;
@@ -120,6 +121,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        app_icon::set_for_all_windows(cc);
         let (tx, rx) = mpsc::channel();
 
         let hk_tx = tx.clone();
@@ -203,7 +205,7 @@ impl App {
             recorder: ShortcutRecorder::default(),
             key_hook_started: false,
             editors: Vec::new(),
-            icon: Arc::new(egui::IconData { rgba: tray::icon_rgba(64).0, width: 64, height: 64 }),
+            icon: app_icon::window(),
             listening: Arc::new(AtomicBool::new(false)),
             snipping_tool: platform::snipping_tool_owns_prtsc(),
             pickers: Vec::new(),
@@ -1141,6 +1143,9 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         viewport: ViewportBuilder::default()
             .with_title("Mythicshot")
+            // An empty icon: eframe would otherwise put its own on the first window that becomes active.
+            // The windows get theirs from `app_icon`.
+            .with_icon(Arc::new(egui::IconData::default()))
             .with_visible(false)
             .with_decorations(false)
             .with_taskbar(false)
