@@ -846,6 +846,28 @@ mod tests {
     }
 
     #[test]
+    fn writing_the_same_tour_twice_gives_the_same_picture_bytes() {
+        // An update finds the pictures the site already has by their bytes, so an unchanged step must encode the same every time.
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let shaded = |i: usize| -> Result<RgbaImage, String> { Ok(RgbaImage::from_fn(100, 80, |x, y| image::Rgba([x as u8, y as u8, (i * 40) as u8, 255]))) };
+        let ev = [left(750, 50, 40), left(1750, 10, 20)];
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        for dir in [&a, &b] {
+            assert_eq!(write_bundle(&r, &[], &ev, &edit(&r), "My tour", dir, shaded, |_| true).unwrap().steps, 3);
+        }
+        let mut pictures = Vec::new();
+        for s in read_json(&a)["steps"].as_array().unwrap() {
+            let name = s["image"].as_str().unwrap();
+            let bytes = std::fs::read(a.join(name)).unwrap();
+            assert_eq!(bytes, std::fs::read(b.join(name)).unwrap(), "{name}");
+            pictures.push(bytes);
+        }
+        // The check means something: different frames do give different files.
+        assert_ne!(pictures[0], pictures[1]);
+    }
+
+    #[test]
     fn step_images_have_crop_applied_and_no_overlays() {
         let mut r = rec();
         // The frame used for the step (frame 1, 500 ms) has a pointer inside the crop.

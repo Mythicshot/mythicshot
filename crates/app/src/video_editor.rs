@@ -969,7 +969,7 @@ impl Editor {
                         !worker.is_cancelled()
                     })
                 });
-                Ok(crate::publish::after_publish(&tour_id, steps, result))
+                Ok(crate::publish::after_publish(&tour_id, "", steps, result))
             })
         });
         if let Some(v) = self.video.as_mut() {
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn closing_the_editor_cancels_a_publish_and_no_other_export() {
-        let done = || Ok(Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 1, outcome: crate::publish::Outcome::Draft });
+        let done = || Ok(Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 1, outcome: crate::publish::Outcome::Draft });
         // Runs of their own, not in the shared list that quitting cancels.
         let run = Arc::new(Run::default());
         let publish = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), "Demo".into(), Before::new_tour());
@@ -1490,7 +1490,7 @@ mod tests {
     #[test]
     fn a_finished_publish_hands_the_result_screen_what_the_tour_was() {
         let was = Before { public: true, link: None, steps: Some(14) };
-        let done = Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), steps: 2, outcome: crate::publish::Outcome::Draft };
+        let done = Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft };
         let sent = done.clone();
         let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone());
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -1502,7 +1502,7 @@ mod tests {
         match result {
             Some(Ok(Exported::Published(got, title, before))) => {
                 assert_eq!((got, title.as_str(), &before), (done, "Customer onboarding", &was));
-                assert_eq!(publish_ui::result_status(&Finished { tour_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, &before), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
+                assert_eq!(publish_ui::result_status(&Finished { tour_id: String::new(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, &before), "Tour uploaded as a draft: 16 steps; the public version is unchanged");
             }
             _ => panic!("the publish did not finish as a published result"),
         }

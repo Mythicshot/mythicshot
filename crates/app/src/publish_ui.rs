@@ -518,7 +518,7 @@ impl Before {
 pub fn result_heading(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Public { .. } => "Tour published",
-        Outcome::Draft | Outcome::NotPublic { .. } => "Draft uploaded",
+        Outcome::Draft | Outcome::NotPublic { .. } | Outcome::Held => "Draft uploaded",
     }
 }
 
@@ -558,7 +558,7 @@ fn uploaded_sentence(before: &Before) -> &'static str {
 /// What else the result screen has to say, and whether it is an error.
 pub fn result_note(outcome: &Outcome, before: &Before) -> Option<(String, bool)> {
     match outcome {
-        Outcome::Draft | Outcome::Public { url: Some(_) } => None,
+        Outcome::Draft | Outcome::Held | Outcome::Public { url: Some(_) } => None,
         Outcome::Public { url: None } if before.link.is_some() => None,
         Outcome::Public { url: None } => Some(("The tour is public, but the server gave no link that can be shown. Look it up in the server's tour list.".to_string(), false)),
         Outcome::NotPublic { cancelled: true, .. } => Some((format!("Publishing was cancelled. {}", uploaded_sentence(before)), false)),
@@ -572,7 +572,7 @@ pub fn result_link<'a>(outcome: &'a Outcome, before: &'a Before) -> Option<&'a s
     match outcome {
         Outcome::Public { url: Some(url) } => Some(url),
         Outcome::Public { url: None } => before.link.as_deref(),
-        Outcome::Draft | Outcome::NotPublic { .. } => before.link.as_deref().filter(|_| before.public),
+        Outcome::Draft | Outcome::NotPublic { .. } | Outcome::Held => before.link.as_deref().filter(|_| before.public),
     }
 }
 
@@ -582,8 +582,8 @@ pub fn result_status(done: &Finished, before: &Before) -> String {
     let rest = if before.public { "the public version is unchanged" } else { "the draft is uploaded, but not public" };
     match &done.outcome {
         Outcome::Public { .. } => format!("Tour published: {steps}"),
-        Outcome::Draft if before.public => format!("Tour uploaded as a draft: {steps}; the public version is unchanged"),
-        Outcome::Draft => format!("Tour uploaded as a draft: {steps}"),
+        Outcome::Draft | Outcome::Held if before.public => format!("Tour uploaded as a draft: {steps}; the public version is unchanged"),
+        Outcome::Draft | Outcome::Held => format!("Tour uploaded as a draft: {steps}"),
         Outcome::NotPublic { cancelled: true, .. } => format!("Publishing cancelled: {rest}"),
         Outcome::NotPublic { cancelled: false, .. } => format!("Publishing failed: {rest}"),
     }
@@ -1254,7 +1254,7 @@ mod tests {
     const LINK: &str = "https://tours.example.com/t/abc";
 
     fn finished(steps: usize, outcome: Outcome) -> Finished {
-        Finished { tour_id: TOUR_ID.into(), steps, outcome }
+        Finished { tour_id: TOUR_ID.into(), chapter_id: String::new(), steps, outcome }
     }
 
     fn failed() -> Outcome {
