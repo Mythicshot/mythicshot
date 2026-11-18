@@ -262,17 +262,28 @@ impl Store {
     /// Finish what a save that replaced a project could not: run at start-up, before
     /// [`Store::finish_removals`] and [`Store::sweep_staging`]. A `.replaced-` folder whose
     /// project file names a tour and chapter with no project in place is put back there. When a
-    /// project is in place, the files the store wrote go from the `.replaced-` folder, and the
-    /// folder too once it is empty. One without a readable project file is left alone.
+    /// project is in place that passes the list's check and was saved no earlier, the files the
+    /// store wrote go from the `.replaced-` folder, and the folder too once it is empty; with any
+    /// other project in place the folder is left alone, and so is one without a readable project
+    /// file. A folder whose clearing was cut off (it carries the removal mark) is cleared.
     pub fn recover_replaced(&self) {
         let _changing = changing();
         for (name, aside) in folders_in(&self.root) {
             if !name.strip_prefix(REPLACED).is_some_and(is_random_name) {
                 continue;
             }
-            let Some(dir) = named_key(&aside).and_then(|key| self.project_dir(&key)) else { continue };
+            if is_removing(&aside) {
+                let _ = remove_files(&aside);
+                continue;
+            }
+            let Some((key, saved_at)) = named_key(&aside) else { continue };
+            let Some(dir) = self.project_dir(&key) else { continue };
             if is_project(&dir) {
-                retire(&aside, &dir);
+                // Only a project that opens, and is no older, makes this copy one to clear away.
+                let in_place = read_info(&dir, &site_of(&key.server), &key.tour_id, &key.chapter_id, Some(&key.server));
+                if in_place.is_some_and(|p| p.problem.is_none() && p.saved_at >= saved_at) {
+                    retire(&aside, &dir);
+                }
                 continue;
             }
             if let Some(parent) = dir.parent() {
@@ -520,6 +531,10 @@ fn save_in_place(dir: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Step
     if !(is_project(dir) && is_open(dir)) {
         return Ok(None);
     }
+    // Closed, replaced and opened again meanwhile: these are no longer the frames that were checked.
+    if !frames_are(dir, frames_bytes) {
+        return Err("the saved recording's frames changed while it was being saved.".into());
+    }
     let had_pictures = std::fs::symlink_metadata(dir.join(PICTURES)).is_ok();
     let mut made = Vec::new();
     let mut written = Ok(());
@@ -570,25 +585,28 @@ fn fill(staging: &Path, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>
 }
 
 /// Take a replaced project's folder away once the new project is in `dir`: the files the store
-/// wrote go, a file somebody else had put beside them moves along when its name is free, and the
-/// folder goes only when it is empty.
+/// wrote go, a file or folder somebody else had put beside them moves along when its name is
+/// free, and the folder goes only when it is empty. A link is never moved into the new project.
 fn retire(aside: &Path, dir: &Path) {
     let _ = remove_files(aside);
     for entry in std::fs::read_dir(aside).into_iter().flatten().flatten() {
         let to = dir.join(entry.file_name());
-        if std::fs::symlink_metadata(&to).is_err() {
+        let real = entry.file_type().is_ok_and(|kind| kind.is_file() || kind.is_dir());
+        if real && std::fs::symlink_metadata(&to).is_err() {
             let _ = std::fs::rename(entry.path(), to);
         }
     }
     let _ = std::fs::remove_dir(aside);
 }
 
-/// The address, tour and chapter a folder's project file names, also one this version cannot open.
-fn named_key(dir: &Path) -> Option<ProjectKey> {
+/// The address, tour and chapter a folder's project file names, and when it says it was saved
+/// (0 when it does not say); also for a file this version cannot open.
+fn named_key(dir: &Path) -> Option<(ProjectKey, i64)> {
     let text = project_file_text(dir).ok()?;
     let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     let word = |name: &str| value.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
-    Some(ProjectKey { server: word("server")?, tour_id: word("tour_id")?, chapter_id: word("chapter_id")? })
+    let saved_at = value.get("saved_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some((ProjectKey { server: word("server")?, tour_id: word("tour_id")?, chapter_id: word("chapter_id")? }, saved_at))
 }
 
 fn project_text(file: &ProjectFile) -> Result<String, String> {
@@ -1307,6 +1325,25 @@ mod tests {
     }
 
     #[test]
+    fn a_frames_file_that_changed_under_an_open_project_stops_the_save() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        let l = loaded(&w.store, &key_1());
+        let whole = contents(&dir);
+        let frames = frames_and_index(FRAMES).0;
+        assert!(frames_are(&dir, frames.len() as u64));
+        assert!(!frames_are(&dir, frames.len() as u64 + 1));
+        std::fs::remove_file(dir.join(FRAMES_FILE)).unwrap();
+        assert!(!frames_are(&dir, frames.len() as u64));
+        // A save from the open editor is refused, and writes nothing.
+        let snap = Snapshot { rec: &l.rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+        let err = w.store.save(&key_1(), &snap).unwrap_err();
+        assert!(err.ends_with('.'), "{err}");
+        assert_eq!(contents(&dir), whole.into_iter().filter(|(name, _)| name != FRAMES_FILE).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn an_open_project_is_never_saved_over_from_another_recording() {
         let w = World::new();
         w.save(&key_1());
@@ -1813,6 +1850,86 @@ mod tests {
     }
 
     #[test]
+    fn a_project_in_place_that_cannot_be_opened_keeps_the_replaced_copy_whole() {
+        let w = World::new();
+        for k in [key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2), key(SITE_A, TOUR_2, CH_1)] {
+            w.save(&k);
+        }
+        let root = w.store.root().to_path_buf();
+        let (cut, no_frames, gone) = (w.dir(&key(SITE_A, TOUR_1, CH_1)), w.dir(&key(SITE_A, TOUR_1, CH_2)), w.dir(&key(SITE_A, TOUR_2, CH_1)));
+        let asides = [root.join(".replaced-1111111111111111"), root.join(".replaced-2222222222222222"), root.join(".replaced-3333333333333333")];
+        for (dir, aside) in [&cut, &no_frames, &gone].iter().zip(&asides) {
+            copy_tree(dir, aside);
+        }
+        // What is in place: a project file cut off, a project without its frames, and one being removed.
+        let text = std::fs::read(cut.join(PROJECT_FILE)).unwrap();
+        std::fs::write(cut.join(PROJECT_FILE), &text[..text.len() / 2]).unwrap();
+        std::fs::remove_file(no_frames.join(FRAMES_FILE)).unwrap();
+        std::fs::write(gone.join(REMOVING_FILE), b"").unwrap();
+        let whole: Vec<_> = asides.iter().map(|d| contents(d)).collect();
+        let in_place: Vec<_> = [&cut, &no_frames, &gone].iter().map(|d| contents(d)).collect();
+
+        w.store.recover_replaced();
+        assert_eq!(asides.iter().map(|d| contents(d)).collect::<Vec<_>>(), whole, "the copy that can still be opened is not the one to go");
+        assert_eq!([&cut, &no_frames, &gone].iter().map(|d| contents(d)).collect::<Vec<_>>(), in_place);
+        assert_eq!(changes(&w.store), 3);
+    }
+
+    /// The folder's project file with its time of saving moved by `by` milliseconds.
+    fn saved_later(dir: &Path, by: i64) {
+        let mut file = state::parse(&std::fs::read_to_string(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        file.saved_at += by;
+        std::fs::write(dir.join(PROJECT_FILE), state::to_text(&file).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn of_two_replaced_copies_only_one_no_newer_than_the_project_in_place_is_cleared() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        let root = w.store.root().to_path_buf();
+        let (older, same, newer) = (root.join(".replaced-1111111111111111"), root.join(".replaced-2222222222222222"), root.join(".replaced-3333333333333333"));
+        for aside in [&older, &same, &newer] {
+            copy_tree(&dir, aside);
+        }
+        saved_later(&older, -60_000);
+        saved_later(&newer, 60_000);
+        let (whole, kept) = (contents(&dir), contents(&newer));
+
+        w.store.recover_replaced();
+        assert!(!older.exists() && !same.exists(), "the project in place is at least as new as these");
+        assert_eq!(contents(&newer), kept, "a copy saved after the project in place is not cleared away");
+        assert_eq!(contents(&dir), whole);
+        assert_eq!(keys(&w.store.list()), vec![key_1()]);
+    }
+
+    #[test]
+    fn a_replaced_folder_whose_clearing_was_cut_off_is_cleared_at_the_next_start() {
+        let w = World::new();
+        w.save(&key_1());
+        let dir = w.dir(&key_1());
+        let whole = contents(&dir);
+        // The app died while the old project's files were being removed: the mark, the files not
+        // yet reached, and a note that was never the store's.
+        let aside = w.store.root().join(".replaced-0123456789abcdef");
+        copy_tree(&dir, &aside);
+        std::fs::remove_file(aside.join(PROJECT_FILE)).unwrap();
+        std::fs::write(aside.join(REMOVING_FILE), b"").unwrap();
+        std::fs::write(aside.join("notes.txt"), b"mine").unwrap();
+        // One with nothing but the store's files left goes whole.
+        let bare = w.store.root().join(".replaced-1111111111111111");
+        copy_tree(&dir, &bare);
+        std::fs::remove_file(bare.join(PROJECT_FILE)).unwrap();
+        std::fs::write(bare.join(REMOVING_FILE), b"").unwrap();
+
+        w.store.recover_replaced();
+        assert_eq!(contents(&aside), vec![("notes.txt".to_string(), b"mine".to_vec())]);
+        assert!(!bare.exists());
+        assert_eq!(contents(&dir), whole);
+        assert_eq!(changes(&w.store), 1);
+    }
+
+    #[test]
     fn a_file_somebody_put_into_a_replaced_folder_is_never_deleted() {
         let w = World::new();
         w.save(&key_1());
@@ -1867,6 +1984,12 @@ mod tests {
         let edit = Edit::new(&other, Default::default());
         w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
         assert_eq!(contents(&outside), kept);
+        // The link stays behind with the replaced project; the new project has none and opens.
+        assert!(std::fs::symlink_metadata(dir.join(PICTURES)).is_err(), "the link was not moved into the new project");
+        let aside = in_root(&w.store, REPLACED);
+        assert_eq!(aside.len(), 1);
+        assert!(std::fs::symlink_metadata(aside[0].join(PICTURES)).is_ok());
+        assert_eq!(loaded(&w.store, &key_1()).restored.title, "Shorter");
         assert_eq!(w.store.remove_tour(SITE_A, TOUR_1), Ok(1));
         assert_eq!(contents(&outside), kept, "the picture behind the link is still there");
         for _ in 0..2 {
