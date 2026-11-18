@@ -2,11 +2,17 @@
 //!
 //! ffmpeg is an external program the user may have installed. It is looked for once, on the
 //! user's PATH only (never the current folder, the application's folder or a relative entry),
-//! kept by its absolute path, and probed for libx264. It is then run with its arguments as a
-//! list (never through a shell), with no console window, below normal priority, and watched:
-//! a stall bound, a total bound, a bound on the size of what it writes, and a cancel that is
-//! asked every 50 ms. Its own error text is drained so it can never block, capped, and never
-//! shown or returned.
+//! kept by its absolute path, and probed for its version and for libx264. It is then run with
+//! its arguments as a list (never through a shell), with no console window, below normal
+//! priority, and watched: a stall bound, a total bound, a bound on the size of what it
+//! writes, and a cancel that is asked every 50 ms. Its own error text is drained so it can
+//! never block, capped, and never shown or returned.
+//!
+//! Every pipe is read or written on a thread of its own that owns its end and is never
+//! waited for without a bound: a program that leaves a child of its own holding the pipes
+//! cannot hang the caller. The started program and its output file belong to a guard that
+//! stops the program and removes the file on every way out, a panic of the caller's own
+//! function included, unless the run ended well.
 //!
 //! [`VideoCodec`] is what the rest of the crate builds on, so tests can use a stand-in;
 //! [`Ffmpeg`] is the real one: near-lossless H.264 4:4:4, full range, in Matroska, one
@@ -43,6 +49,11 @@ const POLL: Duration = Duration::from_millis(50);
 const ERROR_TEXT_KEPT: usize = 8 << 10;
 const PROBE_TIME: Duration = Duration::from_secs(10);
 const PROBE_KEPT: usize = 1 << 20;
+/// How long the pipe threads of a stopped program are waited for before they are left alone.
+const COLLECT: Duration = Duration::from_secs(2);
+/// How long a program that closed its pipe early is given to end by itself, so its exit code
+/// can be told.
+const GRACE: Duration = Duration::from_secs(1);
 
 #[cfg(windows)]
 const EXE_NAME: &str = "ffmpeg.exe";
@@ -55,15 +66,17 @@ const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 /// priority below the recorder's and the user's own work.
 const SPAWN_FLAGS: u32 = CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
 
-/// An ffmpeg that was found on the PATH and answered the probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An ffmpeg that was found on the PATH and answered its version. It can always be used for
+/// the MP4 and WebM exports; it can archive recordings only when [`Ffmpeg::can_archive`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct Ffmpeg {
     exe: PathBuf,
     version: String,
+    has_libx264: bool,
 }
 
 impl Ffmpeg {
-    /// The absolute path of the program.
+    /// The absolute path of the program. It can hold the user's name: never log or show it.
     pub fn exe(&self) -> &Path {
         &self.exe
     }
@@ -72,52 +85,121 @@ impl Ffmpeg {
     pub fn version(&self) -> &str {
         &self.version
     }
+
+    /// Whether this build has libx264, which archiving a recording as video needs. Without it
+    /// [`VideoCodec::encode`] and [`VideoCodec::decode`] refuse.
+    pub fn can_archive(&self) -> bool {
+        self.has_libx264
+    }
+}
+
+/// Never the path: it can hold a folder's or the user's name.
+impl std::fmt::Debug for Ffmpeg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ffmpeg").field("version", &self.version).field("can_archive", &self.has_libx264).finish_non_exhaustive()
+    }
+}
+
+/// What a probe of the program answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probed {
+    pub version: String,
+    pub has_libx264: bool,
+}
+
+/// How the one search of this run ended, as a word and never a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// [`find_now`] has not finished yet.
+    NotYet,
+    /// There is no ffmpeg on the PATH, or the first one there did not answer its version.
+    None,
+    /// There is an ffmpeg, but without libx264: the exports work, archiving does not.
+    Unusable,
+    /// There is an ffmpeg that can archive.
+    Ok,
+}
+
+impl Found {
+    /// The word for the result of a finished search.
+    pub fn of(found: Option<&Ffmpeg>) -> Found {
+        match found {
+            None => Found::None,
+            Some(f) if f.can_archive() => Found::Ok,
+            Some(_) => Found::Unusable,
+        }
+    }
 }
 
 static FOUND: OnceLock<Option<Ffmpeg>> = OnceLock::new();
 
 /// The ffmpeg found by [`find_now`]. None until that ran, and None for good when it found
 /// nothing: ffmpeg is looked for once per run. Never starts a program, so it is safe on the
-/// UI thread.
+/// UI thread. What is found may lack libx264; ask [`Ffmpeg::can_archive`] before archiving.
 pub fn find() -> Option<&'static Ffmpeg> {
     FOUND.get().and_then(Option::as_ref)
+}
+
+/// How the search stands, without starting anything: also tells "not looked yet" from
+/// "nothing found", and "found, but it cannot archive" from "found".
+pub fn found() -> Found {
+    match FOUND.get() {
+        None => Found::NotYet,
+        Some(f) => Found::of(f.as_ref()),
+    }
 }
 
 /// Look for ffmpeg on the PATH and probe it (two short runs of the program), once; later
 /// calls answer what the first one found. For a background thread.
 pub fn find_now() -> Option<&'static Ffmpeg> {
-    FOUND
-        .get_or_init(|| {
-            let path = std::env::var_os("PATH")?;
-            let found = locate(&path, &|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))?;
-            // The canonical path, when it is still a plain absolute path to a file.
-            let exe = std::fs::canonicalize(&found).ok().filter(|p| p.is_absolute() && p.is_file()).unwrap_or(found);
-            let version = probe(&exe)?;
-            Some(Ffmpeg { exe, version })
-        })
-        .as_ref()
+    FOUND.get_or_init(|| find_on(&std::env::var_os("PATH")?)).as_ref()
+}
+
+/// The search [`find_now`] does, on a PATH that is handed in: the real file system and the
+/// real program. Runs the program it finds (bounded), so not for the UI thread.
+pub fn find_on(path_var: &OsStr) -> Option<Ffmpeg> {
+    find_on_with(path_var, &probe)
+}
+
+/// [`find_on`] with the probe handed in. The first absolute entry that holds a file named
+/// `ffmpeg.exe` decides: its canonical path is kept, and only if that still ends in
+/// `ffmpeg.exe` (a link to a script must not bring a shell back) and the probe answers.
+/// Later entries are never tried.
+fn find_on_with(path_var: &OsStr, probe: &dyn Fn(&Path) -> Option<Probed>) -> Option<Ffmpeg> {
+    let listed = locate(path_var, &|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))?;
+    let exe = std::fs::canonicalize(&listed).ok()?;
+    if !is_the_program(&exe) || !exe.is_absolute() || !exe.is_file() {
+        return None;
+    }
+    let probed = probe(&exe)?;
+    Some(Ffmpeg { exe, version: probed.version, has_libx264: probed.has_libx264 })
+}
+
+/// Whether a path is still named `ffmpeg.exe` (in any ASCII case) once links are resolved.
+fn is_the_program(canonical: &Path) -> bool {
+    canonical.file_name().and_then(OsStr::to_str).is_some_and(|name| name.eq_ignore_ascii_case(EXE_NAME))
 }
 
 /// The search itself, with the file system and the program behind two functions: the first
 /// absolute entry of `path_var` that holds a file named `ffmpeg.exe` is taken, and it is kept
-/// only if `probe` answers its version. Empty and relative entries are never looked into, and
-/// no other file name is ever asked about.
-pub fn find_in(path_var: &OsStr, is_file: &dyn Fn(&Path) -> bool, probe: &dyn Fn(&Path) -> Option<String>) -> Option<Ffmpeg> {
+/// only if `probe` answers. Empty and relative entries are never looked into, no other file
+/// name is ever asked about, and a later entry is never tried when the first does not answer.
+pub fn find_in(path_var: &OsStr, is_file: &dyn Fn(&Path) -> bool, probe: &dyn Fn(&Path) -> Option<Probed>) -> Option<Ffmpeg> {
     let exe = locate(path_var, is_file)?;
-    let version = probe(&exe)?;
-    Some(Ffmpeg { exe, version })
+    let probed = probe(&exe)?;
+    Some(Ffmpeg { exe, version: probed.version, has_libx264: probed.has_libx264 })
 }
 
 fn locate(path_var: &OsStr, is_file: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     std::env::split_paths(path_var).filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute()).map(|dir| dir.join(EXE_NAME)).find(|exe| is_file(exe))
 }
 
-/// Ask the program for its version and its encoders; its version if it is an ffmpeg with
-/// libx264.
-fn probe(exe: &Path) -> Option<String> {
+/// Ask the program for its version and its encoders. None when it does not answer its
+/// version as an ffmpeg does.
+fn probe(exe: &Path) -> Option<Probed> {
     let version = version_of(&String::from_utf8_lossy(&capture(exe, &["-hide_banner", "-version"])?))?;
-    let encoders = capture(exe, &["-hide_banner", "-encoders"])?;
-    lists_libx264(&String::from_utf8_lossy(&encoders)).then_some(version)
+    let has_libx264 = capture(exe, &["-hide_banner", "-encoders"]).is_some_and(|text| lists_libx264(&String::from_utf8_lossy(&text)));
+    Some(Probed { version, has_libx264 })
 }
 
 /// The version out of the first line of `ffmpeg -version`.
@@ -136,29 +218,40 @@ fn lists_libx264(text: &str) -> bool {
 
 /// What a short run of the program printed, if it ended well within [`PROBE_TIME`].
 fn capture(exe: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = command(exe).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || drain(stdout, PROBE_KEPT));
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < PROBE_TIME => std::thread::sleep(POLL),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let text = reader.join().ok()?;
-    status.filter(ExitStatus::success).map(|_| text)
+    let mut cmd = command(exe);
+    cmd.args(args);
+    capture_cmd(cmd, PROBE_TIME)
 }
 
-/// A command for `exe` that opens no console window and runs below normal priority.
+/// What `cmd` printed, if it ended well within `within` and its output ended with it.
+fn capture_cmd(mut cmd: Command, within: Duration) -> Option<Vec<u8>> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut run = Run::start(cmd, None).ok()?;
+    let stdout = run.child.stdout.take()?;
+    let (text_out, text) = mpsc::channel();
+    run.detached(move || {
+        let _ = text_out.send(drain(stdout, PROBE_KEPT));
+    })
+    .ok()?;
+    let started = Instant::now();
+    let status = loop {
+        match run.child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < within => std::thread::sleep(POLL),
+            _ => return None,
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    text.recv_timeout(COLLECT).ok()
+}
+
+/// A command for `exe` that opens no console window, runs below normal priority, and is not
+/// told by the environment to write a report file.
 fn command(exe: &Path) -> Command {
-    #[allow(unused_mut)]
     let mut cmd = Command::new(exe);
+    cmd.env_remove("FFREPORT");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -182,15 +275,27 @@ fn drain(mut from: impl Read, keep: usize) -> Vec<u8> {
     }
 }
 
-/// Why an encode or a decode did not finish. It never carries the program's own words.
+/// Which time bound stopped the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Nothing moved for [`STALL`].
+    Stall,
+    /// The whole run took longer than 30 seconds plus [`PER_FRAME`] per frame.
+    Total,
+}
+
+/// Why an encode or a decode did not finish. Numbers and words of this crate only: it never
+/// carries the program's own text.
 #[derive(Debug)]
 pub enum CodecError {
     /// `keep_going` answered false.
     Cancelled,
-    /// The program ended with an error, or closed its pipe early.
-    Failed,
-    /// The stall bound or the total bound passed.
-    TimedOut,
+    /// The program ended with an error (`exit` is its exit code), or it could not do the
+    /// work and was stopped or never started (`exit` is None): it closed its pipe early, or
+    /// this build cannot archive.
+    Failed { exit: Option<i32> },
+    /// A time bound passed and the program was stopped.
+    TimedOut { bound: Bound },
     /// The output grew past the size it was allowed.
     TooLarge,
     /// The number of frames is not the number asked for: the caller had fewer to give, or the
@@ -208,16 +313,21 @@ pub trait VideoCodec: Sync {
     /// What was used, recorded with every video: the codec and its settings.
     fn id(&self) -> &str;
 
-    /// Write `frames` RGBA pictures of `size` to a new file `out`. `next` fills the buffer it
-    /// is handed with the next picture (exactly width × height × 4 bytes) and answers
-    /// `Ok(true)`, or `Ok(false)` when there are no more. `keep_going` is told how many
-    /// frames are done, at least every frame, and stops the work by answering false. On any
-    /// error `out` is removed.
+    /// Write `frames` RGBA pictures of `size` to a new file `out`; what was at `out` before
+    /// is removed first. `next` fills the buffer it is handed with the next picture (exactly
+    /// width × height × 4 bytes) and answers `Ok(true)`, or `Ok(false)` when there are no
+    /// more. `keep_going` is told how many frames are done, at least every frame, and stops
+    /// the work by answering false. On any error, a refusal before the work began included,
+    /// nothing is left at `out`.
     fn encode(&self, size: (u32, u32), frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool) -> Result<(), CodecError>;
 
     /// Read `video` back: `each` gets every picture in order as RGBA of exactly
     /// width × height × 4 bytes. A video with fewer or more than `frames` pictures is an
-    /// error, as is one whose pictures are not of `size`.
+    /// error. What is checked is the number of bytes, nothing else: a video whose pictures
+    /// have another size is refused only when its total does not come to
+    /// `frames × width × height × 4` bytes. One whose total happens to match (4×2 for 2×4,
+    /// or twice the frames at half the size) is handed on as if it were right, so the caller
+    /// must compare the pictures with what it expects before it trusts them.
     #[allow(clippy::type_complexity)]
     fn decode(&self, video: &Path, size: (u32, u32), frames: usize, each: &mut dyn FnMut(usize, &[u8]) -> Result<(), String>, keep_going: &dyn Fn(usize) -> bool) -> Result<(), CodecError>;
 }
@@ -228,23 +338,30 @@ impl VideoCodec for Ffmpeg {
     }
 
     fn encode(&self, size: (u32, u32), frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool) -> Result<(), CodecError> {
-        let frame_len = frame_len(size)?;
-        if frames == 0 {
-            return Err(CodecError::Caller("there are no frames to encode".into()));
-        }
-        let mut cmd = command(&self.exe);
-        cmd.args(encode_args(size, out));
-        run_encode(cmd, frame_len, frames, next, out, max_bytes, keep_going, &Limits::for_frames(frames))?;
-        // Success with nothing written is not a video.
-        if std::fs::metadata(out).is_ok_and(|m| m.is_file() && m.len() > 0) {
-            Ok(())
-        } else {
+        let result = (|| {
+            if !self.has_libx264 {
+                return Err(CodecError::Failed { exit: None });
+            }
+            let frame_len = frame_len(size)?;
+            if frames == 0 {
+                return Err(CodecError::Caller("there are no frames to encode".into()));
+            }
+            let mut cmd = command(&self.exe);
+            cmd.args(encode_args(size, out));
+            run_encode(cmd, frame_len, frames, next, out, max_bytes, keep_going, &Limits::for_frames(frames))?;
+            // Success with nothing written is not a video.
+            if std::fs::metadata(out).is_ok_and(|m| m.is_file() && m.len() > 0) { Ok(()) } else { Err(CodecError::Failed { exit: Some(0) }) }
+        })();
+        if result.is_err() {
             let _ = std::fs::remove_file(out);
-            Err(CodecError::Failed)
         }
+        result
     }
 
     fn decode(&self, video: &Path, size: (u32, u32), frames: usize, each: &mut dyn FnMut(usize, &[u8]) -> Result<(), String>, keep_going: &dyn Fn(usize) -> bool) -> Result<(), CodecError> {
+        if !self.has_libx264 {
+            return Err(CodecError::Failed { exit: None });
+        }
         let frame_len = frame_len(size)?;
         let mut cmd = command(&self.exe);
         cmd.args(decode_args(video));
@@ -296,7 +413,7 @@ fn decode_args(video: &Path) -> Vec<OsString> {
 /// How long a run may take.
 struct Limits {
     /// Nothing moved for this long: no frame through the pipe and, when encoding, no growth
-    /// of the output.
+    /// of the output. Time the caller's own functions take does not count.
     stall: Duration,
     total: Duration,
     poll: Duration,
@@ -327,131 +444,211 @@ impl<'a> Watch<'a> {
     }
 
     fn check(&self) -> Result<(), CodecError> {
-        if self.started.elapsed() > self.limits.total || self.moved.elapsed() > self.limits.stall { Err(CodecError::TimedOut) } else { Ok(()) }
+        if self.started.elapsed() > self.limits.total {
+            Err(CodecError::TimedOut { bound: Bound::Total })
+        } else if self.moved.elapsed() > self.limits.stall {
+            Err(CodecError::TimedOut { bound: Bound::Stall })
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// Stop the program if the run failed, wait for it, and say how it ended.
-fn finish(child: &mut Child, failed: bool) -> Option<ExitStatus> {
-    if failed {
-        let _ = child.kill();
+/// A started program, and what must not outlive a failed run: the program itself, the file
+/// it writes, and the threads on its pipes. Dropping it, on any way out, stops the program
+/// if it still runs, waits for it, gives the pipe threads [`COLLECT`] to end and then leaves
+/// them alone, and removes the output unless [`Run::keep`] was called.
+struct Run {
+    child: Child,
+    /// The output to remove; None once the run ended well, or when there is none.
+    out: Option<PathBuf>,
+    /// The buffer's way to the pipe thread; dropped first, so that thread sees the end.
+    pipe: Option<mpsc::Sender<Vec<u8>>>,
+    /// One per pipe thread: disconnected when the thread has ended.
+    threads: Vec<mpsc::Receiver<()>>,
+    /// The capped error text, when its thread has read to the end.
+    errors: Option<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl Run {
+    /// Start `cmd`, whose pipes the caller has set up. With an output, what is there now is
+    /// removed first, so nothing stale can be taken for the program's work.
+    fn start(mut cmd: Command, out: Option<&Path>) -> Result<Run, CodecError> {
+        if let Some(out) = out {
+            match std::fs::remove_file(out) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(CodecError::Io(e)),
+                _ => {}
+            }
+        }
+        let child = cmd.spawn().map_err(CodecError::Io)?;
+        let mut run = Run { child, out: out.map(Path::to_path_buf), pipe: None, threads: Vec::new(), errors: None };
+        if let Some(stderr) = run.child.stderr.take() {
+            let (text_out, text) = mpsc::channel();
+            run.errors = Some(text);
+            run.detached(move || {
+                let _ = text_out.send(drain(stderr, ERROR_TEXT_KEPT));
+            })?;
+        }
+        Ok(run)
     }
-    child.wait().ok()
+
+    /// Run `work` on a thread of its own that this run never waits for without a bound.
+    fn detached(&mut self, work: impl FnOnce() + Send + 'static) -> Result<(), CodecError> {
+        let (ended, end) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("mythicshot-ffmpeg-pipe".into())
+            .spawn(move || {
+                let _ended = ended;
+                work();
+            })
+            .map_err(CodecError::Io)?;
+        self.threads.push(end);
+        Ok(())
+    }
+
+    /// The run ended well: the output stays.
+    fn keep(&mut self) {
+        self.out = None;
+    }
+
+    /// The error for a program that closed its pipe before the work was done: with its exit
+    /// code if it ends by itself within [`GRACE`].
+    fn gave_up(&mut self) -> CodecError {
+        let until = Instant::now() + GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return CodecError::Failed { exit: status.code() },
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => return CodecError::Failed { exit: None },
+            }
+        }
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.pipe = None;
+        let ended = matches!(self.child.try_wait(), Ok(Some(_)));
+        if !ended {
+            let _ = self.child.kill();
+        }
+        let status = self.child.wait().ok();
+        // The pipe threads end when the program's ends of the pipes are closed. A child of
+        // the program can still hold them; then the threads are left behind.
+        let until = Instant::now() + COLLECT;
+        for thread in &self.threads {
+            while let Ok(()) | Err(RecvTimeoutError::Timeout) = thread.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                if Instant::now() >= until {
+                    break;
+                }
+            }
+        }
+        if let Some(text) = self.errors.take().and_then(|e| e.recv_timeout(until.saturating_duration_since(Instant::now())).ok()) {
+            note_error_text(status, ended, &text);
+        }
+        if let Some(out) = self.out.take() {
+            let _ = std::fs::remove_file(out);
+        }
+    }
 }
 
 /// In a debug build with `MYTHICSHOT_FFMPEG_LOG` set, the exit code and the capped error text
 /// go to the console. Otherwise the text is dropped: it can hold a folder's name.
-fn note_error_text(status: Option<ExitStatus>, text: &[u8]) {
-    if cfg!(debug_assertions) && std::env::var_os("MYTHICSHOT_FFMPEG_LOG").is_some() {
-        eprintln!("ffmpeg ended with {:?}: {}", status.and_then(|s| s.code()), String::from_utf8_lossy(text).trim());
+fn note_error_text(status: Option<ExitStatus>, by_itself: bool, text: &[u8]) {
+    if cfg!(debug_assertions) && !text.is_empty() && std::env::var_os("MYTHICSHOT_FFMPEG_LOG").is_some() {
+        let code = status.filter(|_| by_itself).and_then(|s| s.code());
+        eprintln!("ffmpeg ended with {code:?}: {}", String::from_utf8_lossy(text).trim());
     }
 }
 
-/// Run `cmd` as an encoder: feed it `frames` frames on standard input from a thread of its
-/// own, watch it from this one, and remove `out` unless it ended well.
+/// Run `cmd` as an encoder: feed it `frames` frames on standard input through a thread of
+/// its own, watch it from this one, and leave `out` only if it ended well.
 #[allow(clippy::too_many_arguments)]
-fn run_encode(cmd: Command, frame_len: usize, frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool, limits: &Limits) -> Result<(), CodecError> {
-    let result = feed(cmd, frame_len, frames, next, out, max_bytes, keep_going, limits);
-    if result.is_err() {
-        let _ = std::fs::remove_file(out);
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn feed(mut cmd: Command, frame_len: usize, frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool, limits: &Limits) -> Result<(), CodecError> {
-    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(CodecError::Io)?;
-    let (Some(mut stdin), Some(stderr)) = (child.stdin.take(), child.stderr.take()) else {
-        finish(&mut child, true);
-        return Err(CodecError::Failed);
-    };
-    // One buffer goes back and forth: this thread fills it, the writer thread writes it.
+fn run_encode(mut cmd: Command, frame_len: usize, frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool, limits: &Limits) -> Result<(), CodecError> {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+    // From here on every way out, a panic of `next` or `keep_going` included, goes through
+    // the drop of `run`.
+    let mut run = Run::start(cmd, Some(out))?;
+    let Some(mut stdin) = run.child.stdin.take() else { return Err(CodecError::Failed { exit: None }) };
+    // One buffer goes back and forth: this thread fills it, the pipe thread writes it.
     let (to_writer, writer_in) = mpsc::channel::<Vec<u8>>();
     let (writer_out, from_writer) = mpsc::channel::<Option<Vec<u8>>>();
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            for buf in writer_in {
-                let written = stdin.write_all(&buf).is_ok();
-                if writer_out.send(written.then_some(buf)).is_err() || !written {
+    run.pipe = Some(to_writer);
+    run.detached(move || {
+        for buf in writer_in {
+            let written = stdin.write_all(&buf).is_ok();
+            if writer_out.send(written.then_some(buf)).is_err() || !written {
+                break;
+            }
+        }
+        // Dropping the pipe here tells the program its input has ended.
+    })?;
+
+    let mut watch = Watch::start(limits);
+    let mut size = 0u64;
+    // Asked every poll and every frame: cancel, the output's size, the two time bounds.
+    let mut look = |done: usize, watch: &mut Watch| -> Result<(), CodecError> {
+        if !keep_going(done) {
+            return Err(CodecError::Cancelled);
+        }
+        let now = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+        if now > max_bytes {
+            return Err(CodecError::TooLarge);
+        }
+        if now != size {
+            size = now;
+            watch.moved();
+        }
+        watch.check()
+    };
+    let mut buf = Vec::with_capacity(frame_len);
+    let mut done = 0usize;
+    while done < frames {
+        buf.clear();
+        match next(&mut buf) {
+            Err(text) => return Err(CodecError::Caller(text)),
+            Ok(false) => return Err(CodecError::WrongFrames { got: done }),
+            Ok(true) if buf.len() != frame_len => return Err(CodecError::Caller("a frame has the wrong size".into())),
+            Ok(true) => {}
+        }
+        // Time the caller took is not the program's stall.
+        watch.moved();
+        let sent = run.pipe.as_ref().is_some_and(|pipe| pipe.send(std::mem::take(&mut buf)).is_ok());
+        if !sent {
+            return Err(run.gave_up());
+        }
+        loop {
+            match from_writer.recv_timeout(limits.poll) {
+                Ok(Some(back)) => {
+                    buf = back;
+                    done += 1;
+                    watch.moved();
                     break;
                 }
+                // The program closed its input before it had every frame.
+                Ok(None) | Err(RecvTimeoutError::Disconnected) => return Err(run.gave_up()),
+                Err(RecvTimeoutError::Timeout) => look(done, &mut watch)?,
             }
-            // Dropping the pipe here tells the program its input has ended.
-        });
-        let errors = scope.spawn(move || drain(stderr, ERROR_TEXT_KEPT));
-
-        let mut to_writer = Some(to_writer);
-        let child = &mut child;
-        let mut work = || -> Result<(), CodecError> {
-            let mut watch = Watch::start(limits);
-            let mut size = 0u64;
-            let mut done = 0usize;
-            // Asked every poll and every frame: cancel, the output's size, the two time bounds.
-            let mut look = |done: usize, watch: &mut Watch| -> Result<(), CodecError> {
-                if !keep_going(done) {
-                    return Err(CodecError::Cancelled);
-                }
-                let now = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-                if now > max_bytes {
-                    return Err(CodecError::TooLarge);
-                }
-                if now != size {
-                    size = now;
-                    watch.moved();
-                }
-                watch.check()
-            };
-            let mut buf = Vec::with_capacity(frame_len);
-            while done < frames {
-                buf.clear();
-                match next(&mut buf) {
-                    Err(text) => return Err(CodecError::Caller(text)),
-                    Ok(false) => return Err(CodecError::WrongFrames { got: done }),
-                    Ok(true) if buf.len() != frame_len => return Err(CodecError::Caller("a frame has the wrong size".into())),
-                    Ok(true) => {}
-                }
-                let Some(writer) = &to_writer else { return Err(CodecError::Failed) };
-                if writer.send(std::mem::take(&mut buf)).is_err() {
-                    return Err(CodecError::Failed);
-                }
-                loop {
-                    match from_writer.recv_timeout(limits.poll) {
-                        Ok(Some(back)) => {
-                            buf = back;
-                            done += 1;
-                            watch.moved();
-                            break;
-                        }
-                        // The program closed its input before it had every frame.
-                        Ok(None) | Err(RecvTimeoutError::Disconnected) => return Err(CodecError::Failed),
-                        Err(RecvTimeoutError::Timeout) => look(done, &mut watch)?,
-                    }
-                }
-                look(done, &mut watch)?;
-            }
-            // End of input; now the program finishes the file.
-            to_writer = None;
-            loop {
-                match child.try_wait().map_err(CodecError::Io)? {
-                    Some(status) if status.success() => break,
-                    Some(_) => return Err(CodecError::Failed),
-                    None => {
-                        look(done, &mut watch)?;
-                        std::thread::sleep(limits.poll);
-                    }
-                }
-            }
-            if std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) > max_bytes { Err(CodecError::TooLarge) } else { Ok(()) }
-        };
-        let result = work();
-        drop(to_writer);
-        let status = finish(child, result.is_err());
-        let text = errors.join().unwrap_or_default();
-        if result.is_err() || !text.is_empty() {
-            note_error_text(status, &text);
         }
-        result
-    })
+        look(done, &mut watch)?;
+    }
+    // End of input; now the program finishes the file.
+    run.pipe = None;
+    loop {
+        match run.child.try_wait().map_err(CodecError::Io)? {
+            Some(status) if status.success() => break,
+            Some(status) => return Err(CodecError::Failed { exit: status.code() }),
+            None => {
+                look(done, &mut watch)?;
+                std::thread::sleep(limits.poll);
+            }
+        }
+    }
+    if std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) > max_bytes {
+        return Err(CodecError::TooLarge);
+    }
+    run.keep();
+    Ok(())
 }
 
 /// What the thread reading the program's output tells the watching thread.
@@ -485,100 +682,80 @@ fn read_full(from: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
 /// is shorter or one byte longer.
 #[allow(clippy::type_complexity)]
 fn run_decode(mut cmd: Command, frame_len: usize, frames: usize, each: &mut dyn FnMut(usize, &[u8]) -> Result<(), String>, keep_going: &dyn Fn(usize) -> bool, limits: &Limits) -> Result<(), CodecError> {
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(CodecError::Io)?;
-    let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        finish(&mut child, true);
-        return Err(CodecError::Failed);
-    };
-    // One buffer goes back and forth: the reader thread fills it, this thread hands it on.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // From here on every way out, a panic of `each` or `keep_going` included, goes through
+    // the drop of `run`.
+    let mut run = Run::start(cmd, None)?;
+    let Some(mut stdout) = run.child.stdout.take() else { return Err(CodecError::Failed { exit: None }) };
+    // One buffer goes back and forth: the pipe thread fills it, this thread hands it on.
     let (reader_out, from_reader) = mpsc::channel::<Piece>();
     let (to_reader, reader_in) = mpsc::channel::<Vec<u8>>();
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let mut buf = vec![0u8; frame_len];
-            for _ in 0..frames {
-                buf.resize(frame_len, 0);
-                let piece = match read_full(&mut stdout, &mut buf) {
-                    Ok(n) if n == frame_len => Piece::Frame(std::mem::take(&mut buf)),
-                    Ok(_) => Piece::Short,
-                    Err(e) => Piece::Broken(e),
-                };
-                let whole = matches!(piece, Piece::Frame(_));
-                if reader_out.send(piece).is_err() || !whole {
-                    return;
-                }
-                match reader_in.recv() {
-                    Ok(back) => buf = back,
-                    Err(_) => return,
-                }
-            }
-            let mut one = [0u8; 1];
-            let _ = reader_out.send(match read_full(&mut stdout, &mut one) {
-                Ok(0) => Piece::End,
-                Ok(_) => Piece::Extra,
+    run.pipe = Some(to_reader);
+    run.detached(move || {
+        let mut buf = vec![0u8; frame_len];
+        for _ in 0..frames {
+            buf.resize(frame_len, 0);
+            let piece = match read_full(&mut stdout, &mut buf) {
+                Ok(n) if n == frame_len => Piece::Frame(std::mem::take(&mut buf)),
+                Ok(_) => Piece::Short,
                 Err(e) => Piece::Broken(e),
-            });
-        });
-        let errors = scope.spawn(move || drain(stderr, ERROR_TEXT_KEPT));
-
-        let child = &mut child;
-        let mut work = || -> Result<(), CodecError> {
-            let mut watch = Watch::start(limits);
-            let mut done = 0usize;
-            let look = |done: usize, watch: &Watch| -> Result<(), CodecError> { if keep_going(done) { watch.check() } else { Err(CodecError::Cancelled) } };
-            // A stream that ends early: an error of the program if it says so, else a count.
-            let short = |child: &mut Child, done: usize, watch: &Watch| -> Result<(), CodecError> {
-                loop {
-                    match child.try_wait().map_err(CodecError::Io)? {
-                        Some(status) if status.success() => return Err(CodecError::WrongFrames { got: done }),
-                        Some(_) => return Err(CodecError::Failed),
-                        None => {
-                            look(done, watch)?;
-                            std::thread::sleep(limits.poll);
-                        }
-                    }
-                }
             };
-            loop {
-                match from_reader.recv_timeout(limits.poll) {
-                    Ok(Piece::Frame(buf)) => {
-                        each(done, &buf).map_err(CodecError::Caller)?;
-                        done += 1;
-                        // Time the caller took is not the program's stall.
-                        watch.moved();
-                        look(done, &watch)?;
-                        if to_reader.send(buf).is_err() {
-                            return Err(CodecError::Failed);
-                        }
-                    }
-                    Ok(Piece::Short) => return short(child, done, &watch),
-                    Ok(Piece::Extra) => return Err(CodecError::WrongFrames { got: frames + 1 }),
-                    Ok(Piece::Broken(e)) => return Err(CodecError::Io(e)),
-                    Ok(Piece::End) => break,
-                    Err(RecvTimeoutError::Disconnected) => return Err(CodecError::Failed),
-                    Err(RecvTimeoutError::Timeout) => look(done, &watch)?,
-                }
+            let whole = matches!(piece, Piece::Frame(_));
+            if reader_out.send(piece).is_err() || !whole {
+                return;
             }
-            loop {
-                match child.try_wait().map_err(CodecError::Io)? {
-                    Some(status) if status.success() => return Ok(()),
-                    Some(_) => return Err(CodecError::Failed),
-                    None => {
-                        look(done, &watch)?;
-                        std::thread::sleep(limits.poll);
-                    }
-                }
+            match reader_in.recv() {
+                Ok(back) => buf = back,
+                Err(_) => return,
             }
-        };
-        let result = work();
-        drop(to_reader);
-        let status = finish(child, result.is_err());
-        let text = errors.join().unwrap_or_default();
-        if result.is_err() || !text.is_empty() {
-            note_error_text(status, &text);
         }
-        result
-    })
+        let mut one = [0u8; 1];
+        let _ = reader_out.send(match read_full(&mut stdout, &mut one) {
+            Ok(0) => Piece::End,
+            Ok(_) => Piece::Extra,
+            Err(e) => Piece::Broken(e),
+        });
+    })?;
+
+    let mut watch = Watch::start(limits);
+    let mut done = 0usize;
+    let look = |done: usize, watch: &Watch| -> Result<(), CodecError> { if keep_going(done) { watch.check() } else { Err(CodecError::Cancelled) } };
+    // Whether the stream ended early (a count, unless the program says it failed) or whole.
+    let mut short = false;
+    loop {
+        match from_reader.recv_timeout(limits.poll) {
+            Ok(Piece::Frame(buf)) => {
+                each(done, &buf).map_err(CodecError::Caller)?;
+                done += 1;
+                // Time the caller took is not the program's stall.
+                watch.moved();
+                look(done, &watch)?;
+                if run.pipe.as_ref().is_none_or(|pipe| pipe.send(buf).is_err()) {
+                    return Err(run.gave_up());
+                }
+            }
+            Ok(Piece::Short) => {
+                short = true;
+                break;
+            }
+            Ok(Piece::End) => break,
+            Ok(Piece::Extra) => return Err(CodecError::WrongFrames { got: frames + 1 }),
+            Ok(Piece::Broken(e)) => return Err(CodecError::Io(e)),
+            Err(RecvTimeoutError::Disconnected) => return Err(run.gave_up()),
+            Err(RecvTimeoutError::Timeout) => look(done, &watch)?,
+        }
+    }
+    loop {
+        match run.child.try_wait().map_err(CodecError::Io)? {
+            Some(status) if !status.success() => return Err(CodecError::Failed { exit: status.code() }),
+            Some(_) if short => return Err(CodecError::WrongFrames { got: done }),
+            Some(_) => return Ok(()),
+            None => {
+                look(done, &watch)?;
+                std::thread::sleep(limits.poll);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,8 +775,8 @@ mod tests {
         std::env::join_paths(entries).unwrap()
     }
 
-    fn version(_: &Path) -> Option<String> {
-        Some("7.1-test".into())
+    fn version(_: &Path) -> Option<Probed> {
+        Some(Probed { version: "7.1-test".into(), has_libx264: true })
     }
 
     // ---- the find ----
@@ -616,7 +793,7 @@ mod tests {
         let probed = RefCell::new(Vec::new());
         let probe = |p: &Path| {
             probed.borrow_mut().push(p.to_path_buf());
-            Some("1".to_string())
+            version(p)
         };
         find_in(&path, &holds, &probe).unwrap();
         assert_eq!(*probed.borrow(), vec![b.join(EXE_NAME)]);
@@ -667,11 +844,44 @@ mod tests {
         assert_eq!(find_in(&path, &both, &version).unwrap().exe(), programs.join(EXE_NAME));
     }
 
+    /// Since the review: an ffmpeg without libx264 is found (the exports can use it), and
+    /// only archiving refuses it; one that does not answer its version is not found.
     #[test]
     fn an_ffmpeg_that_does_not_answer_its_version_or_lacks_libx264_is_not_found() {
         let dir = folder("bin");
         let path = path_of(&[&dir]);
         assert!(find_in(&path, &|_| true, &|_| None).is_none());
+        assert_eq!(Found::of(None), Found::None);
+
+        let plain = find_in(&path, &|_| true, &|_| Some(Probed { version: "6.0".into(), has_libx264: false })).unwrap();
+        assert!(!plain.can_archive());
+        assert_eq!(plain.version(), "6.0");
+        assert_eq!(Found::of(Some(&plain)), Found::Unusable);
+        let whole = find_in(&path, &|_| true, &version).unwrap();
+        assert!(whole.can_archive());
+        assert_eq!(Found::of(Some(&whole)), Found::Ok);
+        // Archiving with it is refused before any program is started (this one does not
+        // exist, so a start would be another error), and what stood at the output is removed.
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("out.mkv");
+        std::fs::write(&out, b"older").unwrap();
+        let result = plain.encode((4, 4), 1, &mut |_| Ok(false), &out, 1 << 20, &|_| true);
+        assert!(matches!(result, Err(CodecError::Failed { exit: None })), "{result:?}");
+        assert!(!out.exists());
+        let result = plain.decode(&out, (4, 4), 1, &mut |_, _| Ok(()), &|_| true);
+        assert!(matches!(result, Err(CodecError::Failed { exit: None })), "{result:?}");
+        // The other early refusals of an encode remove the output as well.
+        for (size, frames) in [((0, 4), 1), ((4, 4), 0)] {
+            std::fs::write(&out, b"older").unwrap();
+            let result = whole.encode(size, frames, &mut |_| Ok(false), &out, 1 << 20, &|_| true);
+            assert!(matches!(result, Err(CodecError::Caller(_))), "{result:?}");
+            assert!(!out.exists());
+        }
+        // What the one find of this run says, in a word and without a path.
+        match find_now() {
+            Some(real) => assert_eq!(found(), if real.can_archive() { Found::Ok } else { Found::Unusable }),
+            None => assert_eq!(found(), Found::None),
+        }
 
         // What the real probe makes of the program's answers.
         assert_eq!(version_of("ffmpeg version 7.1-full_build-www.example Copyright (c) 2000-2024 the developers\nbuilt with gcc\n").as_deref(), Some("7.1-full_build-www.example"));
@@ -689,6 +899,72 @@ mod tests {
 
         // A program that is not there, or is not a program, answers nothing.
         assert!(probe(&folder("nowhere").join(EXE_NAME)).is_none());
+    }
+
+    #[cfg(windows)]
+    fn link(to: &Path, at: &Path) -> bool {
+        std::os::windows::fs::symlink_file(to, at).is_ok()
+    }
+    #[cfg(not(windows))]
+    fn link(to: &Path, at: &Path) -> bool {
+        std::os::unix::fs::symlink(to, at).is_ok()
+    }
+
+    #[test]
+    fn the_search_on_a_real_folder_takes_only_a_real_program_file_under_its_own_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let d = root.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let (folder_named, real, empty, other) = (dir("folder named"), dir("real"), dir("empty"), dir("other"));
+        std::fs::create_dir(folder_named.join(EXE_NAME)).unwrap();
+        std::fs::write(real.join(EXE_NAME), b"a program").unwrap();
+        std::fs::write(empty.join(EXE_NAME), b"").unwrap();
+        let probed = RefCell::new(Vec::new());
+        let probe = |p: &Path| {
+            probed.borrow_mut().push(p.to_path_buf());
+            version(p)
+        };
+        // A folder with the program's name is passed over; the file after it is taken, by
+        // its canonical absolute path.
+        let found = find_on_with(&path_of(&[Path::new("relative"), &folder_named, &real, &empty]), &probe).unwrap();
+        assert_eq!(found.exe(), std::fs::canonicalize(real.join(EXE_NAME)).unwrap());
+        assert!(found.exe().is_absolute());
+        assert_eq!(*probed.borrow(), vec![found.exe().to_path_buf()]);
+        // An empty file is a file: it is the first, it decides, and it is no ffmpeg. The
+        // real one after it is not tried.
+        assert!(find_on(&path_of(&[&folder_named, &empty, &real])).is_none());
+        // Nothing there at all.
+        assert!(find_on(&path_of(&[&folder_named, &other])).is_none());
+
+        // The rule for where a link may lead, by itself (a link cannot be made everywhere).
+        assert!(is_the_program(&real.join(EXE_NAME)));
+        assert!(is_the_program(&real.join(EXE_NAME.to_ascii_uppercase())) || !cfg!(windows));
+        for other_name in ["run.cmd", "ffmpeg.bat", "ffmpeg.cmd", "ffmpeg.exe.cmd", "cmd.exe", "ffmpeg2.exe"] {
+            assert!(!is_the_program(&real.join(other_name)), "{other_name}");
+        }
+        assert!(!is_the_program(&real));
+
+        // A link named like the program that leads to a script is never run.
+        let (links, scripts) = (dir("links"), dir("scripts"));
+        std::fs::write(scripts.join("run.cmd"), b"@echo ffmpeg version 1.0").unwrap();
+        if !link(&scripts.join("run.cmd"), &links.join(EXE_NAME)) {
+            println!("skipped: a symbolic link could not be made on this computer");
+            return;
+        }
+        probed.borrow_mut().clear();
+        assert!(find_on_with(&path_of(&[&links, &real]), &probe).is_none());
+        assert!(probed.borrow().is_empty(), "{:?}", probed.borrow());
+        // A link to a program of the same name (in any case) is followed, and the path kept
+        // is where the program really is.
+        let upper = if cfg!(windows) { EXE_NAME.to_ascii_uppercase() } else { EXE_NAME.to_string() };
+        std::fs::write(other.join(&upper), b"a program").unwrap();
+        let links2 = dir("links2");
+        assert!(link(&other.join(&upper), &links2.join(EXE_NAME)));
+        let found = find_on_with(&path_of(&[&links2]), &probe).unwrap();
+        assert_eq!(found.exe(), std::fs::canonicalize(other.join(&upper)).unwrap());
     }
 
     #[test]
@@ -750,7 +1026,7 @@ mod tests {
         assert_eq!(args, expected);
         // The id names exactly these settings.
         assert_eq!(CODEC_ID, format!("x264-444-crf{CRF}-{PRESET}-g{GOP}"));
-        assert_eq!(Ffmpeg { exe: out, version: String::new() }.id(), "x264-444-crf10-medium-g30");
+        assert_eq!(Ffmpeg { exe: out, version: String::new(), has_libx264: true }.id(), "x264-444-crf10-medium-g30");
     }
 
     #[test]
@@ -802,6 +1078,7 @@ mod tests {
 
     const CHILD_MODE: &str = "MYTHICSHOT_TEST_CHILD";
     const CHILD_FILE: &str = "MYTHICSHOT_TEST_CHILD_FILE";
+    const CHILD_BYTES: &str = "MYTHICSHOT_TEST_CHILD_BYTES";
 
     /// Not a test of its own: what the stand-in child does when the runner tests start this
     /// test program again with [`CHILD_MODE`] set. Without it, nothing.
@@ -811,15 +1088,18 @@ mod tests {
         match mode.as_str() {
             // Never reads its input and never ends on its own.
             "deaf" => std::thread::sleep(Duration::from_secs(120)),
-            // Never reads its input, and writes its file without end.
-            "grow" => {
-                let mut file = std::fs::File::create(std::env::var_os(CHILD_FILE).unwrap()).unwrap();
-                for _ in 0..12_000 {
-                    file.write_all(&[7u8; 32 << 10]).unwrap();
-                    file.flush().unwrap();
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+            // Never reads its input, and writes its file again and again (for about 20 seconds):
+            // while it lives, a removed file comes back.
+            "grow" => grow(),
+            // Starts a child of its own that inherits this one's pipes and outlives it, then grows.
+            "family" => {
+                grandchild();
+                grow();
             }
+            // Starts such a child and ends at once, well.
+            "orphan" => grandchild(),
+            // The child of a stand-in: holds the pipes it inherited for a while, and does nothing.
+            "nap" => std::thread::sleep(Duration::from_secs(15)),
             // Writes far more error text than a pipe holds, then reads its input to the end.
             "flood" => {
                 let mut err = std::io::stderr();
@@ -829,9 +1109,44 @@ mod tests {
                 let read = std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
                 std::fs::write(std::env::var_os(CHILD_FILE).unwrap(), read.to_string()).unwrap();
             }
+            // Prints nothing of its own.
+            "quiet" => {}
+            // Ends at once with an error of its own.
+            "fail" => std::process::exit(3),
+            // Writes so many bytes to its output and ends well; "emit-hang" then stays.
+            "emit" | "emit-hang" => {
+                let bytes: usize = std::env::var(CHILD_BYTES).unwrap().parse().unwrap();
+                let mut o = std::io::stdout();
+                o.write_all(&vec![0x5a; bytes]).unwrap();
+                o.flush().unwrap();
+                if mode == "emit-hang" {
+                    std::thread::sleep(Duration::from_secs(15));
+                }
+            }
+            // Writes to its output until nobody listens.
+            "endless" => {
+                let mut o = std::io::stdout();
+                while o.write_all(&[0x5a; 4096]).is_ok() {}
+            }
             other => panic!("unknown stand-in mode {other}"),
         }
         std::process::exit(0);
+    }
+
+    fn grow() {
+        let file = std::env::var_os(CHILD_FILE).unwrap();
+        for _ in 0..2000 {
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file).unwrap();
+            f.write_all(&[7u8; 32 << 10]).unwrap();
+            drop(f);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn grandchild() {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["ffmpeg::tests::stand_in_child", "--exact", "--nocapture", "--test-threads=1"]).env(CHILD_MODE, "nap");
+        std::mem::forget(cmd.spawn().unwrap());
     }
 
     fn stand_in(mode: &str, file: &Path) -> Command {
@@ -866,7 +1181,7 @@ mod tests {
             true
         };
         let result = run_encode(stand_in("deaf", &out), BIG, 8, &mut big_frames(), &out, u64::MAX, &keep_going, &limits(400, 60_000));
-        assert!(matches!(result, Err(CodecError::TimedOut)), "{result:?}");
+        assert!(matches!(result, Err(CodecError::TimedOut { bound: Bound::Stall })), "{result:?}");
         // It waited for the bound, was not left to its 120 seconds, and the output is gone.
         assert!(started.elapsed() >= Duration::from_millis(400), "{:?}", started.elapsed());
         assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
@@ -876,7 +1191,7 @@ mod tests {
         // The total bound stops a child too, also one whose output keeps growing.
         let started = Instant::now();
         let result = run_encode(stand_in("grow", &out), BIG, 8, &mut big_frames(), &out, u64::MAX, &|_| true, &limits(60_000, 500));
-        assert!(matches!(result, Err(CodecError::TimedOut)), "{result:?}");
+        assert!(matches!(result, Err(CodecError::TimedOut { bound: Bound::Total })), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
         assert!(!out.exists());
     }
@@ -984,6 +1299,263 @@ mod tests {
         assert!(matches!(frame_len((0, 10)), Err(CodecError::Caller(_))));
         assert!(matches!(frame_len((u32::MAX, u32::MAX)), Err(CodecError::Caller(_))) || usize::BITS > 64);
         assert_eq!(frame_len((48, 32)).unwrap(), 48 * 32 * 4);
+    }
+
+    // ---- a child whose own child keeps the pipes open, and a caller that panics ----
+
+    #[test]
+    fn a_cancel_returns_and_removes_the_output_when_a_grandchild_still_holds_the_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.mkv");
+        let cancelled: Cell<Option<Instant>> = Cell::new(None);
+        let keep_going = |_: usize| {
+            if cancelled.get().is_none() && out.exists() {
+                cancelled.set(Some(Instant::now()));
+            }
+            cancelled.get().is_none()
+        };
+        let result = run_encode(stand_in("family", &out), BIG, 8, &mut big_frames(), &out, u64::MAX, &keep_going, &limits(60_000, 60_000));
+        let took = cancelled.get().expect("the child never wrote its file").elapsed();
+        assert!(matches!(result, Err(CodecError::Cancelled)), "{result:?}");
+        assert!(took < Duration::from_secs(6), "{took:?}");
+        assert!(!out.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_time_bound_returns_and_removes_the_output_when_a_grandchild_still_holds_the_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.mkv");
+        let started = Instant::now();
+        let result = run_encode(stand_in("family", &out), BIG, 8, &mut big_frames(), &out, u64::MAX, &|_| true, &limits(60_000, 500));
+        assert!(matches!(result, Err(CodecError::TimedOut { bound: Bound::Total })), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        assert!(!out.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_panic_in_the_callers_function_stops_the_child_and_removes_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.mkv");
+        let started = Instant::now();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut given = 0;
+            let mut next = |buf: &mut Vec<u8>| {
+                given += 1;
+                // Wait until the child is writing, then fail badly.
+                while given == 2 && !out.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(given < 2, "the caller's function panics");
+                buf.resize(1000, 9);
+                Ok(true)
+            };
+            run_encode(stand_in("grow", &out), 1000, 8, &mut next, &out, u64::MAX, &|_| true, &limits(60_000, 60_000))
+        }));
+        assert!(caught.is_err());
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        assert!(!out.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!out.exists(), "the child is still writing");
+        // The same when it is the cancel question that panics.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let keep_going = |_: usize| -> bool {
+                if out.exists() {
+                    panic!("the cancel question panics");
+                }
+                true
+            };
+            run_encode(stand_in("grow", &out), BIG, 8, &mut big_frames(), &out, u64::MAX, &keep_going, &limits(60_000, 60_000))
+        }));
+        assert!(caught.is_err());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!out.exists(), "the child is still writing");
+    }
+
+    #[test]
+    fn what_was_at_the_output_before_is_removed_before_the_program_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count.txt");
+        let stale = dir.path().join("out.mkv");
+        std::fs::write(&stale, b"an older video").unwrap();
+        // This child never writes the output; a run that ends well leaves none.
+        let mut left = 2;
+        let mut next = |buf: &mut Vec<u8>| {
+            if left == 0 {
+                return Ok(false);
+            }
+            left -= 1;
+            buf.resize(1000, 1);
+            Ok(true)
+        };
+        let result = run_encode(stand_in("flood", &count), 1000, 2, &mut next, &stale, u64::MAX, &|_| true, &limits(15_000, 30_000));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn every_command_is_built_without_a_report_file_setting() {
+        let cmd = command(Path::new("ffmpeg.exe"));
+        assert!(cmd.get_envs().any(|(name, value)| name == "FFREPORT" && value.is_none()));
+    }
+
+    #[test]
+    fn the_error_text_kept_is_capped_at_8_kb() {
+        let text = vec![b'x'; 100 << 10];
+        assert_eq!(drain(&text[..], ERROR_TEXT_KEPT).len(), 8 << 10);
+        assert_eq!(drain(&text[..100], ERROR_TEXT_KEPT).len(), 100);
+        assert_eq!(ERROR_TEXT_KEPT, 8 << 10);
+    }
+
+    #[test]
+    fn the_debug_text_of_a_found_ffmpeg_holds_no_path() {
+        let found = find_in(&path_of(&[&folder("secret-folder-name")]), &|_| true, &version).unwrap();
+        let text = format!("{found:?}");
+        assert!(!text.contains("secret-folder-name"), "{text}");
+        assert!(text.contains("7.1-test"), "{text}");
+    }
+
+    #[test]
+    fn the_probe_returns_when_a_grandchild_still_holds_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("unused");
+        // The program ended well, and its output never ends.
+        let started = Instant::now();
+        assert!(capture_cmd(stand_in("orphan", &file), Duration::from_secs(10)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        // The program never ends: stopped at the bound, and its output never ends either.
+        let started = Instant::now();
+        assert!(capture_cmd(stand_in("family", &file), Duration::from_millis(300)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        // A program that ends well by itself is read whole.
+        assert!(capture_cmd(stand_in("quiet", &file), Duration::from_secs(10)).is_some());
+        assert!(capture_cmd(stand_in("fail", &file), Duration::from_secs(10)).is_none());
+    }
+
+    #[test]
+    fn a_program_that_ends_with_an_error_is_reported_with_its_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.mkv");
+        let mut next = |buf: &mut Vec<u8>| {
+            buf.resize(1000, 1);
+            Ok(true)
+        };
+        let result = run_encode(stand_in("fail", &out), 1000, 3, &mut next, &out, u64::MAX, &|_| true, &limits(15_000, 30_000));
+        assert!(matches!(result, Err(CodecError::Failed { exit: Some(3) })), "{result:?}");
+        let result = run_decode(stand_in("fail", &out), 1000, 3, &mut |_, _| Ok(()), &|_| true, &limits(15_000, 30_000));
+        assert!(matches!(result, Err(CodecError::Failed { exit: Some(3) })), "{result:?}");
+    }
+
+    #[test]
+    fn a_slow_caller_is_not_the_programs_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count.txt");
+        let out = dir.path().join("out.mkv");
+        let mut left = 3;
+        // Every frame takes the caller longer than the stall bound.
+        let mut next = |buf: &mut Vec<u8>| {
+            if left == 0 {
+                return Ok(false);
+            }
+            left -= 1;
+            std::thread::sleep(Duration::from_millis(700));
+            buf.resize(BIG, 1);
+            Ok(true)
+        };
+        let result = run_encode(stand_in("flood", &count), BIG, 3, &mut next, &out, u64::MAX, &|_| true, &limits(600, 30_000));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ---- the decode runner, with the stand-in ----
+
+    /// What the test program prints by itself before a test's own output; the stand-in's
+    /// bytes come after it, so the tests count it in.
+    fn preamble() -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = capture_cmd(stand_in("quiet", &dir.path().join("unused")), Duration::from_secs(20)).unwrap().len();
+        assert!(bytes < FRAME, "the test program prints {bytes} bytes by itself");
+        bytes
+    }
+
+    const FRAME: usize = 1000;
+
+    /// A stand-in whose whole output is `bytes` long.
+    fn emitting(mode: &str, bytes: usize) -> Command {
+        let mut cmd = stand_in(mode, Path::new("unused"));
+        cmd.env(CHILD_BYTES, (bytes - preamble()).to_string());
+        cmd
+    }
+
+    fn decode_from(cmd: Command, frames: usize, limits: &Limits, keep_going: &dyn Fn(usize) -> bool) -> (Result<(), CodecError>, Vec<usize>) {
+        let mut seen = Vec::new();
+        let mut each = |i: usize, px: &[u8]| {
+            assert_eq!(px.len(), FRAME);
+            seen.push(i);
+            Ok(())
+        };
+        let result = run_decode(cmd, FRAME, frames, &mut each, keep_going, limits);
+        (result, seen)
+    }
+
+    #[test]
+    fn a_stream_of_exactly_the_frames_asked_for_is_read_whole() {
+        let (result, seen) = decode_from(emitting("emit", 5 * FRAME), 5, &limits(15_000, 30_000), &|_| true);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_stream_one_byte_short_or_one_byte_long_is_refused_with_its_count() {
+        let (result, seen) = decode_from(emitting("emit", 5 * FRAME - 1), 5, &limits(15_000, 30_000), &|_| true);
+        assert!(matches!(result, Err(CodecError::WrongFrames { got: 4 })), "{result:?}");
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        let (result, seen) = decode_from(emitting("emit", 5 * FRAME + 1), 5, &limits(15_000, 30_000), &|_| true);
+        assert!(matches!(result, Err(CodecError::WrongFrames { got: 6 })), "{result:?}");
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_stream_without_end_is_stopped_after_the_last_frame() {
+        let started = Instant::now();
+        let (result, seen) = decode_from(stand_in("endless", Path::new("unused")), 5, &limits(15_000, 30_000), &|_| true);
+        assert!(matches!(result, Err(CodecError::WrongFrames { got: 6 })), "{result:?}");
+        assert_eq!(seen.len(), 5);
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_stream_that_stops_short_and_hangs_is_stopped_at_the_stall_bound() {
+        let started = Instant::now();
+        let (result, seen) = decode_from(emitting("emit-hang", 4 * FRAME + 500), 5, &limits(400, 30_000), &|_| true);
+        assert!(matches!(result, Err(CodecError::TimedOut { bound: Bound::Stall })), "{result:?}");
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+        // The same with the caller's own error, and with a panic in it: the child is stopped.
+        let started = Instant::now();
+        let result = run_decode(emitting("emit-hang", 4 * FRAME), FRAME, 5, &mut |_, _| Err("no room".into()), &|_| true, &limits(15_000, 30_000));
+        assert!(matches!(&result, Err(CodecError::Caller(text)) if text == "no room"), "{result:?}");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_decode(emitting("emit-hang", 4 * FRAME), FRAME, 5, &mut |_, _| panic!("the caller panics"), &|_| true, &limits(15_000, 30_000))));
+        assert!(caught.is_err());
+        assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_cancel_stops_a_decode_within_a_second() {
+        let cancelled: Cell<Option<Instant>> = Cell::new(None);
+        let keep_going = |done: usize| {
+            if done == 4 && cancelled.get().is_none() {
+                cancelled.set(Some(Instant::now()));
+            }
+            cancelled.get().is_none()
+        };
+        let (result, seen) = decode_from(emitting("emit-hang", 4 * FRAME + 500), 5, &limits(60_000, 60_000), &keep_going);
+        let took = cancelled.get().unwrap().elapsed();
+        assert!(matches!(result, Err(CodecError::Cancelled)), "{result:?}");
+        assert_eq!(seen.len(), 4);
+        assert!(took < Duration::from_secs(1), "{took:?}");
     }
 
     // ---- the real ffmpeg, when this computer has one ----
@@ -1117,11 +1689,11 @@ mod tests {
         let fake = dir.path().join("frames.mkv");
         std::fs::write(&fake, b"#EXTM3U\nhttp://example.invalid/a.ts\n").unwrap();
         let result = decode_all(ffmpeg, &fake, (48, 32), 3);
-        assert!(matches!(result, Err(CodecError::Failed)), "{:?}", result.map(|f| f.len()));
+        assert!(matches!(result, Err(CodecError::Failed { exit: Some(code) }) if code != 0), "{:?}", result.map(|f| f.len()));
         assert_eq!(std::fs::read(&fake).unwrap(), b"#EXTM3U\nhttp://example.invalid/a.ts\n");
         // A missing file as well.
         let result = decode_all(ffmpeg, &dir.path().join("gone.mkv"), (48, 32), 3);
-        assert!(matches!(result, Err(CodecError::Failed)), "{:?}", result.map(|f| f.len()));
+        assert!(matches!(result, Err(CodecError::Failed { exit: Some(code) }) if code != 0), "{:?}", result.map(|f| f.len()));
         // A cancel during the encode leaves no file.
         let frames = synthetic_frames(48, 32, 40);
         let out = dir.path().join("out.mkv");

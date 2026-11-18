@@ -15,7 +15,7 @@ mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
-pub use ffmpeg::{CodecError, Ffmpeg, VideoCodec};
+pub use ffmpeg::{Bound, CodecError, Ffmpeg, VideoCodec};
 pub use saved::{OpenError, SaveError, SaveStep};
 
 use std::fs::File;
