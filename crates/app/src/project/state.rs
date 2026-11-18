@@ -333,6 +333,10 @@ pub struct Blob {
     pub bytes: Vec<u8>,
 }
 
+/// What a cover logo that could not be saved or restored is called in a list of such things
+/// ([`Restored::dropped`]): the words the two places that leave one out push.
+pub const COVER_LOGO: &str = "the cover logo";
+
 /// A project turned back into editor state. `dropped` names what could not be brought back.
 #[derive(Debug, Clone)]
 pub struct Restored {
@@ -380,6 +384,8 @@ fn hex_hash(bytes: &[u8], chars: usize) -> String {
 }
 
 /// The first 16 hex characters of the SHA-256 of `bytes`: what a file's name normally holds.
+// The tests name files with it; a save goes through `hex_hash`, which can lengthen a name.
+#[cfg(test)]
 fn hash16(bytes: &[u8]) -> String {
     hex_hash(bytes, HASH_CHARS[0])
 }

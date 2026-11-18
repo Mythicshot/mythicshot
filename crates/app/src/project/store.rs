@@ -178,6 +178,8 @@ impl Store {
         local_data.filter(|dir| dir.is_absolute()).map(|dir| dir.join("projects"))
     }
 
+    // Only the tests ask: the app opens `default_root` itself.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -189,6 +191,8 @@ impl Store {
     /// Save the project for `key`. The error is the reason in words that follow "…: " in a
     /// sentence for the user (or [`NOT_PUT_BACK`], a sentence of its own): lower-case, with one
     /// full stop, and without a folder's name or the system's own text.
+    // Only the tests save this way: a publish saves with `save_while`, so that it can be cancelled.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn save(&self, key: &ProjectKey, snap: &Snapshot<'_>) -> Result<Saved, String> {
         self.save_while(key, snap, &|| true)
     }
@@ -351,6 +355,8 @@ impl Store {
     }
 
     /// The projects of one tour on one site: one per saved chapter. `server` is matched exactly.
+    // Only the tests ask for one tour: the Tours page reads a whole site at once with `for_site`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn for_tour(&self, server: &str, tour_id: &str) -> Vec<ProjectInfo> {
         if !is_folder_id(tour_id) {
             return Vec::new();

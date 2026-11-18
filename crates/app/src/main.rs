@@ -739,6 +739,17 @@ impl App {
         self.toast.post(msg, None);
     }
 
+    /// How an update ended that ran on after its editor was closed: the editor's status bar is
+    /// gone, so it is said here. The job has written it to the log already.
+    fn show_background_notices(&mut self) {
+        let said = video_editor::background_notices().take();
+        if !said.is_empty() {
+            // Several that ended together share the one notification, a line each.
+            self.toast.post(said.join("
+"), None);
+        }
+    }
+
     /// Write to the settings file what the tour pages and their background jobs noted since the
     /// last look: a delete that did not finish (or one that now has), and the address the saved
     /// token belongs to. Neither is a secret, and neither is edited on the Preferences page.
@@ -1108,6 +1119,7 @@ impl eframe::App for App {
         self.tick_recording(&ctx);
         self.show_editors(&ctx);
         self.show_pickers(&ctx);
+        self.show_background_notices();
         self.toast.show(&ctx);
         self.main_window(&ctx);
         // Keep the event loop ticking slowly while hidden so queued events are never stranded.

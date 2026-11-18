@@ -24,7 +24,8 @@
 //! - The recordings saved on this computer are read with the list, off the window's thread, and
 //!   again when the store says something was saved or removed; never while drawing. A saved
 //!   recording belongs to a tour by the site's exact address and the tour's id. It is removed
-//!   only after the site has said its tour is gone.
+//!   only after the site has said its tour is gone, and "no such tour" counts as that only for
+//!   a tour this workspace's own list held: the site says the same of another workspace's tour.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -111,21 +112,17 @@ where
     Some(if day.year() == now.year() { day.format("%-d %b").to_string() } else { day.format("%-d %b %Y").to_string() })
 }
 
-/// A size as the rows show it: "840 KB" under a megabyte, else "12.4 MB".
-fn size_text(bytes: u64) -> String {
-    if bytes < 1_048_576 { format!("{} KB", (bytes + 512) / 1024) } else { format!("{:.1} MB", bytes as f64 / 1_048_576.0) }
-}
-
 /// The saved recordings that can be opened: those the list's check found nothing wrong with.
 fn usable(saved: &[ProjectInfo]) -> impl Iterator<Item = &ProjectInfo> {
     saved.iter().filter(|p| p.problem.is_none())
 }
 
 /// What the detail line says about the recordings saved on this computer for a tour:
-/// "recording saved on this computer (12.4 MB)". A recording with a problem is not counted, so
-/// the line never promises one that cannot be opened.
+/// "recording saved on this computer (12.4 MB)", the size written as Preferences writes it
+/// ([`publish_ui::size_text`]). A recording with a problem is not counted, so the line never
+/// promises one that cannot be opened.
 pub fn saved_note(saved: &[ProjectInfo]) -> Option<String> {
-    let size = size_text(usable(saved).map(|p| p.bytes).sum());
+    let size = publish_ui::size_text(usable(saved).map(|p| p.bytes).sum());
     match usable(saved).count() {
         0 => None,
         1 => Some(format!("recording saved on this computer ({size})")),
@@ -211,10 +208,15 @@ pub fn row_buttons(t: &RemoteTour) -> Vec<RowButton> {
     }
 }
 
-/// The question the delete confirmation asks. `has_saved`: a recording of this tour is saved
-/// on this computer, and goes with the tour.
-pub fn delete_question(t: &RemoteTour, has_saved: bool) -> String {
-    let saved = if has_saved { " The recording saved on this computer is deleted too." } else { "" };
+/// The question the delete confirmation asks. `saved`: how many recordings of this tour are
+/// saved on this computer, one per saved chapter and those with a problem included: they all go
+/// with the tour. The sentence for several is proposed and waits for the owner's approval.
+pub fn delete_question(t: &RemoteTour, saved: usize) -> String {
+    let saved = match saved {
+        0 => "",
+        1 => " The recording saved on this computer is deleted too.",
+        _ => " The recordings saved on this computer are deleted too.",
+    };
     format!("Delete \"{}\"? Its {} and images are removed from the site.{saved} This can't be undone.", publish_ui::short_title(&t.title, 60), count(t.steps.into(), "step", "steps"))
 }
 
@@ -291,7 +293,7 @@ impl Conn {
 }
 
 /// A site and token the list was read with. A list or a job belongs to exactly one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Site {
     pub server: String,
     pub epoch: u64,
@@ -338,6 +340,9 @@ pub struct Started {
     /// The tour's title when the job started, to name it should its delete not finish.
     pub title: String,
     pub job: Job,
+    /// The list read from this site with this token held the tour when the job was asked for.
+    /// False for "Finish deleting", which is asked for a tour the list no longer holds.
+    pub listed: bool,
 }
 
 /// A job that worked.
@@ -770,7 +775,7 @@ impl Model {
             return None;
         }
         self.working.insert(id.to_string(), Work::Deleting(None));
-        Some(Started { site, id: id.to_string(), title: entry.title.clone(), job: Job::Delete })
+        Some(Started { site, id: id.to_string(), title: entry.title.clone(), job: Job::Delete, listed: false })
     }
 
     fn begin(&mut self, id: &str, work: Work, job: Job) -> Option<Started> {
@@ -781,8 +786,8 @@ impl Model {
         }
         self.errors.remove(id);
         self.working.insert(id.to_string(), work);
-        let title = self.tour(id).map(|t| t.title.clone()).unwrap_or_default();
-        Some(Started { site, id: id.to_string(), title, job })
+        let (title, listed) = self.tour(id).map_or((String::new(), false), |t| (t.title.clone(), true));
+        Some(Started { site, id: id.to_string(), title, job, listed })
     }
 
     /// A running job's progress.
@@ -1013,7 +1018,8 @@ type Projects = Arc<dyn Fn() -> Option<Store> + Send + Sync>;
 
 /// The tours the site said are gone, in this session, by address and tour id. An upload that
 /// was still saving its recording when its tour was deleted leaves that recording behind; it
-/// is found by this the next time the saved recordings are read.
+/// is found by this the next time the saved recordings are read. A tour that a list read
+/// later holds is taken out again: the site has it.
 #[derive(Clone, Default)]
 struct Gone(Arc<Mutex<HashSet<(String, String)>>>);
 
@@ -1030,10 +1036,40 @@ impl Gone {
         self.lock().remove(&(server.to_string(), tour_id.to_string()));
     }
 
+    /// The site lists these tours: whatever was said before, they are not gone. A recording
+    /// saved for one of them is never removed on the strength of an older answer.
+    fn listed<'a>(&self, server: &str, ids: impl Iterator<Item = &'a str>) {
+        let mut gone = self.lock();
+        for id in ids {
+            gone.remove(&(server.to_string(), id.to_string()));
+        }
+    }
+
     /// The tours among `ids` the site said are gone.
     fn of<'a>(&self, server: &str, ids: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
         let gone = self.lock();
         ids.filter(|id| gone.contains(&(server.to_string(), id.to_string()))).map(str::to_string).collect()
+    }
+}
+
+/// The deletes asked for on a tour's own row in this session, by site (address and token) and
+/// tour id: tours that the list read with that very token held. The site answers "no such
+/// tour" for a tour of another workspace exactly as for one that is gone, so that answer
+/// removes a saved recording only for a tour known this way to have been this workspace's.
+#[derive(Clone, Default)]
+struct Listed(Arc<Mutex<HashSet<(Site, String)>>>);
+
+impl Listed {
+    fn lock(&self) -> MutexGuard<'_, HashSet<(Site, String)>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, site: &Site, tour_id: &str) {
+        self.lock().insert((site.clone(), tour_id.to_string()));
+    }
+
+    fn has(&self, site: &Site, tour_id: &str) -> bool {
+        self.lock().contains(&(site.clone(), tour_id.to_string()))
     }
 }
 
@@ -1044,6 +1080,7 @@ struct Tools {
     unfinished: Unfinished,
     projects: Projects,
     gone: Gone,
+    listed: Listed,
 }
 
 /// The page's state: the model, shared with the jobs, the unfinished deletes, where a job gets
@@ -1055,16 +1092,18 @@ pub struct ToursState {
 
 impl Default for ToursState {
     fn default() -> Self {
-        let tools = Tools { token: Arc::new(publish_ui::token_for), unfinished: Unfinished::default(), projects: Arc::new(|| Store::default_root().map(Store::at)), gone: Gone::default() };
+        let tools = Tools { token: Arc::new(publish_ui::token_for), unfinished: Unfinished::default(), projects: Arc::new(|| Store::default_root().map(Store::at)), gone: Gone::default(), listed: Listed::default() };
         Self { model: Arc::default(), tools }
     }
 }
 
-/// The site said this tour is gone (its delete succeeded, it was gone already, or the delete
-/// is under way with only files left): remove the recordings saved on this computer for it.
-/// Never call it for a delete whose outcome is not known. One that is open in an editor goes
-/// when that editor closes. False when one could not be removed yet; the store finishes that
-/// at the next start. `server` is the address as [`publish::check_server`] writes it.
+/// The site said this tour is gone (its delete succeeded, the delete is under way with only
+/// files left, or a tour this workspace's list held is no longer there): remove the recordings
+/// saved on this computer for it. Never call it for a delete whose outcome is not known, nor
+/// for "no such tour" about a tour that is not known to have been this workspace's. One that
+/// is open in an editor goes when that editor closes. False when one could not be removed yet;
+/// the store finishes that at the next start. `server` is the address as
+/// [`publish::check_server`] writes it.
 fn forget_saved(tools: &Tools, server: &str, tour_id: &str) -> bool {
     // Nothing is saved under an address the address rule would not write.
     let Ok(server) = publish::check_server(server) else { return true };
@@ -1095,6 +1134,19 @@ fn read_saved(tools: &Tools, server: &str) -> (u64, Vec<ProjectInfo>) {
         }
     }
     (epoch, store.for_site(server))
+}
+
+/// Read the site's tour list, and with it what is saved on this computer for the site. The
+/// list is asked for first: a tour it holds is on the site, so it is taken out of the tours
+/// said to be gone before the saved recordings are looked at, and a recording of it is kept.
+/// Never call it on the window's thread.
+fn read_list(tools: &Tools, site: &Site) -> (u64, Vec<ProjectInfo>, Result<Vec<RemoteTour>, String>) {
+    let result = (tools.token)(&site.server).and_then(|token| publish::list_tours(&site.server, &token));
+    if let Ok(tours) = &result {
+        tools.gone.listed(&site.server, tours.iter().map(|t| t.id.as_str()));
+    }
+    let (epoch, saved) = read_saved(tools, &site.server);
+    (epoch, saved, result)
 }
 
 fn lock(model: &Mutex<Model>) -> MutexGuard<'_, Model> {
@@ -1159,9 +1211,12 @@ impl Drop for JobGuard {
 /// files may be there.
 ///
 /// The recordings saved on this computer for the tour are removed only once the site has said
-/// the tour is gone: after a delete that succeeded, and after one that left only files behind.
-/// A refusal, a lost answer or a server error removes nothing. A recording that could not be
-/// removed never turns the delete into a failure.
+/// the tour is gone: after a delete the site answered for this tour (it removed it, or left
+/// only files behind), and after "no such tour" for a tour this workspace is known to have had
+/// ([`knows_tour`]). The site says "no such tour" of another workspace's tour too, so for
+/// "Finish deleting" with a note from an earlier session that answer alone removes nothing: the
+/// saved recording stays for the user to remove. A refusal, a lost answer or a server error
+/// removes nothing. A recording that could not be removed never turns the delete into a failure.
 fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Done, Failure> {
     let (server, id) = (started.site.server.as_str(), started.id.as_str());
     let unfinished = &tools.unfinished;
@@ -1181,11 +1236,15 @@ fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Don
                 Noted::Before => false,
                 Noted::NotSaved => return Err(Failure::Message(NOTE_NOT_SAVED.to_string())),
             };
+            let known = knows_tour(tools, started);
             let result = publish::delete_tour(server, &token, id, |files| lock(model).progress(id, Work::Deleting(files)));
             match result {
-                Ok(()) => {
+                Ok(how) => {
                     unfinished.remove(server, id);
-                    Ok(if forget_saved(tools, server, id) { Done::Deleted } else { Done::DeletedSavedLeft })
+                    // "No such tour" for a tour not known to have been this workspace's says
+                    // nothing about the tour the recording was saved for: it is left alone.
+                    let removed = if how == publish::Deleted::BySite || known { forget_saved(tools, server, id) } else { true };
+                    Ok(if removed { Done::Deleted } else { Done::DeletedSavedLeft })
                 }
                 // The site began: the tour itself is gone, whatever is left of its files.
                 Err(f) if f.unfinished => Err(Failure::DeleteUnfinished(if forget_saved(tools, server, id) { f.message } else { format!("{} {SAVED_NOT_REMOVED}", f.message) })),
@@ -1200,12 +1259,23 @@ fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Don
     }
 }
 
+/// Whether the tour of a delete is known to have been this workspace's: the list read with this
+/// token held it when the delete was asked for, now or earlier in this session (a delete whose
+/// answer was lost is carried on by "Finish deleting", for a tour the list no longer holds).
+/// A delete asked for on a row is remembered for that.
+fn knows_tour(tools: &Tools, started: &Started) -> bool {
+    if started.listed {
+        tools.listed.add(&started.site, &started.id);
+    }
+    started.listed || tools.listed.has(&started.site, &started.id)
+}
+
 impl ToursState {
     /// A page whose jobs get the token from `token` instead of the credential store.
     /// With no folder for saved recordings, so a test never looks at this computer's own.
     #[cfg(test)]
     fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
-        let tools = Tools { token: Arc::new(token), unfinished: Unfinished::default(), projects: Arc::new(|| None), gone: Gone::default() };
+        let tools = Tools { token: Arc::new(token), unfinished: Unfinished::default(), projects: Arc::new(|| None), gone: Gone::default(), listed: Listed::default() };
         Self { model: Arc::default(), tools }
     }
 
@@ -1231,8 +1301,7 @@ impl ToursState {
         let (model, tools) = (self.model.clone(), self.tools.clone());
         std::thread::spawn(move || {
             let mut guard = LoadGuard { model, generation, armed: true };
-            let (epoch, saved) = read_saved(&tools, &site.server);
-            let result = (tools.token)(&site.server).and_then(|token| publish::list_tours(&site.server, &token));
+            let (epoch, saved, result) = read_list(&tools, &site);
             guard.armed = false;
             let mut m = lock(&guard.model);
             m.apply_saved(&site, epoch, saved);
@@ -1517,7 +1586,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
         } else if confirming {
             egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(delete_question(t, !saved.is_empty())).color(ERROR)).wrap());
+                ui.add(egui::Label::new(RichText::new(delete_question(t, saved.len())).color(ERROR)).wrap());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Keep it").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1689,9 +1758,9 @@ mod tests {
 
     #[test]
     fn the_delete_question_names_the_tour_and_its_steps() {
-        assert_eq!(delete_question(&tour(B, "Testing", false, 9), false), "Delete \"Testing\"? Its 9 steps and images are removed from the site. This can't be undone.");
-        assert_eq!(delete_question(&tour(B, "One", false, 1), false), "Delete \"One\"? Its 1 step and images are removed from the site. This can't be undone.");
-        let long = delete_question(&tour(B, &"x".repeat(300), false, 2), true);
+        assert_eq!(delete_question(&tour(B, "Testing", false, 9), 0), "Delete \"Testing\"? Its 9 steps and images are removed from the site. This can't be undone.");
+        assert_eq!(delete_question(&tour(B, "One", false, 1), 0), "Delete \"One\"? Its 1 step and images are removed from the site. This can't be undone.");
+        let long = delete_question(&tour(B, &"x".repeat(300), false, 2), 1);
         assert!(long.chars().count() < 220 && long.contains('…'), "{long}");
     }
 
@@ -1802,7 +1871,7 @@ mod tests {
         m.start_rename(B);
         *m.rename_text().unwrap() = "  Trial run ".into();
         let job = m.save_rename().unwrap();
-        assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Rename("Trial run".into()) });
+        assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Rename("Trial run".into()), listed: true });
         assert_eq!(m.work(B), Some(Work::Renaming));
         assert_eq!(m.edit(), &Edit::None);
         assert_eq!(m.save_rename(), None, "a second Save has nothing to save");
@@ -1841,7 +1910,7 @@ mod tests {
         m.ask_delete(A);
         assert_eq!(m.confirm_delete(B), None);
         let job = m.confirm_delete(A).unwrap();
-        assert_eq!(job, Started { site: site(), id: A.into(), title: "Customer onboarding".into(), job: Job::Delete });
+        assert_eq!(job, Started { site: site(), id: A.into(), title: "Customer onboarding".into(), job: Job::Delete, listed: true });
         assert_eq!(m.work(A), Some(Work::Deleting(None)));
     }
 
@@ -2007,7 +2076,7 @@ mod tests {
         assert!(m.notice().unwrap().error);
         assert!(m.shows_unfinished(&here));
         let again = m.finish_delete(&here).unwrap();
-        assert_eq!(again, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Delete });
+        assert_eq!(again, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Delete, listed: false });
         assert_eq!(m.finish_delete(&here), None, "a second click sends nothing");
         assert_eq!(m.work(B), Some(Work::Deleting(None)));
         m.finish(&again, Ok(Done::Deleted));
@@ -3095,8 +3164,12 @@ mod tests {
     #[test]
     fn the_delete_question_adds_the_saved_recording_sentence_only_when_there_is_one() {
         let t = tour(A, "Customer onboarding", true, 14);
-        assert_eq!(delete_question(&t, true), "Delete \"Customer onboarding\"? Its 14 steps and images are removed from the site. The recording saved on this computer is deleted too. This can't be undone.");
-        assert_eq!(delete_question(&t, false), "Delete \"Customer onboarding\"? Its 14 steps and images are removed from the site. This can't be undone.");
+        assert_eq!(delete_question(&t, 1), "Delete \"Customer onboarding\"? Its 14 steps and images are removed from the site. The recording saved on this computer is deleted too. This can't be undone.");
+        assert_eq!(delete_question(&t, 0), "Delete \"Customer onboarding\"? Its 14 steps and images are removed from the site. This can't be undone.");
+        // Several saved chapters go with the tour, and the sentence says so.
+        for several in [2, 3, 40] {
+            assert_eq!(delete_question(&t, several), "Delete \"Customer onboarding\"? Its 14 steps and images are removed from the site. The recordings saved on this computer are deleted too. This can't be undone.");
+        }
     }
 
     #[test]
@@ -3221,7 +3294,7 @@ mod tests {
         let flat = text.replace('\n', " ");
         assert!(flat.contains("2 chapters · 22 steps · published ") && flat.contains("1 chapter · 9 steps · updated "), "{text}");
         assert_eq!(flat.matches(" · recording saved on this computer (").count(), 2, "{text}");
-        assert!(flat.contains(&format!("updated {} · recording saved on this computer ({})", day_label(1_763_424_000_000, &Local::now()).unwrap(), size_text(saved_b.bytes))), "{text}");
+        assert!(flat.contains(&format!("updated {} · recording saved on this computer ({})", day_label(1_763_424_000_000, &Local::now()).unwrap(), publish_ui::size_text(saved_b.bytes))), "{text}");
         assert!(!flat.contains(WHICH_CHAPTER) && !flat.contains("can't be edited"), "{text}");
         // Edit on B, the tour with one chapter: the app is asked to open exactly that recording.
         let edits = places(&ctx, &mut state, &conn, "Edit");
@@ -3530,7 +3603,7 @@ mod tests {
         // A publish in an editor keeps its recording: the store counts the change, the page reads it.
         let saved = save_project(&store, &s.base, B, CH1, "Testing");
         let text = until(&ctx, &mut state, &conn, |m, _| !m.saved(B).is_empty());
-        assert!(text.contains(&format!(" · recording saved on this computer ({})", size_text(saved.bytes))), "{text}");
+        assert!(text.contains(&format!(" · recording saved on this computer ({})", publish_ui::size_text(saved.bytes))), "{text}");
         assert_eq!(s.lines().len(), 1, "the site was not asked again: {:?}", s.lines());
         // Removed again (its tour was deleted): the line goes, and Edit says so.
         store.remove_tour(&s.base, B).unwrap();
@@ -3564,5 +3637,234 @@ mod tests {
         // Only that one: a recording of a tour that was never deleted is not touched by it.
         assert_eq!(store.list(), vec![kept]);
         assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 1, "nothing more was asked of the site");
+    }
+
+    // ---- "No such tour" is also what the site says of another workspace's tour ----
+
+    /// A page on the stub's site with its saved recordings in `store`, the list read: A, and B when `with_b`.
+    fn listed_page(s: &Stub, store: &Store, epoch: u64, with_b: bool) -> (ToursState, Site) {
+        let state = page().with_store(store.clone());
+        let site = Site { server: s.base.clone(), epoch };
+        read_into(&state, &site, with_b);
+        (state, site)
+    }
+
+    /// The page now belongs to `site`, and its list is read: A, and B when `with_b`.
+    fn read_into(state: &ToursState, site: &Site, with_b: bool) {
+        let mut m = lock(&state.model);
+        m.set_site(Some(site.clone()));
+        let (generation, _) = m.begin_load().unwrap();
+        let mut list = two();
+        list.truncate(if with_b { 2 } else { 1 });
+        m.finish_load(generation, Ok(list), Instant::now());
+    }
+
+    /// Press "Finish deleting" for B and run the job here, as its thread would.
+    fn finish_deleting_b(state: &ToursState, s: &Stub) -> (Started, Result<Done, Failure>) {
+        let job = lock(&state.model).finish_delete(&entry(&s.base, B, "Testing")).expect("the block offers it");
+        let result = run_job(&state.model, &state.tools, &job);
+        lock(&state.model).finish(&job, result.clone());
+        (job, result)
+    }
+
+    #[test]
+    fn finish_deleting_never_removes_a_saved_recording_on_no_such_tour_alone() {
+        // A note from an earlier run of the app, and a token that may be another workspace's by
+        // now: the site answers "no such tour" for a tour of another workspace, which may well exist.
+        let s = stub(|req, _| if req.line == DELETE_B { reply(404, NO_TOUR) } else { reply(200, ONLY_A) });
+        let (_tmp, store) = temp_store();
+        let saved = saved_for_delete(&store, &s);
+        let before = files(store.root());
+        let (state, _) = listed_page(&s, &store, 1, false);
+        state.unfinished().load(vec![entry(&s.base, B, "Testing")]);
+
+        let (job, result) = finish_deleting_b(&state, &s);
+        assert!(!job.listed, "the list does not hold the tour, so nothing says it is this workspace's");
+        assert_eq!(result, Ok(Done::Deleted), "the site has nothing left to delete for this token");
+        assert_eq!(s.lines().iter().filter(|l| *l == DELETE_B).count(), 1);
+        // Not a file of any saved recording changed, and no removal was begun.
+        let after = files(store.root());
+        assert!(after == before, "a file of a saved recording changed");
+        assert!(after.iter().all(|(name, _)| !name.ends_with(".removing")));
+        assert_eq!(store.list().len(), saved.len());
+        // Nor is the tour remembered as gone: reading the saved recordings later removes nothing.
+        let (_, read) = read_saved(&state.tools, &s.base);
+        assert_eq!(read.len(), 3, "both chapters of B and the one of A");
+        assert!(files(store.root()) == before);
+        assert_eq!(lock(&state.model).notice(), None);
+        // They still open.
+        assert!(crate::open_saved(Some(&store), &saved[0].key, &crate::settings::Settings::default()).is_ok());
+    }
+
+    #[test]
+    fn finish_deleting_removes_the_saved_recording_once_the_site_answered_for_that_tour() {
+        // The site still knows the delete: it answers for this very tour, so the tour was the token's.
+        let answers: [fn(usize) -> Answer; 3] = [
+            |_| reply(200, DELETED),
+            |n| if n == 0 { reply(202, r#"{"status":"in_progress","done":5,"total":10}"#) } else { reply(404, NO_TOUR) },
+            |n| if n == 0 { reply(500, r#"{"error":"cleanup_pending","detail":"the tour is deleted, but some of its files could not be removed yet; delete it again to retry"}"#) } else { reply(200, DELETED) },
+        ];
+        for (i, answer) in answers.into_iter().enumerate() {
+            let s = stub(move |req, n| if req.line == DELETE_B { answer(n) } else { reply(200, ONLY_A) });
+            let (_tmp, store) = temp_store();
+            let [b1, b2, a1, elsewhere] = saved_for_delete(&store, &s);
+            let (state, _) = listed_page(&s, &store, 1, false);
+            state.unfinished().load(vec![entry(&s.base, B, "Testing")]);
+            let (job, result) = finish_deleting_b(&state, &s);
+            assert!(!job.listed);
+            assert_eq!(result, Ok(Done::Deleted), "answer {i}");
+            assert!(!b1.dir.exists() && !b2.dir.exists(), "answer {i}: {:?}", files(store.root()));
+            let mut left = vec![a1, elsewhere];
+            left.sort_by(|a, b| a.dir.cmp(&b.dir));
+            assert_eq!(store.list(), left, "answer {i}: exactly that tour's, on that address");
+        }
+        // The same when the site only got as far as the tour itself: files are left there, and
+        // the recordings go from this computer as after any delete that left files behind.
+        let s = stub(|req, _| if req.line == DELETE_B { reply(202, r#"{"status":"in_progress","done":5,"total":10}"#) } else { reply(200, ONLY_A) });
+        let (_tmp, store) = temp_store();
+        saved_for_delete(&store, &s);
+        let (state, _) = listed_page(&s, &store, 1, false);
+        state.unfinished().load(vec![entry(&s.base, B, "Testing")]);
+        let (_, result) = finish_deleting_b(&state, &s);
+        assert!(matches!(result, Err(Failure::DeleteUnfinished(_))), "{result:?}");
+        assert_eq!(store.for_tour(&s.base, B), vec![]);
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn a_delete_from_the_row_removes_the_saved_recording_when_the_tour_was_already_gone() {
+        // The list read with this token held the tour, so "no such tour" is about that tour:
+        // it was deleted elsewhere in the meantime.
+        let s = stub(|req, _| if req.line == DELETE_B { reply(404, NO_TOUR) } else { reply(200, ONLY_A) });
+        let (_tmp, store) = temp_store();
+        let [b1, b2, a1, elsewhere] = saved_for_delete(&store, &s);
+        let (state, site) = listed_page(&s, &store, 1, true);
+        let job = {
+            let mut m = lock(&state.model);
+            m.ask_delete(B);
+            m.confirm_delete(B).unwrap()
+        };
+        assert_eq!(job, Started { site, id: B.into(), title: "Testing".into(), job: Job::Delete, listed: true });
+        assert_eq!(run_job(&state.model, &state.tools, &job), Ok(Done::Deleted));
+        assert!(!b1.dir.exists() && !b2.dir.exists());
+        let mut left = vec![a1, elsewhere];
+        left.sort_by(|a, b| a.dir.cmp(&b.dir));
+        assert_eq!(store.list(), left);
+    }
+
+    #[test]
+    fn finish_deleting_after_a_lost_answer_removes_the_recording_only_under_the_token_that_listed_the_tour() {
+        for same_token in [true, false] {
+            // The delete from the row gets no answer; the site did remove the tour, and says
+            // "no such tour" from then on.
+            let s = stub(|req, n| match (req.line.as_str(), n) {
+                (DELETE_B, 0) => Answer::Drop,
+                (DELETE_B, _) => reply(404, NO_TOUR),
+                _ => reply(200, ONLY_A),
+            });
+            let (_tmp, store) = temp_store();
+            let [b1, b2, a1, elsewhere] = saved_for_delete(&store, &s);
+            let before = files(store.root());
+            let (state, site) = listed_page(&s, &store, 1, true);
+            let job = {
+                let mut m = lock(&state.model);
+                m.ask_delete(B);
+                m.confirm_delete(B).unwrap()
+            };
+            let result = run_job(&state.model, &state.tools, &job);
+            assert!(matches!(result, Err(Failure::Message(_))), "{result:?}");
+            lock(&state.model).finish(&job, result);
+            assert!(files(store.root()) == before, "a lost answer removes nothing");
+            assert_eq!(state.unfinished().for_site(&s.base), vec![entry(&s.base, B, "Testing")], "the note is the way back");
+            // The list is read again and no longer holds the tour: its block offers "Finish deleting".
+            let now = if same_token { site.clone() } else { Site { epoch: site.epoch + 1, ..site.clone() } };
+            read_into(&state, &now, false);
+            let (again, result) = finish_deleting_b(&state, &s);
+            assert!(!again.listed);
+            assert_eq!(result, Ok(Done::Deleted), "same token {same_token}");
+            if same_token {
+                // This token's list held the tour in this session: "no such tour" is about it.
+                assert!(!b1.dir.exists() && !b2.dir.exists(), "{:?}", files(store.root()));
+                let mut left = vec![a1, elsewhere];
+                left.sort_by(|a, b| a.dir.cmp(&b.dir));
+                assert_eq!(store.list(), left);
+            } else {
+                // Another token was saved since, maybe another workspace's: nothing is removed.
+                assert!(files(store.root()) == before, "a file of a saved recording changed");
+                assert_eq!(store.list().len(), 4);
+            }
+        }
+    }
+
+    // ---- A tour that was said to be gone and is listed again ----
+
+    #[test]
+    fn a_tour_the_site_lists_again_is_no_longer_remembered_as_gone() {
+        let s = stub(|req, n| match (req.line.as_str(), n) {
+            // The first list is without B, every later one with it.
+            ("GET /api/v1/tours", 0) => reply(200, ONLY_A),
+            _ => reply(200, LIST),
+        });
+        let (_tmp, store) = temp_store();
+        let state = page().with_store(store.clone());
+        let site = Site { server: s.base.clone(), epoch: 1 };
+        state.tools.gone.add(&s.base, B);
+        state.tools.gone.add(&s.base, C);
+        // While the site's list does not hold it, a recording that shows up for it is removed.
+        let late = save_project(&store, &s.base, B, CH1, "Testing");
+        let (_, saved, result) = read_list(&state.tools, &site);
+        assert_eq!(result.map(|l| l.len()), Ok(1));
+        assert!(!late.dir.exists() && saved.is_empty());
+        // The list holds B again: it is on the site, and a recording saved for it stays.
+        let kept = save_project(&store, &s.base, B, CH1, "Testing");
+        let (_, saved, result) = read_list(&state.tools, &site);
+        assert_eq!(result.map(|l| l.len()), Ok(2));
+        assert_eq!(saved, vec![kept.clone()]);
+        assert!(kept.dir.join("frames.zst").is_file());
+        // For good, not only for that read: the entry is dropped, and only that tour's.
+        assert_eq!(state.tools.gone.of(&s.base, [A, B, C].into_iter()), BTreeSet::from([C.to_string()]));
+        let (_, saved) = read_saved(&state.tools, &s.base);
+        assert_eq!(saved, vec![kept]);
+    }
+
+    #[test]
+    fn a_list_that_could_not_be_read_forgets_no_gone_tour() {
+        let s = stub(|_, _| reply(500, r#"{"error":"internal"}"#));
+        let (_tmp, store) = temp_store();
+        let state = page().with_store(store.clone());
+        state.tools.gone.add(&s.base, B);
+        let late = save_project(&store, &s.base, B, CH1, "Testing");
+        let (_, saved, result) = read_list(&state.tools, &Site { server: s.base.clone(), epoch: 1 });
+        assert!(result.is_err());
+        assert!(!late.dir.exists() && saved.is_empty(), "the tour is still known to be gone");
+        assert_eq!(state.tools.gone.of(&s.base, [B].into_iter()), BTreeSet::from([B.to_string()]));
+        // Another address's list says nothing about this one's tours.
+        state.tools.gone.listed("https://other.example.com", [B].into_iter());
+        assert_eq!(state.tools.gone.of(&s.base, [B].into_iter()).len(), 1);
+    }
+
+    // ---- Sizes ----
+
+    #[test]
+    fn the_row_writes_a_size_as_preferences_does() {
+        let line = |bytes: u64| saved_note(&[info(A, CH1, "Chapter one", bytes, None)]).unwrap();
+        // As before under a hundred megabytes.
+        assert_eq!(line(860_160), "recording saved on this computer (840 KB)");
+        assert_eq!(line(0), "recording saved on this computer (0 KB)");
+        assert_eq!(line(1_048_576), "recording saved on this computer (1.0 MB)");
+        assert_eq!(line(13_002_342), "recording saved on this computer (12.4 MB)");
+        // Whole megabytes from a hundred, and gigabytes from one.
+        assert_eq!(line(432_013_312), "recording saved on this computer (412 MB)");
+        assert_eq!(line(1_073_741_823), "recording saved on this computer (1024 MB)");
+        assert_eq!(line(1_073_741_824), "recording saved on this computer (1.0 GB)");
+        assert_eq!(line(13_314_398_618), "recording saved on this computer (12.4 GB)");
+        let two = [info(A, CH1, "One", 3_221_225_472, None), info(A, CH2, "Two", 2_147_483_648, None)];
+        assert_eq!(saved_note(&two).as_deref(), Some("2 recordings saved on this computer (5.0 GB)"));
+        // The very words Preferences uses for the same number of bytes.
+        for bytes in [0, 860_160, 1_048_575, 13_002_342, 104_857_599, 432_013_312, 1_073_741_823, 1_073_741_824, 161_061_273_600] {
+            let size = publish_ui::size_text(bytes);
+            assert_eq!(line(bytes), format!("recording saved on this computer ({size})"));
+            assert_eq!(crate::settings_ui::saved_recordings_line(project::Totals { count: 1, bytes }), format!("1 saved recording · {size}"));
+        }
     }
 }

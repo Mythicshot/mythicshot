@@ -310,23 +310,8 @@ pub const RECORDINGS_STAY: &str = "Saved recordings stay on this computer until 
 pub fn saved_recordings_line(t: Totals) -> String {
     match t.count {
         0 => "No saved recordings".to_string(),
-        1 => format!("1 saved recording · {}", size_text(t.bytes)),
-        n => format!("{n} saved recordings · {}", size_text(t.bytes)),
-    }
-}
-
-/// A size as the editor's status bar writes one (KB under a megabyte, else MB with one
-/// decimal), in whole megabytes from a hundred up, and in GB with one decimal from a gigabyte.
-fn size_text(bytes: u64) -> String {
-    let mb = bytes as f64 / 1_048_576.0;
-    if bytes < 1_048_576 {
-        format!("{} KB", (bytes + 512) / 1024)
-    } else if mb < 99.95 {
-        format!("{mb:.1} MB")
-    } else if bytes < 1_073_741_824 {
-        format!("{mb:.0} MB")
-    } else {
-        format!("{:.1} GB", mb / 1024.0)
+        1 => format!("1 saved recording · {}", crate::publish_ui::size_text(t.bytes)),
+        n => format!("{n} saved recordings · {}", crate::publish_ui::size_text(t.bytes)),
     }
 }
 

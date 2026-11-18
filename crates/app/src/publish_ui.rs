@@ -25,7 +25,7 @@ pub const TITLE_MAX: usize = 200;
 /// From this many characters the title field shows its count.
 const TITLE_COUNT_FROM: usize = 180;
 /// Longest tour title shown in a picker row before it is cut with an ellipsis.
-const ROW_TITLE_MAX: usize = 40;
+pub(crate) const ROW_TITLE_MAX: usize = 40;
 /// Prefix of the temporary folder a publish writes its bundle into.
 pub const TEMP_PREFIX: &str = "mythicshot-publish-";
 /// How long "Link copied" shows after Copy.
@@ -452,6 +452,22 @@ pub fn tour_row_label(t: &RemoteTour) -> String {
     format!("{} · {}", t.title, tour_row_detail(t))
 }
 
+/// The size of what is saved on this computer, as the Tours page and Preferences both write
+/// it: KB under a megabyte, MB with one decimal, whole megabytes from a hundred up, and GB
+/// with one decimal from a gigabyte.
+pub fn size_text(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_048_576.0;
+    if bytes < 1_048_576 {
+        format!("{} KB", (bytes + 512) / 1024)
+    } else if mb < 99.95 {
+        format!("{mb:.1} MB")
+    } else if bytes < 1_073_741_824 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{:.1} GB", mb / 1024.0)
+    }
+}
+
 /// A title cut to `max` characters, the last one an ellipsis, when it is longer.
 pub fn short_title(title: &str, max: usize) -> String {
     if title.chars().count() <= max { title.to_string() } else { format!("{}…", title.chars().take(max.saturating_sub(1)).collect::<String>().trim_end()) }
@@ -549,7 +565,7 @@ pub struct PublishDone {
 /// added to one. The wording is proposed and waits for the owner's approval.
 pub const NOT_KEPT: &str = "The recording could not be saved on this computer, so it can't be edited later: ";
 /// Before the list of what a kept recording was saved without. The wording is proposed and waits for the owner's approval.
-pub const KEPT_WITHOUT: &str = "The recording was kept for later editing, but without ";
+pub const KEPT_WITHOUT: &str = "The recording was saved for later editing, but without ";
 /// The reason when this computer has no folder for saved recordings: keeping is simply off.
 /// The wording is proposed and waits for the owner's approval.
 pub const NO_FOLDER_FOR_RECORDINGS: &str = "the folder for saved recordings could not be found on this computer.";
@@ -974,6 +990,21 @@ pub const UPDATE_BUTTON: &str = "Update tour";
 pub const UPDATE_NEEDS_NEWER_SITE: &str = "Updating a tour over the same link needs a site running version 0.1.4 or newer.";
 /// Why Update is not offered for a tour the site does not list. The wording is proposed and waits for the owner's approval.
 pub const TOUR_NOT_ON_SITE: &str = "This tour is no longer on the site, so it can only be published as a new tour.";
+/// Why Update is not offered when the site address in Workspace is not the one the recording
+/// was saved for: its tour may well exist, on the other site. The wording is proposed and waits
+/// for the owner's approval.
+pub const SAVED_FOR_ANOTHER_ADDRESS: &str = "This recording was saved for another site address, so here it can only be published as a new tour.";
+/// Under the Update choice, when the cover logo could not be opened with the recording and
+/// has not been added again: an update of the tour's first chapter carries the tour's
+/// settings, so the tour on the site would lose its logo. The wording is proposed and waits
+/// for the owner's approval.
+pub const UPDATE_REMOVES_LOGO: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Tour settings to keep it.";
+
+/// The line under the Update choice about a cover logo that is missing: only while Update is
+/// offered, and only for a recording that was opened without its logo and still has none.
+fn logo_warning(shown: &Shown, logo_missing: bool) -> Option<&'static str> {
+    (logo_missing && matches!(shown, Shown::Update { .. })).then_some(UPDATE_REMOVES_LOGO)
+}
 
 /// Whether pressing Update again can work after an update failed with `error`: not when the
 /// tour or the chapter is gone, and not on a site that cannot replace a chapter.
@@ -1036,6 +1067,8 @@ struct EditMode {
     /// The user picked "Publish as a new tour".
     picked_new: bool,
     block: Block,
+    /// The recording was opened without its cover logo, and has none now.
+    logo_missing: bool,
     /// What the site says its version is: None until it answered, Some(None) for a site that tells none.
     version: Arc<Mutex<Option<Option<String>>>>,
 }
@@ -1044,7 +1077,8 @@ struct EditMode {
 pub enum PickerOutcome {
     Cancel,
     /// Replace the chapter `target` names with this recording, under the chapter title `title`;
-    /// `before` is what the tour was, as the site's list said.
+    /// `before` is what the tour was, as the site's list said, and `target.tour_title` the
+    /// tour's title as that list has it.
     Update { title: String, target: EditTarget, before: Before },
     /// Upload with this title (the new tour's, or the chapter's) into this target, then
     /// publish it or leave it a draft. `tour_title` names the tour on the result screen,
@@ -1076,7 +1110,7 @@ impl Picker {
 
     /// The dialog of an editor opened through Edit, before anything is asked of the site.
     fn new_for_edit(server: String, title: &str, target: EditTarget, block: Block) -> Picker {
-        let edit = EditMode { target, picked_new: false, block, version: Arc::new(Mutex::new(None)) };
+        let edit = EditMode { target, picked_new: false, block, logo_missing: false, version: Arc::new(Mutex::new(None)) };
         Picker { edit: Some(edit), ..Picker::new(server, title) }
     }
 
@@ -1089,9 +1123,42 @@ impl Picker {
     }
 
     /// The same dialog for a recording whose tour belongs to another site address than the
-    /// one configured now: only a new tour is offered, and the site is not asked.
+    /// one configured now: only a new tour is offered, with the line that says why, and the
+    /// site is not asked.
     pub fn open_for_edit_elsewhere(server: String, title: String, target: EditTarget) -> Picker {
-        Picker::new_for_edit(server, &title, target, Block::Because(TOUR_NOT_ON_SITE))
+        Picker::new_for_edit(server, &title, target, Block::Because(SAVED_FOR_ANOTHER_ADDRESS))
+    }
+
+    /// Tell a dialog opened through Edit that the recording was opened without its cover logo
+    /// and still has none: the Update choice then says what updating does to the tour's logo.
+    pub fn with_logo_missing(mut self, missing: bool) -> Picker {
+        if let Some(edit) = self.edit.as_mut() {
+            edit.logo_missing = missing;
+        }
+        self
+    }
+
+    /// The tour the recording was saved for, as the site's list has it now; None until the
+    /// list is read, and for a tour it does not hold.
+    fn site_tour(&self) -> Option<RemoteTour> {
+        let edit = self.edit.as_ref()?;
+        match &*self.list.lock().ok()? {
+            ListState::Loaded(tours) => tours.iter().find(|t| t.id == edit.target.tour_id).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The title of the tour the recording was saved for: the one the site has now (the tour
+    /// may have been renamed since the recording was saved), and until the site has said, the
+    /// one saved with the recording.
+    fn tour_title(&self) -> String {
+        let saved = self.edit.as_ref().map(|e| e.target.tour_title.clone()).unwrap_or_default();
+        self.site_tour().map(|t| t.title).filter(|t| !t.trim().is_empty()).unwrap_or(saved)
+    }
+
+    /// The line under the Update choice about a missing cover logo, when it shows.
+    fn logo_line(&self, shown: &Shown) -> Option<&'static str> {
+        logo_warning(shown, self.edit.as_ref().is_some_and(|e| e.logo_missing))
     }
 
     /// The same dialog after an update failed with `error`: it says why, and offers Update
@@ -1161,12 +1228,11 @@ impl Picker {
         match edit_choice(shown, edit.picked_new)? {
             EditChoice::NewTour => (!self.title.trim().is_empty()).then(|| self.upload()),
             EditChoice::Update => {
-                // What the tour is, as the list this offer came from said.
-                let tour = match &*self.list.lock().ok()? {
-                    ListState::Loaded(tours) => tours.iter().find(|t| t.id == edit.target.tour_id).cloned(),
-                    _ => None,
-                }?;
-                Some(PickerOutcome::Update { title: self.default_title.clone(), target: edit.target.clone(), before: Before::of(&tour) })
+                // What the tour is, as the list this offer came from said: its title too, which
+                // the result screen shows and the saved recording takes over.
+                let tour = self.site_tour()?;
+                let target = EditTarget { tour_title: self.tour_title(), ..edit.target.clone() };
+                Some(PickerOutcome::Update { title: self.default_title.clone(), target, before: Before::of(&tour) })
             }
         }
     }
@@ -1178,7 +1244,8 @@ impl Picker {
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let shown = self.shown();
-        let tour_title = self.edit.as_ref().map(|e| e.target.tour_title.clone()).unwrap_or_default();
+        let tour_title = self.tour_title();
+        let logo_line = self.logo_line(&shown);
         let choice = edit_choice(&shown, self.edit.as_ref().is_some_and(|e| e.picked_new));
         let mut outcome = None;
         let (mut retry, mut pick) = (false, None);
@@ -1222,6 +1289,9 @@ impl Picker {
                 }
                 if let Shown::Update { public } = shown {
                     hint(ui, update_hint(public));
+                }
+                if let Some(line) = logo_line {
+                    hint(ui, line);
                 }
             }
             ui.add_space(8.0);
@@ -1939,8 +2009,8 @@ pub(crate) mod tests {
         assert_eq!(screen(Kept::Failed(project::NOT_PUT_BACK.into())).kept_line().as_deref(), Some(project::NOT_PUT_BACK));
         // Kept, but without something: a full sentence that says how many of a kind.
         let without = screen(Kept::Saved(vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()]));
-        assert_eq!(without.kept_line().as_deref(), Some("The recording was kept for later editing, but without the cover logo and 2 pasted pictures."));
-        assert_eq!(screen(Kept::Saved(vec!["a pasted picture".into()])).kept_line().as_deref(), Some("The recording was kept for later editing, but without a pasted picture."));
+        assert_eq!(without.kept_line().as_deref(), Some("The recording was saved for later editing, but without the cover logo and 2 pasted pictures."));
+        assert_eq!(screen(Kept::Saved(vec!["a pasted picture".into()])).kept_line().as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
         // Every case draws, with and without a link, and after a publish that failed.
         let ctx = egui::Context::default();
         for kept in [Kept::Off, Kept::Saved(vec!["the cover logo".into()]), Kept::Failed("the disk is full.".into())] {
@@ -2165,7 +2235,7 @@ pub(crate) mod tests {
         assert_eq!(NEW_TOUR_LABEL, "Publish as a new tour");
         assert_eq!(NEW_TOUR_HINT, "A new link. The existing tour is left as it is.");
         assert_eq!(UPDATE_BUTTON, "Update tour");
-        for s in [update_hint(true), update_hint(false), NEW_TOUR_HINT, UPDATE_NEEDS_NEWER_SITE, TOUR_NOT_ON_SITE, UPDATE_HELD] {
+        for s in [update_hint(true), update_hint(false), NEW_TOUR_HINT, UPDATE_NEEDS_NEWER_SITE, TOUR_NOT_ON_SITE, SAVED_FOR_ANOTHER_ADDRESS, UPDATE_REMOVES_LOGO, UPDATE_HELD] {
             assert!(s.ends_with('.') && !s.contains('!'), "{s}");
         }
     }
@@ -2206,17 +2276,87 @@ pub(crate) mod tests {
         assert!(draw(&mut p, key_press(egui::Key::Enter)).is_none());
         pick_new(&mut p);
         assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Upload { target: Target::New, .. })));
+    }
 
-        // A recording whose tour belongs to another address than the configured one: the same
-        // line, and no site is asked at all.
+    #[test]
+    fn a_recording_saved_for_another_site_address_says_so_and_offers_only_a_new_tour() {
+        // The address in Workspace is not the one the recording was saved for: nothing is known
+        // about its tour, so the dialog does not claim that it is gone. No site is asked at all.
         let mut p = Picker::open_for_edit_elsewhere(String::new(), "Chapter one".into(), edit_target());
-        assert_eq!(p.shown(), Shown::OnlyNew(Some(TOUR_NOT_ON_SITE)));
+        let shown = p.shown();
+        assert_eq!(shown, Shown::OnlyNew(Some("This recording was saved for another site address, so here it can only be published as a new tour.")));
+        assert_ne!(SAVED_FOR_ANOTHER_ADDRESS, TOUR_NOT_ON_SITE);
         assert!(matches!(*p.list.lock().unwrap(), ListState::Loading), "nothing was loaded, and nothing is being");
+        assert!(p.edit_outcome(&shown).is_none());
         assert!(draw(&mut p, key_press(egui::Key::Enter)).is_none());
         // Even a list that names the tour does not bring Update back.
         *p.edit.as_ref().unwrap().version.lock().unwrap() = Some(Some("0.1.4".into()));
         *p.list.lock().unwrap() = ListState::Loaded(vec![listed_tour("published")]);
-        assert_eq!(p.shown(), Shown::OnlyNew(Some(TOUR_NOT_ON_SITE)));
+        assert_eq!(p.shown(), Shown::OnlyNew(Some(SAVED_FOR_ANOTHER_ADDRESS)));
+        // A new tour is still the user's to pick.
+        pick_new(&mut p);
+        assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Upload { target: Target::New, .. })));
+    }
+
+    #[test]
+    fn a_tour_renamed_on_the_site_is_named_as_the_site_names_it() {
+        // The recording was saved when the tour was "Customer onboarding"; the site calls it otherwise now.
+        let renamed = RemoteTour { title: "Onboarding, spring edition".into(), ..listed_tour("published") };
+        let mut p = edit_picker(Some(Some("0.1.4")), Some(vec![tour("Another", 1, 3, "draft"), renamed]));
+        let shown = p.shown();
+        assert_eq!(p.tour_title(), "Onboarding, spring edition");
+        assert_eq!(update_label(&p.tour_title()), "Update \"Onboarding, spring edition\"");
+        // Update carries the site's title on: to the result screen, and into the saved recording.
+        let Some(PickerOutcome::Update { title, target, before }) = p.edit_outcome(&shown) else { panic!("the button does not update") };
+        assert_eq!(title, "Chapter one", "the chapter's title is the recording's own");
+        assert_eq!(target, EditTarget { tour_title: "Onboarding, spring edition".into(), ..edit_target() }, "the same tour and chapter, under the site's title");
+        let done = PublishDone { finished: Finished { tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 14, outcome: Outcome::Public { url: Some(LINK.into()) } }, kept: Kept::Saved(vec![]) };
+        let screen = ResultDialog::after_update(target.tour_title.clone(), before.clone(), done.clone());
+        assert_eq!(result_line(&screen.title, &screen.done, &screen.before, true), "Onboarding, spring edition · 14 steps · public");
+        assert!(draw(&mut p, egui::RawInput::default()).is_none());
+
+        // Until the site has said, and when it does not list the tour or gives it no title: the saved one.
+        assert_eq!(edit_picker(None, None).tour_title(), "Customer onboarding");
+        assert_eq!(edit_picker(Some(Some("0.1.4")), Some(vec![tour("Another", 1, 3, "draft")])).tour_title(), "Customer onboarding");
+        let blank = RemoteTour { title: "  ".into(), ..listed_tour("draft") };
+        assert_eq!(edit_picker(Some(Some("0.1.4")), Some(vec![blank])).tour_title(), "Customer onboarding");
+        // A tour that was not renamed is named as before.
+        let same = edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("published")]));
+        assert!(matches!(same.edit_outcome(&same.shown()), Some(PickerOutcome::Update { ref target, .. }) if *target == edit_target()));
+    }
+
+    #[test]
+    fn the_update_choice_says_when_updating_removes_the_cover_logo_and_only_then() {
+        const LINE: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Tour settings to keep it.";
+        let offered = || edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("published")]));
+        // The recording lost its logo when it was opened, and Update is offered: the line shows, for a draft too.
+        let mut p = offered().with_logo_missing(true);
+        assert_eq!(p.logo_line(&p.shown()), Some(LINE));
+        assert!(draw(&mut p, egui::RawInput::default()).is_none());
+        let draft = edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("draft")])).with_logo_missing(true);
+        assert_eq!(draft.logo_line(&draft.shown()), Some(LINE));
+        // Update can still be pressed: the line warns, it does not refuse.
+        assert!(matches!(p.edit_outcome(&p.shown()), Some(PickerOutcome::Update { .. })));
+        // A recording that opened whole, or got its logo back: no line.
+        let whole = offered();
+        assert_eq!(whole.logo_line(&whole.shown()), None);
+        assert_eq!(offered().with_logo_missing(false).logo_line(&Shown::Update { public: true }), None);
+        // Not while Update is not offered: still asking, the site could not be asked, an older
+        // site, a tour that is gone, another address, after an update that cannot be tried again.
+        for shown in [Shown::Asking, Shown::Failed("Could not read the workspace.".into()), Shown::OnlyNew(Some(UPDATE_NEEDS_NEWER_SITE)), Shown::OnlyNew(Some(TOUR_NOT_ON_SITE)), Shown::OnlyNew(None)] {
+            assert_eq!(logo_warning(&shown, true), None, "{shown:?}");
+            assert_eq!(logo_warning(&shown, false), None, "{shown:?}");
+        }
+        for public in [true, false] {
+            assert_eq!(logo_warning(&Shown::Update { public }, true), Some(LINE));
+            assert_eq!(logo_warning(&Shown::Update { public }, false), None);
+        }
+        let elsewhere = Picker::open_for_edit_elsewhere(String::new(), "Chapter one".into(), edit_target()).with_logo_missing(true);
+        assert_eq!(elsewhere.logo_line(&elsewhere.shown()), None);
+        // The dialog of a new recording has no such choice, and takes no such line.
+        let fresh = Picker::new(String::new(), "Chapter one").with_logo_missing(true);
+        assert_eq!(fresh.logo_line(&fresh.shown()), None);
+        assert!(LINE.ends_with('.') && !LINE.contains('!'));
     }
 
     #[test]
@@ -2441,7 +2581,7 @@ pub(crate) mod tests {
         // The same reason after a first upload keeps its own sentence.
         assert_eq!(kept_note(&failed_save, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the project file could not be written."));
         assert_eq!(kept_note(&Kept::Saved(vec![]), true), None);
-        assert_eq!(kept_note(&Kept::Saved(vec!["a pasted picture".into()]), true).as_deref(), Some("The recording was kept for later editing, but without a pasted picture."));
+        assert_eq!(kept_note(&Kept::Saved(vec!["a pasted picture".into()]), true).as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
         // The screen shows it, whatever became of the publish, and the upload is reported as it went.
         for outcome in [Outcome::Public { url: Some(LINK.into()) }, Outcome::Draft, Outcome::Held, failed()] {
             let screen = ResultDialog::after_update("Demo".into(), was_public(), PublishDone { finished: finished(3, outcome.clone()), kept: failed_save.clone() });

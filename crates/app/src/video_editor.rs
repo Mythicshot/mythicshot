@@ -189,12 +189,20 @@ impl ExportJob {
         matches!(self, ExportJob::Publish(_, _, _, _, true))
     }
 
+    /// For an update of a chapter, or the publish of one: the title of the tour it changes.
+    fn update_title(&self) -> Option<&str> {
+        match self {
+            ExportJob::Publish(_, _, title, _, true) => Some(title),
+            _ => None,
+        }
+    }
+
     /// The editor is going away: a publish is cancelled, since nobody would see its result.
     /// It stops calling the server; any other export runs on to its end. So does an update:
     /// it changes a tour that is already on the site, and stopping it half-way without a word
     /// would leave that tour, its public page and the saved recording at three different
-    /// points. It runs to its end in the background, and the saved recording stays registered
-    /// as open until then ([`VideoState`]'s drop).
+    /// points. It runs to its end in the background, the saved recording stays registered as
+    /// open until then, and how it ended is said in the app's notification ([`VideoState`]'s drop).
     fn abandon(&self) {
         if let ExportJob::Publish(_, run, _, _, false) = self {
             run.cancel();
@@ -482,6 +490,19 @@ fn edit_target(origin: &Origin) -> EditTarget {
     EditTarget { tour_id: origin.key.tour_id.clone(), chapter_id: origin.key.chapter_id.clone(), tour_title: origin.tour_title.clone() }
 }
 
+/// Whether `target` is the tour and chapter the project `origin` was saved for. The title is
+/// not part of that: the dialog hands on the tour's title as the site has it now, which is
+/// another one after a rename.
+fn is_origin(target: &EditTarget, origin: &Origin) -> bool {
+    target.tour_id == origin.key.tour_id && target.chapter_id == origin.key.chapter_id
+}
+
+/// Whether the dialog should say that updating removes the tour's cover logo: the project was
+/// opened without its logo, and the tour's cover has not been given one since.
+fn logo_missing(origin: &Origin, edit: &Edit) -> bool {
+    origin.logo_dropped && edit.tour_doc.logo_path.is_none()
+}
+
 /// Whether the project `key` belongs to the site at `server`: projects are tied to the exact
 /// address the address rule writes, so a tour of another address is never updated from here.
 fn on_this_site(key: &ProjectKey, server: &str) -> bool {
@@ -504,23 +525,59 @@ fn failed_publish_message(error: &str, updating: bool) -> String {
     }
 }
 
+/// What jobs that ran on after their editor was closed have to say to the user. The editor's
+/// status bar is gone by then, so the app shows each one in its notification, once.
+#[derive(Clone, Default)]
+pub(crate) struct Notices(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Notices {
+    fn post(&self, text: String) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+    }
+
+    /// What was posted since the last call, oldest first.
+    pub(crate) fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// The notices of every editor of this app, which the app reads once a frame.
+pub(crate) fn background_notices() -> Notices {
+    static NOTICES: std::sync::LazyLock<Notices> = std::sync::LazyLock::new(Notices::default);
+    NOTICES.clone()
+}
+
+/// What to tell the user when a job ends after its editor was closed. Only an update says
+/// anything (`update_title` is its tour's title; None for every other job): a publish was
+/// cancelled with the editor, and a file export leaves its file. An update that worked says
+/// what the status bar would have said; one that did not, the sentence the dialog would have
+/// shown, after the tour's title, since no window is left to say which tour it was about.
+/// Never the link, and an error never holds the token.
+fn outlived_message(result: &Result<Exported, String>, update_title: Option<&str>) -> Option<String> {
+    let title = update_title?;
+    match result {
+        Ok(Exported::Published(done, _, before, true)) => Some(publish_ui::result_status(&done.finished, before, true)),
+        Ok(_) => None,
+        Err(e) => Some(format!("\"{}\": {}", publish_ui::short_title(title, publish_ui::ROW_TITLE_MAX), failed_publish_message(e, true))),
+    }
+}
+
 /// The saved project an editor was opened from.
 pub struct Origin {
     pub key: ProjectKey,
+    /// The tour's title: as saved with the recording, and after an update as the site had it then.
     pub tour_title: String,
+    /// The cover logo saved with the recording could not be opened with it.
+    logo_dropped: bool,
     /// Keeps the project registered as open, for as long as this editor or a job it started
     /// reads the recording. Shared, so that whichever of them ends last lets go of it.
     open: Arc<OpenGuard>,
 }
 
 /// Before the list of what a saved project was opened without. The wording is proposed and waits for the owner's approval.
-// Not used until the Tours page opens a saved project.
-#[allow(dead_code)]
 pub const OPENED_WITHOUT: &str = "This recording was opened without ";
 
 /// The status line when a saved project opens without something it was saved with.
-// Not used until the Tours page opens a saved project.
-#[allow(dead_code)]
 pub fn opened_note(dropped: &[String]) -> Option<String> {
     if dropped.is_empty() { None } else { Some(format!("{OPENED_WITHOUT}{}", publish_ui::listed(dropped))) }
 }
@@ -649,6 +706,8 @@ pub struct VideoState {
     drag: Option<TimelineDrag>,
     /// Overlay style last reported to the app, to notice changes.
     last_overlays: OverlayStyle,
+    /// Where an update that outlives this editor says how it ended.
+    notices: Notices,
     /// The saved project this editor was opened from; None for a new recording. Declared last:
     /// it lets go of the project only after the reader above has closed the frames file.
     pub origin: Option<Origin>,
@@ -657,7 +716,8 @@ pub struct VideoState {
 impl Drop for VideoState {
     /// The recording's temp files go with the editor; an export still running
     /// keeps them until it finishes. A publish is cancelled: nobody would see its result.
-    /// An update is not: it runs to its end ([`ExportJob::abandon`] says why).
+    /// An update is not: it runs to its end ([`ExportJob::abandon`] says why), and how it ended
+    /// is handed to the app's notification.
     fn drop(&mut self) {
         if let Some(job) = &self.job {
             job.abandon();
@@ -667,6 +727,7 @@ impl Drop for VideoState {
         // `delete_files` does nothing for it. The project stays registered as open until both
         // this editor's reader and a job still running have stopped reading it.
         let open = self.origin.as_ref().map(|o| o.open.clone());
+        let notices = self.notices.clone();
         match self.job.take() {
             None => rec.delete_files(),
             Some(job) => {
@@ -677,12 +738,11 @@ impl Drop for VideoState {
                             None => std::thread::sleep(std::time::Duration::from_millis(200)),
                         }
                     };
-                    // An update ran on without its editor: how it ended goes to the log, the
-                    // one place left to say it. Never the link, and an error never holds the token.
-                    match &result {
-                        Ok(Exported::Published(done, _, before, true)) => eprintln!("Update tour, after its editor was closed: {}", publish_ui::result_status(&done.finished, before, true)),
-                        Err(e) if job.is_update() => eprintln!("Update tour, after its editor was closed: {}", failed_publish_message(e, true)),
-                        _ => {}
+                    // An update ran on without its editor: how it ended goes to the log, and to
+                    // the app's notification, since a release build shows no log.
+                    if let Some(msg) = outlived_message(&result, job.update_title()) {
+                        eprintln!("Update tour, after its editor was closed: {msg}");
+                        notices.post(msg);
                     }
                     drop(result);
                     rec.delete_files();
@@ -742,6 +802,7 @@ impl Editor {
             fps,
             ffmpeg,
             last_overlays: overlays,
+            notices: background_notices(),
             job: None,
             picker: None,
             publish_result: None,
@@ -781,8 +842,6 @@ impl Editor {
     /// open until it closes. Closing it never asks to export, and deletes nothing: the
     /// recording stays saved. What could not be restored is named in the status bar. When the
     /// recording cannot be read after all, the project is let go of again.
-    // Not used until the Tours page opens a saved project.
-    #[allow(dead_code)]
     pub fn open_project(loaded: Loaded, keys: std::collections::BTreeMap<crate::hotkeys::EditorAction, String>, dest: Context, overlays: OverlayStyle, prefs: crate::settings::EditorPrefs) -> Result<Editor, String> {
         let Loaded { info, rec, restored, open } = loaded;
         let Restored { edit, events, items, title, dropped } = restored;
@@ -796,7 +855,8 @@ impl Editor {
             v.edit = edit;
             // The close question says the recording is deleted, which is untrue here.
             v.exported = true;
-            v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, open: Arc::new(open) });
+            let logo_dropped = dropped.iter().any(|d| d == crate::project::COVER_LOGO);
+            v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, logo_dropped, open: Arc::new(open) });
         }
         // Kept in front of whatever the editor reports next, until the user has had the time to read it.
         if let Some(note) = opened_note(&dropped) {
@@ -1034,6 +1094,10 @@ impl Editor {
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {
+                                // The saved project now holds the title the update was sent under.
+                                if let (true, Some(origin)) = (update, v.origin.as_mut()) {
+                                    origin.tour_title = title.clone();
+                                }
                                 v.publish_result = Some(if update { ResultDialog::after_update(title, before, done) } else { ResultDialog::new(title, before, done) });
                             }
                         }
@@ -1236,8 +1300,8 @@ impl Editor {
             // A new recording: a new tour, or a new chapter of one.
             None => Picker::open(server, title),
             // Opened through Edit: update the tour it was saved for, or publish a new one.
-            Some(origin) if on_this_site(&origin.key, &server) => Picker::open_for_edit(server, title, edit_target(origin)),
-            // The address was changed since: that tour is not on the site that is configured now.
+            Some(origin) if on_this_site(&origin.key, &server) => Picker::open_for_edit(server, title, edit_target(origin)).with_logo_missing(logo_missing(origin, &v.edit)),
+            // The address was changed since: the recording was saved for a tour of another site.
             Some(origin) => Picker::open_for_edit_elsewhere(server, title, edit_target(origin)),
         });
     }
@@ -1250,14 +1314,15 @@ impl Editor {
         if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
             return;
         }
-        v.picker = Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error));
+        v.picker = Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error).with_logo_missing(logo_missing(origin, &v.edit)));
     }
 
     /// "Update tour": replace the chapter this editor's recording was saved for, save the
     /// project over the saved one, then publish when the site says that is safe: see
     /// [`update_job`]. Only for an editor opened through Edit, only for its own tour and
     /// chapter on its own site, and never while another export runs. The project the editor
-    /// was opened from stays its origin.
+    /// was opened from stays its origin. `target.tour_title` is the tour's title as the site
+    /// has it now: the result screen shows it, and the saved project takes it over.
     fn start_update(&mut self, title: String, target: EditTarget, before: Before) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
@@ -1265,7 +1330,7 @@ impl Editor {
         }
         let Some(origin) = v.origin.as_ref() else { return };
         let server = publish_ui::server();
-        if !on_this_site(&origin.key, &server) || target != edit_target(origin) {
+        if !on_this_site(&origin.key, &server) || !is_origin(&target, origin) {
             return;
         }
         let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
@@ -2995,5 +3060,155 @@ mod tests {
         assert!(s.lines().iter().any(|l| l == PUBLISH));
         assert!(project_text(&store.list()[0]).contains(NOTE));
         assert_eq!(reopened(&store, &key).doc.items().len(), 3);
+    }
+
+    /// Close an editor of a new recording while `job` runs in it; what the job says when it
+    /// ends lands in the notices this returns, with the sender that lets the job end.
+    fn closed_while(root: &Path, result: Result<PublishDone, String>, update: bool) -> (Notices, std::sync::mpsc::Sender<()>, PathBuf) {
+        let state = state(root);
+        let mut ed = editor_of(&state);
+        drop(state);
+        let notices = Notices::default();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let job = EncodeJob::spawn(move |_| {
+            let _ = wait.recv();
+            result
+        });
+        let v = ed.video.as_mut().unwrap();
+        v.notices = notices.clone();
+        v.job = Some(ExportJob::Publish(job, Arc::new(Run::default()), TOUR_TITLE.into(), Before { public: true, link: None, steps: Some(2) }, update));
+        drop(ed);
+        (notices, go, root.join("rec"))
+    }
+
+    #[test]
+    fn an_update_that_ends_after_its_editor_was_closed_tells_the_app_how_it_ended_exactly_once() {
+        let done = |outcome: Outcome| Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 14, outcome }, kept: Kept::Saved(vec![]) });
+        let gone = "Could not start the upload: that tour no longer exists.";
+        let cases: [(Result<PublishDone, String>, &str); 7] = [
+            (done(Outcome::Public { url: Some("https://tours.example.com/t/customer-onboarding".into()) }), "Tour updated: 14 steps"),
+            (done(Outcome::Draft), "Draft updated: 14 steps"),
+            (done(Outcome::Held), "Update uploaded: the public page still shows the previous version"),
+            (done(Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: the server had an error (HTTP 500).".into() }), "Update uploaded: the public page still shows the previous version"),
+            (done(Outcome::NotPublic { cancelled: true, error: String::new() }), "Update uploaded: the public page still shows the previous version"),
+            // A failure is the sentence the dialog would have shown, after the tour's title.
+            (Err(gone.to_string()), "\"Customer onboarding\": Could not start the upload: that tour no longer exists."),
+            (Err(CANCELLED.to_string()), "\"Customer onboarding\": Update cancelled"),
+        ];
+        for (result, said) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let (notices, go, temporary) = closed_while(tmp.path(), result, true);
+            // Nothing is said while it still runs.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert_eq!(notices.take(), Vec::<String>::new(), "{said}");
+            go.send(()).unwrap();
+            // The job's thread posts, then lets go of the recording: once that is gone, it has ended.
+            eventually("the job has ended", || !temporary.exists());
+            assert_eq!(notices.take(), [said.to_string()]);
+            assert_eq!(notices.take(), Vec::<String>::new(), "said once: {said}");
+            assert!(!said.contains("https://") && !said.contains(TOKEN));
+        }
+    }
+
+    #[test]
+    fn only_an_update_speaks_after_its_editor_was_closed() {
+        // A publish is cancelled with its editor, and whatever it ends with is not said.
+        let done = || Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft }, kept: Kept::Off });
+        for result in [done(), Err(CANCELLED.to_string()), Err("Could not start the upload: the server had an error (HTTP 500).".to_string())] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (notices, go, temporary) = closed_while(tmp.path(), result, false);
+            go.send(()).unwrap();
+            eventually("the job has ended", || !temporary.exists());
+            assert_eq!(notices.take(), Vec::<String>::new());
+        }
+        // The message itself: nothing for a job that is not an update, whatever it made.
+        let published = Exported::Published(done().unwrap(), TOUR_TITLE.into(), Before::new_tour(), false);
+        assert_eq!(outlived_message(&Ok(published), None), None);
+        assert_eq!(outlived_message(&Ok(Exported::File(PathBuf::from("a.gif"), 10)), None), None);
+        assert_eq!(outlived_message(&Err("Export failed".to_string()), None), None);
+        // A long title is cut as the dialog cuts it.
+        let long = "A".repeat(80);
+        let said = outlived_message(&Err("Could not finish the upload: no answer.".to_string()), Some(&long)).unwrap();
+        assert_eq!(said, format!("\"{}…\": Could not finish the upload: no answer.", "A".repeat(39)));
+        // An editor closed with no job running says nothing, and neither does one still open.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let mut ed = editor_of(&state);
+        let notices = Notices::default();
+        ed.video.as_mut().unwrap().notices = notices.clone();
+        drop(ed);
+        assert_eq!(notices.take(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_update_takes_over_the_title_the_site_has_for_the_tour() {
+        const RENAMED: &str = "Onboarding, spring edition";
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, _info, ed) = reopened_and_changed(tmp.path(), &s);
+        assert_eq!(store.list()[0].tour_title, TOUR_TITLE);
+        // The dialog hands on the site's title. It is still this editor's tour and chapter;
+        // another tour or chapter is not, whatever it is called.
+        let renamed = EditTarget { tour_title: RENAMED.into(), ..target() };
+        let origin = ed.video.as_ref().unwrap().origin.as_ref().unwrap();
+        assert!(is_origin(&target(), origin) && is_origin(&renamed, origin));
+        assert!(!is_origin(&EditTarget { chapter_id: "ch_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..target() }, origin));
+        assert!(!is_origin(&EditTarget { tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..target() }, origin));
+        // The update saves the project under that title: the same project, of the same tour and chapter.
+        let done = update_job(&state_of(&ed), TITLE, &renamed, &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap();
+        assert_eq!(done.kept, Kept::Saved(vec![]));
+        let list = store.list();
+        assert_eq!((list.len(), list[0].tour_title.as_str(), list[0].title.as_str(), &list[0].key), (1, RENAMED, TITLE, &key));
+        // Opened the next time, the editor knows the tour by the new title.
+        drop(ed);
+        let again = reopened(&store, &key);
+        assert_eq!(edit_target(again.video.as_ref().unwrap().origin.as_ref().unwrap()), renamed);
+    }
+
+    #[test]
+    fn a_project_opened_without_its_cover_logo_says_so_until_the_tour_has_a_logo_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state(tmp.path());
+        let logo = tmp.path().join("logo.png");
+        std::fs::write(&logo, b"\x89PNG\r\n\x1a\nnot really a logo").unwrap();
+        state.edit.tour_doc.logo_path = Some(logo.clone());
+        let store = store_in(tmp.path());
+        let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        let snap = Snapshot { rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
+        let saved = store.save(&key, &snap).unwrap();
+        assert_eq!(saved.left_out, Vec::<String>::new());
+        drop(state);
+
+        // Opened whole: the logo is there, and the dialog has nothing to warn of.
+        let ed = reopened(&store, &key);
+        let v = ed.video.as_ref().unwrap();
+        assert!(v.edit.tour_doc.logo_path.is_some());
+        assert!(!logo_missing(v.origin.as_ref().unwrap(), &v.edit));
+        drop(ed);
+
+        // The logo's file is taken out of the project by hand: the recording opens without it.
+        let logos: Vec<PathBuf> = std::fs::read_dir(&saved.info.dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("logo-"))).collect();
+        assert_eq!(logos.len(), 1);
+        std::fs::remove_file(&logos[0]).unwrap();
+        let mut ed = reopened(&store, &key);
+        assert_eq!(ed.status_text(), Some("This recording was opened without the cover logo."));
+        let v = ed.video.as_mut().unwrap();
+        assert!(v.edit.tour_doc.logo_path.is_none());
+        assert!(logo_missing(v.origin.as_ref().unwrap(), &v.edit), "an update would take the logo off the tour");
+        // The logo is added again in Tour settings: nothing is lost by updating now.
+        v.edit.tour_doc.logo_path = Some(logo);
+        assert!(!logo_missing(v.origin.as_ref().unwrap(), &v.edit));
+        // And taken away again by the user: that is the user's own choice, but the tour's logo
+        // would go all the same, so the line is back.
+        v.edit.tour_doc.logo_path = None;
+        assert!(logo_missing(v.origin.as_ref().unwrap(), &v.edit));
+    }
+
+    #[test]
+    fn an_editor_hands_what_outlives_it_to_the_apps_own_notices() {
+        // The app reads one list, and every editor posts to it unless a test gives it another.
+        let tmp = tempfile::tempdir().unwrap();
+        let ed = editor_of(&state(tmp.path()));
+        assert!(Arc::ptr_eq(&ed.video.as_ref().unwrap().notices.0, &background_notices().0));
     }
 }

@@ -123,6 +123,18 @@ pub struct Workspace {
     pub version: Option<String>,
 }
 
+/// How a delete that ended well was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// The site answered this delete for this tour: it removed it, or had begun to before it
+    /// said nothing is left.
+    BySite,
+    /// The site's first answer was that it has no such tour. That is a tour deleted earlier or
+    /// elsewhere, and just as well a tour of another workspace than the token's: the site
+    /// answers both the same way. Nothing of the token's workspace is left to delete either way.
+    NotThere,
+}
+
 /// A delete that did not finish.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteFailed {
@@ -359,10 +371,10 @@ pub fn rename_tour(server: &str, token: &str, tour_id: &str, title: &str) -> Res
 /// `progress` is called once before every request, with the files removed so far when the
 /// site says. A second call of it therefore means the site has begun: the tour itself is
 /// gone and only files remain, which is the moment to note the delete as unfinished. A tour that is already
-/// gone is a success. There is no cancel: the first call removes the tour, the rest only
+/// gone is a success, told apart as [`Deleted::NotThere`]. There is no cancel: the first call removes the tour, the rest only
 /// its files, and stopping half-way would leave files nobody can find again. Blocks like
 /// [`publish_tour`].
-pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+pub fn delete_tour(server: &str, token: &str, tour_id: &str, progress: impl FnMut(Option<Images>)) -> Result<Deleted, DeleteFailed> {
     Client::new(server, token, Timeouts::default()).map_err(|message| DeleteFailed { message, unfinished: false, not_started: true })?.delete_tour(tour_id, PUBLISH_PAUSE, progress)
 }
 
@@ -1018,7 +1030,7 @@ impl Client {
     /// for a tour that is gone. Unlike publish, a call may be sent again: the server
     /// carries on where it stopped, so a 500 `cleanup_pending` is simply called again.
     /// Gives up after [`MAX_STALLED_CALLS`] calls in a row that removed nothing more.
-    fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<(), DeleteFailed> {
+    fn delete_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>)) -> Result<Deleted, DeleteFailed> {
         let what = "Could not delete the tour";
         let failed = |message: String, unfinished: bool| {
             let message = if unfinished { format!("{message}{UNFINISHED_TRAILER}") } else { message };
@@ -1041,8 +1053,9 @@ impl Client {
                 Err(t) => return Err(failed(format!("{what}: {}.", t.0), unfinished)),
             };
             // Gone: deleted by this loop's earlier call, or elsewhere. Either way it is not there.
+            // Only after an earlier answer about this tour is it known to have been the token's.
             if Self::says_no_such_tour(&reply) {
-                return Ok(());
+                return Ok(if unfinished { Deleted::BySite } else { Deleted::NotThere });
             }
             // Never with the "files remain" ending: half-way through, a 404 that is not the
             // site's own (a proxy's page) says nothing about the tour either way.
@@ -1065,7 +1078,7 @@ impl Client {
                 let reply = self.check(what, reply).map_err(|m| if rejected { refused(m, unfinished) } else { failed(m, unfinished) })?;
                 let v = reply.json().ok_or_else(|| failed(not_understood(what), unfinished))?;
                 match reply.status {
-                    200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(()),
+                    200 if v.get("deleted").and_then(Value::as_bool) == Some(true) => return Ok(Deleted::BySite),
                     202 if v.get("status").and_then(Value::as_str) == Some("in_progress") => {}
                     _ => return Err(failed(not_understood(what), unfinished)),
                 }
@@ -2945,7 +2958,7 @@ pub(crate) mod tests {
     }
 
     /// Deletes TOUR against the stub with no pause, recording every progress report.
-    fn delete(stub: &Stub) -> (Result<(), DeleteFailed>, Vec<Option<Images>>) {
+    fn delete(stub: &Stub) -> (Result<Deleted, DeleteFailed>, Vec<Option<Images>>) {
         let mut seen = Vec::new();
         let r = client(stub).delete_tour(TOUR, Duration::ZERO, |p| seen.push(p));
         (r, seen)
@@ -3016,7 +3029,7 @@ pub(crate) mod tests {
     fn a_small_tour_is_deleted_in_one_call() {
         let s = stub(|_, _| reply(200, r#"{"deleted":true}"#));
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None]);
         assert_eq!(s.lines(), [DELETE]);
         let req = &s.requests()[0];
@@ -3032,21 +3045,25 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None, Some((250, 601)), Some((500, 601))]);
         assert_eq!(s.lines(), [DELETE; 3]);
     }
 
     #[test]
     fn a_tour_that_is_already_gone_counts_as_deleted() {
-        // Deleted elsewhere before the first call.
+        // Deleted elsewhere before the first call. The site says the same of another workspace's
+        // tour, so this answer alone does not say the tour was ever the token's.
         let s = stub(|_, _| reply(404, NO_TOUR));
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::NotThere));
         assert_eq!(s.lines().len(), 1);
-        // Or finished by someone else between two calls.
+        // Or finished by someone else between two calls: the site had answered for this tour.
         let s = stub(|_, seen| if seen == 0 { deleting(250, 601) } else { reply(404, NO_TOUR) });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         assert_eq!(s.lines().len(), 2);
+        // The same after files that could not be removed yet.
+        let s = stub(|_, seen| if seen == 0 { reply(500, CLEANUP_PENDING) } else { reply(404, NO_TOUR) });
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
     }
 
     #[test]
@@ -3091,12 +3108,12 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(s.lines().len(), 4);
         assert_eq!(seen, [None, Some((250, 601)), Some((250, 601)), Some((500, 601))]);
         // On the very first call too: the tour is deleted by then, only files are left.
         let s = stub(|_, seen| if seen == 0 { reply(500, CLEANUP_PENDING) } else { reply(200, r#"{"deleted":true}"#) });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         // A site that keeps failing is given up, and the error says what is left.
         let s = stub(|_, _| reply(500, CLEANUP_PENDING));
         let e = delete(&s).0.unwrap_err();
@@ -3119,7 +3136,7 @@ pub(crate) mod tests {
             3 | 4 | 5 => deleting(500, 1000),
             _ => reply(200, r#"{"deleted":true}"#),
         });
-        assert_eq!(delete(&s).0, Ok(()));
+        assert_eq!(delete(&s).0, Ok(Deleted::BySite));
         // An answer without counts is not progress.
         let s = stub(|_, _| reply(202, r#"{"status":"in_progress"}"#));
         let (r, seen) = delete(&s);
@@ -3186,7 +3203,7 @@ pub(crate) mod tests {
             _ => reply(200, r#"{"deleted":true}"#),
         });
         let (r, seen) = delete(&s);
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(Deleted::BySite));
         assert_eq!(seen, [None, None, None]);
     }
 
