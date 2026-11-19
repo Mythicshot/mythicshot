@@ -627,6 +627,13 @@ impl Store {
     // Asked by the conversion queue; until that is built, only by the tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_candidate(&self, codec_id: &str, min_bytes: u64) -> Option<Candidate> {
+        self.next_candidate_but(codec_id, min_bytes, &|_, _| false)
+    }
+
+    /// [`Store::next_candidate`] among the projects `skip` does not answer true for; it is
+    /// asked with a project's key and its time of saving. For a queue that has given some
+    /// projects up and goes on with the next oldest.
+    pub fn next_candidate_but(&self, codec_id: &str, min_bytes: u64, skip: &dyn Fn(&ProjectKey, i64) -> bool) -> Option<Candidate> {
         let mut found = Vec::new();
         for (dir, site, tour, chapter) in self.chapter_folders() {
             if is_removing(&dir) || is_open(&dir) {
@@ -635,14 +642,16 @@ impl Store {
             let Ok(file) = read_project(&dir) else { continue };
             let belongs = site_of(&file.server) == site && file.tour_id == tour && file.chapter_id == chapter;
             if belongs && file.store.form == SavedForm::Frames && file.frames_bytes >= min_bytes && payload_ok(&dir, &file) && mark_holds(&file.store, codec_id).is_none() {
-                found.push((file.saved_at, dir, file));
+                let key = ProjectKey { server: file.server.clone(), tour_id: file.tour_id.clone(), chapter_id: file.chapter_id.clone() };
+                if !skip(&key, file.saved_at) {
+                    found.push((file.saved_at, dir, key, file));
+                }
             }
         }
         found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        found.into_iter().find_map(|(saved_at, dir, file)| {
+        found.into_iter().find_map(|(saved_at, dir, key, file)| {
             // One whose index does not describe its frames file cannot be converted, or opened.
             let rec = Recording::open_saved(&dir).ok()?;
-            let key = ProjectKey { server: file.server.clone(), tour_id: file.tour_id.clone(), chapter_id: file.chapter_id.clone() };
             let frames_bytes = file.frames_bytes;
             Some(Candidate { key, must: must_frames(file, &dir, &rec), dir, saved_at, frames_bytes })
         })
@@ -4572,6 +4581,29 @@ mod tests {
             assert_eq!(w.store.next_candidate(TEST_CODEC, 0).map(|c| c.key), Some(newest.clone()));
             swap(&w, &newest);
             assert_eq!(w.store.next_candidate(TEST_CODEC, 0), None);
+        }
+
+        #[test]
+        fn a_project_the_caller_skips_gives_way_to_the_next_oldest() {
+            let w = World::new();
+            let (newest, oldest, middle) = (key(SITE_A, TOUR_1, CH_1), key(SITE_B, TOUR_2, CH_2), key(SITE_A, TOUR_2, CH_1));
+            for (k, by) in [(&newest, 0), (&oldest, -120_000), (&middle, -60_000)] {
+                w.save(k);
+                saved_later(&w.dir(k), by);
+            }
+            let whole = contents(w.store.root());
+            let next = |skip: &dyn Fn(&ProjectKey, i64) -> bool| w.store.next_candidate_but(TEST_CODEC, 0, skip).map(|c| c.key);
+            assert_eq!(next(&|_, _| false), Some(oldest.clone()));
+            assert_eq!(w.store.next_candidate_but(TEST_CODEC, 0, &|_, _| false), w.store.next_candidate(TEST_CODEC, 0));
+            assert_eq!(next(&|k, _| *k == oldest), Some(middle.clone()));
+            assert_eq!(next(&|k, _| *k == oldest || *k == middle), Some(newest.clone()));
+            assert_eq!(next(&|_, _| true), None);
+            // It is asked with the time of saving the project file names.
+            let at = project_file(&w.dir(&middle)).saved_at;
+            assert_eq!(next(&|_, saved_at| saved_at != at), Some(middle.clone()));
+            // The least size still counts, and nothing was changed by asking.
+            assert_eq!(w.store.next_candidate_but(TEST_CODEC, u64::MAX, &|_, _| false), None);
+            assert_eq!(contents(w.store.root()), whole);
         }
 
         #[test]

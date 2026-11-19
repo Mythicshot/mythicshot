@@ -12,6 +12,7 @@ use eframe::egui::{self, Color32, CornerRadius, Rect, RichText, Sense, Stroke, S
 use mythicshot_destinations::{self as dest, Context};
 use mythicshot_editor::overlays::{ClickStyle, InputEvent, KeyStyle, OverlayStyle};
 use mythicshot_recording::export::{Format, ffmpeg_available};
+use mythicshot_recording::ffmpeg::Found;
 use mythicshot_recording::{FrameReader, Recording};
 
 use crate::editor_ui::Editor;
@@ -302,6 +303,13 @@ pub(crate) fn keeping_now() -> Keeping {
     keeping(publish_ui::keeps_recordings(), Store::default_root())
 }
 
+/// The export format an editor shows for the one it was asked for: MP4 and WebM need ffmpeg,
+/// and give way to GIF only once ffmpeg was looked for and there is none. While the one search
+/// of this run is still under way, the format that was asked for stays.
+fn usable_format(format: Format, found: Found) -> Format {
+    if format.needs_ffmpeg() && found == Found::None { Format::Gif } else { format }
+}
+
 /// How a project is saved: the store, the key, the state, and the check that says whether to go on.
 type SaveFn<'a> = dyn Fn(&Store, &ProjectKey, &Snapshot<'_>, &dyn Fn() -> bool) -> Result<Saved, String> + 'a;
 
@@ -337,7 +345,11 @@ fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, keep_going: &dyn Fn() ->
         save(store, &key, &snap, keep_going)
     }));
     match saved {
-        Ok(Ok(saved)) => Kept::Saved(saved.left_out),
+        Ok(Ok(saved)) => {
+            // There is a recording to store as video now.
+            crate::project::nudge();
+            Kept::Saved(saved.left_out)
+        }
         Ok(Err(why)) => Kept::Failed(why),
         Err(_) => Kept::Failed(publish_ui::KEEPING_BROKE_OFF.to_string()),
     }
@@ -693,7 +705,6 @@ pub struct VideoState {
     quality: u8,
     loop_forever: bool,
     fps: u32,
-    ffmpeg: bool,
     job: Option<ExportJob>,
     /// The "Publish tour" dialog, while it is open.
     picker: Option<Picker>,
@@ -774,8 +785,8 @@ impl Editor {
             "webm" => Format::Webm,
             _ => Format::Gif,
         };
-        let ffmpeg = ffmpeg_available();
-        let format = if format.needs_ffmpeg() && !ffmpeg { Format::Gif } else { format };
+        // ffmpeg may still be looked for when the first editor opens: see `usable_format`.
+        let format = usable_format(format, mythicshot_recording::ffmpeg::found());
         let (quality, loop_forever, fps, scale) = (prefs.export_quality, prefs.export_loop, prefs.export_fps, prefs.export_scale);
         let mut editor = Editor::new(first, title, keys, dest, prefs);
         for it in items {
@@ -800,7 +811,6 @@ impl Editor {
             quality,
             loop_forever,
             fps,
-            ffmpeg,
             last_overlays: overlays,
             notices: background_notices(),
             job: None,
@@ -1449,9 +1459,13 @@ impl Editor {
         let Some(v) = self.video.as_mut() else { return };
         ui.set_min_width(260.0);
         ui.label(RichText::new("Format").strong());
+        // Read when the menu is drawn, not when the editor opened: the search for ffmpeg may
+        // have ended since. Both are answers kept in memory; no program is started here.
+        let ffmpeg = ffmpeg_available();
+        v.format = usable_format(v.format, mythicshot_recording::ffmpeg::found());
         ui.horizontal(|ui| {
             for f in Format::ALL {
-                let ok = !f.needs_ffmpeg() || v.ffmpeg;
+                let ok = !f.needs_ffmpeg() || ffmpeg;
                 let r = ui.add_enabled(ok, egui::Button::selectable(v.format == f, f.label()));
                 let r = if ok { r } else { r.on_disabled_hover_text("Needs ffmpeg installed and on the PATH") };
                 if r.clicked() {
@@ -2540,6 +2554,39 @@ mod tests {
         assert_eq!(done.kept, Kept::Failed("saving was cancelled.".into()));
         assert_eq!(publish_ui::kept_note(&done.kept, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving was cancelled."));
         assert!(store.list().is_empty() && !store.root().exists(), "nothing is left of the save");
+    }
+
+    #[test]
+    fn a_saved_video_format_is_kept_while_ffmpeg_is_looked_for_and_gives_way_only_when_there_is_none() {
+        for format in [Format::Mp4, Format::Webm] {
+            assert_eq!([Found::NotYet, Found::Ok, Found::Unusable, Found::None].map(|found| usable_format(format, found)), [format, format, format, Format::Gif]);
+        }
+        for format in [Format::Gif, Format::Apng] {
+            assert_eq!([Found::NotYet, Found::Ok, Found::Unusable, Found::None].map(|found| usable_format(format, found)), [format; 4]);
+        }
+    }
+
+    #[test]
+    fn a_recording_that_was_kept_wakes_the_conversion_queue_and_one_that_was_not_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        // Every publish to a site of its own: a site takes a step once.
+        let publish = |keeping: &Keeping, save: &SaveFn<'_>| {
+            let s = publish_stub(|_| reply(200, LIVE));
+            publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, keeping, &Arc::new(Run::default()), &|_| {}, save).unwrap().kept
+        };
+        let nudges = crate::project::nudges_here;
+        let before = nudges();
+        // Not kept: the switch is off, there is no folder, the save failed, the save broke.
+        assert_eq!(publish(&Keeping::Off, &store_save), Kept::Off);
+        assert!(matches!(publish(&Keeping::NoFolder, &store_save), Kept::Failed(_)));
+        assert!(matches!(publish(&Keeping::In(store.clone()), &|_, _, _, _| Err("the disk is full.".to_string())), Kept::Failed(_)));
+        assert!(matches!(publish(&Keeping::In(store.clone()), &|_, _, _, _| panic!("the save broke")), Kept::Failed(_)));
+        assert_eq!(nudges(), before);
+        // Kept: once.
+        assert_eq!(publish(&Keeping::In(store.clone()), &store_save), Kept::Saved(vec![]));
+        assert_eq!((nudges(), store.list().len()), (before + 1, 1));
     }
 
     #[test]
