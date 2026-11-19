@@ -102,35 +102,78 @@ pub enum ArchiveError {
     Unusable(&'static str),
 }
 
+/// The PSNR, in dB, of a squared error summed over `values` colour values.
+fn db(squared: u64, values: u64) -> f64 {
+    if values == 0 {
+        0.0
+    } else if squared == 0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0 * 255.0 * values as f64 / squared as f64).log10()
+    }
+}
+
+/// Whether the two are RGBA pictures of the same, whole number of pixels, and not of none.
+fn fit(a: &[u8], b: &[u8]) -> bool {
+    !a.is_empty() && a.len() == b.len() && a.len().is_multiple_of(4)
+}
+
 /// The PSNR of `b` against `a` over red, green and blue, in dB. Both are RGBA; alpha is not
 /// measured. Infinite when the colours are the same; 0 when the two do not fit each other.
-pub fn psnr_rgb(_a: &[u8], _b: &[u8]) -> f64 {
-    0.0
+pub fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
+    if !fit(a, b) {
+        return 0.0;
+    }
+    let mut squared = 0u64;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        squared += (0..3).map(|c| (x[c].abs_diff(y[c]) as u64).pow(2)).sum::<u64>();
+    }
+    db(squared, (a.len() / 4 * 3) as u64)
 }
 
 /// The PSNR of the worst block of `b` against `a`, in dB: the picture is cut into squares of
 /// `block` pixels from its top-left corner, and the ones at the right and bottom edges are as
 /// small as what is left. 0 when the pictures do not fit the size.
-pub fn worst_block_psnr(_a: &[u8], _b: &[u8], _width: u32, _height: u32, _block: u32) -> f64 {
-    0.0
+pub fn worst_block_psnr(a: &[u8], b: &[u8], width: u32, height: u32, block: u32) -> f64 {
+    measure(a, b, width, height, block).map_or(0.0, |m| m.block_db)
 }
 
 /// The mean of `b - a` for red, green and blue, in levels: a colour cast, with its direction.
 /// 255 on every channel when the two do not fit each other.
-pub fn mean_shift(_a: &[u8], _b: &[u8]) -> [f64; 3] {
-    [255.0; 3]
+pub fn mean_shift(a: &[u8], b: &[u8]) -> [f64; 3] {
+    if !fit(a, b) {
+        return [255.0; 3];
+    }
+    let mut sums = [0i64; 3];
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for c in 0..3 {
+            sums[c] += y[c] as i64 - x[c] as i64;
+        }
+    }
+    sums.map(|sum| sum as f64 / (a.len() / 4) as f64)
 }
 
 /// Which frames of a recording of `frames` frames are compared with their pictures, in
 /// order: every frame of a short recording; of a long one the first, the last, the last of
 /// every group of pictures (where drift is largest) and every frame in `must` that exists.
-pub fn sample(_frames: usize, _must: &[usize]) -> Vec<usize> {
-    Vec::new()
+pub fn sample(frames: usize, must: &[usize]) -> Vec<usize> {
+    if frames <= CHECK_ALL_UP_TO {
+        return (0..frames).collect();
+    }
+    let group = GOP as usize;
+    let mut picked: Vec<usize> = (group - 1..frames).step_by(group).collect();
+    picked.extend([0, frames - 1]);
+    picked.extend(must.iter().copied().filter(|i| *i < frames));
+    picked.sort_unstable();
+    picked.dedup();
+    picked
 }
 
 /// The most a video of a recording whose frames take `lossless` bytes may take.
-fn allowed_bytes(_lossless: u64, _smaller_by: f64) -> u64 {
-    0
+fn allowed_bytes(lossless: u64, smaller_by: f64) -> u64 {
+    // A float that is not a number, or a part of more than the whole, leaves nothing; the
+    // cast cuts off below nothing and above the largest size.
+    (lossless as f64 * (1.0 - smaller_by)).floor() as u64
 }
 
 /// What one picture measures against its frame.
@@ -143,23 +186,68 @@ struct Measured {
 }
 
 /// Every measure of `b` against `a` in one walk. None when the pictures do not fit the size.
-fn measure(_a: &[u8], _b: &[u8], _width: u32, _height: u32, _block: u32) -> Option<Measured> {
-    None
+fn measure(a: &[u8], b: &[u8], width: u32, height: u32, block: u32) -> Option<Measured> {
+    let (w, h) = (width as usize, height as usize);
+    let len = w.checked_mul(h)?.checked_mul(4)?;
+    if len == 0 || a.len() != len || b.len() != len {
+        return None;
+    }
+    let block = (block as usize).max(1);
+    // The squared error of each block of the row of blocks being walked.
+    let mut row = vec![0u64; w.div_ceil(block)];
+    let (mut total, mut worst) = (0u64, f64::INFINITY);
+    let mut sums = [0i64; 3];
+    let mut opaque = true;
+    for y in 0..h {
+        let (line_a, line_b) = (&a[y * w * 4..][..w * 4], &b[y * w * 4..][..w * 4]);
+        for ((cell_a, cell_b), squared) in line_a.chunks(block * 4).zip(line_b.chunks(block * 4)).zip(&mut row) {
+            for (p, q) in cell_a.chunks_exact(4).zip(cell_b.chunks_exact(4)) {
+                for c in 0..3 {
+                    let d = q[c] as i64 - p[c] as i64;
+                    sums[c] += d;
+                    *squared += (d * d) as u64;
+                }
+                opaque &= q[3] == 255;
+            }
+        }
+        if y % block == block - 1 || y == h - 1 {
+            let lines = y % block + 1;
+            for (i, squared) in row.iter_mut().enumerate() {
+                let across = block.min(w - i * block);
+                worst = worst.min(db(*squared, (across * lines * 3) as u64));
+                total += *squared;
+                *squared = 0;
+            }
+        }
+    }
+    Some(Measured { frame_db: db(total, (w * h * 3) as u64), block_db: worst, shift: sums.map(|sum| sum as f64 / (w * h) as f64), opaque })
 }
 
 /// Whether what was measured is within the tolerance, and if not, what is wrong first.
-fn check(_frame: usize, _m: &Measured, _tol: &Tolerance) -> Result<(), Mismatch> {
-    Ok(())
+fn check(frame: usize, m: &Measured, tol: &Tolerance) -> Result<(), Mismatch> {
+    if !m.opaque {
+        Err(Mismatch::Alpha { frame })
+    } else if m.frame_db < tol.frame_db {
+        Err(Mismatch::Frame { frame, db: m.frame_db })
+    } else if m.block_db < tol.block_db {
+        Err(Mismatch::Block { frame, db: m.block_db })
+    } else if m.shift.iter().any(|s| s.abs() > tol.mean_shift) {
+        Err(Mismatch::Shift { frame })
+    } else {
+        Ok(())
+    }
 }
 
 impl Recording {
     /// Write this recording to `out` as a video and verify it: one picture per frame, in
     /// order, and the frames in [`sample`]`(frames, must)` compared with their pictures
     /// against `tol`. `keep_going` is told the pass and how many frames of it are done, at
-    /// least every frame, and stops the work by answering false.
+    /// least before every frame, and stops the work by answering false.
     ///
     /// One frame is held at a time in both passes. On any error, a cancel included, nothing
-    /// is left at `out`, and nothing but `out` is ever written.
+    /// is left at `out` (what stood there before is gone too), and nothing but `out` is ever
+    /// written. `out` must not be the recording's own frames file: that is refused, and the
+    /// frames stay.
     pub fn archive_video(&self, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<Archived, ArchiveError> {
         archive(self, codec, out, must, tol, keep_going).map(|(archived, _)| archived)
     }
@@ -167,10 +255,172 @@ impl Recording {
 
 /// [`Recording::archive_video`], and with it the largest mean shift of any channel of any
 /// frame that was compared.
-fn archive(_rec: &Recording, _codec: &dyn VideoCodec, _out: &Path, _must: &[usize], _tol: &Tolerance, _keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
-    let _ = (File::open(FRAMES_FILE).map(|mut f| f.seek(SeekFrom::Start(0)).and_then(|_| f.read(&mut []))), GOP, CHECK_ALL_UP_TO, xor_into as fn(&mut [u8], &[u8]));
-    let _ = Buf::new(0);
-    Err(ArchiveError::Unusable("not built yet"))
+fn archive(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
+    // The one file that must never be written over or removed here: the frames themselves.
+    let frames_file = std::fs::canonicalize(rec.dir.join(FRAMES_FILE));
+    if frames_file.is_ok_and(|frames| std::fs::canonicalize(out).is_ok_and(|out| out == frames)) {
+        return Err(ArchiveError::Unusable("the video cannot take the place of the frames"));
+    }
+    let result = encode_and_verify(rec, codec, out, must, tol, keep_going);
+    if result.is_err() {
+        // Whatever the codec left, or whatever stood here before: it is not this recording.
+        let _ = std::fs::remove_file(out);
+    }
+    result
+}
+
+const FRAMES_UNREADABLE: &str = "the frames could not be read";
+
+fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
+    let n = rec.frames.len();
+    if n == 0 {
+        return Err(ArchiveError::Unusable("the recording has no frames"));
+    }
+    let (w, h) = (rec.width, rec.height);
+    let len = (w as u64).checked_mul(h as u64).and_then(|px| px.checked_mul(4)).and_then(|b| usize::try_from(b).ok()).filter(|b| *b > 0).ok_or(ArchiveError::Unusable("the picture size is not usable"))?;
+    let lossless = std::fs::metadata(rec.dir.join(FRAMES_FILE)).ok().filter(|m| m.is_file()).map(|m| m.len()).ok_or(ArchiveError::Unusable(FRAMES_UNREADABLE))?;
+    let max_bytes = allowed_bytes(lossless, tol.smaller_by);
+
+    // The first pass: every frame, one at a time, into the codec.
+    {
+        let mut frames = Frames::open(rec, len).map_err(ArchiveError::Unusable)?;
+        let mut stopped = None;
+        let mut given = 0usize;
+        let mut next = |buf: &mut Vec<u8>| -> Result<bool, String> {
+            if given == n {
+                return Ok(false);
+            }
+            if !keep_going(Stage::Encoding, given, n) {
+                stopped = Some(ArchiveError::Cancelled);
+                return Err(String::new());
+            }
+            match frames.next() {
+                Ok(px) => {
+                    buf.clear();
+                    buf.extend_from_slice(px);
+                    given += 1;
+                    Ok(true)
+                }
+                Err(why) => {
+                    stopped = Some(ArchiveError::Unusable(why));
+                    Err(String::new())
+                }
+            }
+        };
+        let result = codec.encode((w, h), n, &mut next, out, max_bytes, &|done| keep_going(Stage::Encoding, done, n));
+        // Why this side stopped comes before what the codec made of it.
+        if let Some(why) = stopped {
+            return Err(why);
+        }
+        match result {
+            Ok(()) if given == n => {}
+            Ok(()) => return Err(ArchiveError::Codec(CodecError::WrongFrames { got: given })),
+            Err(CodecError::Cancelled) => return Err(ArchiveError::Cancelled),
+            Err(CodecError::TooLarge) => return Err(ArchiveError::NotSmaller),
+            Err(e) => return Err(ArchiveError::Codec(e)),
+        }
+    }
+    // The codec's word is not taken for the file or for its size.
+    let bytes = std::fs::metadata(out).ok().filter(|m| m.is_file() && m.len() > 0).map(|m| m.len()).ok_or(ArchiveError::Codec(CodecError::Failed { exit: None }))?;
+    if bytes > max_bytes {
+        return Err(ArchiveError::NotSmaller);
+    }
+
+    // The second pass: the video read back, and the frames walked again in step.
+    let picked = sample(n, must);
+    let mut frames = Frames::open(rec, len).map_err(ArchiveError::Unusable)?;
+    let mut stopped = None;
+    let (mut seen, mut at, mut checked) = (0usize, 0usize, 0usize);
+    let (mut worst_frame_db, mut worst_block_db, mut worst_shift) = (f64::INFINITY, f64::INFINITY, 0.0f64);
+    let mut each = |i: usize, picture: &[u8]| -> Result<(), String> {
+        let mut verdict = || -> Result<(), ArchiveError> {
+            if i != seen || i >= n {
+                // A picture too many, or pictures out of order.
+                return Err(ArchiveError::Verify(Mismatch::Count { got: seen + 1 }));
+            }
+            if picture.len() != len {
+                return Err(ArchiveError::Verify(Mismatch::Count { got: seen }));
+            }
+            if !keep_going(Stage::Verifying, i, n) {
+                return Err(ArchiveError::Cancelled);
+            }
+            let frame = frames.next().map_err(ArchiveError::Unusable)?;
+            seen += 1;
+            if picked.get(at) != Some(&i) {
+                return Ok(());
+            }
+            at += 1;
+            let m = measure(frame, picture, w, h, tol.block).ok_or(ArchiveError::Unusable("the picture size is not usable"))?;
+            checked += 1;
+            worst_frame_db = worst_frame_db.min(m.frame_db);
+            worst_block_db = worst_block_db.min(m.block_db);
+            worst_shift = m.shift.iter().fold(worst_shift, |worst, s| worst.max(s.abs()));
+            check(i, &m, tol).map_err(ArchiveError::Verify)
+        };
+        verdict().map_err(|why| {
+            stopped = Some(why);
+            String::new()
+        })
+    };
+    if !keep_going(Stage::Verifying, 0, n) {
+        return Err(ArchiveError::Cancelled);
+    }
+    let result = codec.decode(out, (w, h), n, &mut each, &|done| keep_going(Stage::Verifying, done, n));
+    if let Some(why) = stopped {
+        return Err(why);
+    }
+    match result {
+        Ok(()) if seen == n => {}
+        Ok(()) => return Err(ArchiveError::Verify(Mismatch::Count { got: seen })),
+        Err(CodecError::Cancelled) => return Err(ArchiveError::Cancelled),
+        Err(CodecError::WrongFrames { got }) => return Err(ArchiveError::Verify(Mismatch::Count { got })),
+        Err(e) => return Err(ArchiveError::Codec(e)),
+    }
+    Ok((Archived { bytes, checked, worst_frame_db, worst_block_db }, worst_shift))
+}
+
+/// The frames of a recording, one after the other: the chain of differences walked once,
+/// with one frame, one difference and one compressed frame held, however long it is.
+struct Frames<'a> {
+    rec: &'a Recording,
+    file: File,
+    file_len: u64,
+    /// The frame that was read last.
+    px: Buf,
+    /// The difference that made it out of the one before.
+    delta: Buf,
+    packed: Vec<u8>,
+    at: usize,
+}
+
+impl<'a> Frames<'a> {
+    fn open(rec: &'a Recording, len: usize) -> Result<Frames<'a>, &'static str> {
+        let file = File::open(rec.dir.join(FRAMES_FILE)).map_err(|_| FRAMES_UNREADABLE)?;
+        let file_len = file.metadata().map_err(|_| FRAMES_UNREADABLE)?.len();
+        Ok(Frames { rec, file, file_len, px: Buf::new(len), delta: Buf::new(len), packed: Vec::new(), at: 0 })
+    }
+
+    /// The next frame, as RGBA. An error when there is none, or it cannot be read whole.
+    fn next(&mut self) -> Result<&[u8], &'static str> {
+        let m = self.rec.frames.get(self.at).ok_or("the recording has no such frame")?;
+        // An index that points past the file is not followed into a huge buffer.
+        if m.offset.checked_add(m.len as u64).is_none_or(|end| end > self.file_len) {
+            return Err(FRAMES_UNREADABLE);
+        }
+        self.packed.resize(m.len as usize, 0);
+        self.file.seek(SeekFrom::Start(m.offset)).and_then(|_| self.file.read_exact(&mut self.packed)).map_err(|_| FRAMES_UNREADABLE)?;
+        let whole = |written: std::io::Result<usize>, len: usize| if written.is_ok_and(|n| n == len) { Ok(()) } else { Err(FRAMES_UNREADABLE) };
+        if m.key {
+            whole(zstd::bulk::decompress_to_buffer(&self.packed, &mut self.px.0[..]), self.px.0.len())?;
+        } else if self.at == 0 {
+            return Err("the first frame is not a whole one");
+        } else {
+            whole(zstd::bulk::decompress_to_buffer(&self.packed, &mut self.delta.0[..]), self.delta.0.len())?;
+            xor_into(&mut self.px.0, &self.delta.0);
+        }
+        self.at += 1;
+        Ok(&self.px.0)
+    }
 }
 
 /// A buffer the size of one frame. Under test every one that is alive is counted.
@@ -260,10 +510,11 @@ mod tests {
 
     /// Frame `i` of something like a screen: a flat title bar, a dark side panel and a light
     /// page (flat panels), lines of dark glyph-sized marks whose lengths change from frame to
-    /// frame (text-like sharp edges), six squares of saturated flat colour, and a block the
+    /// frame, one line every `pitch` pixels (text-like sharp edges), six squares of saturated
+    /// flat colour, and a block the
     /// size of a pointer, white with a black outline, that moves every frame. With `striped`,
     /// also a patch of one-pixel red, green and blue stripes.
-    fn screen_with(i: usize, w: u32, h: u32, striped: bool) -> Vec<u8> {
+    fn screen_with(i: usize, w: u32, h: u32, pitch: usize, striped: bool) -> Vec<u8> {
         let (w, h) = (w as usize, h as usize);
         let mut px = vec![255u8; w * h * 4];
         let side = w / 5;
@@ -281,13 +532,17 @@ mod tests {
         }
         let cells = (w - side).saturating_sub(10) / 6;
         let text_end = h.saturating_sub(36);
-        for (line, top) in (18..text_end.saturating_sub(8)).step_by(11).enumerate() {
+        for (line, top) in (18..text_end.saturating_sub(8)).step_by(pitch).enumerate() {
             let length = if cells == 0 { 0 } else { 3 + (line * 7 + i) % cells };
             for col in 0..length.min(cells) {
-                for gy in 0..7 {
-                    for gx in 0..5 {
-                        if bit(line, col, gx, gy) {
-                            put(&mut px, w, side + 6 + col * 6 + gx, top + gy, [20, 20, 20]);
+                // A mark of up to seven strokes, one pixel wide, as the segments of a digit.
+                let strokes: [(std::ops::Range<usize>, std::ops::Range<usize>); 7] = [(0..5, 0..1), (0..5, 3..4), (0..5, 6..7), (0..1, 0..4), (4..5, 0..4), (0..1, 3..7), (4..5, 3..7)];
+                for (k, (xs, ys)) in strokes.into_iter().enumerate() {
+                    if k == (line + col) % 7 || bit(line, col, k, 1) {
+                        for gy in ys {
+                            for gx in xs.clone() {
+                                put(&mut px, w, side + 6 + col * 6 + gx, top + gy, [20, 20, 20]);
+                            }
                         }
                     }
                 }
@@ -319,7 +574,7 @@ mod tests {
     }
 
     fn screen(i: usize, w: u32, h: u32) -> Vec<u8> {
-        screen_with(i, w, h, false)
+        screen_with(i, w, h, 22, false)
     }
 
     /// A whole picture of one-pixel red, green and blue columns.
@@ -612,7 +867,9 @@ mod tests {
         assert_eq!(allowed_bytes(1000, 1.0), 0);
         assert_eq!(allowed_bytes(1000, 7.0), 0);
         assert_eq!(allowed_bytes(1000, f64::NAN), 0);
-        assert_eq!(allowed_bytes(1000, ANY_SIZE.smaller_by), u64::MAX);
+        assert_eq!(allowed_bytes(1000, -1.0), 2000);
+        assert_eq!(allowed_bytes(1000, f64::NEG_INFINITY), u64::MAX);
+        assert!(allowed_bytes(1, ANY_SIZE.smaller_by) > 1 << 39);
         assert_eq!(allowed_bytes(u64::MAX, 0.0), u64::MAX);
     }
 
@@ -994,6 +1251,13 @@ mod tests {
         let result = other.archive_video(&Fake::new(Fault::None), &b.out, &[], &ANY_SIZE, &|_, _, _| true);
         assert!(matches!(result, Err(ArchiveError::Unusable(_))), "{result:?}");
         assert!(!b.out.exists());
+        // The frames file itself as the output: refused, and neither written over nor removed.
+        let codec = Fake::new(Fault::None);
+        for own in [b.rec.dir.join(FRAMES_FILE), b.rec.dir.join(".").join(FRAMES_FILE.to_uppercase())] {
+            let result = b.rec.archive_video(&codec, &own, &[], &ANY_SIZE, &|_, _, _| true);
+            assert!(matches!(result, Err(ArchiveError::Unusable(_))), "{result:?}");
+        }
+        assert!(codec.touched.lock().unwrap().is_empty());
         assert_eq!(b.frames_bytes(), before);
     }
 
@@ -1122,7 +1386,7 @@ mod tests {
         assert!(b.archive(ffmpeg, &ANY_SIZE).is_ok());
 
         // One-pixel coloured stripes: a patch of them on a screen, and a whole picture.
-        let b = bench_of(w, h, (0..35).map(|i| screen_with(i, w, h, true)).collect());
+        let b = bench_of(w, h, (0..35).map(|i| screen_with(i, w, h, 22, true)).collect());
         let (patch, patch_shift) = measured("a patch of one-pixel coloured stripes on a screen", &b, ffmpeg);
         let b = bench_of(w, h, vec![stripes(w, h); 6]);
         let (whole, whole_shift) = measured("a whole picture of one-pixel coloured stripes", &b, ffmpeg);
@@ -1152,6 +1416,34 @@ mod tests {
         // Near-lossless is not lossless: the numbers are real ones.
         assert!(archived.worst_frame_db.is_finite() && archived.worst_block_db <= archived.worst_frame_db);
         assert_eq!(archived.bytes, std::fs::metadata(&b.out).unwrap().len());
+    }
+
+    /// MEASURED, not chosen: a screen filled wall to wall with small one-pixel marks (a line
+    /// of them every 11 pixels, where the screen-like frames above have one every 22) came
+    /// back at 39.07 dB on its worst frame with ffmpeg 9.0.2 (worst block 34.70 dB, mean
+    /// shift 0.228), which is under the 40 dB a frame must reach. The weak frames are the
+    /// key pictures (the first of each group of 30, and most of all the one that opens a
+    /// short last group); the frames between them measured 44 to 52 dB. The threshold is not
+    /// lowered for it: such a recording is refused by the frame measure and keeps its
+    /// lossless frames. This test pins that the verdict follows the measure, whichever side
+    /// of 40 dB another ffmpeg lands on, and prints what was measured.
+    #[test]
+    fn a_screen_full_of_small_sharp_text_is_judged_by_what_it_measures() {
+        let Some(ffmpeg) = real() else { return };
+        let (w, h, n) = (256, 192, 35);
+        let b = bench_of(w, h, (0..n).map(|i| screen_with(i, w, h, 11, true)).collect());
+        let (dense, shift) = measured("a screen full of small one-pixel marks (dense text)", &b, ffmpeg);
+        // What was measured, with room for another version of the encoder.
+        assert!(dense.worst_frame_db > 36.0 && dense.worst_frame_db < 44.0, "{dense:?}");
+        assert!(dense.worst_block_db >= TOLERANCE.block_db && shift <= TOLERANCE.mean_shift, "{dense:?} {shift}");
+        let result = b.archive(ffmpeg, &ANY_SIZE);
+        if dense.worst_frame_db >= TOLERANCE.frame_db {
+            assert_eq!(result.unwrap(), dense);
+        } else {
+            // Refused for a key picture, with the number that was measured, and nothing left.
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Frame { frame, db })) if frame % 30 == 0 && db < TOLERANCE.frame_db), "{result:?}");
+            assert_eq!(b.files(), vec![FRAMES_FILE.to_string()]);
+        }
     }
 
     /// Not run by itself: `MYTHICSHOT_MEASURE_DIR=<a saved recording's folder> cargo test -p
