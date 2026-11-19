@@ -65,8 +65,9 @@ pub enum Outcome {
     /// The frames are kept and the project file says why ([`MARK_FAILED`] or
     /// [`MARK_NOT_SMALLER`]): it is not tried again by this codec and version.
     Marked(&'static str),
-    /// Nothing was changed or noted, and this run does not try the project again: the codec
-    /// itself failed, the recording could not be read, or the project could not be rewritten.
+    /// Nothing was changed or noted. Either the codec itself failed, which the queue counts
+    /// and tries again until it has failed three times in a row; or this run does not try the
+    /// project again: its recording could not be read, or the project could not be rewritten.
     GaveUp,
     /// The work was told to stop. Nothing was changed or noted.
     Cancelled,
@@ -512,8 +513,9 @@ mod tests {
         let path = format!("{}::{name}", module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest));
         let out = std::process::Command::new(std::env::current_exe().unwrap()).args([path.as_str(), "--exact", "--nocapture", "--test-threads=1"]).env(ALONE, "1").output().unwrap();
         let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        for line in stdout.lines().filter(|line| line.starts_with("skipped:")) {
-            println!("{line}");
+        // What a test that could not run said, wherever on its line the test runner put it.
+        for said in stdout.lines().filter_map(|line| line.find("skipped:").map(|at| &line[at..])) {
+            println!("{said}");
         }
         assert!(out.status.success() && stdout.contains("1 passed"), "{path} on its own:\n{stdout}\n{stderr}");
     }
@@ -1092,7 +1094,7 @@ mod tests {
             let saved = w.save(CH_A);
             // A try the real codec made, as its mark says: read only while that codec is the one in use.
             assert_eq!(w.store.mark_conversion(&w.next().unwrap(), MARK_FAILED, ffmpeg::CODEC_ID), Ok(true));
-            let whole = files(w.store.root());
+            let whole = files(&saved.dir);
             let read = || w.info(CH_A).convert;
             set_current_codec(None);
             assert_eq!(read(), ConvertState::NotTried);
@@ -1115,7 +1117,7 @@ mod tests {
             // Without a folder for saved recordings the codec is told all the same.
             start(None, Some(&found(true)), &open_gate());
             assert_eq!(read(), ConvertState::Failed);
-            assert_eq!((names(&saved.dir).len(), whole.len()), (3, 3));
+            assert_eq!(files(&saved.dir), whole);
         });
     }
 
@@ -1165,6 +1167,9 @@ mod tests {
                 });
                 read_only(&project_file, false);
                 assert_eq!((files(&saved.dir) == whole, w.converting_folders(), w.info(CH_A).form), (true, 0, Form::Frames));
+                // Why it was given up is logged, in the store's words, without a name.
+                let lines = lines_without_names(&w);
+                assert!(lines.iter().any(|line| line.contains("keeps its frames") || line.contains("could not be noted")), "{lines:#?}");
             }
         });
     }
@@ -1191,6 +1196,21 @@ mod tests {
             }
             assert_eq!(w.info(CH_A).form, Form::Video);
         });
+    }
+
+    /// Every line logged in this process so far, each checked: a fixed sentence, with no part
+    /// of a path, no id of a tour or chapter, no address, and nothing a codec or the system said.
+    fn lines_without_names(w: &World) -> Vec<String> {
+        let lines = LINES.lock().unwrap().clone();
+        let folder = w.tmp.path().file_name().unwrap().to_string_lossy().to_string();
+        let hidden: Vec<String> = [folder.as_str(), "projects", TOUR, CH_A, CH_B, "tours.example.com", "somebody", "the caller's own words", "Users", "frames.", "project.json", ".converting-", "os error"].map(String::from).into_iter().chain(w.tmp.path().components().filter_map(|part| part.as_os_str().to_str().map(String::from)).filter(|part| part.len() > 3)).collect();
+        for line in &lines {
+            assert!(line.starts_with("Saved recordings: ") && line.ends_with('.') && !line.contains('\\') && !line.contains('/'), "{line}");
+            for word in &hidden {
+                assert!(!line.contains(word.as_str()), "{line:?} holds {word:?}");
+            }
+        }
+        lines
     }
 
     fn caller() -> CodecError {
@@ -1236,16 +1256,8 @@ mod tests {
             assert_eq!(outcomes[..11], [Later, Later, Later, GaveUp, GaveUp, GaveUp, Cancelled, Later, GaveUp, Marked(MARK_FAILED), Marked(MARK_NOT_SMALLER)]);
             assert!(matches!(outcomes[11], Swapped { .. }));
 
-            let lines = LINES.lock().unwrap().clone();
+            let lines = lines_without_names(&w);
             assert!(lines.len() >= outcomes.len(), "{lines:#?}");
-            let folder = w.tmp.path().file_name().unwrap().to_string_lossy().to_string();
-            let hidden: Vec<String> = [folder.as_str(), "projects", TOUR, CH_A, CH_B, "tours.example.com", "somebody", "the caller's own words", "Users", "frames.", "project.json", ".converting-"].map(String::from).into_iter().chain(w.tmp.path().components().filter_map(|part| part.as_os_str().to_str().map(String::from)).filter(|part| part.len() > 3)).collect();
-            for line in &lines {
-                assert!(line.starts_with("Saved recordings: ") && line.ends_with('.') && !line.contains('\\') && !line.contains('/') && !line.contains(":\\"), "{line}");
-                for word in &hidden {
-                    assert!(!line.contains(word.as_str()), "{line:?} holds {word:?}");
-                }
-            }
             // What they do hold: sizes, counts, the exit code, and which bound stopped the program.
             let any = |part: &str| lines.iter().any(|line| line.contains(part));
             assert!(any("exit code 1") && any("stall") && any("total") && any(&format!("{} bytes", c.frames_bytes)) && any(&format!("{FRAMES} frames")), "{lines:#?}");
