@@ -662,6 +662,63 @@ impl Settings {
         self.destinations = Some(list);
     }
 
+    /// Take over what the Preferences and Workspace pages changed in their copy, `edited`:
+    /// every field one of those pages edits directly, and no other. Shortcuts go through
+    /// `SetBinding`, the Print Screen switch has its own action, and the rest is the app's own
+    /// and may be newer here than in the window's copy.
+    pub fn take_edited(&mut self, edited: &Settings) {
+        // Every field is named, so a new one does not compile until it is decided here
+        // whether a page edits it.
+        let Settings {
+            output_dir,
+            destinations,
+            filename_pattern,
+            image_format,
+            jpeg_quality,
+            magnifier,
+            record_fps,
+            countdown_secs,
+            gif_quality,
+            record_keys,
+            overlays,
+            publish_server,
+            tray_left_click,
+            keep_published_recordings,
+            store_recordings_as_video,
+            saved_recordings_warn_gb,
+            // Not edited by a page.
+            take_print_screen: _,
+            last_region: _,
+            hotkeys: _,
+            editor_keys: _,
+            editor: _,
+            editor_keys_version: _,
+            publish_saved_for: _,
+            publish_binding_settled: _,
+            unfinished_deletes: _,
+            load_problem: _,
+            open_editor: _,
+            save_to_file: _,
+            copy_to_clipboard: _,
+        } = edited;
+        self.output_dir = output_dir.clone();
+        self.destinations = destinations.clone();
+        self.filename_pattern = filename_pattern.clone();
+        self.image_format = *image_format;
+        self.jpeg_quality = *jpeg_quality;
+        self.magnifier = *magnifier;
+        self.record_fps = *record_fps;
+        self.countdown_secs = *countdown_secs;
+        self.gif_quality = *gif_quality;
+        self.record_keys = *record_keys;
+        self.overlays = *overlays;
+        self.publish_server = publish_server.clone();
+        self.tray_left_click = *tray_left_click;
+        self.keep_published_recordings = *keep_published_recordings;
+        self.store_recordings_as_video = *store_recordings_as_video;
+        self.saved_recordings_warn_gb = *saved_recordings_warn_gb;
+    }
+
     pub fn dest_context(&self, title: &str) -> Context {
         Context {
             output_dir: self.output_dir.clone(),
@@ -676,6 +733,68 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_the_pages_edit_is_carried_over() {
+        use mythicshot_editor::overlays::ClickStyle;
+        let mut mine = Settings::default();
+        mine.hotkeys.insert(Action::ALL[0], "control+KeyQ".to_string());
+        let before = mine.clone();
+        // The window's copy, with every field a page edits changed.
+        let mut edited = mine.clone();
+        edited.output_dir = PathBuf::from("D:/Shots");
+        edited.toggle_destination(DestId::Clipboard);
+        edited.filename_pattern = "shot ${hh}".to_string();
+        edited.image_format = ImageFormat::Jpeg;
+        edited.jpeg_quality = 41;
+        edited.magnifier = !mine.magnifier;
+        edited.record_fps = 24;
+        edited.countdown_secs = 10;
+        edited.gif_quality = 51;
+        edited.record_keys = !mine.record_keys;
+        edited.overlays = OverlayStyle { keys: KeyStyle::Keyboard, clicks: ClickStyle::Both, halo: true, pointer: false };
+        edited.publish_server = "https://tours.example.com".to_string();
+        edited.tray_left_click = TrayLeftClick::CaptureRegion;
+        edited.keep_published_recordings = false;
+        edited.store_recordings_as_video = false;
+        edited.saved_recordings_warn_gb = 12;
+        assert!(mine.keep_published_recordings && mine.store_recordings_as_video && mine.saved_recordings_warn_gb == 5 && mine.overlays != edited.overlays);
+        assert!(mine.image_format != edited.image_format && mine.tray_left_click != edited.tray_left_click && mine.destinations != edited.destinations);
+        // And what no page edits changed too: a window's copy can be a frame behind the app's.
+        edited.hotkeys.clear();
+        edited.editor_keys.clear();
+        edited.take_print_screen = !mine.take_print_screen;
+        edited.last_region = Some([1, 2, 3, 4]);
+        edited.editor_keys_version = 99;
+        edited.publish_saved_for = Some("https://elsewhere.example.com".to_string());
+        edited.publish_binding_settled = !mine.publish_binding_settled;
+
+        mine.take_edited(&edited);
+        assert_eq!(mine.output_dir, PathBuf::from("D:/Shots"));
+        assert!(mine.destinations == edited.destinations && mine.has_destination(DestId::Clipboard) != before.has_destination(DestId::Clipboard));
+        assert_eq!(mine.filename_pattern, "shot ${hh}");
+        assert!(mine.image_format == ImageFormat::Jpeg && mine.tray_left_click == TrayLeftClick::CaptureRegion);
+        assert_eq!((mine.jpeg_quality, mine.record_fps, mine.countdown_secs, mine.gif_quality), (41, 24, 10, 51));
+        assert_eq!((mine.magnifier, mine.record_keys), (!before.magnifier, !before.record_keys));
+        assert!(mine.overlays == edited.overlays);
+        assert_eq!(mine.publish_server, "https://tours.example.com");
+        // The three of the saved-recordings section.
+        assert!(!mine.keep_published_recordings, "the keep switch is carried over");
+        assert!(!mine.store_recordings_as_video, "the video switch is carried over");
+        assert_eq!(mine.saved_recordings_warn_gb, 12, "the limit is carried over");
+        // Shortcuts go their own way, and the rest is the app's own.
+        assert_eq!((&mine.hotkeys, &mine.editor_keys), (&before.hotkeys, &before.editor_keys));
+        assert_eq!(mine.binding(Action::ALL[0]), "control+KeyQ");
+        assert_eq!((mine.take_print_screen, mine.last_region, mine.editor_keys_version), (before.take_print_screen, before.last_region, before.editor_keys_version));
+        assert_eq!((&mine.publish_saved_for, mine.publish_binding_settled), (&before.publish_saved_for, before.publish_binding_settled));
+        // Taken twice is taken once, and an unchanged copy changes nothing.
+        let once = toml::to_string(&mine).unwrap();
+        mine.take_edited(&edited);
+        assert_eq!(toml::to_string(&mine).unwrap(), once);
+        let mut same = before.clone();
+        same.take_edited(&before);
+        assert_eq!(toml::to_string(&same).unwrap(), toml::to_string(&before).unwrap());
+    }
 
     #[test]
     fn pen_and_crop_move_off_f_and_c_unless_rebound() {

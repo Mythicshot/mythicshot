@@ -2,10 +2,7 @@
 //! total is past it, and the texts of the usage line and of a row in the list. Pure functions
 //! only; nothing here reads the disk, and nothing here ever removes anything.
 
-// Preferences and the publish result screen are the callers; until they are built, only the tests are.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use super::store::{ConvertState, Form, ProjectInfo};
+use super::store::{ConvertState, Form, Problem, ProjectInfo};
 use crate::publish_ui::{short_title, size_text};
 
 /// The highest limit that can be set, in GB: four digits.
@@ -34,6 +31,8 @@ pub fn over_limit(bytes: u64, limit_gb: u32) -> bool {
 }
 
 /// Whether going from `before` to `after` crossed the limit: under or at it before, over it after.
+// The publish result screen is the caller; until it asks, only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pushed_over(before: u64, after: u64, limit_gb: u32) -> bool {
     !over_limit(before, limit_gb) && over_limit(after, limit_gb)
 }
@@ -79,15 +78,29 @@ pub fn remove_question(title: &str) -> String {
     format!("Remove the recording of \"{}\"? The tour stays online, but it can no longer be edited from this computer.", short_title(title, QUESTION_TITLE_MAX))
 }
 
-/// What a row of the list is called: the tour's title, and the chapter's after it when it
-/// differs or when several saved projects share the tour (`shared_tour`).
+/// What a row of the list is called: the tour's title, and the chapter's after it only when
+/// several saved projects share the tour (`shared_tour`).
 pub fn row_title(info: &ProjectInfo, shared_tour: bool) -> String {
     let (tour, chapter) = (info.tour_title.as_str(), info.title.as_str());
     // A project file that cannot be read may name only one of the two, or neither.
-    if tour.is_empty() || chapter.is_empty() {
-        return format!("{tour}{chapter}");
+    match (tour.is_empty(), chapter.is_empty()) {
+        (true, true) => UNTITLED.to_string(),
+        (true, false) => chapter.to_string(),
+        (false, false) if shared_tour => format!("{tour} · {chapter}"),
+        (false, _) => tour.to_string(),
     }
-    if shared_tour || chapter != tour { format!("{tour} · {chapter}") } else { tour.to_string() }
+}
+
+/// What a row is called when its project file names no title at all.
+pub const UNTITLED: &str = "Untitled recording";
+
+/// The form column of a recording that cannot be opened: what is wrong with it.
+pub fn problem_text(problem: Problem) -> &'static str {
+    match problem {
+        Problem::Damaged => "damaged",
+        Problem::Newer => "saved by a newer version",
+        Problem::FramesMissing => "frames missing",
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +184,18 @@ mod tests {
         // Past the limit the line still only counts; the warning is its own sentence.
         assert_eq!(usage_line(40, 5_798_205_850, 5), "40 saved recordings · 5.4 GB of 5 GB");
         assert_eq!(usage_line(2, 3 * MB / 2, 9999), "2 saved recordings · 1.5 MB of 9999 GB");
+        // Under a megabyte in KB; from a megabyte with one decimal; from a hundred without; from a gigabyte in GB.
+        assert_eq!(usage_line(1, 860_160, 0), "1 saved recording · 840 KB");
+        assert_eq!(usage_line(1, 0, 0), "1 saved recording · 0 KB");
+        assert_eq!(usage_line(1, 1_048_575, 0), "1 saved recording · 1024 KB");
+        assert_eq!(usage_line(1, 1_048_576, 0), "1 saved recording · 1.0 MB");
+        assert_eq!(usage_line(2, 104_752_742, 0), "2 saved recordings · 99.9 MB");
+        assert_eq!(usage_line(2, 104_857_599, 0), "2 saved recordings · 100 MB");
+        assert_eq!(usage_line(9, 1_073_741_823, 0), "9 saved recordings · 1024 MB");
+        assert_eq!(usage_line(9, 1_073_741_824, 0), "9 saved recordings · 1.0 GB");
+        assert_eq!(usage_line(90, 13_314_398_618, 0), "90 saved recordings · 12.4 GB");
+        assert_eq!(usage_line(900, 161_061_273_600, 0), "900 saved recordings · 150.0 GB");
+        assert_eq!(usage_line(900, 161_061_273_600, 100), "900 saved recordings · 150.0 GB of 100 GB");
         // Sizes are written as everywhere else in the app.
         for bytes in [0, 860_160, 13_002_342, 104_857_599, 1_073_741_823, 13_314_398_618] {
             assert_eq!(usage_line(2, bytes, 0), format!("2 saved recordings · {}", size_text(bytes)));
@@ -227,22 +252,38 @@ mod tests {
 
     fn info(tour_title: &str, title: &str) -> ProjectInfo {
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), chapter_id: "chap_cccccccccccccccccccccccc".into() };
-        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
+        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, frames_bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     #[test]
-    fn a_chapter_is_named_only_when_the_tour_has_several_or_it_differs() {
-        // A tour of one chapter with the tour's own title: the title once.
+    fn a_chapter_is_named_only_when_the_tour_has_several() {
+        // The only saved recording of a tour: the tour's title, whatever the chapter is called.
         assert_eq!(row_title(&info("Customer onboarding", "Customer onboarding"), false), "Customer onboarding");
+        assert_eq!(row_title(&info("Customer onboarding", "Invite your team"), false), "Customer onboarding");
         // Several saved recordings of one tour: each names its chapter, also one titled as the tour.
         assert_eq!(row_title(&info("Customer onboarding", "Invite your team"), true), "Customer onboarding · Invite your team");
         assert_eq!(row_title(&info("Customer onboarding", "Customer onboarding"), true), "Customer onboarding · Customer onboarding");
-        // The only saved recording of a tour, with a title of its own.
-        assert_eq!(row_title(&info("Customer onboarding", "Invite your team"), false), "Customer onboarding · Invite your team");
         // A project whose file names only one of the two (a damaged one): what there is, with no stray dot.
         assert_eq!(row_title(&info("Customer onboarding", ""), true), "Customer onboarding");
+        assert_eq!(row_title(&info("Customer onboarding", ""), false), "Customer onboarding");
         assert_eq!(row_title(&info("", "Invite your team"), false), "Invite your team");
         assert_eq!(row_title(&info("", "Invite your team"), true), "Invite your team");
-        assert_eq!(row_title(&info("", ""), true), "");
+    }
+
+    #[test]
+    fn a_recording_without_any_title_is_called_untitled() {
+        for shared in [false, true] {
+            assert_eq!(row_title(&info("", ""), shared), "Untitled recording");
+        }
+        assert_eq!(UNTITLED, "Untitled recording");
+        // And the question reads with it.
+        assert!(remove_question(&row_title(&info("", ""), false)).starts_with("Remove the recording of \"Untitled recording\"? "));
+    }
+
+    #[test]
+    fn a_recording_with_a_problem_names_it_in_the_form_column() {
+        assert_eq!(problem_text(Problem::Damaged), "damaged");
+        assert_eq!(problem_text(Problem::Newer), "saved by a newer version");
+        assert_eq!(problem_text(Problem::FramesMissing), "frames missing");
     }
 }
