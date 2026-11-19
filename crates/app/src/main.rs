@@ -977,19 +977,7 @@ impl App {
                 }
                 UiAction::SettingsChanged => {
                     // The General and Output tabs and the Workspace page edit fields directly; shortcuts go through SetBinding.
-                    self.settings.output_dir = edited.output_dir.clone();
-                    self.settings.destinations = edited.destinations.clone();
-                    self.settings.filename_pattern = edited.filename_pattern.clone();
-                    self.settings.image_format = edited.image_format;
-                    self.settings.jpeg_quality = edited.jpeg_quality;
-                    self.settings.magnifier = edited.magnifier;
-                    self.settings.record_fps = edited.record_fps;
-                    self.settings.countdown_secs = edited.countdown_secs;
-                    self.settings.record_keys = edited.record_keys;
-                    self.settings.overlays = edited.overlays;
-                    self.settings.gif_quality = edited.gif_quality;
-                    self.settings.publish_server = edited.publish_server.clone();
-                    self.settings.tray_left_click = edited.tray_left_click;
+                    self.settings.take_edited(&edited);
                     self.settings_changed();
                 }
                 UiAction::SetTakePrintScreen(on) => {
