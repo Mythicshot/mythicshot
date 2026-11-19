@@ -108,6 +108,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     let hooks = Hooks {
         open_folder: &mut |folder| crate::platform::open_folder(folder),
         ffmpeg: ffmpeg_state(),
+        epoch: project::epoch(),
         list: &mut |root| list_in_background(root, lister.clone()),
         remove: &mut |root, dir| remove_in_background(root, dir, remover.clone()),
     };
@@ -121,6 +122,8 @@ struct Hooks<'a> {
     open_folder: &'a mut dyn FnMut(&Path),
     /// How the search for ffmpeg stands.
     ffmpeg: FfmpegState,
+    /// [`project::epoch`]: it moves when a project is saved or removed, or a conversion starts or ends.
+    epoch: u64,
     /// Read the saved recordings of a projects folder, off the UI thread.
     list: &'a mut dyn FnMut(&Path) -> Receiver<Listed>,
     /// Remove, from the store in the first folder, the project in the second, off the UI thread.
@@ -215,7 +218,7 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, ho
     let opened = saved.drawn_in.is_none_or(|last| pass > last + 1);
     saved.drawn_in = Some(pass);
     // Everything the disk is asked happens here, before anything is drawn, and on other threads.
-    saved.refresh(project::epoch(), opened, hooks.list);
+    saved.refresh(hooks.epoch, opened, hooks.list);
     saved.build(view.settings.store_recordings_as_video, hooks.ffmpeg, &chrono::Local::now());
     egui::ScrollArea::vertical().show(ui, |ui| output_page(ui, view, saved, hooks, out));
 }
@@ -1081,6 +1084,8 @@ mod tests {
         opened: Vec<PathBuf>,
         screen: egui::Vec2,
         ffmpeg: FfmpegState,
+        /// The count of saves and removals the page is told: its own, so that the tests running beside it do not move it.
+        epoch: u64,
         /// What a read answers instead of the store's own list.
         fake: Option<Listed>,
         /// How many reads were started.
@@ -1102,6 +1107,7 @@ mod tests {
                 opened: Vec::new(),
                 screen: SCREEN,
                 ffmpeg: FfmpegState::NotFound,
+                epoch: 0,
                 fake: None,
                 reads: 0,
                 removals: Vec::new(),
@@ -1120,13 +1126,14 @@ mod tests {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)), events, ..Default::default() };
             let errors = HashMap::new();
             let (settings, state, actions, opened) = (&mut self.settings, &mut self.state, &mut self.actions, &mut self.opened);
-            let (fake, reads, removals, answer, ffmpeg) = (&self.fake, &mut self.reads, &mut self.removals, &self.answer, self.ffmpeg);
+            let (fake, reads, removals, answer, ffmpeg, epoch) = (&self.fake, &mut self.reads, &mut self.removals, &self.answer, self.ffmpeg, self.epoch);
             let ctx = self.ctx.clone();
             let mut out = self.ctx.run_ui(input, |ui| {
                 let view = View { settings: &mut *settings, errors: &errors, snipping_tool: None, autostart: false };
                 let hooks = Hooks {
                     open_folder: &mut |folder| opened.push(folder.to_path_buf()),
                     ffmpeg,
+                    epoch,
                     list: &mut |root| {
                         *reads += 1;
                         match fake {
@@ -1507,16 +1514,20 @@ mod tests {
 
         // The page itself: one read however often it is drawn, and none from clicking about in it.
         let mut page = Page::showing(listed(vec![info(SITE, "tour_a", "chap_a", "Customer onboarding", "Customer onboarding", 1, 20 * MB)]));
-        let epoch = project::epoch();
         for _ in 0..50 {
             page.frame(vec![]);
         }
         page.click(REMOVE_RECORDING);
         page.click(KEEP_IT);
-        // Other tests save and remove projects of their own meanwhile, which moves the counter for everybody.
-        if project::epoch() == epoch {
-            assert_eq!(page.reads, 1);
+        page.click(STORE_AS_VIDEO);
+        page.type_limit("7");
+        assert_eq!(page.reads, 1);
+        // A project is saved or removed, or a conversion starts or ends: one more read.
+        page.epoch += 1;
+        for _ in 0..50 {
+            page.frame(vec![]);
         }
+        assert_eq!(page.reads, 2);
     }
 
     #[test]
