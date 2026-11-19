@@ -568,12 +568,6 @@ fn failed_publish_message(error: &str, updating: bool) -> String {
     }
 }
 
-/// Whether the "Publish tour" dialog comes back with the reason after a publish or an update
-/// ended with `error` and nothing uploaded.
-fn dialog_comes_back(error: &str, updating: bool) -> bool {
-    (updating && error != crate::publish::CANCELLED) || crate::publish::full_workspace(error).is_some()
-}
-
 /// What jobs that ran on after their editor was closed have to say to the user. The editor's
 /// status bar is gone by then, so the app shows each one in its notification, once.
 #[derive(Clone, Default)]
@@ -745,6 +739,9 @@ pub struct VideoState {
     job: Option<ExportJob>,
     /// The "Publish tour" dialog, while it is open.
     picker: Option<Picker>,
+    /// The "Publish tour" dialog as the user left it when the running publish or update was
+    /// started from it: it comes back like that when the site has no room for the tour.
+    picker_left: Option<Picker>,
     /// The screen after a publish or a draft upload, until "Done".
     publish_result: Option<ResultDialog>,
     /// The "Add to site" dialog, while it is open.
@@ -852,6 +849,7 @@ impl Editor {
             notices: background_notices(),
             job: None,
             picker: None,
+            picker_left: None,
             publish_result: None,
             site_dialog: None,
             exported: false,
@@ -1009,7 +1007,7 @@ impl Editor {
                         }
                     }
                     None => {
-                        v.picker = None;
+                        v.picker_left = v.picker.take();
                         self.start_publish(title, target, mode, tour_title, before);
                     }
                 }
@@ -1023,7 +1021,7 @@ impl Editor {
                         }
                     }
                     None => {
-                        v.picker = None;
+                        v.picker_left = v.picker.take();
                         self.start_update(title, target, before);
                     }
                 }
@@ -1084,6 +1082,7 @@ impl Editor {
         let tour_cancelling = v.job.as_ref().and_then(|j| j.tour_cancelling()) == Some(true);
         if let Some(r) = finished {
             v.job = None;
+            let left = v.picker_left.take();
             let next = after_export(is_tour, r.is_ok(), v.close_after_export);
             match r {
                 Ok(done) => {
@@ -1156,18 +1155,9 @@ impl Editor {
                     self.notify(msg);
                     // An update that failed: the dialog comes back with the reason, and still
                     // offers a new tour. A cancel is the user's own doing and brings nothing back.
-                    // A workspace without room brings it back for a new tour too: its message
-                    // has a heading and a small line, which the status bar cannot show.
-                    if dialog_comes_back(&e, updating) {
-                        if updating {
-                            self.offer_update_again(e);
-                        } else {
-                            self.open_publish_picker();
-                            if let Some(p) = self.video.as_mut().and_then(|v| v.picker.as_mut()) {
-                                p.refuse(e);
-                            }
-                        }
-                    }
+                    // A workspace without room brings back the dialog as it was left, for a
+                    // new tour or chapter too: its message is more than a status line.
+                    self.bring_dialog_back(left, e, updating);
                 }
                 Err(e) if is_site => {
                     let msg = if e == "cancelled" { "Adding to site cancelled".to_string() } else { e };
@@ -1362,15 +1352,19 @@ impl Editor {
         });
     }
 
-    /// The dialog again after an update failed, with the reason.
-    fn offer_update_again(&mut self, error: String) {
+    /// The dialog again after a publish or an update ended with `error` and nothing uploaded:
+    /// see [`publish_ui::dialog_after_refusal`]. `left` is the dialog the upload was started from.
+    fn bring_dialog_back(&mut self, left: Option<Picker>, error: String, updating: bool) {
         let title = self.title().to_string();
         let Some(v) = self.video.as_mut() else { return };
-        let Some(origin) = &v.origin else { return };
         if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
             return;
         }
-        v.picker = Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error).with_logo_missing(logo_missing(origin, &v.edit)));
+        let (origin, edit) = (&v.origin, &v.edit);
+        v.picker = publish_ui::dialog_after_refusal(left, error, updating, |error| {
+            let origin = origin.as_ref()?;
+            Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error).with_logo_missing(logo_missing(origin, edit)))
+        });
     }
 
     /// "Update tour": replace the chapter this editor's recording was saved for, save the
@@ -3187,14 +3181,9 @@ mod tests {
         assert_eq!(failed_publish_message(CANCELLED, true), "Update cancelled");
         assert_eq!(failed_publish_message(CANCELLED, false), "Publishing cancelled");
         assert_eq!(failed_publish_message("Could not start the upload: that tour no longer exists.", true), "Could not start the upload: that tour no longer exists.");
-        // The dialog comes back with the reason after a failed update, and after a publish only
-        // when the workspace has no room: that message is more than a status line.
+        // A workspace without room is one line in the status bar; the dialog has its three parts.
         let full = "The tour was not uploaded. This tour needs 310 MB, and your workspace has 120 MB left of its 5.0 GB. Delete tours you no longer need, or ask for more room, and publish again. Tours that are already online are not affected.";
         assert_eq!(failed_publish_message(full, false), full);
-        assert!(dialog_comes_back(full, false) && dialog_comes_back(full, true));
-        assert!(dialog_comes_back("Could not send step 3: the server could not be reached.", true));
-        assert!(!dialog_comes_back("Could not send step 3: the server could not be reached.", false));
-        assert!(!dialog_comes_back(CANCELLED, true) && !dialog_comes_back(CANCELLED, false));
 
         // The job itself: progress climbs through the writing and the upload, and the run
         // then carries the site's count.

@@ -5,7 +5,7 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 ## 0.2.9 (2026-11-19)
 
 - A publish or an update that would take the workspace past its storage allowance now says how much room the tour needs and how much is left, under the heading "The tour was not uploaded". Tours that are already online are not affected.
-- An update of a tour with a logo no longer needs spare room for the logo, on sites running platform 0.1.8 or newer.
+- An update of a tour with a logo no longer needs spare room for a logo that is not larger than the present one, and a new tour holds room for its logo's real size, on sites running platform 0.1.8 or newer.
 
 ## 0.2.8 (2026-11-19)
 

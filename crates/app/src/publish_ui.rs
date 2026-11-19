@@ -1109,6 +1109,25 @@ fn show_refusal(ui: &mut egui::Ui, why: &str) {
     }
 }
 
+/// The dialog to show again after a publish or an update ended with `error` and nothing
+/// uploaded; None when none comes back. `left` is the dialog as the user left it when the
+/// upload started. A workspace without room brings that very dialog back, with its title, its
+/// choice and its mode, and the message under them: nothing is chosen for the user. Any other
+/// failed update gets the dialog `again` makes for it; a cancel brings nothing back.
+pub fn dialog_after_refusal(left: Option<Picker>, error: String, updating: bool, again: impl FnOnce(String) -> Option<Picker>) -> Option<Picker> {
+    if error == publish::CANCELLED {
+        return None;
+    }
+    match left.filter(|_| publish::full_workspace(&error).is_some()) {
+        Some(mut picker) => {
+            picker.refuse(error);
+            Some(picker)
+        }
+        None if updating => again(error),
+        None => None,
+    }
+}
+
 /// The two things a dialog opened through Edit can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditChoice {
@@ -2680,6 +2699,81 @@ pub(crate) mod tests {
         let mut p = Picker::new(String::new(), "Demo");
         p.refuse(FULL.into());
         assert!(draw(&mut p, egui::RawInput::default()).is_none());
+    }
+
+    /// What a main-button press gave, in short.
+    fn pressed(p: &mut Picker) -> String {
+        match draw(p, key_press(egui::Key::Enter)) {
+            Some(PickerOutcome::Upload { title, target, mode, .. }) => format!("upload {title:?} {target:?} {mode:?}"),
+            Some(PickerOutcome::Update { target, .. }) => format!("update {}", target.chapter_id),
+            Some(PickerOutcome::Cancel) => "cancel".into(),
+            None => "nothing".into(),
+        }
+    }
+
+    fn never(_: String) -> Option<Picker> {
+        panic!("no other dialog is made")
+    }
+
+    #[test]
+    fn after_a_full_workspace_the_dialog_comes_back_as_the_user_left_it() {
+        // From an editor opened through Edit, "Publish as a new tour" with a typed title, as a draft.
+        let mut p = edit_picker(Some(Some("0.1.8")), Some(vec![listed_tour("published")]));
+        pick_new(&mut p);
+        p.title = "A tour of its own".into();
+        p.mode = Mode::Draft;
+        let asked = pressed(&mut p);
+        assert_eq!(asked, r#"upload "A tour of its own" New Draft"#);
+        let mut back = dialog_after_refusal(Some(p), FULL.into(), false, never).expect("the dialog comes back");
+        assert_eq!(back.refused.as_deref(), Some(FULL));
+        assert_eq!(pressed(&mut back), asked, "never an update of the tour the recording was saved for");
+
+        // A new chapter of a listed tour, published now.
+        let mut p = Picker::new(String::new(), "Chapter two");
+        *p.list.lock().unwrap() = ListState::Loaded(vec![listed_tour("draft")]);
+        p.choice = Choice::Tour(TOUR_ID.into());
+        let asked = pressed(&mut p);
+        assert_eq!(asked, format!(r#"upload "Chapter two" Chapter("{TOUR_ID}") PublishNow"#));
+        let mut back = dialog_after_refusal(Some(p), FULL.into(), false, never).unwrap();
+        assert_eq!(back.refused.as_deref(), Some(FULL));
+        assert_eq!(pressed(&mut back), asked);
+
+        // A new tour with a typed title.
+        let mut p = Picker::new(String::new(), "Demo");
+        p.title = "Typed".into();
+        let mut back = dialog_after_refusal(Some(p), FULL.into(), false, never).unwrap();
+        assert_eq!(pressed(&mut back), r#"upload "Typed" New PublishNow"#);
+
+        // An update: Update is still the choice, in the dialog that was left.
+        let p = edit_picker(Some(Some("0.1.8")), Some(vec![listed_tour("published")]));
+        let mut back = dialog_after_refusal(Some(p), FULL.into(), true, never).unwrap();
+        assert_eq!(back.shown(), Shown::Update { public: true });
+        assert_eq!(back.refused.as_deref(), Some(FULL));
+        assert_eq!(pressed(&mut back), format!("update {CHAPTER_ID}"));
+    }
+
+    #[test]
+    fn any_other_ending_brings_back_what_it_did_before() {
+        let left = || Some(edit_picker(Some(Some("0.1.8")), Some(vec![listed_tour("published")])));
+        // A failed update gets the dialog made for it, with the reason.
+        let gone = "Could not start the upload: that tour no longer exists.";
+        let made = dialog_after_refusal(left(), gone.into(), true, |e| {
+            assert_eq!(e, gone);
+            let mut p = Picker::new_for_edit(String::new(), "Chapter one", edit_target(), Block::Said);
+            p.refuse(e);
+            Some(p)
+        })
+        .unwrap();
+        assert_eq!(made.shown(), Shown::OnlyNew(None));
+        // A failed publish of a new tour or chapter says so in the status bar only.
+        assert!(dialog_after_refusal(left(), "Could not send step 3: the server could not be reached.".into(), false, never).is_none());
+        // A cancel is the user's own doing.
+        assert!(dialog_after_refusal(left(), publish::CANCELLED.into(), true, never).is_none());
+        assert!(dialog_after_refusal(left(), publish::CANCELLED.into(), false, never).is_none());
+        // No dialog was left (the publish was not started from one): a full workspace on an
+        // update still gets the update's dialog, and otherwise there is none to bring back.
+        assert!(dialog_after_refusal(None, FULL.into(), true, |_| left()).is_some());
+        assert!(dialog_after_refusal(None, FULL.into(), false, never).is_none());
     }
 
     // ---- The result screen after an update ----

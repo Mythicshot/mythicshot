@@ -473,15 +473,35 @@ pub const FULL_HEADING: &str = "The tour was not uploaded";
 pub const FULL_NOTE: &str = "Tours that are already online are not affected.";
 
 /// The error for an upload refused for want of room: the heading, the sentence with the three
-/// sizes, and the small line, as one text. Waiting does not help; making room does.
+/// sizes, and the small line, as one text. Waiting does not help; making room does. What the
+/// tour needs is rounded up and what is left down, so the two never read as if it would fit.
 fn full_workspace_error(needed: u64, left: u64, allowance: u64) -> String {
-    let size = crate::publish_ui::size_text;
     format!(
         "{FULL_HEADING}. This tour needs {}, and your workspace has {} left of its {}. Delete tours you no longer need, or ask for more room, and publish again. {FULL_NOTE}",
-        size(needed),
-        size(left),
-        size(allowance)
+        size_rounded(needed, true),
+        size_rounded(left, false),
+        crate::publish_ui::size_text(allowance)
     )
+}
+
+/// A size written the way the app writes sizes (whole KB, MB with one decimal below 100 and
+/// whole above, GB with one decimal), but rounded up or down instead of to the nearest. Rounded
+/// up, anything above nothing is at least "1 KB", and a size never reads as 1024 of a unit.
+fn size_rounded(bytes: u64, up: bool) -> String {
+    const MB: u128 = 1 << 20;
+    const GB: u128 = 1 << 30;
+    let bytes = u128::from(bytes);
+    let over = |unit: u128| if up { bytes.div_ceil(unit) } else { bytes / unit };
+    let tenths = |unit: u128| if up { (bytes * 10).div_ceil(unit) } else { bytes * 10 / unit };
+    if bytes < MB && over(1024) < 1024 {
+        format!("{} KB", over(1024))
+    } else if tenths(MB) < 1000 {
+        format!("{}.{} MB", tenths(MB) / 10, tenths(MB) % 10)
+    } else if bytes < GB && over(MB) < 1024 {
+        format!("{} MB", over(MB))
+    } else {
+        format!("{}.{} GB", tenths(GB) / 10, tenths(GB) % 10)
+    }
 }
 
 /// When `error` (from an upload or an update) says the workspace has no room for the tour: the
@@ -714,21 +734,10 @@ impl Client {
                 reply.retry_after.map(|s| format!(" or about {} seconds", s.min(3600))).unwrap_or_default()
             )),
             429 => Err(format!("{what}: the server is busy (HTTP 429). Try again later.")),
-            // No room in the workspace: said with the site's numbers, never with its text. An
-            // answer without all three numbers (another site) keeps the site's own sentence.
-            413 if reply.error_code().as_deref() == Some("storage_full") => Err(match Self::room(&reply) {
-                Some((needed, left, allowance)) => full_workspace_error(needed, left, allowance),
-                None => self.as_the_site_says(what, &reply),
+            s => Err(match self.server_detail(&reply) {
+                Some(d) => format!("{what}: {d} (HTTP {s})."),
+                None => format!("{what}: the server answered HTTP {s}."),
             }),
-            _ => Err(self.as_the_site_says(what, &reply)),
-        }
-    }
-
-    /// A refusal in the site's own words, with its status.
-    fn as_the_site_says(&self, what: &str, reply: &Reply) -> String {
-        match self.server_detail(reply) {
-            Some(d) => format!("{what}: {d} (HTTP {}).", reply.status),
-            None => format!("{what}: the server answered HTTP {}.", reply.status),
         }
     }
 
@@ -828,6 +837,15 @@ impl Client {
         // A site that does not know the `replace` target yet refuses it by that name.
         if replace && reply.status == 400 && reply.error_code().as_deref() == Some("bad_target") {
             return Err(format!("{what}: {UPDATE_NEEDS_UPDATE}"));
+        }
+        // No room in the workspace: said with the site's numbers, never with its text. Only the
+        // create is refused this way; an answer without all three numbers (another site) keeps
+        // the site's own sentence, like any other refusal.
+        if reply.status == 413
+            && reply.error_code().as_deref() == Some("storage_full")
+            && let Some((needed, left, allowance)) = Self::room(&reply)
+        {
+            return Err(full_workspace_error(needed, left, allowance));
         }
         let reply = self.check(what, reply)?;
         let answer = reply.json().ok_or_else(|| not_understood(what))?;
@@ -1373,8 +1391,9 @@ impl Bundle {
 }
 
 /// A file named in `tour.json`: a plain name directly inside the folder, a regular file
-/// (not a link or a folder), PNG or JPEG by name, of exactly `bytes` bytes (`exact`) or at most.
-/// Either way the file must keep the size it has now until it is sent.
+/// (not a link or a folder), PNG or JPEG by name, and now of exactly `bytes` bytes (`exact`) or
+/// of at most that many. What comes back holds the size the file really has, not `bytes`: it
+/// must still have that size when it is hashed and when it is sent.
 fn bundle_file(dir: &Path, name: &str, bytes: u64, exact: bool) -> Result<BundleFile, String> {
     let mut parts = Path::new(name).components();
     let plain = matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) && !name.contains([':', '/', '\\']) && !name.chars().any(char::is_control);
@@ -2589,6 +2608,86 @@ pub(crate) mod tests {
         // The code under another status is not it either.
         let s = refusing_create(500, r#"{"error":"storage_full","detail":"no","used_bytes":1,"allowance_bytes":2,"needed_bytes":3}"#);
         assert_eq!(update(&s, dir.path()).unwrap_err(), "Could not start the upload: no (HTTP 500).");
+    }
+
+    #[test]
+    fn only_the_create_gets_the_full_workspace_message() {
+        let body = storage_full("1", "2", "3", "no room");
+        let dir = distinct_bundle(2, false);
+        // On a step and on the commit it is the site's sentence with its status, and the upload is aborted once.
+        for (at, said) in [("/steps/1", "Could not send step 1: no room (HTTP 413)."), ("/commit", "Could not finish the upload: no room (HTTP 413).")] {
+            let body = body.clone();
+            let s = stub(move |req, seen| if req.line.ends_with(at) { reply(413, &body) } else { platform(req, seen) });
+            let e = upload_bundle(&s.base, TOKEN, dir.path(), &Target::New, |_| true).unwrap_err();
+            assert_eq!(e, said);
+            assert_eq!(full_workspace(&e), None);
+            assert_eq!(count(&s.lines(), |l| l.starts_with("DELETE ")), 1, "{at}");
+        }
+        // On the logo too.
+        let with_logo = logo_bundle(1);
+        let b = body.clone();
+        let s = stub(move |req, seen| if req.line.ends_with("/logo") { reply(413, &b) } else { platform(req, seen) });
+        assert_eq!(upload_bundle(&s.base, TOKEN, with_logo.path(), &Target::New, |_| true).unwrap_err(), "Could not send the logo: no room (HTTP 413).");
+        assert_eq!(count(&s.lines(), |l| l.starts_with("DELETE ")), 1);
+        // On the publish step: the upload is done, and the result carries the site's sentence.
+        let b = body.clone();
+        let s = platform_with(move |_| reply(413, &b));
+        let done = upload_and_publish_to(&s, true, |_| true).unwrap();
+        assert!(matches!(&done.outcome, Outcome::NotPublic { cancelled: false, error } if error == "Could not publish the tour: no room (HTTP 413)."), "{done:?}");
+        // And on every other request.
+        let b = body.clone();
+        let s = stub(move |_, _| reply(413, &b));
+        let c = client(&s);
+        assert_eq!(c.workspace().unwrap_err(), "Could not check the server: no room (HTTP 413).");
+        assert_eq!(c.list_tours().unwrap_err(), "Could not list the tours: no room (HTTP 413).");
+        assert_eq!(c.rename_tour(TOUR, "New").unwrap_err(), "Could not rename the tour: no room (HTTP 413).");
+        assert_eq!(c.unpublish_tour(TOUR, Duration::ZERO).unwrap_err(), "Could not unpublish the tour: no room (HTTP 413).");
+        assert_eq!(c.delete_tour(TOUR, Duration::ZERO, |_| {}).unwrap_err().message, "Could not delete the tour: no room (HTTP 413).");
+    }
+
+    #[test]
+    fn the_sizes_never_contradict_each_other_and_never_overflow() {
+        let dir = distinct_bundle(2, false);
+        let said = |used: u64, allowance: u64, needed: u64| {
+            let s = full_create(storage_full(&used.to_string(), &allowance.to_string(), &needed.to_string(), "x"));
+            let e = update(&s, dir.path()).unwrap_err();
+            full_workspace(&e).map(str::to_string).unwrap_or(e)
+        };
+        let rest = "Delete tours you no longer need, or ask for more room, and publish again.";
+        // What the tour needs is rounded up and what is left down: both would read 3.1 MB to the nearest.
+        let left = 3 * MB + MB / 8;
+        assert_eq!(said(1024 * MB - left, 1024 * MB, left + 1), format!("This tour needs 3.2 MB, and your workspace has 3.1 MB left of its 1.0 GB. {rest}"));
+        // A need above nothing is never "0 KB", and a rest under one unit is none.
+        assert_eq!(said(1024 * MB - 100, 1024 * MB, 101), format!("This tour needs 1 KB, and your workspace has 0 KB left of its 1.0 GB. {rest}"));
+        // Rounding up moves to the next unit instead of writing 1024 of the smaller one.
+        assert_eq!(said(0, 500 * 1024, MB - 1), format!("This tour needs 1.0 MB, and your workspace has 500 KB left of its 500 KB. {rest}"));
+        assert_eq!(said(0, 99 * MB, 100 * MB - 1), format!("This tour needs 100 MB, and your workspace has 99.0 MB left of its 99.0 MB. {rest}"));
+        assert_eq!(said(1, 1024 * MB, 1024 * MB), format!("This tour needs 1.0 GB, and your workspace has 1023 MB left of its 1.0 GB. {rest}"));
+        assert_eq!(said(0, 2047 * MB, 1024 * MB + 1), format!("This tour needs 1.1 GB, and your workspace has 1.9 GB left of its 2.0 GB. {rest}"));
+        // The largest numbers there are.
+        let huge = said(0, u64::MAX, u64::MAX);
+        assert!(huge.starts_with("This tour needs 17179869184.0 GB, and your workspace has 17179869183.9 GB left of its "), "{huge}");
+        assert!(said(u64::MAX, u64::MAX, u64::MAX).contains("has 0 KB left"));
+    }
+
+    #[test]
+    fn numbers_that_are_no_byte_counts_and_bodies_that_are_no_answers_read_as_before() {
+        let dir = distinct_bundle(2, false);
+        for odd in ["1e30", "18446744073709551616", "1e3", "3.0"] {
+            let s = full_create(storage_full("1", "2", odd, "no room"));
+            assert_eq!(update(&s, dir.path()).unwrap_err(), "Could not start the upload: no room (HTTP 413).", "{odd}");
+        }
+        // Not JSON at all: a hosting error page, or nothing.
+        for body in ["<html><body>413 Request Entity Too Large</body></html>", "storage_full", "{\"error\":\"storage_full\""] {
+            let s = full_create(body.to_string());
+            assert_eq!(update(&s, dir.path()).unwrap_err(), "Could not start the upload: the server answered HTTP 413.", "{body}");
+        }
+        // The site's own sentence is cut like any other text from a site.
+        let long = "room ".repeat(100);
+        let s = full_create(format!(r#"{{"error":"storage_full","detail":"{long}"}}"#));
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, format!("Could not start the upload: {} (HTTP 413).", long.chars().take(MAX_DETAIL_CHARS).collect::<String>().trim()));
+        assert!(e.chars().count() < MAX_DETAIL_CHARS + 60);
     }
 
     #[test]
