@@ -1078,6 +1078,37 @@ pub fn update_can_be_tried_again(error: &str) -> bool {
     !(publish::is_gone(error) || publish::is_chapter_gone(error) || publish::needs_newer_site(error))
 }
 
+/// Why an upload did not start, as the dialog shows it: a heading and a small line only for a
+/// message that has them, around the sentence.
+#[derive(Debug, PartialEq)]
+struct Refusal<'a> {
+    heading: Option<&'static str>,
+    body: &'a str,
+    note: Option<&'static str>,
+}
+
+fn refusal_parts(why: &str) -> Refusal<'_> {
+    match publish::full_workspace(why) {
+        Some(body) => Refusal { heading: Some(publish::FULL_HEADING), body, note: Some(publish::FULL_NOTE) },
+        None => Refusal { heading: None, body: why, note: None },
+    }
+}
+
+/// Draw why the last upload did not start, under the dialog's choices.
+fn show_refusal(ui: &mut egui::Ui, why: &str) {
+    let r = refusal_parts(why);
+    ui.add_space(8.0);
+    if let Some(heading) = r.heading {
+        ui.add(egui::Label::new(RichText::new(heading).color(ERROR).strong()).wrap());
+        ui.add_space(2.0);
+    }
+    ui.add(egui::Label::new(RichText::new(r.body).color(ERROR)).wrap());
+    if let Some(note) = r.note {
+        ui.add_space(2.0);
+        ui.add(egui::Label::new(RichText::new(note).color(MUTED).size(12.0)).wrap());
+    }
+}
+
 /// The two things a dialog opened through Edit can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditChoice {
@@ -1390,8 +1421,7 @@ impl Picker {
                 }
             }
             if let Some(why) = &self.refused {
-                ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(why).color(ERROR)).wrap());
+                show_refusal(ui, why);
             }
             ui.add_space(16.0);
             let can = self.edit_outcome(&shown).is_some();
@@ -1571,8 +1601,7 @@ impl Picker {
             }
             drop(list);
             if let Some(why) = &self.refused {
-                ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(why).color(ERROR)).wrap());
+                show_refusal(ui, why);
             }
             ui.add_space(16.0);
             let can_upload = self.can_upload();
@@ -2618,6 +2647,39 @@ pub(crate) mod tests {
         assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Update { .. })));
         pick_new(&mut p);
         assert!(matches!(p.edit_outcome(&p.shown()), Some(PickerOutcome::Upload { target: Target::New, .. })));
+    }
+
+    const FULL: &str = "The tour was not uploaded. This tour needs 310 MB, and your workspace has 120 MB left of its 5.0 GB. Delete tours you no longer need, or ask for more room, and publish again. Tours that are already online are not affected.";
+
+    #[test]
+    fn a_full_workspace_is_shown_as_a_heading_the_sentence_and_a_small_line() {
+        assert_eq!(
+            refusal_parts(FULL),
+            Refusal {
+                heading: Some("The tour was not uploaded"),
+                body: "This tour needs 310 MB, and your workspace has 120 MB left of its 5.0 GB. Delete tours you no longer need, or ask for more room, and publish again.",
+                note: Some("Tours that are already online are not affected."),
+            }
+        );
+        // Every other reason is one sentence, as it is.
+        for why in ["Wait for the running export to finish, then upload.", "Could not start the upload: the server is busy (HTTP 429). Try again later.", ""] {
+            assert_eq!(refusal_parts(why), Refusal { heading: None, body: why, note: None });
+        }
+    }
+
+    #[test]
+    fn after_a_full_workspace_the_dialog_is_back_with_the_message_and_update_still_there() {
+        // Making room is the user's to do; after that the same update can work, so it stays offered.
+        assert!(update_can_be_tried_again(FULL));
+        let mut p = edit_picker(Some(Some("0.1.8")), Some(vec![listed_tour("published")]));
+        p.refuse(FULL.into());
+        assert_eq!(p.shown(), Shown::Update { public: true });
+        assert!(draw(&mut p, egui::RawInput::default()).is_none());
+        assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Update { .. })));
+        // The dialog for a new tour draws it too.
+        let mut p = Picker::new(String::new(), "Demo");
+        p.refuse(FULL.into());
+        assert!(draw(&mut p, egui::RawInput::default()).is_none());
     }
 
     // ---- The result screen after an update ----

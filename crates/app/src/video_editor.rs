@@ -568,6 +568,12 @@ fn failed_publish_message(error: &str, updating: bool) -> String {
     }
 }
 
+/// Whether the "Publish tour" dialog comes back with the reason after a publish or an update
+/// ended with `error` and nothing uploaded.
+fn dialog_comes_back(error: &str, updating: bool) -> bool {
+    (updating && error != crate::publish::CANCELLED) || crate::publish::full_workspace(error).is_some()
+}
+
 /// What jobs that ran on after their editor was closed have to say to the user. The editor's
 /// status bar is gone by then, so the app shows each one in its notification, once.
 #[derive(Clone, Default)]
@@ -1150,8 +1156,17 @@ impl Editor {
                     self.notify(msg);
                     // An update that failed: the dialog comes back with the reason, and still
                     // offers a new tour. A cancel is the user's own doing and brings nothing back.
-                    if updating && e != crate::publish::CANCELLED {
-                        self.offer_update_again(e);
+                    // A workspace without room brings it back for a new tour too: its message
+                    // has a heading and a small line, which the status bar cannot show.
+                    if dialog_comes_back(&e, updating) {
+                        if updating {
+                            self.offer_update_again(e);
+                        } else {
+                            self.open_publish_picker();
+                            if let Some(p) = self.video.as_mut().and_then(|v| v.picker.as_mut()) {
+                                p.refuse(e);
+                            }
+                        }
                     }
                 }
                 Err(e) if is_site => {
@@ -3172,6 +3187,14 @@ mod tests {
         assert_eq!(failed_publish_message(CANCELLED, true), "Update cancelled");
         assert_eq!(failed_publish_message(CANCELLED, false), "Publishing cancelled");
         assert_eq!(failed_publish_message("Could not start the upload: that tour no longer exists.", true), "Could not start the upload: that tour no longer exists.");
+        // The dialog comes back with the reason after a failed update, and after a publish only
+        // when the workspace has no room: that message is more than a status line.
+        let full = "The tour was not uploaded. This tour needs 310 MB, and your workspace has 120 MB left of its 5.0 GB. Delete tours you no longer need, or ask for more room, and publish again. Tours that are already online are not affected.";
+        assert_eq!(failed_publish_message(full, false), full);
+        assert!(dialog_comes_back(full, false) && dialog_comes_back(full, true));
+        assert!(dialog_comes_back("Could not send step 3: the server could not be reached.", true));
+        assert!(!dialog_comes_back("Could not send step 3: the server could not be reached.", false));
+        assert!(!dialog_comes_back(CANCELLED, true) && !dialog_comes_back(CANCELLED, false));
 
         // The job itself: progress climbs through the writing and the upload, and the run
         // then carries the site's count.
