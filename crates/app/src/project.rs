@@ -4,6 +4,7 @@
 //! [`state`] is the on-disk format (`project.json`) and its conversions to and from the editor's types.
 //! [`store`] is the folder the projects live in: save, list, open, remove.
 
+mod convert;
 mod state;
 mod store;
 mod usage;
@@ -17,6 +18,11 @@ pub use usage::{LIMIT_MAX_GB, form_text, over_limit, over_limit_sentence, parse_
 // queue and the pages that show it ask the store; nothing outside this module asks yet.
 #[allow(unused_imports)]
 pub use store::{Candidate, ConvertState, Converting, Expand, Form, LOAD_CANCELLED, LOAD_NEEDS_FFMPEG, LOAD_NO_ROOM, LOAD_VIDEO_DAMAGED, MARK_FAILED, MARK_NOT_SMALLER, cancel_conversion_of, converting_now, set_current_codec};
+// The conversion queue: what the app tells it, and what the pages ask it.
+#[allow(unused_imports)]
+pub use convert::{AFTER_SAVE, FfmpegState, Gate, MIN_BYTES, Outcome, START_AFTER, convert_one, ffmpeg_state, gate, nudge, run, set_enabled, set_recording, shutdown, start};
+#[cfg(test)]
+pub use convert::nudges_here;
 // What removing one saved recording answers; nothing outside this module asks for one yet.
 #[allow(unused_imports)]
 pub use store::Removed;

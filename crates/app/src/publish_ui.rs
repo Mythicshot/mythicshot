@@ -34,6 +34,10 @@ const COPIED_FOR: Duration = Duration::from_secs(2);
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// What a save of a recording that was cut off left behind is removed at start-up once it is this old.
 const STAGING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// What a conversion that was cut off left behind is removed at start-up once it is this old:
+/// no conversion of this run has started yet, and an hour leaves alone one that another
+/// Mythicshot on this computer is in the middle of.
+const CONVERTING_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Whether an API token is saved. The token itself is never kept here.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,28 +87,40 @@ pub fn init(settings: &crate::settings::Settings) {
     set_server(&settings.publish_server);
     config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
     set_keep_recordings(settings.keep_published_recordings);
+    project::set_enabled(settings.store_recordings_as_video);
     std::thread::spawn(refresh_token_now);
     std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
-    // The saved recordings' folder is looked at off the UI thread, whatever the switch says:
-    // what an earlier run could not finish is finished either way.
+    // Look for ffmpeg once per run, on a thread of its own and never on the UI thread (it runs
+    // the program twice): the MP4 and WebM exports are offered only when this has found one,
+    // and neither it nor the tidying below waits for the other.
     std::thread::spawn(|| {
-        // Look for ffmpeg once per run, here and never on the UI thread: the MP4 and WebM
-        // exports are offered only when this has found one.
         mythicshot_recording::ffmpeg::find_now();
-        if let Some(root) = Store::default_root() {
-            tidy_saved_recordings(&Store::at(root));
+    });
+    // The saved recordings' folder is looked at off the UI thread, whatever the switches say:
+    // what an earlier run could not finish is finished either way. Then this thread is the
+    // conversion queue's for the rest of the run.
+    std::thread::spawn(|| {
+        let store = Store::default_root().map(Store::at);
+        if let Some(store) = &store {
+            tidy_saved_recordings(store);
         }
+        // Answers what the search above found, once it has: the program is not run again.
+        project::start(store.as_ref(), mythicshot_recording::ffmpeg::find_now(), project::gate());
     });
 }
 
 /// What a start does to the folder of saved recordings, in the order the store asks for: put
 /// back a recording a cut-off save moved aside, finish removals a closed editor was holding
-/// up, and remove what cut-off saves left behind a day or more ago. No saved recording is
-/// removed by it. Never call it on the UI thread.
+/// up, and remove what cut-off saves left behind a day or more ago; then finish what a swap
+/// of frames for a video that was cut off left to do, and remove what cut-off conversions left
+/// behind an hour or more ago. No saved recording is removed by it. Never call it on the UI
+/// thread.
 pub fn tidy_saved_recordings(store: &Store) {
     store.recover_replaced();
     store.finish_removals();
     store.sweep_staging(STAGING_AFTER);
+    store.finish_conversions();
+    store.sweep_converting(CONVERTING_AFTER);
 }
 
 /// The setting "keep the recording when I publish a tour": set at start-up and whenever the
