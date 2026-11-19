@@ -149,6 +149,8 @@ pub fn load_sentence(error: &LoadError) -> &'static str {
         LoadError::Damaged(_) => SAVED_DAMAGED,
         LoadError::Newer => SAVED_NEWER,
         LoadError::AlreadyOpen => ALREADY_OPEN,
+        // A recording kept as a video that did not open: said as before, until the page has a sentence for each.
+        LoadError::NeedsFfmpeg | LoadError::Cancelled | LoadError::NoRoom | LoadError::VideoDamaged => SAVED_DAMAGED,
     }
 }
 
@@ -3901,7 +3903,7 @@ mod tests {
         for bytes in [0, 860_160, 1_048_575, 13_002_342, 104_857_599, 432_013_312, 1_073_741_823, 1_073_741_824, 161_061_273_600] {
             let size = publish_ui::size_text(bytes);
             assert_eq!(line(bytes), format!("recording saved on this computer ({size})"));
-            assert_eq!(crate::settings_ui::saved_recordings_line(project::Totals { count: 1, bytes }), format!("1 saved recording · {size}"));
+            assert_eq!(project::usage_line(1, bytes, 0), format!("1 saved recording · {size}"));
         }
     }
 

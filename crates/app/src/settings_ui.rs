@@ -10,7 +10,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke,
 use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_pattern};
 
 use crate::hotkeys::{self, Action, EditorAction};
-use crate::project::{self, ConvertState, Form, ProjectInfo, Removed, Store, Totals, form_text, over_limit, over_limit_sentence, parse_limit, problem_text, remove_question, row_title, usage_fraction, usage_line};
+use crate::project::{self, ConvertState, FfmpegState, Form, ProjectInfo, Removed, Store, Totals, form_text, over_limit, over_limit_sentence, parse_limit, problem_text, remove_question, row_title, usage_fraction, usage_line};
 use crate::publish_ui::size_text;
 use crate::settings::{Settings, TrayLeftClick};
 
@@ -111,7 +111,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>) -> Vec<U
     let (lister, remover) = (ui.ctx().clone(), ui.ctx().clone());
     let hooks = Hooks {
         open_folder: &mut |folder| crate::platform::open_folder(folder),
-        ffmpeg: ffmpeg_state(),
+        ffmpeg: project::ffmpeg_state(),
         epoch: project::epoch(),
         list: &mut |root| list_in_background(root, lister.clone()),
         remove: &mut |root, dir| remove_in_background(root, dir, remover.clone()),
@@ -136,26 +136,6 @@ struct Hooks<'a> {
 
 /// What a removal answers: what the store did, or its reason for not doing it.
 type Removal = Result<Removed, String>;
-
-/// Whether there is an ffmpeg to store recordings as video with.
-// The conversion queue's own `FfmpegState` takes this one's place at the merge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FfmpegState {
-    Checking,
-    Found,
-    NotFound,
-}
-
-/// How the one search for ffmpeg of this run stands. Starts no program.
-// At the merge the body becomes `project::ffmpeg_state()`.
-fn ffmpeg_state() -> FfmpegState {
-    use mythicshot_recording::ffmpeg::Found;
-    match mythicshot_recording::ffmpeg::found() {
-        Found::NotYet => FfmpegState::Checking,
-        Found::Ok => FfmpegState::Found,
-        Found::None | Found::Unusable => FfmpegState::NotFound,
-    }
-}
 
 /// [`ui`], with what it asks of the world handed in.
 fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hooks: Hooks<'_>) -> Vec<UiAction> {
@@ -568,10 +548,6 @@ pub const KEEP_IT: &str = "Keep it";
 pub const REMOVED_WHEN_CLOSED: &str = "This recording is open in an editor. It is removed when that editor is closed.";
 pub const NOT_REMOVED: &str = "The recording could not be removed. Close anything that has it open and try again.";
 
-/// A recording smaller than this is never stored as video: there is too little to win.
-// The conversion queue's `convert::MIN_BYTES` takes this one's place at the merge.
-const MIN_CONVERT_BYTES: u64 = 8 << 20;
-
 fn ffmpeg_line(ffmpeg: FfmpegState) -> &'static str {
     match ffmpeg {
         FfmpegState::Checking => FFMPEG_LOOKING,
@@ -622,19 +598,12 @@ impl Row {
     }
 }
 
-/// The usage line without a limit, under the name the Tours page's test of the shared wording
-/// still asks for; [`usage_line`] took its place on the page.
-#[cfg(test)]
-pub fn saved_recordings_line(t: Totals) -> String {
-    usage_line(t.count, t.bytes, 0)
-}
-
 /// Whether the conversion queue would store this recording as video: the switch is on, ffmpeg
 /// was found, and the recording is kept as frames, has nothing wrong with it, was not tried
 /// before and its frames file is large enough (the folder's size, which the row shows, also
 /// counts the project file and the pictures).
 fn will_convert(p: &ProjectInfo, video_on: bool, ffmpeg: FfmpegState) -> bool {
-    video_on && ffmpeg == FfmpegState::Found && p.form == Form::Frames && p.convert == ConvertState::NotTried && p.problem.is_none() && p.frames_bytes >= MIN_CONVERT_BYTES
+    video_on && ffmpeg == FfmpegState::Found && p.form == Form::Frames && p.convert == ConvertState::NotTried && p.problem.is_none() && p.frames_bytes >= project::MIN_BYTES
 }
 
 /// The list and the totals for what was read. Reads nothing itself.
@@ -1498,8 +1467,8 @@ mod tests {
         // Exactly the smallest size the queue takes, and one byte less.
         // The queue measures the frames file, not the folder with its project file and pictures.
         let edge = |bytes, frames_bytes| listing(&Listed { projects: vec![ProjectInfo { frames_bytes, ..info(SITE, "tour_a", "chap_a", "A", "A", nov_18, bytes) }], converting: None }, true, FfmpegState::Found, &now).rows[0].form;
-        assert_eq!((edge(MIN_CONVERT_BYTES, MIN_CONVERT_BYTES), edge(MIN_CONVERT_BYTES + MB, MIN_CONVERT_BYTES - 1), MIN_CONVERT_BYTES), ("not compressed yet", "not compressed", 8 * MB));
-        assert_eq!((edge(9 * MB, MIN_CONVERT_BYTES), edge(20 * MB, 0)), ("not compressed yet", "not compressed"));
+        assert_eq!((edge(project::MIN_BYTES, project::MIN_BYTES), edge(project::MIN_BYTES + MB, project::MIN_BYTES - 1), project::MIN_BYTES), ("not compressed yet", "not compressed", 8 * MB));
+        assert_eq!((edge(9 * MB, project::MIN_BYTES), edge(20 * MB, 0)), ("not compressed yet", "not compressed"));
 
         // The one being stored as video when the list was read says so, whatever else is true of it.
         let converting = Listed { converting: Some(large.dir.clone()), ..listed.clone() };
@@ -2213,13 +2182,5 @@ mod tests {
         let forms = [form_text(Form::Video, ConvertState::Done, false, false), form_text(Form::Frames, ConvertState::NotTried, false, true), form_text(Form::Frames, ConvertState::NotTried, true, true), form_text(Form::Frames, ConvertState::NotTried, false, false)];
         assert_eq!(forms, ["video", "not compressed yet", "compressing…", "not compressed"]);
         assert_eq!([Problem::Damaged, Problem::Newer, Problem::FramesMissing].map(problem_text), ["damaged", "saved by a newer version", "frames missing"]);
-    }
-
-    #[test]
-    fn the_search_for_ffmpeg_is_read_without_starting_anything() {
-        // Whatever this computer has: the answer is one of the three, and asking twice agrees
-        // unless the search finished in between.
-        let (first, second) = (ffmpeg_state(), ffmpeg_state());
-        assert!(first == second || first == FfmpegState::Checking);
     }
 }

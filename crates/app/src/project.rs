@@ -21,10 +21,12 @@ pub use usage::{UNTITLED, pushed_over};
 pub use store::{ConvertState, Form, Removed, converting_now};
 // What the conversion queue and the Tours page ask the store; nothing outside this module asks yet.
 #[allow(unused_imports)]
-pub use store::{Candidate, Converting, Expand, LOAD_CANCELLED, LOAD_NEEDS_FFMPEG, LOAD_NO_ROOM, LOAD_VIDEO_DAMAGED, MARK_FAILED, MARK_NOT_SMALLER, cancel_conversion_of, set_current_codec};
+pub use store::{Candidate, Converting, Expand, MARK_FAILED, MARK_NOT_SMALLER, cancel_conversion_of, set_current_codec};
 // The conversion queue: what the app tells it, and what the pages ask it.
+pub use convert::{FfmpegState, MIN_BYTES, ffmpeg_state, gate, nudge, set_enabled, set_recording, shutdown, start};
+// The queue's own parts, named outside this module by nothing.
 #[allow(unused_imports)]
-pub use convert::{AFTER_SAVE, FfmpegState, Gate, MIN_BYTES, Outcome, START_AFTER, convert_one, ffmpeg_state, gate, nudge, run, set_enabled, set_recording, shutdown, start};
+pub use convert::{AFTER_SAVE, Gate, Outcome, START_AFTER, convert_one, run};
 #[cfg(test)]
 pub use convert::nudges_here;
 
