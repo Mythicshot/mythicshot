@@ -17,7 +17,7 @@ use mythicshot_recording::{FrameReader, Recording};
 
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store};
+use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
 use crate::publish::{Published, Target};
 use crate::publish_ui::{self, Before, EditTarget, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
@@ -318,6 +318,27 @@ fn store_save(store: &Store, key: &ProjectKey, snap: &Snapshot<'_>, keep_going: 
     store.save_while(key, snap, keep_going)
 }
 
+/// The limit a publish measures the saved recordings against once its own is saved: how many
+/// GB they may take (0 for no limit), and how what they take is read. The reading lists every
+/// saved project, so it is for the job's thread only.
+struct Limit<'a> {
+    warn_gb: u32,
+    totals: &'a dyn Fn(&Store) -> Totals,
+}
+
+/// Whether the save that just made `saved` took the recordings in `store` past the limit: the
+/// new total and the limit when it did. The store is listed once, after the save; what it held
+/// before is that total less what this save wrote, which is true for a project that was not
+/// there before. Without a limit nothing is read. A reading that breaks is no notice, and
+/// never an error of the save or of the upload.
+fn over_after(store: &Store, saved: &Saved, limit: &Limit<'_>) -> Option<(u64, u32)> {
+    if limit.warn_gb == 0 {
+        return None;
+    }
+    let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (limit.totals)(store))).ok()?;
+    publish_ui::went_over(after.bytes, saved.info.bytes, limit.warn_gb)
+}
+
 /// The editor's state as it was when a publish started: what is uploaded, and what is kept.
 pub(crate) struct PublishState {
     pub(crate) rec: Arc<Recording>,
@@ -330,8 +351,12 @@ pub(crate) struct PublishState {
 /// address the upload went to, the tour and the chapter. Whatever goes wrong here, a panic
 /// included, is a reason in the answer and never an error of the upload; so is a cancel that
 /// stops a copy of the frames (`keep_going` says no).
+///
+/// `limit`: for a save that makes a new project, what to measure the saved recordings against
+/// afterwards, so the answer says when this save took them past it. `None` for an update, which
+/// saves over a project that was there already and never says so.
 #[allow(clippy::too_many_arguments)]
-fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, keep_going: &dyn Fn() -> bool, server: &str, up: &Published, state: &PublishState, title: &str, tour_title: &str) -> Kept {
+fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, limit: Option<&Limit<'_>>, keep_going: &dyn Fn() -> bool, server: &str, up: &Published, state: &PublishState, title: &str, tour_title: &str) -> Kept {
     let store = match keeping {
         Keeping::Off => return Kept::Off,
         Keeping::NoFolder => return Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.to_string()),
@@ -348,7 +373,9 @@ fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, keep_going: &dyn Fn() ->
         Ok(Ok(saved)) => {
             // There is a recording to store as video now.
             crate::project::nudge();
-            Kept::Saved(saved.left_out)
+            // Read here, on the job's thread and after the save: never on the UI thread.
+            let over = limit.and_then(|limit| over_after(store, &saved, limit));
+            Kept::Saved { left_out: saved.left_out, over }
         }
         Ok(Err(why)) => Kept::Failed(why),
         Err(_) => Kept::Failed(publish_ui::KEEPING_BROKE_OFF.to_string()),
@@ -360,7 +387,8 @@ fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, keep_going: &dyn Fn() ->
 /// recording (as `keeping` says), then publish when `publish_now`. The folder is removed
 /// afterwards whether it worked or not. `token` is asked for only once the bundle is written.
 /// An error means nothing was uploaded, and then nothing is kept either; a recording that
-/// cannot be kept never makes it an error.
+/// cannot be kept never makes it an error. A recording that was kept is measured against the
+/// limit of the settings, here on the job's thread.
 #[allow(clippy::too_many_arguments)]
 fn publish_job(
     state: &PublishState,
@@ -374,10 +402,12 @@ fn publish_job(
     worker: &Arc<Run>,
     progress: &dyn Fn(f32),
 ) -> Result<PublishDone, String> {
-    publish_job_with(state, title, tour_title, server, token, target, publish_now, keeping, worker, progress, &store_save)
+    let limit = Limit { warn_gb: publish_ui::warn_gb(), totals: &Store::totals };
+    publish_job_with(state, title, tour_title, server, token, target, publish_now, keeping, worker, progress, &store_save, &limit)
 }
 
-/// [`publish_job`] with the save handed in, so a test can make it fail, panic or wait.
+/// [`publish_job`] with the save and the limit handed in, so a test can make the save fail,
+/// panic or wait, and can say what the saved recordings take.
 #[allow(clippy::too_many_arguments)]
 fn publish_job_with(
     state: &PublishState,
@@ -391,6 +421,7 @@ fn publish_job_with(
     worker: &Arc<Run>,
     progress: &dyn Fn(f32),
     save: &SaveFn<'_>,
+    limit: &Limit<'_>,
 ) -> Result<PublishDone, String> {
     with_bundle(state, title, worker, progress, |dir| {
         let token = token()?;
@@ -408,7 +439,7 @@ fn publish_job_with(
             // The commit has answered: the project is saved now, before the publish step, so
             // that it matches the site's draft whatever becomes of the publish. A cancel stops
             // a copy of the frames, so it never holds the publish step up.
-            |up| kept = keep_recording(keeping, save, &|| !worker.is_cancelled(), server, up, state, title, tour_title),
+            |up| kept = keep_recording(keeping, save, Some(limit), &|| !worker.is_cancelled(), server, up, state, title, tour_title),
             |images| {
                 worker.set_publishing(images);
                 !worker.is_cancelled()
@@ -487,7 +518,7 @@ fn update_job_with(
                 progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
                 !worker.is_cancelled()
             },
-            |up| kept = keep_recording(keeping, save, &|| true, server, up, state, title, &target.tour_title),
+            |up| kept = keep_recording(keeping, save, None, &|| true, server, up, state, title, &target.tour_title),
             |images| {
                 worker.set_publishing(images);
                 !worker.is_cancelled()
@@ -1941,7 +1972,7 @@ mod tests {
     #[test]
     fn a_finished_publish_hands_the_result_screen_what_the_tour_was() {
         let was = Before { public: true, link: None, steps: Some(14) };
-        let done = PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, kept: Kept::Saved(vec!["the cover logo".into()]) };
+        let done = PublishDone { finished: Finished { tour_id: "tour_aaaaaaaaaaaaaaaaaaaaaaaa".into(), chapter_id: String::new(), steps: 2, outcome: crate::publish::Outcome::Draft }, kept: Kept::Saved { left_out: vec!["the cover logo".into()], over: None } };
         let sent = done.clone();
         let job = ExportJob::Publish(EncodeJob::spawn(move |_| Ok(sent)), Arc::new(Run::default()), "Customer onboarding".into(), was.clone(), false);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -2146,7 +2177,7 @@ mod tests {
         let done = publish_to(&s, &state, true, &keep).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "{done:?}");
         assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str()), (TOUR, CH));
-        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
         // One project, for exactly the address the upload went to, the tour and the chapter.
         let key = key_at(&s);
         let list = store.list();
@@ -2168,7 +2199,7 @@ mod tests {
         let state = state(tmp.path());
         let store = store_in(tmp.path());
         let done = publish_to(&s, &state, false, &Keeping::In(store.clone())).unwrap();
-        assert_eq!((done.finished.outcome.clone(), done.kept.clone()), (Outcome::Draft, Kept::Saved(vec![])));
+        assert_eq!((done.finished.outcome.clone(), done.kept.clone()), (Outcome::Draft, Kept::Saved { left_out: vec![], over: None }));
         assert!(!s.lines().iter().any(|l| l == PUBLISH));
         assert_eq!(store.list().iter().map(|p| p.key.clone()).collect::<Vec<_>>(), [key_at(&s)]);
     }
@@ -2188,7 +2219,7 @@ mod tests {
         let done = publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: false, .. }), "{done:?}");
         assert_eq!(*seen_at_publish.lock().unwrap(), [1], "the project was there when the publish step began");
-        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
         let key = key_at(&s);
         let saved = project_text(&store.list()[0]);
         drop(store.load(&key).unwrap());
@@ -2196,11 +2227,11 @@ mod tests {
         // "Try again" publishes the same upload: it names the chapter the commit answered, and saves nothing again.
         let mut screen = Some(ResultDialog::new(TOUR_TITLE.into(), Before::new_tour(), done));
         let retry = publish_ui::take_retry(&mut screen, false).unwrap();
-        assert_eq!((retry.tour_id.as_str(), retry.chapter_id.as_str(), &retry.kept), (TOUR, CH, &Kept::Saved(vec![])));
+        assert_eq!((retry.tour_id.as_str(), retry.chapter_id.as_str(), &retry.kept), (TOUR, CH, &Kept::Saved { left_out: vec![], over: None }));
         let uploads = s.lines().iter().filter(|l| l.ends_with("/commit")).count();
         let again = retry_done(&retry, crate::publish::publish_tour(&s.base, TOKEN, &retry.tour_id, |_| true));
         assert!(matches!(again.finished.outcome, Outcome::Public { .. }), "{again:?}");
-        assert_eq!((again.finished.tour_id.as_str(), again.finished.chapter_id.as_str(), &again.kept), (TOUR, CH, &Kept::Saved(vec![])));
+        assert_eq!((again.finished.tour_id.as_str(), again.finished.chapter_id.as_str(), &again.kept), (TOUR, CH, &Kept::Saved { left_out: vec![], over: None }));
         assert_eq!(s.lines().iter().filter(|l| l.ends_with("/commit")).count(), uploads, "nothing was uploaded again");
         assert_eq!(store.list().len(), 1);
         assert_eq!(project_text(&store.list()[0]), saved, "the project was not written a second time");
@@ -2290,7 +2321,7 @@ mod tests {
         let temporary = tmp.path().join("rec");
         let third = state.rec.frame(2).unwrap().into_raw();
         let ed = editor_of(&state);
-        assert_eq!(publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved(vec![]));
+        assert_eq!(publish_to(&s, &state, true, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved { left_out: vec![], over: None });
         assert!(temporary.join("frames.zst").exists());
         // The job has ended and the editor closes: the recording's own folder goes.
         let frames = state.rec.frames.len();
@@ -2443,7 +2474,7 @@ mod tests {
         let (job, go, run) = waiting_job(move || {
             let snap = Snapshot { rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
             match saving.save(&to_key, &snap) {
-                Ok(saved) => Kept::Saved(saved.left_out),
+                Ok(saved) => Kept::Saved { left_out: saved.left_out, over: None },
                 Err(why) => Kept::Failed(why),
             }
         });
@@ -2528,7 +2559,7 @@ mod tests {
         assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
         assert!(!s.lines().iter().any(|l| l == PUBLISH), "nothing was published");
         // The upload is on the site, so its recording is kept: the frames are linked, which a cancel never stops.
-        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
         assert_eq!(store.list().iter().map(|p| (p.key.clone(), p.problem)).collect::<Vec<_>>(), [(key_at(&s), None)]);
         assert_eq!(publish_ui::result_status(&done.finished, &Before::new_tour(), false), "Publishing cancelled: the draft is uploaded, but not public");
         assert_eq!(publish_ui::result_note(&done.finished.outcome, &Before::new_tour(), false), Some(("Publishing was cancelled. The draft is uploaded, but it is not public.".to_string(), false)));
@@ -2548,7 +2579,7 @@ mod tests {
             asked.set(asked.get() + 1);
             if keep_going() { store.save(key, snap) } else { Err(crate::project::SAVING_CANCELLED.to_string()) }
         };
-        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &run, &|_| {}, copying).unwrap();
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &run, &|_| {}, copying, &NO_LIMIT).unwrap();
         assert_eq!(asked.get(), 1);
         assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() }, "the upload is in, and the publish was cancelled");
         assert_eq!(done.kept, Kept::Failed("saving was cancelled.".into()));
@@ -2574,7 +2605,7 @@ mod tests {
         // Every publish to a site of its own: a site takes a step once.
         let publish = |keeping: &Keeping, save: &SaveFn<'_>| {
             let s = publish_stub(|_| reply(200, LIVE));
-            publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, keeping, &Arc::new(Run::default()), &|_| {}, save).unwrap().kept
+            publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, keeping, &Arc::new(Run::default()), &|_| {}, save, &NO_LIMIT).unwrap().kept
         };
         let nudges = crate::project::nudges_here;
         let before = nudges();
@@ -2585,7 +2616,7 @@ mod tests {
         assert!(matches!(publish(&Keeping::In(store.clone()), &|_, _, _, _| panic!("the save broke")), Kept::Failed(_)));
         assert_eq!(nudges(), before);
         // Kept: once.
-        assert_eq!(publish(&Keeping::In(store.clone()), &store_save), Kept::Saved(vec![]));
+        assert_eq!(publish(&Keeping::In(store.clone()), &store_save), Kept::Saved { left_out: vec![], over: None });
         assert_eq!((nudges(), store.list().len()), (before + 1, 1));
     }
 
@@ -2596,7 +2627,7 @@ mod tests {
         let state = state(tmp.path());
         let store = store_in(tmp.path());
         let broken: &SaveFn<'_> = &|_, _, _, _| panic!("the save broke");
-        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, broken).unwrap();
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, broken, &NO_LIMIT).unwrap();
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the publish step ran all the same: {done:?}");
         assert_eq!(done.kept, Kept::Failed(publish_ui::KEEPING_BROKE_OFF.into()));
         assert_eq!(publish_ui::kept_note(&done.kept, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: saving failed because of an internal error."));
@@ -2617,6 +2648,152 @@ mod tests {
         publish_ui::set_keep_recordings(false);
         assert!(matches!(keeping_now(), Keeping::Off));
         publish_ui::set_keep_recordings(was);
+    }
+
+    // ---- The notice after a publish that went past the limit ----
+
+    const GB: u64 = 1 << 30;
+
+    /// No limit is set: the saved recordings are never measured.
+    const NO_LIMIT: Limit<'static> = Limit { warn_gb: 0, totals: &Store::totals };
+
+    /// A publish to a site of its own, into an empty store, on a computer whose earlier
+    /// recordings take `others` bytes and whose limit is `warn_gb`: what the job answers, how
+    /// often it measured the saved recordings, and what the store holds afterwards.
+    fn published_beside(others: u64, warn_gb: u32, publish_now: bool, keeping: impl Fn(&Store) -> Keeping, save: &SaveFn<'_>) -> (PublishDone, u32, Totals) {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let read = std::cell::Cell::new(0);
+        let totals = |store: &Store| {
+            read.set(read.get() + 1);
+            let here = store.totals();
+            Totals { count: here.count + 3, bytes: here.bytes + others }
+        };
+        let limit = Limit { warn_gb, totals: &totals };
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, publish_now, &keeping(&store), &Arc::new(Run::default()), &|_| {}, save, &limit).unwrap();
+        (done, read.get(), store.totals())
+    }
+
+    fn kept_in(store: &Store) -> Keeping {
+        Keeping::In(store.clone())
+    }
+
+    #[test]
+    fn a_publish_that_crosses_the_limit_reports_it_and_still_succeeds() {
+        // Exactly at the limit before, so this recording is what takes them past it.
+        let (done, read, held) = published_beside(5 * GB, 5, true, kept_in, &store_save);
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "the tour is published all the same: {done:?}");
+        assert_eq!((held.count, read), (1, 1), "the recording is saved, and the store was measured once");
+        assert!(held.bytes > 0);
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: Some((5 * GB + held.bytes, 5)) });
+        assert_eq!(publish_ui::kept_note(&done.kept, false), None, "the recording was kept whole");
+        assert_eq!(publish_ui::over_note(&done.kept).as_deref(), Some("Saved recordings take 5.0 GB, more than the 5 GB you set. Nothing is removed automatically: remove recordings you no longer need in Preferences."));
+        // A draft upload saves its recording as well, and says the same.
+        let (draft, _, held) = published_beside(5 * GB, 5, false, kept_in, &store_save);
+        assert_eq!((draft.finished.outcome.clone(), draft.kept), (Outcome::Draft, Kept::Saved { left_out: vec![], over: Some((5 * GB + held.bytes, 5)) }));
+        // The first recording on a computer with a limit smaller than it: there was nothing before.
+        let (first, _, held) = published_beside(0, 1, true, kept_in, &store_save);
+        assert_eq!(first.kept, Kept::Saved { left_out: vec![], over: None }, "{} bytes are not a gigabyte", held.bytes);
+
+        // Past the limit already, or still within it: saved, and nothing said.
+        for others in [6 * GB, 5 * GB + 1, 4 * GB, 0] {
+            let (done, read, held) = published_beside(others, 5, true, kept_in, &store_save);
+            assert_eq!((done.kept, held.count, read), (Kept::Saved { left_out: vec![], over: None }, 1, 1), "{others}");
+        }
+        // No limit: saved, nothing said, and the saved recordings are not even measured.
+        let (done, read, held) = published_beside(100 * GB, 0, true, kept_in, &store_save);
+        assert_eq!((done.kept, held.count, read), (Kept::Saved { left_out: vec![], over: None }, 1, 0));
+
+        // A recording that was not saved crossed nothing, and nothing is measured for it.
+        let (off, read, held) = published_beside(5 * GB, 5, true, |_| Keeping::Off, &store_save);
+        assert_eq!((off.kept, held.count, read), (Kept::Off, 0, 0));
+        let (no_folder, read, _) = published_beside(5 * GB, 5, true, |_| Keeping::NoFolder, &store_save);
+        assert_eq!((no_folder.kept, read), (Kept::Failed(publish_ui::NO_FOLDER_FOR_RECORDINGS.into()), 0));
+        let (failed, read, held) = published_beside(5 * GB, 5, true, kept_in, &|_, _, _, _| Err("the disk is full.".to_string()));
+        assert_eq!((failed.kept.clone(), held.count, read), (Kept::Failed("the disk is full.".into()), 0, 0));
+        assert_eq!(publish_ui::over_note(&failed.kept), None);
+        let (broke, read, _) = published_beside(5 * GB, 5, true, kept_in, &|_, _, _, _| panic!("the save broke"));
+        assert_eq!((broke.kept, read), (Kept::Failed(publish_ui::KEEPING_BROKE_OFF.into()), 0));
+    }
+
+    #[test]
+    fn a_measuring_that_breaks_says_nothing_and_the_recording_stays_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = publish_stub(|_| reply(200, LIVE));
+        let state = state(tmp.path());
+        let store = store_in(tmp.path());
+        let nudges = crate::project::nudges_here();
+        let limit = Limit { warn_gb: 5, totals: &|_| panic!("the folder could not be listed") };
+        let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, &store_save, &limit).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "{done:?}");
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
+        assert_eq!((store.list().len(), crate::project::nudges_here()), (1, nudges + 1), "saved, and the conversion queue was told");
+    }
+
+    #[test]
+    fn the_totals_are_read_on_the_job_thread_after_the_save() {
+        // What happened, in order, with the thread it happened on and the projects the store held then.
+        let log = Mutex::new(Vec::new());
+        let note = |what: &'static str, store: &Store| log.lock().unwrap().push((what, std::thread::current().id(), store.list().len()));
+        let (job_thread, done, requests) = std::thread::scope(|scope| {
+            let job = scope.spawn(|| {
+                let tmp = tempfile::tempdir().unwrap();
+                let s = publish_stub(|_| reply(200, LIVE));
+                let state = state(tmp.path());
+                let store = store_in(tmp.path());
+                let save: &SaveFn<'_> = &|store, key, snap, keep_going| {
+                    note("save", store);
+                    store_save(store, key, snap, keep_going)
+                };
+                let totals = |store: &Store| {
+                    note("totals", store);
+                    let here = store.totals();
+                    Totals { count: here.count, bytes: here.bytes + 5 * GB }
+                };
+                let limit = Limit { warn_gb: 5, totals: &totals };
+                let done = publish_job_with(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}, save, &limit);
+                (std::thread::current().id(), done.unwrap(), s.lines())
+            });
+            job.join().unwrap()
+        });
+        assert_ne!(job_thread, std::thread::current().id());
+        // Once, on the job's own thread, when the project was in the store.
+        assert_eq!(*log.lock().unwrap(), vec![("save", job_thread, 0), ("totals", job_thread, 1)]);
+        assert!(matches!(done.kept, Kept::Saved { over: Some((_, 5)), .. }), "{:?}", done.kept);
+        // And the publish step came after both: the stub's publish route is the last request.
+        assert!(requests.last().is_some_and(|l| l.contains(PUBLISH)), "{requests:?}");
+    }
+
+    #[test]
+    fn an_update_never_reports_the_limit() {
+        // The smallest limit there is, for as long as this test runs.
+        let _alone = publish_ui::tests::SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        let was = publish_ui::warn_gb();
+        publish_ui::set_warn_gb(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, _info, ed) = reopened_and_changed(tmp.path(), &s);
+        let done = update_to(&s, &state_of(&ed), &store, &Arc::new(Run::default())).unwrap();
+        publish_ui::set_warn_gb(was);
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }), "{done:?}");
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
+        assert_eq!(publish_ui::over_note(&done.kept), None);
+        assert_eq!(store.list().iter().map(|p| &p.key).collect::<Vec<_>>(), vec![&key], "the same project, saved over");
+        // The save of an update is handed no limit at all, so there is nothing it could measure:
+        // the same save with one, as a new tour's, is what reports.
+        let state = state_of(&ed);
+        let up = Published { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, publish: None };
+        let read = std::cell::Cell::new(0);
+        let totals = |store: &Store| {
+            read.set(read.get() + 1);
+            Totals { count: 2, bytes: store.totals().bytes + GB }
+        };
+        let keep = |limit: Option<&Limit<'_>>| keep_recording(&Keeping::In(store.clone()), &store_save, limit, &|| true, &s.base, &up, &state, TITLE, TOUR_TITLE);
+        assert_eq!((keep(None), read.get()), (Kept::Saved { left_out: vec![], over: None }, 0));
+        assert!(matches!(keep(Some(&Limit { warn_gb: 1, totals: &totals })), Kept::Saved { over: Some((_, 1)), .. }));
+        assert_eq!(read.get(), 1);
     }
 
     // ---- Update tour ----
@@ -2703,7 +2880,7 @@ mod tests {
     fn reopened_and_changed(root: &Path, stub: &Stub) -> (Store, ProjectKey, ProjectInfo, Editor) {
         let first = state(root);
         let store = store_in(root);
-        assert_eq!(publish_to(stub, &first, false, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved(vec![]));
+        assert_eq!(publish_to(stub, &first, false, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved { left_out: vec![], over: None });
         drop(first);
         let key = key_at(stub);
         let info = store.list().remove(0);
@@ -2760,7 +2937,7 @@ mod tests {
             assert_eq!(sent.len(), 2, "step 1 is on the site already: {sent:?}");
             assert!(sent[0].ends_with("/steps/2") && sent[1].ends_with("/steps/3"));
             // The project is rewritten, for every outcome, and before anything was published.
-            assert_eq!(done.kept, Kept::Saved(vec![]), "{advice}");
+            assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None }, "{advice}");
             assert_eq!(*saved_at_publish.lock().unwrap(), if uploads_before_publish { vec![true] } else { vec![] }, "{advice}");
             let list = store.list();
             assert_eq!(list.len(), 1, "the same project, not a second one");
@@ -2909,7 +3086,7 @@ mod tests {
         assert_eq!(go_on.get(), Some(true), "the site has the changes: the save is not cut short");
         assert_eq!(done.finished.outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
         assert!(!s.lines().iter().any(|l| l == PUBLISH));
-        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
         assert!(project_text(&store.list()[0]).contains(NOTE));
         assert_eq!(store.list()[0].key, key);
         let was = Before { public: true, link: None, steps: Some(2) };
@@ -2932,7 +3109,7 @@ mod tests {
         let sent = s.lines().len();
         let again = retry_done(&retry, crate::publish::publish_tour(&s.base, TOKEN, &retry.tour_id, |_| true));
         assert!(matches!(again.finished.outcome, Outcome::Public { .. }), "{again:?}");
-        assert_eq!((again.finished.chapter_id.as_str(), &again.kept), (CH, &Kept::Saved(vec![])));
+        assert_eq!((again.finished.chapter_id.as_str(), &again.kept), (CH, &Kept::Saved { left_out: vec![], over: None }));
         assert_eq!(&s.lines()[sent..], [PUBLISH], "one publish call, and nothing else");
         assert_eq!(files_of(&info.dir), saved, "the project was not written a second time");
     }
@@ -2957,7 +3134,7 @@ mod tests {
         let sent = s.lines().len();
         // "Publish as a new tour" is the publish of any recording, with a new tour as its target.
         let done = publish_job(&state_of(&ed), "A second tour", "A second tour", &s.base, || Ok(TOKEN.to_string()), &Target::New, false, &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap();
-        assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str(), &done.kept), (OTHER_TOUR, OTHER_CH, &Kept::Saved(vec![])));
+        assert_eq!((done.finished.tour_id.as_str(), done.finished.chapter_id.as_str(), &done.kept), (OTHER_TOUR, OTHER_CH, &Kept::Saved { left_out: vec![], over: None }));
         let create: serde_json::Value = serde_json::from_slice(&s.requests()[sent].body).unwrap();
         assert_eq!(create["target"], serde_json::json!({ "kind": "new" }));
         assert!(create.get("sha256").is_none());
@@ -3068,7 +3245,7 @@ mod tests {
     #[test]
     fn closing_the_editor_does_not_cancel_a_running_update() {
         // An update, and "Try again" after one: neither is told to stop when the editor goes.
-        let done = || Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 1, outcome: Outcome::Draft }, kept: Kept::Saved(vec![]) });
+        let done = || Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 1, outcome: Outcome::Draft }, kept: Kept::Saved { left_out: vec![], over: None } });
         let run = Arc::new(Run::default());
         let update = ExportJob::Publish(EncodeJob::spawn(move |_| done()), run.clone(), TOUR_TITLE.into(), Before::new_tour(), true);
         assert!(update.is_update());
@@ -3130,7 +3307,7 @@ mod tests {
 
     #[test]
     fn an_update_that_ends_after_its_editor_was_closed_tells_the_app_how_it_ended_exactly_once() {
-        let done = |outcome: Outcome| Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 14, outcome }, kept: Kept::Saved(vec![]) });
+        let done = |outcome: Outcome| Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 14, outcome }, kept: Kept::Saved { left_out: vec![], over: None } });
         let gone = "Could not start the upload: that tour no longer exists.";
         let cases: [(Result<PublishDone, String>, &str); 7] = [
             (done(Outcome::Public { url: Some("https://tours.example.com/t/customer-onboarding".into()) }), "Tour updated: 14 steps"),
@@ -3203,7 +3380,7 @@ mod tests {
         assert!(!is_origin(&EditTarget { tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..target() }, origin));
         // The update saves the project under that title: the same project, of the same tour and chapter.
         let done = update_job(&state_of(&ed), TITLE, &renamed, &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap();
-        assert_eq!(done.kept, Kept::Saved(vec![]));
+        assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
         let list = store.list();
         assert_eq!((list.len(), list[0].tour_title.as_str(), list[0].title.as_str(), &list[0].key), (1, RENAMED, TITLE, &key));
         // Opened the next time, the editor knows the tour by the new title.
