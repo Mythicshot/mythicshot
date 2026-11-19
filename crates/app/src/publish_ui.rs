@@ -107,6 +107,8 @@ pub fn init(settings: &crate::settings::Settings) {
         if let Some(store) = &store {
             tidy_saved_recordings(store);
         }
+        // What expansions for an editor left in the temporary folder when an earlier run was cut off.
+        crate::tours_ui::sweep_stale_edits(&crate::tours_ui::edit_base(), std::process::id(), crate::tours_ui::EDIT_STALE_AFTER);
         // Answers what the search above found, once it has: the program is not run again.
         project::start(store.as_ref(), mythicshot_recording::ffmpeg::find_now(), project::gate());
     });

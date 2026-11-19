@@ -179,23 +179,17 @@ pub enum LoadError {
     Newer,
     /// The project is open in an editor.
     AlreadyOpen,
+    /// The recording is kept as a video, and there is no ffmpeg to open it with: none was
+    /// handed in, or the one found cannot be run. Nothing is wrong with the project.
+    NeedsFfmpeg,
+    /// The caller stopped the expansion of the video.
+    Cancelled,
+    /// The disk had no room for the expanded frames.
+    NoRoom,
+    /// The video could not be read back into the frames its index names. Nothing was changed:
+    /// it may be the video, or the ffmpeg that read it.
+    VideoDamaged,
 }
-
-/// The text of [`LoadError::Damaged`] when a recording kept as a video cannot be opened because
-/// there is no ffmpeg to expand it with (none was handed in, or the one found cannot be run).
-/// Nothing is wrong with the project.
-///
-/// These four texts stand in for the variants `LoadError::NeedsFfmpeg`, `Cancelled`, `NoRoom` and
-/// `VideoDamaged`, which the Tours page's part of video storage adds together with their
-/// sentences; `not_expanded` is the one place that makes them.
-pub const LOAD_NEEDS_FFMPEG: &str = "the recording is kept as a video, and there is no ffmpeg to open it with";
-/// The text of [`LoadError::Damaged`] when the caller stopped the expansion of a video.
-pub const LOAD_CANCELLED: &str = "opening the recording was cancelled";
-/// The text of [`LoadError::Damaged`] when the disk had no room for the expanded frames.
-pub const LOAD_NO_ROOM: &str = "there is not enough room to open the recording";
-/// The text of [`LoadError::Damaged`] when the video could not be read back into the frames
-/// its index names. Nothing was changed: it may be the video, or the ffmpeg that read it.
-pub const LOAD_VIDEO_DAMAGED: &str = "the recording could not be read back from its video";
 
 /// How a video is expanded when a project that keeps one is opened.
 pub struct Expand<'a> {
@@ -1182,18 +1176,14 @@ enum NotExpanded {
     VideoDamaged,
 }
 
-/// The one place the four outcomes become a [`LoadError`]. Until `LoadError` has a variant for
-/// each (see [`LOAD_NEEDS_FFMPEG`]), they are told apart by these fixed texts.
+/// The one place the four outcomes become a [`LoadError`].
 fn not_expanded(why: NotExpanded) -> LoadError {
-    LoadError::Damaged(
-        match why {
-            NotExpanded::NeedsFfmpeg => LOAD_NEEDS_FFMPEG,
-            NotExpanded::Cancelled => LOAD_CANCELLED,
-            NotExpanded::NoRoom => LOAD_NO_ROOM,
-            NotExpanded::VideoDamaged => LOAD_VIDEO_DAMAGED,
-        }
-        .to_string(),
-    )
+    match why {
+        NotExpanded::NeedsFfmpeg => LoadError::NeedsFfmpeg,
+        NotExpanded::Cancelled => LoadError::Cancelled,
+        NotExpanded::NoRoom => LoadError::NoRoom,
+        NotExpanded::VideoDamaged => LoadError::VideoDamaged,
+    }
 }
 
 /// What an expansion that did not make a recording means for the one who asked. Nothing of it
@@ -4314,7 +4304,7 @@ mod tests {
             w.save(&key_1());
             swap(&w, &key_1());
             let whole = contents(w.tmp.path());
-            let needs = LoadError::Damaged(LOAD_NEEDS_FFMPEG.to_string());
+            let needs = LoadError::NeedsFfmpeg;
             assert_eq!(load_err(&w.store, &key_1()), needs);
             assert_eq!(why(w.store.load_with(&key_1(), &Expand { codec: None, temp: &w.tmp.path().join("edit"), keep_going: &go })), needs);
             // An ffmpeg that was found at start and cannot be run now is the same thing to the user.
@@ -4346,10 +4336,10 @@ mod tests {
             };
             // Cancelled after a few frames.
             let stop = |done: usize, _: usize| done < 4;
-            assert_eq!(why(w.store.load_with(&key_1(), &Expand { codec: Some(&Fake::default()), temp: &temp, keep_going: &stop })), LoadError::Damaged(LOAD_CANCELLED.to_string()));
+            assert_eq!(why(w.store.load_with(&key_1(), &Expand { codec: Some(&Fake::default()), temp: &temp, keep_going: &stop })), LoadError::Cancelled);
             empty("cancelled");
             // The program says it cannot read the video; the video holds too few pictures; a bound passed.
-            let damaged = LoadError::Damaged(LOAD_VIDEO_DAMAGED.to_string());
+            let damaged = LoadError::VideoDamaged;
             let unreadable = Fake { fails: Some(|| CodecError::Failed { exit: Some(1) }), ..Fake::default() };
             let short = Fake { short_by: 1, ..Fake::default() };
             let slow = Fake { fails: Some(|| CodecError::TimedOut { bound: mythicshot_recording::Bound::Stall }), ..Fake::default() };
@@ -4358,8 +4348,8 @@ mod tests {
                 empty(what);
             }
             // No room is its own reason.
-            assert_eq!(expand_failed(mythicshot_recording::ExpandError::NoRoom), LoadError::Damaged(LOAD_NO_ROOM.to_string()));
-            assert_eq!(expand_failed(mythicshot_recording::ExpandError::Io(no_room())), LoadError::Damaged(LOAD_NO_ROOM.to_string()));
+            assert_eq!(expand_failed(mythicshot_recording::ExpandError::NoRoom), LoadError::NoRoom);
+            assert_eq!(expand_failed(mythicshot_recording::ExpandError::Io(no_room())), LoadError::NoRoom);
             // A temporary folder that already holds something is not written into.
             std::fs::write(temp.join("mine.txt"), b"mine").unwrap();
             assert!(matches!(why(open_with(&w.store, &key_1(), &Fake::default(), &temp)), LoadError::Damaged(_)));
@@ -4368,9 +4358,9 @@ mod tests {
             // None of it marked or changed the project, and none left it open: it opens now.
             assert_eq!((w.store.list()[0].problem, w.store.list()[0].convert), (None, ConvertState::Done));
             open_with(&w.store, &key_1(), &Fake::default(), &temp).unwrap();
-            // The four reasons are four texts, each a sentence's worth with no folder in it.
-            let reasons = [LOAD_NEEDS_FFMPEG, LOAD_CANCELLED, LOAD_NO_ROOM, LOAD_VIDEO_DAMAGED];
-            assert_eq!(reasons.iter().collect::<BTreeSet<_>>().len(), 4);
+            // The four reasons are four outcomes of their own, and none of them is "damaged".
+            let reasons = [not_expanded(NotExpanded::NeedsFfmpeg), not_expanded(NotExpanded::Cancelled), not_expanded(NotExpanded::NoRoom), not_expanded(NotExpanded::VideoDamaged)];
+            assert_eq!(reasons, [LoadError::NeedsFfmpeg, LoadError::Cancelled, LoadError::NoRoom, LoadError::VideoDamaged]);
         }
 
         #[test]

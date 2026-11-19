@@ -42,7 +42,7 @@ type Free<'a> = &'a (dyn Fn(&Path) -> Option<u64> + Sync);
 /// The room left for this user on the disk `folder` is on. None when the folder is not
 /// there, the system does not say, or on a system this is not written for.
 #[cfg(windows)]
-fn free_bytes(folder: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(folder: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let name: Vec<u16> = folder.as_os_str().encode_wide().collect();
@@ -57,7 +57,7 @@ fn free_bytes(folder: &Path) -> Option<u64> {
 }
 
 #[cfg(not(windows))]
-fn free_bytes(_: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(_: &Path) -> Option<u64> {
     None
 }
 
@@ -73,8 +73,6 @@ pub enum FfmpegState {
 }
 
 /// How the search for ffmpeg stands. Starts nothing; safe on the UI thread.
-// Read by Preferences and the Tours page; until they are built, by nothing.
-#[allow(dead_code)]
 pub fn ffmpeg_state() -> FfmpegState {
     state_of(ffmpeg::found())
 }
