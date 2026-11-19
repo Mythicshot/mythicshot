@@ -28,7 +28,12 @@ use std::time::{Duration, Instant};
 
 /// The quality of a kept recording. Constants, and part of [`CODEC_ID`]: a change of any of
 /// them must change the id, so recordings marked under the old one are tried again.
-pub const CRF: u32 = 10;
+///
+/// The crf is 8, not the 10 first planned: at 10 the key pictures of a screen full of small
+/// sharp text came back at 39 dB, under the 40 dB the verification asks of every frame; at 8
+/// they measured 44 dB, for 5 to 7 percent more bytes (the ignored test
+/// `measure_encoder_candidates` in `video.rs` measures the alternatives again).
+pub const CRF: u32 = 8;
 pub const PRESET: &str = "medium";
 /// A key picture every this many frames, so a damaged spot costs at most one group.
 pub const GOP: u32 = 30;
@@ -40,7 +45,7 @@ pub const STALL: Duration = Duration::from_secs(120);
 /// ffmpeg is stopped after 30 seconds plus this much per frame, whatever it is doing.
 pub const PER_FRAME: Duration = Duration::from_secs(5);
 /// What [`Ffmpeg`] answers as its [`VideoCodec::id`].
-pub const CODEC_ID: &str = "x264-444-crf10-medium-g30";
+pub const CODEC_ID: &str = "x264-444-crf8-medium-g30";
 
 const BASE_TIME: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
@@ -1009,7 +1014,7 @@ mod tests {
         assert_eq!(value_of(&args, "-color_range"), "pc");
         assert_eq!(value_of(&args, "-colorspace"), "bt709");
         assert_eq!(value_of(&args, "-c:v"), "libx264");
-        assert_eq!(value_of(&args, "-crf"), "10");
+        assert_eq!(value_of(&args, "-crf"), "8");
         assert_eq!(value_of(&args, "-preset"), "medium");
         assert_eq!(value_of(&args, "-g"), "30");
         assert_eq!(value_of(&args, "-keyint_min"), "30");
@@ -1020,13 +1025,13 @@ mod tests {
         assert_eq!(value_of(&args, "-loglevel"), "error");
         assert!(args.contains(&"-nostdin".to_string()) && args.contains(&"-an".to_string()));
         // The whole list, in the planned order.
-        let planned = "-hide_banner -nostdin -loglevel error -y -f rawvideo -pix_fmt rgba -video_size 2560x1440 -framerate 25 -i pipe:0 -an -vf scale=out_range=full:out_color_matrix=bt709,format=yuv444p -c:v libx264 -crf 10 -preset medium -g 30 -keyint_min 30 -sc_threshold 0 -color_range pc -colorspace bt709 -f matroska";
+        let planned = "-hide_banner -nostdin -loglevel error -y -f rawvideo -pix_fmt rgba -video_size 2560x1440 -framerate 25 -i pipe:0 -an -vf scale=out_range=full:out_color_matrix=bt709,format=yuv444p -c:v libx264 -crf 8 -preset medium -g 30 -keyint_min 30 -sc_threshold 0 -color_range pc -colorspace bt709 -f matroska";
         let mut expected: Vec<String> = planned.split(' ').map(String::from).collect();
         expected.push(out.to_string_lossy().into_owned());
         assert_eq!(args, expected);
         // The id names exactly these settings.
         assert_eq!(CODEC_ID, format!("x264-444-crf{CRF}-{PRESET}-g{GOP}"));
-        assert_eq!(Ffmpeg { exe: out, version: String::new(), has_libx264: true }.id(), "x264-444-crf10-medium-g30");
+        assert_eq!(Ffmpeg { exe: out, version: String::new(), has_libx264: true }.id(), "x264-444-crf8-medium-g30");
     }
 
     #[test]

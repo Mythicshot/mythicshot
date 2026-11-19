@@ -36,8 +36,9 @@ pub struct Tolerance {
 
 /// The tolerance of a kept recording.
 ///
-/// `frame_db` stands on the owner's real recording (46.7 dB mean, 43.7 dB worst frame at this
-/// quality; a range or matrix mistake lands near 25).
+/// `frame_db` stands on the owner's real recording (46.7 dB mean, 43.7 dB worst frame at
+/// crf 10; a range or matrix mistake lands near 25). The encoder has since gone to crf 8 so
+/// that the key pictures of dense small text clear it too.
 ///
 /// `mean_shift` is 1.5 and PROVISIONAL, pending the owner's confirmation: the plan proposed
 /// 0.5, but with the planned ffmpeg arguments a flat pure red and a flat pure blue come back
@@ -1682,31 +1683,122 @@ mod tests {
         assert_eq!(archived.bytes, std::fs::metadata(&b.out).unwrap().len());
     }
 
-    /// MEASURED, not chosen: a screen filled wall to wall with small one-pixel marks (a line
-    /// of them every 11 pixels, where the screen-like frames above have one every 22) came
-    /// back at 39.07 dB on its worst frame with ffmpeg 9.0.2 (worst block 34.70 dB, mean
-    /// shift 0.228), which is under the 40 dB a frame must reach. The weak frames are the
-    /// key pictures (the first of each group of 30, and most of all the one that opens a
-    /// short last group); the frames between them measured 44 to 52 dB. The threshold is not
-    /// lowered for it: such a recording is refused by the frame measure and keeps its
-    /// lossless frames. This test pins that the verdict follows the measure, whichever side
-    /// of 40 dB another ffmpeg lands on, and prints what was measured.
+    /// A screen filled wall to wall with small one-pixel marks (a line of them every 11
+    /// pixels, where the screen-like frames above have one every 22) is the hardest content
+    /// found for the frame measure: at crf 10 its key pictures came back at 39.07 dB, under
+    /// the 40 dB a frame must reach. The encoder was made to meet the check, not the check
+    /// weakened: at the crf that ships (chosen by `measure_encoder_candidates`) the worst
+    /// frame measured 44.29 dB with ffmpeg 9.0.2, and this test asks for the 42 dB the choice
+    /// was made by.
     #[test]
-    fn a_screen_full_of_small_sharp_text_is_judged_by_what_it_measures() {
+    fn a_screen_full_of_small_sharp_text_archives_and_verifies() {
         let Some(ffmpeg) = real() else { return };
         let (w, h, n) = (256, 192, 35);
         let b = bench_of(w, h, (0..n).map(|i| screen_with(i, w, h, 11, true)).collect());
         let (dense, shift) = measured("a screen full of small one-pixel marks (dense text)", &b, ffmpeg);
-        // What was measured, with room for another version of the encoder.
-        assert!(dense.worst_frame_db > 36.0 && dense.worst_frame_db < 44.0, "{dense:?}");
+        assert!(dense.worst_frame_db >= 42.0, "{dense:?}");
         assert!(dense.worst_block_db >= TOLERANCE.block_db && shift <= TOLERANCE.mean_shift, "{dense:?} {shift}");
-        let result = b.archive(ffmpeg, &ANY_SIZE);
-        if dense.worst_frame_db >= TOLERANCE.frame_db {
-            assert_eq!(result.unwrap(), dense);
-        } else {
-            // Refused for a key picture, with the number that was measured, and nothing left.
-            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Frame { frame, db })) if frame % 30 == 0 && db < TOLERANCE.frame_db), "{result:?}");
-            assert_eq!(b.files(), vec![FRAMES_FILE.to_string()]);
+        assert_eq!(b.archive(ffmpeg, &ANY_SIZE).unwrap(), dense);
+        assert_eq!(dense.checked, n);
+    }
+
+    /// Encode pictures with ffmpeg by hand: the arguments of the real encoder, but for the crf
+    /// and the x264 parameters, which are the candidate's.
+    fn encode_by_hand(ffmpeg: &Ffmpeg, (w, h): (u32, u32), pictures: &[Vec<u8>], crf: u32, params: Option<&str>, out: &Path) {
+        let mut cmd = std::process::Command::new(ffmpeg.exe());
+        cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-video_size", &format!("{w}x{h}"), "-framerate", "25", "-i", "pipe:0", "-an"]);
+        cmd.args(["-vf", "scale=out_range=full:out_color_matrix=bt709,format=yuv444p", "-c:v", "libx264", "-crf", &crf.to_string(), "-preset", "medium", "-g", "30", "-keyint_min", "30", "-sc_threshold", "0"]);
+        if let Some(params) = params {
+            cmd.args(["-x264-params", params]);
+        }
+        cmd.args(["-color_range", "pc", "-colorspace", "bt709", "-f", "matroska"]).arg(out);
+        cmd.env_remove("FFREPORT").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // No console window, below normal priority.
+            cmd.creation_flags(0x0800_0000 | 0x0000_4000);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        for px in pictures {
+            stdin.write_all(px).unwrap();
+        }
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "ffmpeg refused crf {crf} with {params:?}");
+    }
+
+    /// Not run by itself: `cargo test -p mythicshot-recording measure_encoder_candidates --
+    /// --ignored --nocapture` encodes dense small text (and, for the size, an ordinary
+    /// screen) with each candidate setting of the encoder, at two picture sizes, in a
+    /// temporary folder, and prints the worst frame, the worst block and the size against
+    /// plain crf 10. It ends with what comparing every frame costs in the second pass.
+    #[test]
+    #[ignore = "needs ffmpeg and a few minutes; it measures, it does not test"]
+    fn measure_encoder_candidates() {
+        let Some(ffmpeg) = real() else { return };
+        let candidates: [(&str, u32, Option<&str>); 10] = [
+            ("plain crf 10", 10, None),
+            ("(a) ipratio=2.0", 10, Some("ipratio=2.0")),
+            ("(b) psy-rd=0:0", 10, Some("psy-rd=0,0")),
+            ("(c) ipratio=2.0, psy-rd=0:0", 10, Some("ipratio=2.0:psy-rd=0,0")),
+            ("(d) (c) with qpmax=16", 10, Some("ipratio=2.0:psy-rd=0,0:qpmax=16")),
+            ("(d) (c) with qpmax=12", 10, Some("ipratio=2.0:psy-rd=0,0:qpmax=12")),
+            ("(d) (c) with qpmax=10", 10, Some("ipratio=2.0:psy-rd=0,0:qpmax=10")),
+            ("(e) crf 8 (the one that ships)", 8, None),
+            ("(f) crf 6", 6, None),
+            ("extra: qpmax=12 alone", 10, Some("qpmax=12")),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.mkv");
+        let mut kept = Vec::new();
+        for (w, h, n) in [(256u32, 192u32, 35usize), (1280, 720, 60)] {
+            for (content, pitch) in [("dense small text", 11usize), ("an ordinary screen", 22)] {
+                let pictures: Vec<Vec<u8>> = (0..n).map(|i| screen_with(i, w, h, pitch, true)).collect();
+                let mut plain = 0u64;
+                for (name, crf, params) in candidates {
+                    encode_by_hand(ffmpeg, (w, h), &pictures, crf, params, &out);
+                    let bytes = std::fs::metadata(&out).unwrap().len();
+                    if plain == 0 {
+                        plain = bytes;
+                    }
+                    let (mut frame_db, mut block_db, mut cast, mut at) = (f64::INFINITY, f64::INFINITY, 0.0f64, 0usize);
+                    let mut each = |i: usize, px: &[u8]| {
+                        let m = measure(&pictures[i], px, w, h, TOLERANCE.block).unwrap();
+                        assert!(m.opaque);
+                        if m.frame_db < frame_db {
+                            (frame_db, at) = (m.frame_db, i);
+                        }
+                        block_db = block_db.min(m.block_db);
+                        cast = m.shift.iter().fold(cast, |worst, s| worst.max(s.abs()));
+                        Ok(())
+                    };
+                    ffmpeg.decode(&out, (w, h), n, &mut each, &|_| true).unwrap();
+                    println!("candidate, {w}×{h}, {n} frames, {content}: {name}: worst frame {frame_db:.2} dB (frame {at}), worst block {block_db:.2} dB, worst mean shift {cast:.3}, {bytes} bytes, {:.2} × plain", bytes as f64 / plain as f64);
+                }
+                if (w, pitch) == (1280, 11) {
+                    kept = pictures;
+                }
+            }
+        }
+        // What the second pass costs: reading the video back and walking the frames in step,
+        // without and with the comparison of every frame.
+        let (w, h, n) = (1280u32, 720u32, kept.len());
+        let b = bench_of(w, h, kept);
+        let (archived, _) = archive(&b.rec, ffmpeg, &b.out, &[], &MEASURE_ONLY, &|_, _, _| true).unwrap();
+        for compare in [false, true] {
+            let mut frames = Frames::open(&b.rec, (w * h * 4) as usize).unwrap();
+            let mut worst = f64::INFINITY;
+            let started = std::time::Instant::now();
+            let mut each = |_: usize, px: &[u8]| {
+                let frame = frames.next().unwrap();
+                if compare {
+                    worst = worst.min(measure(frame, px, w, h, TOLERANCE.block).unwrap().frame_db);
+                }
+                Ok(())
+            };
+            ffmpeg.decode(&b.out, (w, h), n, &mut each, &|_| true).unwrap();
+            println!("second pass, {w}×{h}, {n} frames, {} build: {:.2} s {} (worst frame {worst:.2} dB; the archive said {:.2})", if cfg!(debug_assertions) { "debug" } else { "release" }, started.elapsed().as_secs_f64(), if compare { "with every frame compared" } else { "reading back and walking only" }, archived.worst_frame_db);
         }
     }
 
