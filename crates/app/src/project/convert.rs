@@ -126,13 +126,16 @@ struct GateState {
     converting: bool,
     /// The queue waits: for the switch, for a session to end, or for a nudge.
     parked: bool,
+    /// How often the queue looked for work.
+    #[cfg(test)]
+    looks: u32,
 }
 
 impl Gate {
     /// A gate with the switch off, and the four numbers the app's own gate takes from
     /// [`START_AFTER`], [`AFTER_SAVE`], [`AFTER_CANCEL`] and [`MIN_BYTES`].
     pub const fn new(start_after: Duration, after_save: Duration, after_cancel: Duration, min_bytes: u64) -> Gate {
-        Gate { state: Mutex::new(GateState { enabled: false, recording: false, quitting: false, nudged: false, converting: false, parked: false }), changed: Condvar::new(), start_after, after_save, after_cancel, min_bytes }
+        Gate { state: Mutex::new(GateState { enabled: false, recording: false, quitting: false, nudged: false, converting: false, parked: false, #[cfg(test)] looks: 0 }), changed: Condvar::new(), start_after, after_save, after_cancel, min_bytes }
     }
 
     fn state(&self) -> MutexGuard<'_, GateState> {
@@ -239,7 +242,12 @@ impl Gate {
 
     /// The queue is about to look for work: what happens from now on is a new nudge.
     fn looking(&self) {
-        self.state().nudged = false;
+        let mut s = self.state();
+        s.nudged = false;
+        #[cfg(test)]
+        {
+            s.looks += 1;
+        }
     }
 
     /// Notes that a conversion is under way until the answer is dropped; None, and nothing
@@ -257,6 +265,11 @@ impl Gate {
     #[cfg(test)]
     fn parked(&self) -> bool {
         self.state().parked
+    }
+
+    #[cfg(test)]
+    fn looks(&self) -> u32 {
+        self.state().looks
     }
 }
 
@@ -332,8 +345,9 @@ pub fn start(store: Option<&Store>, found: Option<&Ffmpeg>, gate: &Gate) {
 /// session, the switch turned on) and looks `after_save` later. A conversion that has to wait
 /// (no room, a time bound) or gave way to an editor or a save is tried again after the next
 /// nudge, and the queue goes on with the next oldest meanwhile; one the gate stopped ends the
-/// pass. A project that gave way is looked for again every `after_cancel` as well, until its
-/// conversion has ended in some other way: an editor closed without saving nudges nobody.
+/// pass. A project that gave way, and one that was open in an editor when the queue looked, is
+/// looked for again every `after_cancel` as well, until its conversion has ended in some other
+/// way or it is no longer there to be stored: an editor closed without saving nudges nobody.
 /// A conversion that panics gives its project up for this run, and the queue lives on.
 ///
 /// A project this run gave up on (see [`Outcome::GaveUp`]) is not tried again in this run, and
@@ -352,8 +366,9 @@ fn run_with(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate, free: Fr
     // Not tried again before the queue has rested: the ones that have to wait, and the ones
     // that gave way to an editor or a save.
     let mut not_now: HashSet<(ProjectKey, i64)> = HashSet::new();
-    // The projects whose conversion gave way and has not ended in another way since: while
-    // there is one, the queue looks again without a nudge.
+    // The projects whose conversion gave way and has not ended in another way since, and the
+    // ones a look found open in an editor: while there is one, the queue looks again without
+    // a nudge.
     let mut gave_way: HashSet<ProjectKey> = HashSet::new();
     let mut pause = gate.start_after;
     loop {
@@ -374,7 +389,16 @@ fn run_with(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate, free: Fr
                 let project = (key.clone(), saved_at);
                 given_up.contains(&project) || not_now.contains(&project)
             };
-            let Some(candidate) = store.next_candidate_but(codec.id(), gate.min_bytes, &skip) else { break };
+            let look = store.look(codec.id(), gate.min_bytes, &skip);
+            let Some(candidate) = look.next else {
+                // Nothing is left for this pass. What the queue goes on looking for without a
+                // nudge: a project that gave way in this pass, and one an editor has open. One
+                // that gave way earlier and is neither is no longer there to be stored (it was
+                // removed, or stored or noted meanwhile), and is forgotten.
+                gave_way.retain(|key| not_now.iter().any(|(waiting, _)| waiting == key));
+                gave_way.extend(look.open);
+                break;
+            };
             let end = {
                 // Not noted when the gate has closed meanwhile: a quit must not wait for a
                 // conversion that will not start.
@@ -484,7 +508,7 @@ fn convert(store: &Store, codec: &dyn VideoCodec, c: &Candidate, tol: &Tolerance
     // before the conversion is: whoever waits for the conversion to let go takes that for the
     // frames file being closed.
     let (frames, archived) = match Recording::open_saved(&c.dir) {
-        Ok(rec) => (rec.frames.len(), rec.archive_video(codec, &conv.video_path(), &c.must, tol, &|_: Stage, _, _| !stopped())),
+        Ok(rec) => (rec.frames.len(), rec.archive_video(codec, &conv.video_path(), &[], tol, &|_: Stage, _, _| !stopped())),
         Err(_) => (0, Err(ArchiveError::Unusable("the recording could not be opened"))),
     };
     let size = format!("{frames} frames, {before} bytes of frames");
@@ -1574,6 +1598,64 @@ mod tests {
                 drop(opened.lock().unwrap().take());
                 until("the recording to be stored as video", || w.info(CH_A).form == Form::Video);
                 assert_eq!(fake.encodes(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn a_project_that_was_open_when_the_queue_looked_is_looked_at_again_without_a_nudge() {
+        alone("a_project_that_was_open_when_the_queue_looked_is_looked_at_again_without_a_nudge", || {
+            let w = World::new();
+            let saved = w.save(CH_A);
+            let whole = files(&saved.dir);
+            // The editor has the project before the queue ever looks: no conversion gives way.
+            let loaded = w.store.load(&key(CH_A)).unwrap_or_else(|e| panic!("{e:?}"));
+            let (fake, gate) = (Fake::default(), open_gate_looking_again_after(Duration::from_millis(40)));
+            queue(&w, &fake, &gate, || {
+                until("the queue to have looked", || gate.looks() >= 2);
+                assert_eq!((fake.encodes(), files(&saved.dir) == whole), (0, true));
+                // The editor is closed without saving: nobody nudges, and the recording is converted all the same.
+                drop(loaded);
+                until("the recording to be stored as video", || w.info(CH_A).form == Form::Video);
+                assert_eq!(fake.encodes(), 1);
+                // Nothing waits any more: the queue rests until it is nudged.
+                rests(&gate);
+            });
+        });
+    }
+
+    /// The queue has stopped looking by itself: it rests, and stays at rest for many times
+    /// the wait after which it would look again.
+    fn rests(gate: &Gate) {
+        std::thread::sleep(Duration::from_millis(150));
+        until("the queue to rest", || gate.parked());
+        let looks = gate.looks();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!((gate.looks(), gate.parked()), (looks, true), "the queue looked again with nothing to wait for");
+    }
+
+    #[test]
+    fn a_project_that_gave_way_and_is_no_longer_there_is_forgotten() {
+        alone("a_project_that_gave_way_and_is_no_longer_there_is_forgotten", || {
+            let w = World::new();
+            let saved = w.save(CH_A);
+            let (opened, once): (Mutex<Option<Loaded>>, AtomicBool) = (Mutex::new(None), AtomicBool::new(false));
+            let fake = Fake::during(|i| {
+                if i == 1 && !once.swap(true, Ordering::SeqCst) {
+                    *opened.lock().unwrap() = Some(w.store.load(&key(CH_A)).unwrap_or_else(|e| panic!("{e:?}")));
+                }
+            });
+            let gate = open_gate_looking_again_after(Duration::from_millis(40));
+            queue(&w, &fake, &gate, || {
+                until("the conversion to give way to the editor", || fake.encodes() == 1 && converting_now().is_none());
+                // While the editor has it, the queue looks again and again.
+                let looks = gate.looks();
+                until("the queue to look again", || gate.looks() >= looks + 2);
+                // The recording is removed while its editor is open: it will never be converted.
+                assert_eq!(w.store.remove_project(&saved.dir), Ok(crate::project::Removed::WhenItsEditorCloses));
+                rests(&gate);
+                drop(opened.lock().unwrap().take());
+                assert_eq!((fake.encodes(), w.store.list().len()), (1, 0));
             });
         });
     }
