@@ -44,6 +44,11 @@ const MAX_MS: u64 = u32::MAX as u64;
 /// at least a byte; a video index by the video's size in the same way.
 const MAX_FRAMES: usize = (MAX_MS / 1000 * 60) as usize;
 
+/// The largest index file that is read at all. A recording of an hour at the recorder's
+/// highest rate has an index of about 10 MB; anything past this is not an index, and is
+/// refused by its size before a byte of it is read into memory.
+const MAX_INDEX_BYTES: u64 = 64 << 20;
+
 /// How far left of or above the recorded area the recorder still notes the pointer.
 const POINTER_MARGIN: i32 = 32;
 
@@ -208,7 +213,13 @@ impl Recording {
     /// of the video form: the answer says [`Form::Video`], and the frames are not kept and
     /// never encoded a second time. If the video is gone or has another size, the expanded
     /// frames are kept like any recording's. A file of the other form that was already in
-    /// `dir` is not this call's to remove and stays; the index says which one counts.
+    /// `dir` is not this call's to remove and stays; the index says which one counts. Saving
+    /// into the folder the video itself lies in only rewrites the video's index.
+    ///
+    /// Whatever stops a save half way, the folder never holds an index beside a file it was
+    /// not written for: when a frames file or video of the same name is replaced, the index
+    /// is removed first, unless it is of the other form; that one describes a file this save
+    /// does not touch, and stays until the new index takes its place in one rename.
     pub fn save_into(&self, dir: &Path) -> Result<SavedAs, String> {
         self.save_with(dir, |from, to| std::fs::hard_link(from, to), copy_whole)
     }
@@ -257,7 +268,13 @@ impl Recording {
         }
 
         let (staged, kept) = match self.video_to_keep() {
-            Some((video, bytes)) => (self.stage_as(dir, video, VIDEO_FILE, bytes, link, copy, |to| self.write_video_index_to(to, bytes))?, SavedAs { form: Form::Video, bytes }),
+            // The video already lies in this folder under its name: it is not linked onto
+            // itself, and the index that is there stays until the new one replaces it.
+            Some((video, bytes)) if video.file_name().is_some_and(|name| name == VIDEO_FILE) && video.parent().is_some_and(|parent| same_folder(parent, dir)) => {
+                self.write_video_index(dir, bytes)?;
+                return Ok(SavedAs { form: Form::Video, bytes });
+            }
+            Some((video, bytes)) => (self.stage_video(dir, video, bytes, link, copy)?, SavedAs { form: Form::Video, bytes }),
             None => (self.stage(dir, expected, link, copy)?, SavedAs { form: Form::Frames, bytes: expected }),
         };
         if let Err(e) = staged.swap_frames() {
@@ -281,15 +298,34 @@ impl Recording {
     /// under a temporary name in `dir`. Nothing that was in the folder has been touched yet,
     /// and a failure removes both temporary files.
     fn stage(&self, dir: &Path, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<Staged, SaveError> {
-        self.stage_as(dir, &self.dir.join(FRAMES_FILE), FRAMES_FILE, expected, link, copy, |to| self.write_index_to(to))
+        self.stage_as(dir, &self.dir.join(FRAMES_FILE), Form::Frames, expected, link, copy, |to| self.write_index_to(to))
+    }
+
+    /// [`Recording::stage`] for the video form: the video `video` of `bytes` bytes and its index.
+    fn stage_video(&self, dir: &Path, video: &Path, bytes: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>) -> Result<Staged, SaveError> {
+        self.stage_as(dir, video, Form::Video, bytes, link, copy, |to| self.write_video_index_to(to, bytes))
     }
 
     /// [`Recording::stage`] for either form: the file `src` of `expected` bytes under the
-    /// name `name`, and the index that `write_index` writes.
+    /// name of `form`'s file, and the index that `write_index` writes.
     #[allow(clippy::too_many_arguments)]
-    fn stage_as(&self, dir: &Path, src: &Path, name: &str, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>, write_index: impl FnOnce(&Path) -> io::Result<()>) -> Result<Staged, SaveError> {
+    fn stage_as(&self, dir: &Path, src: &Path, form: Form, expected: u64, link: impl FnOnce(&Path, &Path) -> io::Result<()>, copy: impl FnOnce(&Path, &Path) -> io::Result<()>, write_index: impl FnOnce(&Path) -> io::Result<()>) -> Result<Staged, SaveError> {
+        let name = match form {
+            Form::Frames => FRAMES_FILE,
+            Form::Video => VIDEO_FILE,
+        };
         let (frames, index) = (dir.join(name), dir.join(INDEX_FILE));
-        let staged = Staged { frames_tmp: temp_beside(&frames), index_tmp: temp_beside(&index), replaces: frames.exists(), frames, index };
+        let replaces = frames.exists();
+        // An index known to be of the other form describes a file this save leaves alone, and
+        // stays until the new index replaces it. Any other index may describe the file about
+        // to be replaced (one of this form does; one that cannot be read right now might),
+        // and goes first: if it cannot be removed the save stops before it touched anything.
+        let other = match form {
+            Form::Frames => Form::Video,
+            Form::Video => Form::Frames,
+        };
+        let index_first = replaces && form_of(dir) != Ok(other);
+        let staged = Staged { frames_tmp: temp_beside(&frames), index_tmp: temp_beside(&index), replaces, index_first, frames, index };
         let tmp = &staged.frames_tmp;
         // A link is the same data under a second name: make sure that data is on the disk.
         let result = link(src, tmp)
@@ -349,7 +385,7 @@ impl Recording {
     /// whatever is found. Only the frames form is opened: a folder whose index is of the
     /// video form answers [`OpenError::Video`], whatever else lies in it.
     pub fn open_saved(dir: &Path) -> Result<Recording, OpenError> {
-        let text = std::fs::read(dir.join(INDEX_FILE)).map_err(not_readable)?;
+        let text = read_index(dir)?;
         let head: Head = serde_json::from_slice(&text).map_err(|_| damaged("the index cannot be read"))?;
         if form_of_head(&head)? == Form::Video {
             return Err(OpenError::Video);
@@ -447,7 +483,7 @@ impl Recording {
 /// nothing about whether they are whole. An index from a newer version is
 /// [`OpenError::Newer`], one without a known format number is damaged.
 pub fn form_of(dir: &Path) -> Result<Form, OpenError> {
-    form_in(&std::fs::read(dir.join(INDEX_FILE)).map_err(not_readable)?)
+    form_in(&read_index(dir)?)
 }
 
 /// [`form_of`] on the index's text.
@@ -476,7 +512,7 @@ fn form_of_head(head: &Head) -> Result<Form, OpenError> {
 /// than a recording can hold, and a video index names a video of at least a byte per frame.
 /// All of it is checked here, before a caller sizes anything by these numbers.
 pub fn open_video_index(dir: &Path) -> Result<VideoIndex, OpenError> {
-    read_video_index(&std::fs::read(dir.join(INDEX_FILE)).map_err(not_readable)?)
+    read_video_index(&read_index(dir)?)
 }
 
 /// [`open_video_index`] on the index's text.
@@ -542,7 +578,9 @@ const VIDEO_UNREADABLE: &str = "the video cannot be read";
 /// The index is checked against its limits before anything is made or sized by it. A video
 /// that is missing, not the size its index notes, or that does not decode to exactly the
 /// index's number of pictures of the index's size is [`ExpandError::Damaged`], in this
-/// crate's own words; a full disk is [`ExpandError::NoRoom`].
+/// crate's own words; a full disk is [`ExpandError::NoRoom`]. The codec's word is not taken
+/// for the count: a codec that answers success after fewer pictures, a short picture, one
+/// out of order or one past the total is refused the same way.
 ///
 /// What "exactly" can mean here is the codec's limit: a decode counts bytes and nothing
 /// else. A video whose pictures have another size, and whose total still comes to
@@ -583,7 +621,8 @@ fn expand_with<W: Write>(index: &VideoIndex, video: &Path, into: &Path, codec: &
     let mut each = |i: usize, px: &[u8]| -> Result<(), String> {
         let step = match index.times.get(i) {
             _ if !keep_going(i, total) => Err(ExpandError::Cancelled),
-            Some((t_ms, cursor)) if px.len() == frame_len => writer.push_io(px, *t_ms, *cursor).map_err(|(_, e)| write_failed(e)),
+            // Picture i is frame i: the next one in order, of the index's size, and not past its end.
+            Some((t_ms, cursor)) if i == writer.frames.len() && px.len() == frame_len => writer.push_io(px, *t_ms, *cursor).map_err(|(_, e)| write_failed(e)),
             _ => Err(ExpandError::Damaged(VIDEO_WRONG_COUNT)),
         };
         step.map_err(|why| {
@@ -629,6 +668,22 @@ fn write_failed(e: io::Error) -> ExpandError {
     if matches!(e.kind(), io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded) { ExpandError::NoRoom } else { ExpandError::Io(e) }
 }
 
+/// The text of the index in `dir`. Its size is looked at first, and a file larger than any
+/// index ([`MAX_INDEX_BYTES`]) is damaged without being read.
+fn read_index(dir: &Path) -> Result<Vec<u8>, OpenError> {
+    let path = dir.join(INDEX_FILE);
+    if std::fs::metadata(&path).map_err(not_readable)?.len() > MAX_INDEX_BYTES {
+        return Err(damaged("the index is larger than any recording's"));
+    }
+    // The file may have grown since: no more than the cap and one byte is ever read.
+    let mut text = Vec::new();
+    io::Read::read_to_end(&mut io::Read::take(File::open(&path).map_err(not_readable)?, MAX_INDEX_BYTES + 1), &mut text).map_err(not_readable)?;
+    if text.len() as u64 > MAX_INDEX_BYTES {
+        return Err(damaged("the index is larger than any recording's"));
+    }
+    Ok(text)
+}
+
 fn damaged(why: &str) -> OpenError {
     OpenError::Damaged(why.to_string())
 }
@@ -667,16 +722,19 @@ struct Staged {
     frames: PathBuf,
     index_tmp: PathBuf,
     index: PathBuf,
-    /// The folder already held a frames file, which the new one replaces.
+    /// The folder already held a file of this name, which the new one replaces.
     replaces: bool,
+    /// The index in the folder describes that file, or may, and so has to go before it does.
+    index_first: bool,
 }
 
 impl Staged {
-    /// Put the new frames in place. An index that described the frames being replaced goes
-    /// first, so if the save stops right here the folder holds frames without an index and
-    /// never an index beside frames it does not describe.
+    /// Put the new frames file or video in place. An index that described the file being
+    /// replaced goes first, so if the save stops right here the folder holds that file
+    /// without an index and never an index beside a file it does not describe. An index of
+    /// the other form describes a file that is not touched, and stays.
     fn swap_frames(&self) -> io::Result<()> {
-        if self.replaces {
+        if self.index_first {
             match patiently(|| std::fs::remove_file(&self.index)) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
@@ -1213,16 +1271,37 @@ mod tests {
         fails: Option<fn() -> CodecError>,
         /// Never asks `keep_going` itself.
         quiet: bool,
+        /// What a decode does wrong while it answers success.
+        lies: Option<Lie>,
         decodes: AtomicUsize,
+    }
+
+    /// A way for a codec to break its word and still answer success.
+    #[derive(Clone, Copy)]
+    enum Lie {
+        /// Hands on only this many pictures.
+        Fewer(usize),
+        /// Hands on this picture one byte short.
+        ShortSlice(usize),
+        /// Hands on one more picture, numbered past the total.
+        PastTheTotal,
+        /// Leaves this picture out and numbers the rest as they were.
+        Skips(usize),
+        /// Swallows the caller's error at this picture and goes on.
+        IgnoresTheCaller(usize),
     }
 
     impl Fake {
         fn new() -> Fake {
-            Fake { fails: None, quiet: false, decodes: AtomicUsize::new(0) }
+            Fake { fails: None, quiet: false, lies: None, decodes: AtomicUsize::new(0) }
         }
 
         fn quiet() -> Fake {
             Fake { quiet: true, ..Fake::new() }
+        }
+
+        fn lying(lie: Lie) -> Fake {
+            Fake { lies: Some(lie), ..Fake::new() }
         }
 
         fn failing(with: fn() -> CodecError) -> Fake {
@@ -1260,6 +1339,24 @@ mod tests {
             let bytes = std::fs::read(video).map_err(|_| CodecError::Failed { exit: Some(1) })?;
             let len = (size.0 * size.1 * 4) as usize;
             let whole = bytes.len() / len;
+            if let Some(lie) = self.lies {
+                let picture = |i: usize| &bytes[i * len..(i + 1) * len];
+                for i in 0..frames.min(whole) {
+                    match lie {
+                        Lie::Fewer(n) if i >= n => break,
+                        Lie::ShortSlice(at) if i == at => each(i, &picture(i)[..len - 1]).map_err(CodecError::Caller)?,
+                        Lie::Skips(at) if i == at => {}
+                        Lie::IgnoresTheCaller(at) if i >= at => {
+                            let _ = each(i, picture(i));
+                        }
+                        _ => each(i, picture(i)).map_err(CodecError::Caller)?,
+                    }
+                }
+                if matches!(lie, Lie::PastTheTotal) {
+                    each(frames, picture(0)).map_err(CodecError::Caller)?;
+                }
+                return Ok(());
+            }
             for i in 0..frames.min(whole) {
                 each(i, &bytes[i * len..(i + 1) * len]).map_err(CodecError::Caller)?;
                 if !self.quiet && !keep_going(i + 1) {
@@ -2180,5 +2277,223 @@ mod tests {
     /// The same recording through a second handle that does not own the folder, for a reader.
     fn opened_as_is(rec: &Recording) -> Recording {
         Recording { dir: rec.dir.clone(), owned: false, width: rec.width, height: rec.height, frames: rec.frames.clone(), end_ms: rec.end_ms, expanded_from: None }
+    }
+
+    // ---- after review: a cap on the index file, saving over a kept folder, a codec that lies ----
+
+    #[test]
+    fn an_index_file_larger_than_any_real_one_is_refused_without_being_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = recorded(tmp.path());
+        let kept = folder(tmp.path(), "kept");
+        rec.save_into(&kept).unwrap();
+        let index = kept.join(INDEX_FILE);
+        let too_large = |result: Result<(), OpenError>, what: &str| match result {
+            Err(OpenError::Damaged(why)) => assert_eq!(why, "the index is larger than any recording's", "{what}"),
+            other => panic!("{what}: {other:?}"),
+        };
+        let all_refuse = |what: &str| {
+            too_large(Recording::open_saved(&kept).map(|_| ()), what);
+            too_large(open_video_index(&kept).map(|_| ()), what);
+            too_large(form_of(&kept).map(|_| ()), what);
+        };
+        // A whole and true index with room behind it for one byte too many: only its size is wrong.
+        let file = std::fs::OpenOptions::new().write(true).open(&index).unwrap();
+        file.set_len(MAX_INDEX_BYTES + 1).unwrap();
+        drop(file);
+        all_refuse("one byte over");
+        // While another program holds it and shares it with nobody it cannot be read at all,
+        // and the answer is the same: the size was enough.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&index).unwrap();
+            assert!(std::fs::read(&index).is_err(), "the file can be read while it is held");
+            all_refuse("held by another program");
+            drop(held);
+        }
+        // Far larger, without a byte of it written.
+        std::fs::OpenOptions::new().write(true).open(&index).unwrap().set_len(MAX_INDEX_BYTES * 4).unwrap();
+        all_refuse("four times over");
+        // Nothing was changed or removed for it.
+        assert_eq!(std::fs::metadata(&index).unwrap().len(), MAX_INDEX_BYTES * 4);
+        assert_eq!(names(&kept), [FRAMES_FILE, INDEX_FILE]);
+        // Exactly at the cap the size is not the reason: the text is read, and is not an index.
+        std::fs::OpenOptions::new().write(true).open(&index).unwrap().set_len(MAX_INDEX_BYTES).unwrap();
+        for result in [Recording::open_saved(&kept).map(|_| ()), open_video_index(&kept).map(|_| ()), form_of(&kept).map(|_| ())] {
+            assert_eq!(result, Err(OpenError::Damaged("the index cannot be read".into())));
+        }
+        // A real index is far below it.
+        rec.save_into(&kept).unwrap();
+        assert!(std::fs::metadata(&index).unwrap().len() < MAX_INDEX_BYTES / 1000);
+        assert_every_frame(&opened(&kept));
+    }
+
+    fn no_link_made(_: &Path, _: &Path) -> io::Result<()> {
+        panic!("a link was made")
+    }
+
+    /// A project folder in the video form, and a recording expanded from the video in it.
+    fn expanded_from_its_project(root: &Path) -> (Recording, PathBuf, u64, Recording) {
+        let (rec, video, bytes) = with_video(root);
+        let project = folder(root, "project");
+        std::fs::rename(&video, project.join(VIDEO_FILE)).unwrap();
+        rec.write_video_index(&project, bytes).unwrap();
+        let expanded = expand_video(&open_video_index(&project).unwrap(), &project.join(VIDEO_FILE), &folder(root, "edit"), &Fake::new(), &always).unwrap();
+        (rec, project, bytes, expanded)
+    }
+
+    #[test]
+    fn saving_into_the_folder_its_video_lives_in_only_rewrites_the_video_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, project, bytes, expanded) = expanded_from_its_project(tmp.path());
+        let as_video = SavedAs { form: Form::Video, bytes };
+        let index = std::fs::read(project.join(INDEX_FILE)).unwrap();
+        let video = std::fs::read(project.join(VIDEO_FILE)).unwrap();
+        let written = std::fs::metadata(project.join(VIDEO_FILE)).unwrap().modified().unwrap();
+        // Neither a link nor a copy is asked for, and the video is the file it was.
+        assert_eq!(expanded.save_with(&project, no_link_made, no_copy), Ok(as_video));
+        assert_eq!(names(&project), [VIDEO_FILE, INDEX_FILE]);
+        assert_eq!(std::fs::read(project.join(INDEX_FILE)).unwrap(), index);
+        assert_eq!(std::fs::read(project.join(VIDEO_FILE)).unwrap(), video);
+        assert_eq!(std::fs::metadata(project.join(VIDEO_FILE)).unwrap().modified().unwrap(), written);
+        // The folder named another way is still the same folder, and the public ways in do the same.
+        assert_eq!(expanded.save_with(&project.join("..").join("project"), no_link_made, no_copy), Ok(as_video));
+        assert_eq!(expanded.save_into(&project), Ok(as_video));
+        assert!(matches!(expanded.save_into_with(&project, &|| panic!("nothing is copied")), Ok(kept) if kept == as_video));
+        // An index that was lost is written again.
+        std::fs::remove_file(project.join(INDEX_FILE)).unwrap();
+        assert_eq!(expanded.save_with(&project, no_link_made, no_copy), Ok(as_video));
+        assert_eq!(std::fs::read(project.join(INDEX_FILE)).unwrap(), index);
+        assert_eq!(names(&project), [VIDEO_FILE, INDEX_FILE]);
+        assert_eq!(open_video_index(&project).unwrap(), index_of(&rec, Some(bytes)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_index_that_cannot_be_rewritten_beside_its_own_video_leaves_the_folder_as_it_was() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, project, bytes, expanded) = expanded_from_its_project(tmp.path());
+        let index = std::fs::read(project.join(INDEX_FILE)).unwrap();
+        // Another program holds the index and shares it with nobody: it can be neither
+        // removed nor replaced, and the save must not have removed it before it found out.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(project.join(INDEX_FILE)).unwrap();
+        assert!(expanded.save_with(&project, no_link_made, no_copy).is_err());
+        drop(held);
+        assert_eq!(names(&project), [VIDEO_FILE, INDEX_FILE]);
+        assert_eq!(std::fs::read(project.join(INDEX_FILE)).unwrap(), index);
+        assert_eq!(form_of(&project), Ok(Form::Video));
+        assert_eq!(open_video_index(&project).unwrap(), index_of(&rec, Some(bytes)));
+        // It still expands, and saves once the index is free.
+        assert_every_frame(&expand_video(&open_video_index(&project).unwrap(), &project.join(VIDEO_FILE), &folder(tmp.path(), "again"), &Fake::new(), &always).unwrap());
+        assert_eq!(expanded.save_into(&project), Ok(SavedAs { form: Form::Video, bytes }));
+    }
+
+    #[test]
+    fn a_save_in_the_other_form_never_removes_the_index_that_was_there_before_its_own_is_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, video, bytes) = with_video(tmp.path());
+        let expanded = expand_video(&index_of(&rec, Some(bytes)), &video, &folder(tmp.path(), "edit"), &Fake::new(), &always).unwrap();
+        let other = recorded_as(tmp.path(), "other", 5);
+
+        // A frames-form folder with a stray video beside it (what a swap cut off early leaves)
+        // receives a save in the video form.
+        let kept = folder(tmp.path(), "kept");
+        rec.save_into(&kept).unwrap();
+        std::fs::write(kept.join(VIDEO_FILE), b"a stray video").unwrap();
+        let frames_index = std::fs::read(kept.join(INDEX_FILE)).unwrap();
+        let staged = expanded.stage_video(&kept, &video, bytes, no_link, copy_whole).unwrap();
+        assert_every_frame(&opened(&kept));
+        staged.swap_frames().unwrap();
+        // Cut off here, the folder is still the frames form, whole: its index was not removed,
+        // and the new video is only a stray like the one before it.
+        assert_eq!(std::fs::read(kept.join(INDEX_FILE)).unwrap(), frames_index);
+        assert_eq!(form_of(&kept), Ok(Form::Frames));
+        assert_every_frame(&opened(&kept));
+        // The second half makes it the video form, whole.
+        staged.swap_index().unwrap();
+        assert_eq!(names(&kept), [VIDEO_FILE, FRAMES_FILE, INDEX_FILE]);
+        assert_eq!(form_of(&kept), Ok(Form::Video));
+        assert_eq!(open_video_index(&kept).unwrap(), index_of(&rec, Some(bytes)));
+        assert_eq!(std::fs::read(kept.join(VIDEO_FILE)).unwrap(), std::fs::read(&video).unwrap());
+
+        // The same save failing before its second half leaves the frames form as it was.
+        let failing = folder(tmp.path(), "failing");
+        rec.save_into(&failing).unwrap();
+        std::fs::write(failing.join(VIDEO_FILE), b"a stray video").unwrap();
+        assert!(expanded.save_with(&failing, no_link, |_, _| Err(io::Error::other("the disk is full"))).is_err());
+        assert_eq!(names(&failing), [VIDEO_FILE, FRAMES_FILE, INDEX_FILE]);
+        assert_eq!(std::fs::read(failing.join(VIDEO_FILE)).unwrap(), b"a stray video");
+        assert_every_frame(&opened(&failing));
+
+        // The other way round: a video-form folder with stray frames receives a save of other frames.
+        let as_video = folder(tmp.path(), "as-video");
+        expanded.save_into(&as_video).unwrap();
+        std::fs::write(as_video.join(FRAMES_FILE), b"stray frames").unwrap();
+        let video_index = std::fs::read(as_video.join(INDEX_FILE)).unwrap();
+        let staged = other.stage(&as_video, other.frames_end().unwrap(), no_link, copy_whole).unwrap();
+        staged.swap_frames().unwrap();
+        assert_eq!(std::fs::read(as_video.join(INDEX_FILE)).unwrap(), video_index);
+        assert_eq!(form_of(&as_video), Ok(Form::Video));
+        assert_every_frame(&expand_video(&open_video_index(&as_video).unwrap(), &as_video.join(VIDEO_FILE), &folder(tmp.path(), "again"), &Fake::new(), &always).unwrap());
+        staged.swap_index().unwrap();
+        assert_eq!(form_of(&as_video), Ok(Form::Frames));
+        assert_eq!(opened(&as_video).frames.len(), 5);
+
+        // The same form still loses its index first, in the video form as in the frames form:
+        // an index never lies beside a video it was not written for.
+        let same = folder(tmp.path(), "same");
+        expanded.save_into(&same).unwrap();
+        let staged = expanded.stage_video(&same, &video, bytes, no_link, copy_whole).unwrap();
+        staged.swap_frames().unwrap();
+        assert_eq!(names(&same), [VIDEO_FILE, staged.index_tmp.file_name().unwrap().to_str().unwrap()]);
+        assert_eq!(form_of(&same), Err(OpenError::Missing));
+        staged.swap_index().unwrap();
+        assert_eq!(names(&same), [VIDEO_FILE, INDEX_FILE]);
+        assert_eq!(open_video_index(&same).unwrap(), index_of(&rec, Some(bytes)));
+        // An index nobody can read may have been written for the video being replaced, so it
+        // goes first as well; only one known to be of the other form stays.
+        for unread in ["not an index", r#"{"format":3}"#] {
+            std::fs::write(same.join(INDEX_FILE), unread).unwrap();
+            let staged = expanded.stage_video(&same, &video, bytes, no_link, copy_whole).unwrap();
+            staged.swap_frames().unwrap();
+            assert_eq!(form_of(&same), Err(OpenError::Missing), "{unread}");
+            staged.swap_index().unwrap();
+            assert_eq!(open_video_index(&same).unwrap(), index_of(&rec, Some(bytes)));
+        }
+    }
+
+    #[test]
+    fn a_codec_that_answers_success_without_the_whole_video_is_refused_as_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, video, bytes) = with_video(tmp.path());
+        let index = index_of(&rec, Some(bytes));
+        let into = folder(tmp.path(), "edit");
+        let lies = [
+            ("no picture at all", Lie::Fewer(0)),
+            ("one picture", Lie::Fewer(1)),
+            ("all but the last picture", Lie::Fewer(N - 1)),
+            ("the first picture a byte short", Lie::ShortSlice(0)),
+            ("a later picture a byte short", Lie::ShortSlice(KEYFRAME_EVERY + 1)),
+            ("the last picture a byte short", Lie::ShortSlice(N - 1)),
+            ("a picture numbered past the total", Lie::PastTheTotal),
+            ("a picture left out", Lie::Skips(3)),
+            ("the last picture left out", Lie::Skips(N - 1)),
+        ];
+        for (what, lie) in lies {
+            match expand_video(&index, &video, &into, &Fake::lying(lie), &always) {
+                Err(ExpandError::Damaged(why)) => assert_eq!(why, "the video does not hold the frames the index names", "{what}"),
+                other => panic!("{what}: {:?}", other.map(|_| ())),
+            }
+            assert_eq!(names(&into), Vec::<String>::new(), "{what}");
+        }
+        // A codec that swallows this function's own refusal does not turn it into a success.
+        let result = expand_video(&index, &video, &into, &Fake::lying(Lie::IgnoresTheCaller(0)), &|done, _| done < 4);
+        assert!(matches!(result, Err(ExpandError::Cancelled)), "{:?}", result.map(|_| ()));
+        assert_eq!(names(&into), Vec::<String>::new());
+        // The same fake telling the truth is taken, and the video was only read.
+        assert_every_frame(&expand_video(&index, &video, &into, &Fake::lying(Lie::Fewer(N)), &always).unwrap());
+        assert_eq!(std::fs::metadata(&video).unwrap().len(), bytes);
     }
 }
