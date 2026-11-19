@@ -13,9 +13,11 @@ pub use state::{COVER_LOGO, ProjectKey, Restored, Snapshot};
 pub use store::{LoadError, Loaded, NOT_PUT_BACK, OpenGuard, Problem, ProjectInfo, Saved, Store, Totals, epoch};
 // What the saved recordings take, in words: for the settings and for Preferences.
 pub use usage::{LIMIT_MAX_GB, form_text, over_limit, over_limit_sentence, parse_limit, problem_text, remove_question, row_title, usage_fraction, usage_line};
-// For the publish result screen, which does not ask yet.
+// For the publish result screen: whether a save went past the limit.
+pub use usage::pushed_over;
+// The title of a recording without one; named outside this module by nothing.
 #[allow(unused_imports)]
-pub use usage::{UNTITLED, pushed_over};
+pub use usage::UNTITLED;
 // The form a recording is kept in and how storing it as video went, and what removing one
 // answers: Preferences shows them.
 pub use store::{ConvertState, Form, Removed, converting_now};

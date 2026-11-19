@@ -106,16 +106,20 @@ fn start_opening(job: OpenJob) -> Opening {
     let (cancel, temp) = (job.cancel.clone(), job.temp.clone());
     let thread = std::thread::spawn(move || {
         let OpenJob { store, key, codec, free, temp, cancel, rows, tx, wake } = job;
-        let codec = codec();
-        let open = tours_ui::VideoOpen { store: store.as_ref(), codec, temp: &temp, cancel: &cancel, free: &free };
-        tours_ui::open_video(&open, &key, &rows, |result| {
+        let report = |result: Result<project::Loaded, project::LoadError>| {
             // Nobody is left to take it: the frames it was expanded into go with it.
             if let Err(mpsc::SendError(AppEvent::ProjectOpened(lost))) = tx.send(AppEvent::ProjectOpened(Box::new((key.clone(), result))))
                 && let Ok(loaded) = &lost.1
             {
                 loaded.rec.delete_files();
             }
-        });
+        };
+        // A search for ffmpeg that breaks off still ends in a report, like work that does
+        // ([`tours_ui::open_video`]): the row would say "opening" for the rest of the run.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(codec)) {
+            Ok(codec) => tours_ui::open_video(&tours_ui::VideoOpen { store: store.as_ref(), codec, temp: &temp, cancel: &cancel, free: &free }, &key, &rows, report),
+            Err(_) => report(Err(project::LoadError::Damaged("the search for ffmpeg broke off".into()))),
+        }
         wake();
     });
     Opening { cancel, temp, thread }
@@ -229,9 +233,6 @@ impl App {
             save_retry.record(&settings.save(), Instant::now());
         }
         publish_ui::init(&settings);
-        // Start-up housekeeping, off the UI thread: what expansions for an editor left in the
-        // temporary folder when an earlier run was cut off.
-        std::thread::spawn(|| tours_ui::sweep_stale_edits(&tours_ui::edit_base(), std::process::id(), tours_ui::EDIT_STALE_AFTER));
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
@@ -763,8 +764,8 @@ impl App {
     /// when [`AppEvent::ProjectOpened`] arrives.
     fn open_saved_project(&mut self, ctx: &egui::Context, key: project::ProjectKey) {
         let store = project::Store::default_root().map(project::Store::at);
-        if !needs_thread(store.as_ref(), &key) {
-            match open_saved(store.as_ref(), &key, &self.settings) {
+        if let Some(opened) = open_at_once(store.as_ref(), &key, &self.settings) {
+            match opened {
                 Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
                 Err(sentence) => self.edit_failed(&key, sentence),
             }
@@ -795,20 +796,10 @@ impl App {
         if let Ok(s) = self.window.lock() {
             s.tours.open_ended(&key);
         }
-        match result {
-            // Cancel was pressed when the last frame was already through.
-            Ok(loaded) if cancelled => loaded.rec.delete_files(),
-            Ok(loaded) => match open_loaded(loaded, &self.settings) {
-                Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
-                Err(sentence) => self.edit_failed(&key, sentence),
-            },
-            // Whatever a cancelled open ended with: it was stopped, and nothing is said.
-            Err(_) if cancelled => {}
-            Err(e) => {
-                if let Some(sentence) = tours_ui::load_sentence(&e) {
-                    self.edit_failed(&key, sentence);
-                }
-            }
+        match after_open(cancelled, result).map(|ready| ready.and_then(|loaded| open_loaded(loaded, &self.settings))) {
+            Some(Ok(editor)) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Some(Err(sentence)) => self.edit_failed(&key, sentence),
+            None => {}
         }
     }
 
@@ -1285,13 +1276,50 @@ fn needs_thread(store: Option<&project::Store>, key: &project::ProjectKey) -> bo
     store.is_some_and(|store| store.form_of(key) == Some(project::Form::Video))
 }
 
-/// Open the recording saved for `key` in an editor, as [`App::open_saved_project`] does for a
-/// recording kept as frames. `store` is the folder of saved recordings, None when this user has
-/// none. The error is the sentence for the tour's row on the Tours page; a recording that is
-/// already open in an editor opens nothing new.
+/// [`open_at_once`] as the tests of the Tours page ask it: a recording kept as a video, which
+/// the app opens on a thread, answers here that it needs ffmpeg.
+#[cfg(test)]
 fn open_saved(store: Option<&project::Store>, key: &project::ProjectKey, settings: &Settings) -> Result<editor_ui::Editor, &'static str> {
-    let loaded = store.ok_or(project::LoadError::NotSaved).and_then(|store| store.load(key)).map_err(|e| tours_ui::load_sentence(&e).unwrap_or(tours_ui::SAVED_DAMAGED))?;
-    open_loaded(loaded, settings)
+    open_at_once(store, key, settings).unwrap_or(Err(tours_ui::NEEDS_FFMPEG))
+}
+
+/// Open the recording saved for `key` in an editor on the caller's thread, when that can be
+/// done at once; None when it runs on a thread of its own ([`start_opening`]): the recording
+/// is kept as a video.
+fn open_at_once(store: Option<&project::Store>, key: &project::ProjectKey, settings: &Settings) -> Option<Result<editor_ui::Editor, &'static str>> {
+    if needs_thread(store, key) {
+        return None;
+    }
+    at_once(store.ok_or(project::LoadError::NotSaved).and_then(|store| store.load(key)), settings)
+}
+
+/// What a load on the caller's thread ended in: an editor, or the sentence for the tour's
+/// row. None when it found the recording kept as a video after all (the conversion queue
+/// stored it so between the look at its form and the load): nothing is wrong, and opening it
+/// is the thread's.
+fn at_once(loaded: Result<project::Loaded, project::LoadError>, settings: &Settings) -> Option<Result<editor_ui::Editor, &'static str>> {
+    match loaded {
+        Err(project::LoadError::NeedsFfmpeg) => None,
+        Err(e) => Some(Err(tours_ui::load_sentence(&e).unwrap_or(tours_ui::SAVED_DAMAGED))),
+        Ok(loaded) => Some(open_loaded(loaded, settings)),
+    }
+}
+
+/// What the app does with an expansion that has ended, `cancelled` being whether Cancel was
+/// pressed for it: the recording to put into an editor, the sentence for the tour's row, or
+/// None for nothing at all. A recording that was ready when Cancel was pressed goes to no
+/// editor: its frames are removed and its project is let go of. A cancelled open says nothing,
+/// whatever it ended with.
+fn after_open(cancelled: bool, result: Result<project::Loaded, project::LoadError>) -> Option<Result<project::Loaded, &'static str>> {
+    match result {
+        Ok(loaded) if cancelled => {
+            loaded.rec.delete_files();
+            None
+        }
+        Ok(loaded) => Some(Ok(loaded)),
+        Err(_) if cancelled => None,
+        Err(e) => tours_ui::load_sentence(&e).map(Err),
+    }
 }
 
 /// Put a loaded project into an editor. The error is the sentence for the tour's row.
@@ -1455,5 +1483,85 @@ mod tests {
         let loaded = result.expect("the recording opens");
         assert_eq!((key, loaded.rec.frames.len()), (saved.key.clone(), 3));
         loaded.rec.delete_files();
+    }
+
+    #[test]
+    fn a_search_for_ffmpeg_that_breaks_off_still_reports_the_open_as_ended() {
+        let (tmp, store) = temp_store();
+        let saved = video_project(&store, SITE, TOUR, CHAPTER, "Testing");
+        let temp = tours_ui::new_edit_folder(&tmp.path().join("edits"));
+        let (tx, rx) = mpsc::channel();
+        let woken = Arc::new(AtomicBool::new(false));
+        let wake = woken.clone();
+        let broken = OpenJob { codec: Box::new(|| panic!("the search for ffmpeg of this test breaks off")), wake: Box::new(move || wake.store(true, Ordering::SeqCst)), ..job(&store, &saved.key, FakeCodec::default(), &temp, tx) };
+        let opening = start_opening(broken);
+        until("the thread has ended", || opening.thread.is_finished());
+        let Ok(AppEvent::ProjectOpened(done)) = rx.try_recv() else { panic!("the app was not told, and the row would say opening for the rest of the run") };
+        assert!(rx.try_recv().is_err(), "it is told once");
+        let (key, result) = *done;
+        assert_eq!(key, saved.key);
+        let error = result.err().expect("nothing opened");
+        assert_eq!(tours_ui::load_sentence(&error), Some(tours_ui::SAVED_DAMAGED));
+        assert!(woken.load(Ordering::SeqCst) && !temp.exists());
+        // The project was never touched: it opens with a search that works.
+        let (tx, rx) = mpsc::channel();
+        let opening = start_opening(job(&store, &saved.key, FakeCodec::default(), &temp, tx));
+        until("the expansion has ended", || opening.thread.is_finished());
+        stop_opening(opening, &rx, Duration::ZERO);
+    }
+
+    /// A recording expanded from a video, as the opening thread hands it over, and its folder.
+    fn expanded(tmp: &Path, store: &project::Store, key: &project::ProjectKey) -> (project::Loaded, PathBuf) {
+        let temp = tours_ui::new_edit_folder(&tmp.join("edits"));
+        let loaded = store.load_with(key, &project::Expand { codec: Some(&FakeCodec::default()), temp: &temp, keep_going: &|_, _| true });
+        (loaded.expect("the recording expands"), temp)
+    }
+
+    #[test]
+    fn what_the_app_does_with_an_open_that_ended_depends_on_cancel_and_the_result() {
+        use project::LoadError;
+        let (tmp, store) = temp_store();
+        let saved = video_project(&store, SITE, TOUR, CHAPTER, "Testing");
+        // Ready, and nobody cancelled: it goes to an editor, with its frames.
+        let (loaded, temp) = expanded(tmp.path(), &store, &saved.key);
+        let Some(Ok(loaded)) = after_open(false, Ok(loaded)) else { panic!("a recording that is ready opens") };
+        assert!(temp.join("frames.zst").is_file());
+        loaded.rec.delete_files();
+        drop(loaded);
+        // Ready, but Cancel was pressed when the last frame was through: no editor, the frames
+        // are removed and the project is let go of.
+        let (loaded, temp) = expanded(tmp.path(), &store, &saved.key);
+        assert!(after_open(true, Ok(loaded)).is_none());
+        assert!(!temp.exists());
+        assert!(!matches!(store.load(&saved.key), Err(LoadError::AlreadyOpen)));
+        // It did not open: the sentence of the reason.
+        for (error, sentence) in [(LoadError::NeedsFfmpeg, tours_ui::NEEDS_FFMPEG), (LoadError::VideoDamaged, tours_ui::VIDEO_DAMAGED), (LoadError::NoRoom, tours_ui::NO_ROOM), (LoadError::AlreadyOpen, tours_ui::ALREADY_OPEN), (LoadError::Damaged("anything".into()), tours_ui::SAVED_DAMAGED)] {
+            assert_eq!(after_open(false, Err(error.clone())).map(|said| said.err()), Some(Some(sentence)), "{error:?}");
+            // Cancelled, whatever it ended with: nothing is said.
+            assert!(after_open(true, Err(error)).is_none());
+        }
+        assert!(after_open(false, Err(LoadError::Cancelled)).is_none());
+        assert!(after_open(true, Err(LoadError::Cancelled)).is_none());
+    }
+
+    #[test]
+    fn a_recording_that_became_a_video_while_it_was_asked_for_goes_to_the_thread() {
+        use project::LoadError;
+        let (_tmp, store) = temp_store();
+        let settings = Settings::default();
+        let frames = crate::tours_ui::tests::save_project(&store, SITE, TOUR, CHAPTER, "Testing");
+        // Kept as frames: opened at once.
+        assert!(matches!(open_at_once(Some(&store), &frames.key, &settings), Some(Ok(_))));
+        // The queue stored it as video between the look at its form and the load: the load says
+        // it needs ffmpeg, and that is the thread's to find out, not a sentence for the row.
+        assert!(at_once(Err(LoadError::NeedsFfmpeg), &settings).is_none());
+        // Every other answer is given at once.
+        for (error, sentence) in [(LoadError::NotSaved, tours_ui::NOT_SAVED), (LoadError::AlreadyOpen, tours_ui::ALREADY_OPEN), (LoadError::Newer, tours_ui::SAVED_NEWER), (LoadError::Damaged("anything".into()), tours_ui::SAVED_DAMAGED)] {
+            assert_eq!(at_once(Err(error), &settings).map(|opened| opened.err()), Some(Some(sentence)));
+        }
+        // A project that is a video when it is looked at never tries the load on the window's thread.
+        let video = video_project(&store, SITE, "tour_aaaaaaaaaaaaaaaaaaaaaaaa", CHAPTER, "Getting started");
+        assert!(open_at_once(Some(&store), &video.key, &settings).is_none());
+        assert!(matches!(open_at_once(None, &video.key, &settings), Some(Err(sentence)) if sentence == tours_ui::NOT_SAVED));
     }
 }

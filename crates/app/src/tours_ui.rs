@@ -27,8 +27,9 @@
 //!   only after the site has said its tour is gone, and "no such tour" counts as that only for
 //!   a tour this workspace's own list held: the site says the same of another workspace's tour.
 //! - A recording kept as a video is expanded for its editor on a thread of the app's, never
-//!   here: the row shows how far it is, with Cancel, and one recording opens at a time. A list
-//!   that no longer holds the tour drops what the row showed and stops nothing.
+//!   here: the row shows how far it is, with Cancel, and one recording opens at a time. What
+//!   the row shows is read from the one record of that work, so it is there whenever the tour
+//!   is listed for the site it was asked on; a list without the tour stops nothing.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -437,6 +438,16 @@ enum Listing {
     Failed(String),
 }
 
+/// A recording kept as a video that is being expanded for an editor.
+#[derive(Debug)]
+struct Opening {
+    key: ProjectKey,
+    /// Stops the work; set by Cancel on the row, and by the app when it closes.
+    cancel: Arc<AtomicBool>,
+    /// Frames done and their number, once the work has reported.
+    progress: Option<(u32, u32)>,
+}
+
 #[derive(Debug, Default)]
 pub struct Model {
     site: Option<Site>,
@@ -463,9 +474,10 @@ pub struct Model {
     /// The folder of the project that was being stored as video when `saved` was read
     /// ([`project::converting_now`]). Read with `saved`, never while drawing.
     converting: Option<PathBuf>,
-    /// The one recording kept as a video that is being expanded for an editor, and the flag
-    /// that stops it. It stays until the work has ended, whatever the page shows meanwhile.
-    opening: Option<(ProjectKey, Arc<AtomicBool>)>,
+    /// The one recording kept as a video that is being expanded for an editor. It stays until
+    /// the work has ended, whatever the page shows meanwhile; the tour's row reads its state
+    /// from it ([`Model::work`]).
+    opening: Option<Opening>,
     /// The search for ffmpeg ended without one that can read a recording kept as a video.
     no_ffmpeg: bool,
 }
@@ -486,7 +498,15 @@ impl Model {
     }
 
     pub fn work(&self, id: &str) -> Option<Work> {
-        self.working.get(id).copied()
+        self.working.get(id).copied().or_else(|| self.opening_on(id).map(|opening| Work::Opening(opening.progress)))
+    }
+
+    /// The recording that is being opened for the tour `id`, when its row shows that: the tour
+    /// is listed for the site the recording belongs to, and Cancel was not pressed.
+    fn opening_on(&self, id: &str) -> Option<&Opening> {
+        let opening = self.opening.as_ref().filter(|opening| opening.key.tour_id == id && !opening.cancel.load(Ordering::SeqCst))?;
+        let listed = self.site.as_ref().is_some_and(|site| site.server == opening.key.server) && self.tour(id).is_some();
+        listed.then_some(opening)
     }
 
     pub fn error(&self, id: &str) -> Option<&str> {
@@ -513,7 +533,7 @@ impl Model {
 
     /// Whether an action may start on this tour: it is in the list and nothing runs on it.
     fn can_act(&self, id: &str) -> bool {
-        self.site.is_some() && self.tour(id).is_some() && !self.working.contains_key(id)
+        self.site.is_some() && self.tour(id).is_some() && self.work(id).is_none()
     }
 
     /// Tell the model which site the page belongs to now. A change (another address, a token
@@ -538,8 +558,6 @@ impl Model {
         self.saved_epoch = None;
         self.saved_reading = false;
         self.converting = None;
-        // A recording that is being opened goes on opening; its row is another site's.
-        self.working.retain(|_, work| !matches!(work, Work::Opening(_)));
     }
 
     /// Whether the saved recordings should be read again: the store's counter is not the one
@@ -682,8 +700,6 @@ impl Model {
             Edit::None => {}
         }
         self.errors.retain(|id, _| tours.iter().any(|t| &t.id == id));
-        // A recording that is being opened for a tour that is gone goes on opening, with no row to show it on.
-        self.working.retain(|id, work| !matches!(work, Work::Opening(_)) || tours.iter().any(|t| &t.id == id));
         if self.copied.as_ref().is_some_and(|(id, _)| !tours.iter().any(|t| &t.id == id)) {
             self.copied = None;
         }
@@ -804,57 +820,48 @@ impl Model {
     pub fn begin_open(&mut self, key: &ProjectKey, cancel: Arc<AtomicBool>) -> bool {
         let id = key.tour_id.as_str();
         if self.opening.is_some() {
-            // The row of the one that is opening has nothing to press, and nothing to be told.
-            if !self.working.contains_key(id) {
+            // A row that shows work has nothing to press, and nothing to be told.
+            if self.work(id).is_none() {
                 self.edit_failed(key, OPENING_ANOTHER);
             }
             return false;
         }
-        self.opening = Some((key.clone(), cancel));
-        let listed = self.site.as_ref().is_some_and(|s| s.server == key.server) && self.tour(id).is_some();
-        if listed && !self.working.contains_key(id) {
+        self.opening = Some(Opening { key: key.clone(), cancel, progress: None });
+        if self.opening_on(id).is_some() {
             if self.edit.tour_id() == Some(id) {
                 self.edit = Edit::None;
             }
             self.errors.remove(id);
-            self.working.insert(id.to_string(), Work::Opening(None));
         }
         true
     }
 
-    /// How far the expansion of `key`'s recording is: frames done, and their number. Only the
-    /// row that shows the work is told; one that was cancelled or is gone stays as it is.
+    /// How far the expansion of `key`'s recording is: frames done, and their number.
     pub fn open_progress(&mut self, key: &ProjectKey, done: usize, total: usize) {
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        if self.opening.as_ref().is_some_and(|(opening, _)| opening == key)
-            && let Some(work @ Work::Opening(_)) = self.working.get_mut(&key.tour_id)
-        {
-            *work = Work::Opening(Some((count(done), count(total))));
+        if let Some(opening) = self.opening.as_mut().filter(|opening| opening.key == *key) {
+            opening.progress = Some((count(done), count(total)));
         }
     }
 
     /// The expansion of `key`'s recording has ended, however it did: the row is an ordinary
-    /// one again, and another recording may be opened.
+    /// one again, another recording may be opened, and a row that was told to wait for this
+    /// one no longer says so.
     pub fn open_ended(&mut self, key: &ProjectKey) {
-        if self.opening.as_ref().is_none_or(|(opening, _)| opening != key) {
+        if self.opening.as_ref().is_none_or(|opening| opening.key != *key) {
             return;
         }
         self.opening = None;
-        if matches!(self.working.get(&key.tour_id), Some(Work::Opening(_))) {
-            self.working.remove(&key.tour_id);
-        }
+        self.errors.retain(|_, said| said != OPENING_ANOTHER);
     }
 
     /// "Cancel" on a row whose recording is being opened: the work is told to stop, and the row
     /// is an ordinary one at once. The work lets go within a moment; until it has
     /// ([`Model::open_ended`]) no other recording is opened.
     pub fn cancel_open(&mut self, id: &str) {
-        let Some((key, cancel)) = &self.opening else { return };
-        if key.tour_id != id || !matches!(self.working.get(id), Some(Work::Opening(_))) {
-            return;
+        if let Some(opening) = self.opening_on(id) {
+            opening.cancel.store(true, Ordering::SeqCst);
         }
-        cancel.store(true, Ordering::SeqCst);
-        self.working.remove(id);
     }
 
     /// Whether a recording is being expanded for an editor.
@@ -1594,7 +1601,13 @@ fn expand(open: &VideoOpen<'_>, key: &ProjectKey, rows: &OpenRows) -> Result<Loa
     // Without anything to read the video with, the store says so; room is asked about only
     // when the work would start.
     if open.codec.is_some() && !has_room(open, store, key) {
-        return Err(LoadError::NoRoom);
+        // Too little room is the answer only when nothing else is in the way: the project is
+        // asked for without anything to read its video with, which expands nothing and makes
+        // no folder, and whatever it says besides "needs ffmpeg" is the truer answer.
+        return match store.load_with(key, &Expand { codec: None, temp: open.temp, keep_going: &|_, _| false }) {
+            Err(LoadError::NeedsFfmpeg) => Err(LoadError::NoRoom),
+            other => other,
+        };
     }
     let keep_going = |done: usize, total: usize| {
         rows.progress(key, done, total);
@@ -1887,7 +1900,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     }
 
     // Jobs report into the model, not to the window: look again soon while one runs.
-    let waiting = m.is_loading() || m.saved_reading || !m.working.is_empty() || conn.token == TokenStatus::Checking || m.copied.is_some();
+    let waiting = m.is_loading() || m.saved_reading || !m.working.is_empty() || m.opening.is_some() || conn.token == TokenStatus::Checking || m.copied.is_some();
     ui.ctx().request_repaint_after(if waiting { Duration::from_millis(100) } else { STALE_AFTER });
 }
 
@@ -4865,9 +4878,9 @@ pub(crate) mod tests {
         assert!(m.is_opening() && !cancel.load(Ordering::SeqCst), "the open runs on");
         m.open_progress(&video.key, 4, 9);
         assert_eq!(m.work(B), None, "progress has no row to show on");
-        // The tour is listed again: the row is an ordinary one.
+        // The tour is listed again: the row shows the work again, where it is by now.
         reload(&mut m, three());
-        assert_eq!((m.work(B), m.error(B)), (None, None));
+        assert_eq!((m.work(B), m.error(B)), (Some(Work::Opening(Some((4, 9)))), None));
         assert!(m.is_opening());
         // Still only one at a time.
         assert!(!m.begin_open(&key(&site().server, C, CH1), Arc::default()));
@@ -5180,5 +5193,105 @@ pub(crate) mod tests {
         remove_edit_folder(&link);
         assert!(std::fs::symlink_metadata(&link).is_ok() && outside.join("frames.zst").is_file());
         remove_edit_folder(&base.join("missing"));
+    }
+
+    #[test]
+    fn too_little_room_never_hides_the_truer_answer() {
+        let (tmp, store) = temp_store();
+        let server = site().server;
+        let open_one = video_project(&store, &server, A, CH1, "Open in an editor");
+        let cut_short = video_project(&store, &server, A, CH2, "Cut short");
+        let damaged = video_project(&store, &server, B, CH1, "Damaged");
+        let newer = video_project(&store, &server, B, CH2, "Newer");
+        let sound = video_project(&store, &server, C, CH1, "Sound");
+        let state = page_with(vec![]);
+        let (cancel, codec) = (AtomicBool::new(false), FakeCodec::default());
+        let temp = new_edit_folder(&tmp.path().join("edits"));
+        // One is open in an editor; one lost half its video; one has a project file that cannot
+        // be read; one was saved by a later version.
+        let held = opened(&VideoOpen { store: Some(&store), codec: Some(&codec), temp: &new_edit_folder(&tmp.path().join("edits")), cancel: &cancel, free: &any_room }, &open_one.key, &state.open_rows()).expect("it opens");
+        std::fs::write(cut_short.dir.join("frames.mkv"), b"half").unwrap();
+        std::fs::write(damaged.dir.join("project.json"), b"{ not a project").unwrap();
+        let mut later: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(newer.dir.join("project.json")).unwrap()).unwrap();
+        later["format"] = serde_json::json!(project::FORMAT + 1);
+        std::fs::write(newer.dir.join("project.json"), later.to_string()).unwrap();
+        let before = files(store.root());
+        let decodes = codec.decodes.load(Ordering::SeqCst);
+        // The disk has no room at all, for any of them.
+        let none = |folder: &Path| folder.is_dir().then_some(0u64);
+        let open = VideoOpen { store: Some(&store), codec: Some(&codec), temp: &temp, cancel: &cancel, free: &none };
+        let why = |key: &ProjectKey| opened(&open, key, &state.open_rows()).err().expect("nothing opens without room");
+        assert_eq!(why(&open_one.key), LoadError::AlreadyOpen);
+        assert!(matches!(why(&cut_short.key), LoadError::Damaged(_)));
+        assert!(matches!(why(&damaged.key), LoadError::Damaged(_)));
+        assert_eq!(why(&newer.key), LoadError::Newer);
+        assert_eq!(why(&key(&server, C, CH2)), LoadError::NotSaved);
+        // Only a recording with nothing else in its way is told about the room.
+        assert_eq!(why(&sound.key), LoadError::NoRoom);
+        // None of it read a video, made a folder, changed a project or left one open.
+        assert_eq!(codec.decodes.load(Ordering::SeqCst), decodes);
+        assert!(!temp.exists());
+        assert!(files(store.root()) == before);
+        let roomy = VideoOpen { store: Some(&store), codec: Some(&codec), temp: &temp, cancel: &cancel, free: &any_room };
+        opened(&roomy, &sound.key, &state.open_rows()).expect("it opens once there is room").rec.delete_files();
+        held.rec.delete_files();
+    }
+
+    #[test]
+    fn a_row_that_lost_its_opening_state_has_it_back_when_the_tour_is_listed_again() {
+        let video = video_info(B, CH1, "Testing", mb(32.2));
+        let mut m = loaded_with(three(), vec![video.clone()]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(m.begin_open(&video.key, cancel.clone()));
+        m.open_progress(&video.key, 3, 9);
+        // One refresh misses the tour; the work goes on and reports.
+        reload(&mut m, vec![tour(A, "Customer onboarding", true, 22)]);
+        assert_eq!(m.work(B), None);
+        m.open_progress(&video.key, 4, 9);
+        // The next one lists it: the row shows where the work is, and has nothing else to press.
+        reload(&mut m, three());
+        assert_eq!(m.work(B), Some(Work::Opening(Some((4, 9)))));
+        assert_eq!(m.ask_edit(B), None);
+        m.ask_delete(B);
+        m.start_rename(B);
+        assert_eq!((m.edit(), m.error(B)), (&Edit::None, None));
+        // The page belongs to another site for a while, with a tour of the same id: not its recording.
+        let other = Site { server: "https://other.example.com".into(), epoch: 1 };
+        m.set_site(Some(other));
+        let (generation, _) = m.begin_load().unwrap();
+        m.finish_load(generation, Ok(three()), Instant::now());
+        assert_eq!(m.work(B), None);
+        m.cancel_open(B);
+        assert!(!cancel.load(Ordering::SeqCst), "another site's row stops nothing");
+        m.open_progress(&video.key, 5, 9);
+        // The site is set again: the row is back with its progress, and its Cancel works.
+        m.set_site(Some(site()));
+        let (generation, _) = m.begin_load().unwrap();
+        m.finish_load(generation, Ok(three()), Instant::now());
+        assert_eq!(m.work(B), Some(Work::Opening(Some((5, 9)))));
+        m.cancel_open(B);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert_eq!(m.work(B), None);
+        // A cancelled open does not come back with the next list either.
+        reload(&mut m, three());
+        assert_eq!(m.work(B), None);
+        m.open_ended(&video.key);
+        assert!(!m.is_opening());
+    }
+
+    #[test]
+    fn the_refusal_on_another_row_goes_when_the_open_has_ended() {
+        let (first, second) = (video_info(B, CH1, "Testing", mb(32.2)), video_info(C, CH1, "Third", mb(8.0)));
+        let mut m = loaded_with(three(), vec![first.clone(), second.clone()]);
+        assert!(m.begin_open(&first.key, Arc::default()));
+        assert_eq!(m.ask_edit(C), None);
+        assert_eq!(m.error(C), Some(OPENING_ANOTHER));
+        // Another row says something else: that stays.
+        m.edit_failed(&key(&site().server, A, CH1), SAVED_DAMAGED);
+        // The end of something else changes nothing.
+        m.open_ended(&second.key);
+        assert_eq!(m.error(C), Some(OPENING_ANOTHER));
+        m.open_ended(&first.key);
+        assert_eq!((m.error(C), m.error(A)), (None, Some(SAVED_DAMAGED)));
     }
 }
