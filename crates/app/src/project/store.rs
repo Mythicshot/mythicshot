@@ -392,8 +392,9 @@ impl Store {
         if is_open(dir) {
             return Err("this tour's saved recording is open in an editor and could not be replaced.".into());
         }
-        // A conversion that started on it while the staging folder was filled.
-        cancel_conversion_of(dir, LET_GO);
+        // A conversion that started on it while the staging folder was filled is told to stop.
+        // Nothing waits for it here: this runs with the store's lock held.
+        cancel_conversion_of(dir, Duration::ZERO);
         let parents: Vec<&Path> = dir.ancestors().skip(1).take(2).collect();
         if let Some(parent) = parents.first() {
             std::fs::create_dir_all(parent).map_err(|e| reason("the folder for saved recordings could not be written", &e))?;
@@ -695,7 +696,10 @@ impl Store {
     /// project file that names it (format 2) replaces the old one in one rename; the index
     /// replaces the frames' index; the frames file is removed, under this project's name only.
     /// An error before the project file is replaced leaves the project as it was, in its frames
-    /// form. From that rename on the project is in its video form and the answer is `Ok(true)`:
+    /// form; a video that is no longer the verified file in the project when the project file
+    /// is about to name it is such an error. After the commit the same look is taken before
+    /// the index is replaced and before the frames are removed, and a video that changed
+    /// keeps both. From that rename on the project is in its video form and the answer is `Ok(true)`:
     /// what could not be finished ([`Store::finish_conversions`] does it at the next start) is
     /// the frames' index or the frames file still lying there, which a video project ignores.
     /// The frames file is removed only after the new project file is on the disk.
@@ -730,7 +734,8 @@ impl Store {
         file.format = state::FORMAT;
         file.store = StoreInfo { form: SavedForm::Video, video_bytes, lossless_bytes: c.frames_bytes, convert: None };
         let text = project_text(&file)?;
-        sync_file(&made).map_err(|e| reason(NOT_STORED, &e))?;
+        // Another program (a scanner, a sync) may hold the fresh video for a moment.
+        patiently(|| sync_file(&made)).map_err(|e| reason(NOT_STORED, &e))?;
 
         // 1. The video into the project, and on the disk there. Until the project file names
         //    it, it is a file the frames project ignores and the next start removes.
@@ -739,13 +744,19 @@ impl Store {
         let undo = || {
             let _ = patiently(|| std::fs::remove_file(&video));
         };
-        if let Err(e) = sync_file(&video) {
+        if let Err(e) = patiently(|| sync_file(&video)) {
             undo();
             return Err(reason(NOT_STORED, &e));
         }
         sync_folder(dir);
 
-        // 2. The commit: the project file that names the video takes the old one's place.
+        // 2. The commit: the project file that names the video takes the old one's place. Only
+        //    if the video is still the file that was verified, where the project will look for it.
+        if !video_is(dir, video_bytes) {
+            undo();
+            eprintln!("Saved recordings: the video of a recording was changed while it was being stored, so the recording keeps its frames.");
+            return Err(format!("{NOT_STORED}."));
+        }
         let path = dir.join(PROJECT_FILE);
         let tmp = temp_beside(&path);
         if let Err(e) = write_whole(&tmp, text.as_bytes()).and_then(|()| (steps.rename)(&tmp, &path)) {
@@ -761,12 +772,23 @@ impl Store {
         }
         sync_folder(dir);
 
+        // From here on the frames and their index go. Not if the video the project now names
+        // is no longer the file that was verified: then they are all there is, and they stay.
+        const VIDEO_CHANGED: &str = "Saved recordings: the video of a recording was changed while it was being stored, so its frames are kept.";
+        if !video_is(dir, video_bytes) {
+            eprintln!("{VIDEO_CHANGED}");
+            return Ok(true);
+        }
         // 3. The video's index over the frames' index, which holds the same times.
         if let Err(e) = (steps.rename)(&conv.work.join(INDEX_FILE), &dir.join(INDEX_FILE)) {
             eprintln!("Saved recordings: a recording was stored as video and its frames are kept until the next start ({:?}).", e.kind());
             return Ok(true);
         }
         // 4. The frames: this project's name for them, and no other project's.
+        if !video_is(dir, video_bytes) {
+            eprintln!("{VIDEO_CHANGED}");
+            return Ok(true);
+        }
         if let Err(e) = patiently(|| std::fs::remove_file(dir.join(FRAMES_FILE))) {
             eprintln!("Saved recordings: a recording was stored as video and its frames are removed at the next start ({:?}).", e.kind());
         }
@@ -804,9 +826,10 @@ impl Store {
     ///
     /// - a project kept as a video whose video is there at its size: an index of the frames
     ///   form is replaced by the video's (when the frames it describes are still there to
-    ///   read it with), and the frames file is removed, with temporary files a swap left;
+    ///   read it with); then, if its index reads and names this video or none (what opening
+    ///   it asks), the frames file is removed, with temporary files a swap left;
     /// - a project kept as frames that passes the list's check: a video beside it is removed,
-    ///   with temporary files a swap left;
+    ///   and temporary files a swap or a mark left;
     /// - a folder with no project file that holds nothing at all but a video (what a version
     ///   before video storage leaves when it deletes such a tour) is removed.
     ///
@@ -833,7 +856,7 @@ impl Store {
             }
             changed |= match file.store.form {
                 SavedForm::Video => finish_swap(&dir, file.store.video_bytes),
-                SavedForm::Frames => remove_stray_video(&dir),
+                SavedForm::Frames => remove_stray_video(&dir) | remove_swap_temps(&dir),
             };
         }
         if changed {
@@ -855,9 +878,10 @@ impl Store {
     fn sweep_converting_at(&self, age: Duration, now: SystemTime) {
         let _changing = changing();
         let now = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let running = converting().as_ref().map(|slot| slot.work.clone());
+        // By its name, which no other folder has: the same folder can be spelled in more than one way.
+        let running = converting().as_ref().and_then(|slot| slot.work.file_name().map(|name| name.to_os_string()));
         for (name, dir) in folders_in(&self.root) {
-            if converting_started(&name).is_some_and(|started| now >= u128::from(started) + age.as_millis()) && running.as_ref() != Some(&dir) {
+            if converting_started(&name).is_some_and(|started| now >= u128::from(started) + age.as_millis()) && running.as_deref() != Some(std::ffi::OsStr::new(&name)) {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
@@ -1197,6 +1221,11 @@ fn finish_swap(dir: &Path, video_bytes: u64) -> bool {
     {
         changed |= rec.write_video_index(dir, video_bytes).is_ok();
     }
+    // The frames go only from a project that opens as a video: the same look at the index as
+    // when one is opened. One that would not open keeps every file it has.
+    if !open_video_index(dir).is_ok_and(|index| index.video_bytes.is_none_or(|noted| noted == video_bytes)) {
+        return changed;
+    }
     let frames = dir.join(FRAMES_FILE);
     if std::fs::symlink_metadata(&frames).is_ok_and(|m| m.is_file()) {
         changed |= patiently(|| std::fs::remove_file(&frames)).is_ok();
@@ -1210,8 +1239,7 @@ fn remove_stray_video(dir: &Path) -> bool {
     if !std::fs::symlink_metadata(&video).is_ok_and(|m| m.is_file()) {
         return false;
     }
-    let removed = patiently(|| std::fs::remove_file(&video)).is_ok();
-    removed | remove_swap_temps(dir)
+    patiently(|| std::fs::remove_file(&video)).is_ok()
 }
 
 /// The temporary files of the store's own top files in a project folder.
@@ -4621,6 +4649,209 @@ mod tests {
             assert_eq!(contents(&dir), whole);
             assert_eq!(w.save(&key_1()).info.convert, ConvertState::NotTried);
             assert_eq!(project_file(&dir).store, StoreInfo::default());
+        }
+
+        // ---- Hardening after review ----
+
+        /// The project of `key_1` as a swap cut off after its commit leaves it: the project file
+        /// names the video, and the frames and their index are still there.
+        fn cut_off_after_the_commit(w: &World) -> PathBuf {
+            let dir = w.dir(&key_1());
+            let (frames, index) = (std::fs::read(dir.join(FRAMES_FILE)).unwrap(), std::fs::read(dir.join(INDEX_FILE)).unwrap());
+            swap(w, &key_1());
+            std::fs::write(dir.join(FRAMES_FILE), frames).unwrap();
+            std::fs::write(dir.join(INDEX_FILE), index).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_video_taken_away_between_the_steps_of_a_swap_never_costs_the_frames() {
+            let frames = frames_and_index(FRAMES);
+            // After which rename an outside hand takes the video, and whether it removes it or cuts it short.
+            for (after, cut_short) in [(1, false), (1, true), (2, false), (2, true), (3, false), (3, true)] {
+                let _one = one_conversion();
+                let w = World::new();
+                w.save(&key_1());
+                let dir = w.dir(&key_1());
+                let whole = contents(&dir);
+                let (c, conv) = converted(&w, &key_1());
+                let count = std::cell::Cell::new(0);
+                let rename = |from: &Path, to: &Path| {
+                    count.set(count.get() + 1);
+                    std::fs::rename(from, to)?;
+                    if count.get() == after {
+                        if cut_short { std::fs::write(dir.join(VIDEO_FILE), &VIDEO[..VIDEO.len() - 1]).unwrap() } else { std::fs::remove_file(dir.join(VIDEO_FILE)).unwrap() }
+                    }
+                    Ok(())
+                };
+                let result = w.store.swap_with(&c, &conv, VIDEO.len() as u64, &Steps { keep_frames: &real_frames, rename: &rename });
+                drop(conv);
+                let what = format!("after rename {after}, cut short: {cut_short}");
+                // Whatever else: the frames are there, every byte.
+                assert_eq!(std::fs::read(dir.join(FRAMES_FILE)).unwrap(), frames.0, "{what}");
+                if after == 1 {
+                    // Before the commit: a refused step, and the project is as it was.
+                    let err = result.unwrap_err();
+                    assert!(reads_as_a_reason(&err, w.tmp.path()), "{what}: {err}");
+                    assert_eq!(count.get(), 1, "{what}: the project file was not replaced");
+                    assert_eq!(contents(&dir), whole, "{what}");
+                    assert_eq!(lists_and_loads("taken", &w.store, w.tmp.path(), &what), Form::Frames);
+                } else {
+                    // After it: the swap is made, the frames are kept, and nothing later removes them.
+                    assert_eq!(result, Ok(true), "{what}");
+                    assert_eq!(count.get(), after, "{what}: no step that leans on the video is taken after it changed");
+                    assert_eq!(w.store.list()[0].problem, Some(Problem::FramesMissing), "{what}");
+                    let left = contents(&dir);
+                    w.store.finish_conversions();
+                    w.store.sweep_converting(Duration::ZERO);
+                    assert_eq!(contents(&dir), left, "{what}: the next start removes nothing");
+                    // Taken before the index was replaced: the frames and their index are still a whole recording.
+                    assert_eq!(Recording::open_saved(&dir).is_ok(), after == 2, "{what}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_next_start_keeps_the_frames_of_a_video_project_that_would_not_open_as_one() {
+            // The index cannot be read; it names another video size; it is not there.
+            for case in ["unreadable", "another size", "newer", "gone"] {
+                let _one = one_conversion();
+                let w = World::new();
+                w.save(&key_1());
+                let dir = cut_off_after_the_commit(&w);
+                match case {
+                    "unreadable" => std::fs::write(dir.join(INDEX_FILE), b"{\"format\": 2, \"width\"").unwrap(),
+                    "another size" => Recording::open_saved(&dir).unwrap().write_video_index(&dir, VIDEO.len() as u64 + 1).unwrap(),
+                    "newer" => std::fs::write(dir.join(INDEX_FILE), b"{\"format\": 3}").unwrap(),
+                    _ => std::fs::remove_file(dir.join(INDEX_FILE)).unwrap(),
+                }
+                let (whole, epoch) = (contents(&dir), changes(&w.store));
+                w.store.finish_conversions();
+                assert_eq!(contents(&dir), whole, "{case}: nothing is removed from a project that would not open");
+                assert_eq!(changes(&w.store), epoch, "{case}");
+                assert_eq!(std::fs::read(dir.join(FRAMES_FILE)).unwrap(), frames_and_index(FRAMES).0, "{case}");
+                assert!(open_with(&w.store, &key_1(), &Fake::default(), &w.tmp.path().join("edit")).is_err(), "{case}: it does not open, which is why");
+            }
+            // The same state with its index whole is finished: the test above is not passing for another reason.
+            let _one = one_conversion();
+            let w = World::new();
+            w.save(&key_1());
+            let dir = cut_off_after_the_commit(&w);
+            w.store.finish_conversions();
+            assert!(video_form(&dir));
+            // An index of the frames form whose frames are damaged still names the times: the project opens, so the frames go.
+            let w = World::new();
+            w.save(&key_1());
+            let dir = cut_off_after_the_commit(&w);
+            std::fs::write(dir.join(FRAMES_FILE), b"cut").unwrap();
+            w.store.finish_conversions();
+            assert!(!dir.join(FRAMES_FILE).exists() && form_of(&dir) == Ok(Form::Frames));
+            assert_eq!(lists_and_loads("damaged frames", &w.store, w.tmp.path(), "after"), Form::Video);
+        }
+
+        #[test]
+        fn a_conversion_of_one_project_is_never_swapped_into_another() {
+            let _one = one_conversion();
+            let w = World::new();
+            let (first, second) = (key_1(), key(SITE_A, TOUR_1, CH_2));
+            w.save(&first);
+            w.save(&second);
+            let (_, conv) = converted(&w, &first);
+            // The second project is whole, unchanged, not open: everything but the conversion is its own.
+            let other = candidate(&second, &w.dir(&second));
+            let whole = contents(w.store.root());
+            assert_eq!(w.store.swap_to_video(&other, &conv, VIDEO.len() as u64), Ok(false));
+            assert_eq!(contents(w.store.root()), whole, "nothing was touched, the video in the conversion's folder included");
+            assert!(frames_form(&w.dir(&second)) && frames_form(&w.dir(&first)));
+        }
+
+        #[test]
+        fn a_save_over_a_project_that_is_being_converted_waits_for_it_once_and_not_under_the_lock() {
+            let _one = one_conversion();
+            let w = World::new();
+            w.save(&key_1());
+            let (_c, conv) = converted(&w, &key_1());
+            let other = recorded(w.tmp.path(), "other", 4);
+            let edit = Edit::new(&other, Default::default());
+            let started = Instant::now();
+            // The conversion never lets go here: the save waits its two seconds once, outside the lock.
+            w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+            let took = started.elapsed();
+            assert!(conv.cancelled());
+            assert!(took >= LET_GO && took < LET_GO * 2 - Duration::from_millis(400), "{took:?}");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn the_folder_of_the_running_conversion_is_never_swept_however_the_projects_folder_is_spelled() {
+            let _one = one_conversion();
+            let w = World::new();
+            w.save(&key_1());
+            let (_c, conv) = converted(&w, &key_1());
+            // The same folder, spelled in capitals: the system finds it, and the paths are not equal.
+            let shouted = PathBuf::from(w.store.root().to_string_lossy().to_uppercase());
+            assert!(shouted != w.store.root() && shouted.is_dir());
+            let other = own_store(shouted);
+            other.sweep_converting_at(Duration::ZERO, SystemTime::now() + FAR);
+            w.store.sweep_converting_at(Duration::ZERO, SystemTime::now() + FAR);
+            assert_eq!(std::fs::read(conv.video_path()).unwrap(), VIDEO, "the running conversion's folder is whole");
+            // Once it is given up, the name is nobody's: a cut-off folder of that name would go.
+            let work = conv.work_dir().to_path_buf();
+            drop(conv);
+            std::fs::create_dir(&work).unwrap();
+            other.sweep_converting_at(Duration::ZERO, SystemTime::now() + FAR);
+            assert!(!work.exists());
+        }
+
+        #[test]
+        fn a_temporary_project_file_a_cut_off_mark_left_is_cleared_at_the_next_start() {
+            let w = World::new();
+            let (marked_one, open_one) = (key_1(), key(SITE_A, TOUR_1, CH_2));
+            w.save(&marked_one);
+            w.save(&open_one);
+            let (dir, open_dir) = (w.dir(&marked_one), w.dir(&open_one));
+            let whole = contents(&dir);
+            // The app died between writing the new project file and renaming it: no video anywhere.
+            for d in [&dir, &open_dir] {
+                std::fs::write(d.join("project.json.0123456789abcdef.tmp"), b"{\"format\": 1, \"store\"").unwrap();
+            }
+            std::fs::write(dir.join("notes.txt.0123456789abcdef.tmp"), b"mine").unwrap();
+            let open = loaded(&w.store, &open_one);
+            let epoch = changes(&w.store);
+            w.store.finish_conversions();
+            let mut want = whole.clone();
+            want.push(("notes.txt.0123456789abcdef.tmp".to_string(), b"mine".to_vec()));
+            want.sort();
+            assert_eq!(contents(&dir), want, "the store's own temporary file is gone, and nothing else");
+            assert_eq!(changes(&w.store), epoch + 1, "the size in the list changed");
+            assert!(open_dir.join("project.json.0123456789abcdef.tmp").is_file(), "an open project is left alone");
+            drop(open);
+            w.store.finish_conversions();
+            assert!(!open_dir.join("project.json.0123456789abcdef.tmp").exists());
+            // Nothing left to clear: nothing changes.
+            let epoch = changes(&w.store);
+            w.store.finish_conversions();
+            assert_eq!(changes(&w.store), epoch);
+            loaded(&w.store, &marked_one);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_fresh_video_another_program_holds_for_a_moment_is_still_swapped_in() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _one = one_conversion();
+            let w = World::new();
+            w.save(&key_1());
+            let (c, conv) = converted(&w, &key_1());
+            // A scanner reads the new video and lets nobody else open it, for a fifth of a second.
+            let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(conv.video_path()).unwrap();
+            let scanner = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(held);
+            });
+            assert_eq!(w.store.swap_to_video(&c, &conv, VIDEO.len() as u64), Ok(true));
+            scanner.join().unwrap();
+            assert!(video_form(&w.dir(&key_1())));
         }
     }
 }
