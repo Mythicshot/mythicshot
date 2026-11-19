@@ -5,7 +5,7 @@
 // Preferences and the publish result screen are the callers; until they are built, only the tests are.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use super::store::ProjectInfo;
+use super::store::{ConvertState, Form, ProjectInfo};
 use crate::publish_ui::{short_title, size_text};
 
 /// The highest limit that can be set, in GB: four digits.
@@ -15,31 +15,6 @@ pub const LIMIT_MAX_GB: u32 = 9999;
 const QUESTION_TITLE_MAX: usize = 60;
 
 const GB: u64 = 1 << 30;
-
-/// Which form a saved project's recording is kept in.
-///
-/// Declared here only until the store tracks the form: `ProjectInfo` then carries it, and this
-/// declaration moves to `store.rs` (or becomes the recording crate's own) with no other change here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Form {
-    /// The lossless frames file, as every version before video storage kept it.
-    Frames,
-    /// A verified video.
-    Video,
-}
-
-/// How the last try to store a project's recording as video ended.
-///
-/// Declared here only until the store tracks it, as [`Form`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConvertState {
-    NotTried,
-    /// The video did not pass verification, so the frames were kept.
-    Failed,
-    /// The video was not enough smaller than the frames, so the frames were kept.
-    NotSmaller,
-    Done,
-}
 
 /// The limit typed into the field, in GB. Empty means no warning, as 0 does. `None` for anything
 /// that is not a whole number of one to four digits: the caller keeps the value it had.
@@ -252,7 +227,7 @@ mod tests {
 
     fn info(tour_title: &str, title: &str) -> ProjectInfo {
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), chapter_id: "chap_cccccccccccccccccccccccc".into() };
-        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None }
+        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     #[test]
