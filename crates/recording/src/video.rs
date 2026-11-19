@@ -270,6 +270,20 @@ fn archive(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], 
 }
 
 const FRAMES_UNREADABLE: &str = "the frames could not be read";
+const FRAME_TOO_LARGE: &str = "a frame in the index is larger than a frame can be";
+
+#[allow(clippy::too_many_arguments)]
+fn archive_with(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool, _sync: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(Archived, f64), ArchiveError> {
+    archive(rec, codec, out, must, tol, keep_going)
+}
+
+fn sync_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn is_the_frames_file(_frames: &Path, _out: &Path, _resolve: &dyn Fn(&Path) -> std::io::Result<std::path::PathBuf>, _exists: &dyn Fn(&Path) -> bool) -> bool {
+    false
+}
 
 fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
     let n = rec.frames.len();
@@ -816,47 +830,6 @@ mod tests {
         assert!(m.block_db <= m.frame_db && m.frame_db.is_finite());
     }
 
-    // ---- the sample ----
-
-    #[test]
-    fn a_short_recording_is_checked_whole() {
-        assert_eq!(sample(0, &[]), Vec::<usize>::new());
-        assert_eq!(sample(0, &[0, 5]), Vec::<usize>::new());
-        assert_eq!(sample(1, &[]), vec![0]);
-        assert_eq!(sample(40, &[3, 3, 99]), (0..40).collect::<Vec<_>>());
-        assert_eq!(sample(600, &[]), (0..600).collect::<Vec<_>>());
-        assert!(sample(601, &[]).len() < 601);
-    }
-
-    #[test]
-    fn a_long_recording_checks_first_last_one_per_group_and_every_step_frame() {
-        let picked = sample(1000, &[500, 7, 7, 31, 998]);
-        let mut expected: Vec<usize> = (0..1000).filter(|i| i % 30 == 29).collect();
-        expected.extend([0, 999, 500, 7, 31, 998]);
-        expected.sort_unstable();
-        expected.dedup();
-        assert_eq!(picked, expected);
-        // In order, each once: 33 groups of 30 fit in 1000, plus the first, the last and four steps.
-        assert!(picked.windows(2).all(|p| p[0] < p[1]));
-        assert_eq!(picked.len(), 33 + 2 + 4);
-        // A step frame that is already picked is not picked twice.
-        assert_eq!(sample(1000, &[0, 29, 999]), sample(1000, &[]));
-        // The group is the encoder's group of pictures.
-        assert_eq!(GOP, 30);
-        // 601 frames: the last frame is the first of its group, and is still checked.
-        let picked = sample(601, &[]);
-        assert_eq!((picked[0], picked[1], *picked.last().unwrap(), picked.len()), (0, 29, 600, 22));
-    }
-
-    #[test]
-    fn a_step_frame_beyond_the_recording_is_ignored() {
-        let picked = sample(700, &[700, 701, 9999, usize::MAX, 699, 12]);
-        assert!(picked.iter().all(|i| *i < 700), "{picked:?}");
-        assert!(picked.contains(&12) && picked.contains(&699));
-        assert_eq!(picked, sample(700, &[12]));
-        assert_eq!(sample(3, &[3, 10]), vec![0, 1, 2]);
-    }
-
     #[test]
     fn the_video_may_take_what_the_tolerance_leaves_of_the_frames() {
         assert_eq!(allowed_bytes(1000, 0.20), 800);
@@ -891,10 +864,20 @@ mod tests {
         Short,
         /// Adds this much to one channel of every picture.
         Shift { channel: usize, by: u8 },
+        /// Adds this much to the red of one picture.
+        ShiftAt { frame: usize, by: u8 },
         /// Breaks 8 × 8 pixels of the second picture.
         BreakBlock,
         /// Hands out one pixel of the second picture with alpha 0.
         AlphaZero,
+        /// Hands out one pixel of this picture with alpha 0.
+        AlphaAt(usize),
+        /// Hands out one picture twice and leaves another out: the count is right.
+        DupDrop { dup: usize, drop: usize },
+        /// Hands out two pictures in each other's place.
+        Swap(usize, usize),
+        /// Hands out this picture under the index of the next one.
+        WrongIndex(usize),
         /// Writes this many bytes more than it was allowed, and says all is well.
         Grow(u64),
         /// Says all is well and writes nothing.
@@ -910,7 +893,8 @@ mod tests {
         asks: bool,
         /// Whether it removes its file when it fails, as the trait says it must.
         tidy: bool,
-        /// The most frames it held itself at once.
+        /// How many frame buffers it holds itself right now, and the most it held.
+        holding: AtomicUsize,
         held: AtomicUsize,
         /// The most frame buffers the archive held while this codec was at work.
         seen_alive: AtomicUsize,
@@ -918,13 +902,32 @@ mod tests {
         touched: Mutex<Vec<std::path::PathBuf>>,
     }
 
+    /// One frame buffer of the fake codec, counted while it lives.
+    struct Held<'a> {
+        of: &'a Fake,
+        px: Vec<u8>,
+    }
+
+    impl<'a> Held<'a> {
+        fn new(of: &'a Fake, len: usize) -> Held<'a> {
+            let now = of.holding.fetch_add(1, Ordering::Relaxed) + 1;
+            of.held.fetch_max(now, Ordering::Relaxed);
+            Held { of, px: vec![0; len] }
+        }
+    }
+
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            self.of.holding.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     impl Fake {
         fn new(fault: Fault) -> Fake {
-            Fake { fault, asks: true, tidy: true, held: AtomicUsize::new(0), seen_alive: AtomicUsize::new(0), touched: Mutex::new(Vec::new()) }
+            Fake { fault, asks: true, tidy: true, holding: AtomicUsize::new(0), held: AtomicUsize::new(0), seen_alive: AtomicUsize::new(0), touched: Mutex::new(Vec::new()) }
         }
 
         fn look(&self) {
-            self.held.fetch_max(1, Ordering::Relaxed);
             self.seen_alive.fetch_max(live::now(), Ordering::Relaxed);
         }
 
@@ -943,22 +946,25 @@ mod tests {
 
         fn encode(&self, _size: (u32, u32), frames: usize, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<bool, String>, out: &Path, max_bytes: u64, keep_going: &dyn Fn(usize) -> bool) -> Result<(), CodecError> {
             self.touched.lock().unwrap().push(out.to_path_buf());
-            let _ = std::fs::remove_file(out);
+            match std::fs::remove_file(out) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(CodecError::Io(e)),
+                _ => {}
+            }
             let mut file = File::create(out).map_err(CodecError::Io)?;
-            let mut buf = Vec::new();
+            let mut buf = Held::new(self, 0);
             let mut total = 0u64;
             for i in 0..frames {
-                buf.clear();
-                match next(&mut buf) {
+                buf.px.clear();
+                match next(&mut buf.px) {
                     Err(text) => return self.fail(out, CodecError::Caller(text)),
                     Ok(false) => return self.fail(out, CodecError::WrongFrames { got: i }),
                     Ok(true) => {}
                 }
                 self.look();
                 if self.fault != Fault::Nothing {
-                    file.write_all(&buf).map_err(CodecError::Io)?;
+                    file.write_all(&buf.px).map_err(CodecError::Io)?;
                 }
-                total += buf.len() as u64;
+                total += buf.px.len() as u64;
                 if total > max_bytes {
                     return self.fail(out, CodecError::TooLarge);
                 }
@@ -980,31 +986,44 @@ mod tests {
             let mut file = File::open(video).map_err(CodecError::Io)?;
             let len = (size.0 * size.1 * 4) as usize;
             let w = size.0 as usize;
-            let mut frame = vec![0u8; len];
-            let give = match self.fault {
-                Fault::Drop | Fault::DropQuietly => frames - 1,
-                _ => frames,
-            };
-            for i in 0..give {
-                file.read_exact(&mut frame).map_err(CodecError::Io)?;
+            let mut frame = Held::new(self, len);
+            // Which stored picture is handed out at each place.
+            let mut order: Vec<usize> = (0..frames).collect();
+            match self.fault {
+                Fault::Drop | Fault::DropQuietly => {
+                    order.pop();
+                }
+                Fault::DupDrop { dup, drop } => {
+                    order.retain(|i| *i != drop);
+                    let at = order.iter().position(|i| *i == dup).unwrap();
+                    order.insert(at, dup);
+                }
+                Fault::Swap(a, b) => order.swap(a, b),
+                _ => {}
+            }
+            for (i, stored) in order.iter().copied().enumerate() {
+                file.seek(SeekFrom::Start((stored * len) as u64)).and_then(|_| file.read_exact(&mut frame.px)).map_err(CodecError::Io)?;
                 match self.fault {
-                    Fault::Shift { channel, by } => frame.chunks_exact_mut(4).for_each(|p| p[channel] = p[channel].saturating_add(by)),
+                    Fault::Shift { channel, by } => frame.px.chunks_exact_mut(4).for_each(|p| p[channel] = p[channel].saturating_add(by)),
+                    Fault::ShiftAt { frame: at, by } if i == at => frame.px.chunks_exact_mut(4).for_each(|p| p[0] = if p[0] > 127 { p[0] - by } else { p[0] + by }),
                     Fault::BreakBlock if i == 1 => {
                         for y in 64..72 {
                             for x in 64..72 {
                                 let o = (y * w + x) * 4;
-                                for v in &mut frame[o..o + 3] {
+                                for v in &mut frame.px[o..o + 3] {
                                     *v = if (x + y) % 2 == 0 { v.wrapping_add(128) } else { v.wrapping_sub(128) };
                                 }
                             }
                         }
                     }
-                    Fault::AlphaZero if i == 1 => frame[4 * 17 + 3] = 0,
+                    Fault::AlphaZero if i == 1 => frame.px[4 * 17 + 3] = 0,
+                    Fault::AlphaAt(at) if i == at => frame.px[len - 1] = 0,
                     _ => {}
                 }
                 self.look();
-                let handed = if self.fault == Fault::Short && i == 1 { &frame[..len - 4] } else { &frame[..] };
-                each(i, handed).map_err(CodecError::Caller)?;
+                let handed = if self.fault == Fault::Short && i == 1 { &frame.px[..len - 4] } else { &frame.px[..] };
+                let index = if self.fault == Fault::WrongIndex(i) { i + 1 } else { i };
+                each(index, handed).map_err(CodecError::Caller)?;
                 if self.asks && !keep_going(i + 1) {
                     return Err(CodecError::Cancelled);
                 }
@@ -1012,7 +1031,7 @@ mod tests {
             match self.fault {
                 Fault::Drop => Err(CodecError::WrongFrames { got: frames - 1 }),
                 Fault::Extra => Err(CodecError::WrongFrames { got: frames + 1 }),
-                Fault::ExtraQuietly => each(frames, &frame).map_err(CodecError::Caller),
+                Fault::ExtraQuietly => each(frames, &frame.px).map_err(CodecError::Caller),
                 _ => Ok(()),
             }
         }
@@ -1149,22 +1168,234 @@ mod tests {
         assert!(!b.out.exists());
     }
 
-    /// Of a long recording only the sample is compared, and the frames named in `must` are
-    /// part of it.
+    /// Flat pictures, each far from every other one near it, so that a picture in another's
+    /// place cannot pass for it.
+    fn distinct(w: u32, h: u32, count: usize) -> Vec<Vec<u8>> {
+        (0..count).map(|i| flat([(i * 37 % 256) as u8, (i * 91 % 256) as u8, (i * 53 % 256) as u8], w, h)).collect()
+    }
+
     #[test]
-    fn a_fault_outside_the_sample_of_a_long_recording_is_seen_only_when_its_frame_must_be_checked() {
-        let (w, h, n) = (16, 8, 640);
-        let b = bench_of(w, h, (0..n).map(|i| flat([(i % 200) as u8, 90, 40], w, h)).collect());
-        // The fake breaks the second picture's alpha; frame 1 is not in the sample of 640.
-        let archived = b.rec.archive_video(&Fake::new(Fault::AlphaZero), &b.out, &[], &ANY_SIZE, &|_, _, _| true).unwrap();
-        assert_eq!(archived.checked, sample(n, &[]).len());
-        assert_eq!(archived.checked, 23);
-        let result = b.rec.archive_video(&Fake::new(Fault::AlphaZero), &b.out, &[1, 9999], &ANY_SIZE, &|_, _, _| true);
-        assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Alpha { frame: 1 }))), "{result:?}");
-        assert!(!b.out.exists());
-        // The count is of every picture, sampled or not.
+    fn a_fault_at_any_single_frame_of_a_long_recording_is_caught() {
+        let (w, h, n) = (8, 8, 700);
+        let b = bench_of(w, h, distinct(w, h, n));
+        // Faithful, every frame is compared, whatever the list of frames that must be.
+        for must in [&[][..], &[1, 9999][..]] {
+            let archived = b.rec.archive_video(&Fake::new(Fault::None), &b.out, must, &ANY_SIZE, &|_, _, _| true).unwrap();
+            assert_eq!(archived.checked, n);
+        }
+        // One pixel's alpha, at every single frame in turn.
+        for frame in 0..n {
+            let result = b.archive(&Fake::new(Fault::AlphaAt(frame)), &ANY_SIZE);
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Alpha { frame: f })) if f == frame), "{frame}: {result:?}");
+            assert!(!b.out.exists(), "{frame}");
+        }
+        // A colour that is off in one picture, at frames in and out of every old sample.
+        for frame in (0..n).step_by(7).chain([1, 28, 29, 30, 31, 598, 599, 600, 601, 698, 699]) {
+            let result = b.archive(&Fake::new(Fault::ShiftAt { frame, by: 40 }), &ANY_SIZE);
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Frame { frame: f, .. })) if f == frame), "{frame}: {result:?}");
+            assert!(!b.out.exists(), "{frame}");
+        }
+        // The count is of every picture.
         let result = b.archive(&Fake::new(Fault::DropQuietly), &ANY_SIZE);
-        assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Count { got: 639 }))), "{result:?}");
+        assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Count { got: 699 }))), "{result:?}");
+    }
+
+    #[test]
+    fn a_picture_handed_out_twice_in_place_of_a_dropped_one_is_caught() {
+        let (w, h, n) = (8, 8, 700);
+        let b = bench_of(w, h, distinct(w, h, n));
+        // The count is right every time; the first picture out of its place is named.
+        for (dup, drop, first) in [(0, 1, 1), (10, 500, 11), (500, 10, 10), (698, 699, 699), (699, 0, 0), (320, 321, 321)] {
+            let result = b.archive(&Fake::new(Fault::DupDrop { dup, drop }), &ANY_SIZE);
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Frame { frame, .. })) if frame == first), "{dup} twice, {drop} dropped: {result:?}");
+            assert!(!b.out.exists());
+        }
+    }
+
+    #[test]
+    fn two_pictures_that_changed_places_are_caught() {
+        let (w, h, n) = (8, 8, 700);
+        let b = bench_of(w, h, distinct(w, h, n));
+        for (one, other) in [(0, 1), (0, 699), (333, 334), (610, 650), (31, 32)] {
+            let result = b.archive(&Fake::new(Fault::Swap(one, other)), &ANY_SIZE);
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Frame { frame, .. })) if frame == one), "{one} and {other}: {result:?}");
+            assert!(!b.out.exists());
+        }
+    }
+
+    #[test]
+    fn a_picture_handed_out_under_a_wrong_index_is_refused() {
+        let (w, h, n) = (8, 8, 40);
+        let b = bench_of(w, h, distinct(w, h, n));
+        for at in [0, 1, 17, 39] {
+            let result = b.archive(&Fake::new(Fault::WrongIndex(at)), &ANY_SIZE);
+            assert!(matches!(result, Err(ArchiveError::Verify(Mismatch::Count { got })) if got == at + 1), "{at}: {result:?}");
+            assert!(!b.out.exists());
+        }
+    }
+
+    #[test]
+    fn a_measure_or_a_tolerance_that_is_not_a_number_fails() {
+        let (w, h) = (96, 80);
+        let a = screen(0, w, h);
+        let nan = f64::NAN;
+        // Identical pictures, and still refused when the tolerance is not a number.
+        assert_eq!(verdict(&a, &a, w, h, &Tolerance { frame_db: nan, ..TOLERANCE }), Err(Mismatch::Frame { frame: 7, db: f64::INFINITY }));
+        assert_eq!(verdict(&a, &a, w, h, &Tolerance { block_db: nan, ..TOLERANCE }), Err(Mismatch::Block { frame: 7, db: f64::INFINITY }));
+        assert_eq!(verdict(&a, &a, w, h, &Tolerance { mean_shift: nan, ..TOLERANCE }), Err(Mismatch::Shift { frame: 7 }));
+        // A measure that is not a number is refused by any tolerance.
+        let fine = Measured { frame_db: 50.0, block_db: 50.0, shift: [0.0; 3], opaque: true };
+        assert_eq!(check(7, &fine, &TOLERANCE), Ok(()));
+        assert!(matches!(check(7, &Measured { frame_db: nan, ..fine }, &TOLERANCE), Err(Mismatch::Frame { frame: 7, .. })));
+        assert!(matches!(check(7, &Measured { block_db: nan, ..fine }, &TOLERANCE), Err(Mismatch::Block { frame: 7, .. })));
+        assert_eq!(check(7, &Measured { shift: [0.0, nan, 0.0], ..fine }, &TOLERANCE), Err(Mismatch::Shift { frame: 7 }));
+        assert!(matches!(check(7, &Measured { frame_db: nan, ..fine }, &MEASURE_ONLY), Err(Mismatch::Frame { .. })));
+        // Through the archive: nothing is kept, whichever number is missing.
+        let b = bench(w, h, 4);
+        for tol in [Tolerance { frame_db: nan, ..ANY_SIZE }, Tolerance { block_db: nan, ..ANY_SIZE }, Tolerance { mean_shift: nan, ..ANY_SIZE }] {
+            let result = b.archive(&Fake::new(Fault::None), &tol);
+            assert!(matches!(result, Err(ArchiveError::Verify(_))), "{result:?}");
+            assert!(!b.out.exists());
+        }
+        let result = b.archive(&Fake::new(Fault::None), &Tolerance { smaller_by: nan, ..TOLERANCE });
+        assert!(matches!(result, Err(ArchiveError::NotSmaller)), "{result:?}");
+        assert!(!b.out.exists());
+    }
+
+    #[test]
+    fn a_video_is_synced_to_disk_before_it_is_archived_and_one_that_cannot_be_is_not() {
+        let b = bench(64, 48, 6);
+        let keep = |_: Stage, _: usize, _: usize| true;
+        // Asked once, for the video, after the last frame was verified.
+        let synced = Mutex::new(Vec::new());
+        let verified = AtomicUsize::new(0);
+        let watch = |stage: Stage, done: usize, _: usize| {
+            if stage == Stage::Verifying {
+                verified.fetch_max(done, Ordering::Relaxed);
+            }
+            true
+        };
+        let sync = |path: &Path| {
+            synced.lock().unwrap().push((path.to_path_buf(), verified.load(Ordering::Relaxed), path.is_file()));
+            Ok(())
+        };
+        archive_with(&b.rec, &Fake::new(Fault::None), &b.out, &[], &ANY_SIZE, &watch, &sync).unwrap();
+        assert_eq!(*synced.lock().unwrap(), vec![(b.out.clone(), 6, true)]);
+        // A sync that fails: no archive, and nothing left.
+        let result = archive_with(&b.rec, &Fake::new(Fault::None), &b.out, &[], &ANY_SIZE, &keep, &|_| Err(std::io::Error::other("the disk went away")));
+        assert!(matches!(result, Err(ArchiveError::Codec(CodecError::Io(_)))), "{result:?}");
+        assert_eq!(b.files(), vec![FRAMES_FILE.to_string()]);
+        // A video that was refused is not synced at all.
+        synced.lock().unwrap().clear();
+        assert!(archive_with(&b.rec, &Fake::new(Fault::AlphaZero), &b.out, &[], &ANY_SIZE, &keep, &sync).is_err());
+        assert!(synced.lock().unwrap().is_empty());
+        // The real one works on a real file, and says so when there is none.
+        b.archive(&Fake::new(Fault::None), &ANY_SIZE).unwrap();
+        assert!(sync_file(&b.out).is_ok());
+        assert!(sync_file(&b.out_dir.path().join("nowhere.mkv")).is_err());
+    }
+
+    #[test]
+    fn a_panic_in_either_pass_leaves_no_file() {
+        let b = bench(64, 48, 9);
+        for stage in [Stage::Encoding, Stage::Verifying] {
+            for tidy in [true, false] {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let codec = Fake { tidy, ..Fake::new(Fault::None) };
+                    b.rec.archive_video(&codec, &b.out, &[], &ANY_SIZE, &|s, done, _| {
+                        assert!(!(s == stage && done == 5), "the cancel question panics");
+                        true
+                    })
+                }));
+                assert!(caught.is_err());
+                assert_eq!(b.files(), vec![FRAMES_FILE.to_string()], "{stage:?}, tidy {tidy}");
+            }
+        }
+        // And a video that was archived stays.
+        b.archive(&Fake::new(Fault::None), &ANY_SIZE).unwrap();
+        assert!(b.out.is_file());
+    }
+
+    #[test]
+    fn the_frames_file_is_never_the_output() {
+        let frames = Path::new("some").join("folder").join(FRAMES_FILE);
+        let real = |p: &Path| Ok(p.to_path_buf());
+        let broken = |_: &Path| Err(std::io::Error::other("no"));
+        let exists = |_: &Path| true;
+        let nothing = |_: &Path| false;
+        // The same path as written, whatever else can be found out.
+        assert!(is_the_frames_file(&frames, &frames, &broken, &nothing));
+        // The same file under another spelling.
+        let other = Path::new("other").join("frames.mkv");
+        assert!(is_the_frames_file(&frames, &other, &|_| Ok(frames.clone()), &exists));
+        assert!(!is_the_frames_file(&frames, &other, &real, &exists));
+        // Frames that are there and cannot be resolved: any output that exists is refused.
+        assert!(is_the_frames_file(&frames, &other, &broken, &exists));
+        // An output that exists and cannot be resolved is refused too.
+        let only_frames = |p: &Path| if p == frames { Ok(p.to_path_buf()) } else { Err(std::io::Error::other("no")) };
+        assert!(is_the_frames_file(&frames, &other, &only_frames, &exists));
+        // An output that is not there yet is no file at all.
+        assert!(!is_the_frames_file(&frames, &other, &only_frames, &|p| p == frames));
+        assert!(!is_the_frames_file(&frames, &other, &broken, &|p| p == frames));
+        // No frames at all: nothing to protect (and nothing to archive).
+        assert!(!is_the_frames_file(&frames, &other, &broken, &|p| p != frames));
+    }
+
+    #[test]
+    fn a_hard_link_to_the_frames_given_as_the_output_leaves_the_frames_readable() {
+        let (w, h, n) = (64, 48, 9);
+        let b = bench(w, h, n);
+        let before = b.frames_bytes();
+        let frames_file = b.rec.dir.join(FRAMES_FILE);
+        for fault in [Fault::None, Fault::AlphaZero] {
+            for tidy in [true, false] {
+                let _ = std::fs::remove_file(&b.out);
+                if std::fs::hard_link(&frames_file, &b.out).is_err() {
+                    println!("skipped: a hard link could not be made on this computer");
+                    return;
+                }
+                let result = b.rec.archive_video(&Fake { tidy, ..Fake::new(fault) }, &b.out, &[], &ANY_SIZE, &|_, _, _| true);
+                assert_eq!(result.is_ok(), fault == Fault::None, "{result:?}");
+                // Whatever became of the output, the recording still reads, frame for frame.
+                assert_eq!(b.frames_bytes(), before, "{fault:?}, tidy {tidy}");
+                let mut seen = 0;
+                b.rec
+                    .for_each_frame(|i, img| {
+                        assert!(img.into_raw() == b.pictures[i], "frame {i}");
+                        seen += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(seen, n);
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_the_index_says_is_larger_than_a_frame_can_be_is_not_read() {
+        let (w, h) = (8u32, 8u32);
+        let dir = tempfile::tempdir().unwrap();
+        // A file large enough for what the index claims, and nothing a frame of 8 × 8 can be.
+        std::fs::write(dir.path().join(FRAMES_FILE), vec![0u8; 1 << 20]).unwrap();
+        let claims = |len: u32| Recording { dir: dir.path().to_path_buf(), owned: false, width: w, height: h, frames: vec![crate::FrameMeta { offset: 0, len, key: true, t_ms: 0, cursor: None }], end_ms: 1 };
+        let bound = zstd::zstd_safe::compress_bound(256) as u32;
+        let rec = claims(bound + 1);
+        let mut frames = Frames::open(&rec, 256).unwrap();
+        assert_eq!(frames.next().err(), Some(FRAME_TOO_LARGE));
+        assert!(frames.packed.capacity() <= bound as usize);
+        let rec = claims(1 << 20);
+        let mut frames = Frames::open(&rec, 256).unwrap();
+        assert_eq!(frames.next().err(), Some(FRAME_TOO_LARGE));
+        assert_eq!(frames.packed.capacity(), 0);
+        // At the bound it is read (and is then no frame: these are zeros).
+        let rec = claims(bound);
+        let mut frames = Frames::open(&rec, 256).unwrap();
+        assert_eq!(frames.next().err(), Some(FRAMES_UNREADABLE));
+        // Through the archive it is a recording that cannot be used.
+        let out = dir.path().join("frames.mkv");
+        let result = claims(1 << 20).archive_video(&Fake::new(Fault::None), &out, &[], &ANY_SIZE, &|_, _, _| true);
+        assert!(matches!(result, Err(ArchiveError::Unusable(why)) if why == FRAME_TOO_LARGE), "{result:?}");
+        assert!(!out.exists());
     }
 
     #[test]
@@ -1311,7 +1542,9 @@ mod tests {
             // two buffers, however many frames there are, and none once it is over.
             assert_eq!(live::peak(), 2, "{n} frames");
             assert_eq!(codec.seen_alive.load(Ordering::Relaxed), 2, "{n} frames");
-            assert_eq!(codec.held.load(Ordering::Relaxed), 1);
+            // The codec's own: one buffer in each pass, counted as it is made and dropped.
+            assert_eq!(codec.held.load(Ordering::Relaxed), 1, "{n} frames");
+            assert_eq!(codec.holding.load(Ordering::Relaxed), 0);
             assert_eq!(live::now(), 0);
             // The same when it ends badly.
             live::reset();
@@ -1319,6 +1552,12 @@ mod tests {
             assert!(b.rec.archive_video(&Fake::new(Fault::None), &b.out, &[], &ANY_SIZE, &|s, done, _| !(s == Stage::Verifying && done == 2)).is_err());
             assert_eq!((live::peak(), live::now()), (2, 0));
         }
+        // The counter of the codec's own buffers is a real one.
+        let codec = Fake::new(Fault::None);
+        let (one, two) = (Held::new(&codec, 4), Held::new(&codec, 4));
+        assert_eq!((codec.holding.load(Ordering::Relaxed), codec.held.load(Ordering::Relaxed), one.px.len() + two.px.len()), (2, 2, 8));
+        drop((one, two));
+        assert_eq!((codec.holding.load(Ordering::Relaxed), codec.held.load(Ordering::Relaxed)), (0, 2));
     }
 
     // ---- the real ffmpeg, when this computer has one ----
