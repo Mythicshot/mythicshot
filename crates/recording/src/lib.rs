@@ -12,11 +12,13 @@
 mod cursor;
 pub mod ffmpeg;
 mod saved;
+pub mod video;
 
 pub use cursor::position as pointer_position;
 pub mod export;
 pub use ffmpeg::{Bound, CodecError, Ffmpeg, VideoCodec};
 pub use saved::{ExpandError, Form, OpenError, SaveError, SaveStep, SavedAs, VIDEO_FILE, VideoIndex, expand_video, form_of, open_video_index};
+pub use video::{ArchiveError, Archived, Mismatch, Stage, TOLERANCE, Tolerance};
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
