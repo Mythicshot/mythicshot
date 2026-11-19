@@ -3438,4 +3438,8 @@ mod tests {
 
     /// One real pass against a platform server running on this computer; ignored unless asked for.
     mod e2e_platform;
+
+    /// One real pass of a real recording through the folder of saved recordings, with the real
+    /// ffmpeg; ignored unless asked for.
+    mod e2e_recording;
 }

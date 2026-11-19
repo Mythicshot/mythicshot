@@ -75,6 +75,26 @@ First set it up in Settings › Output › Tour publishing: enter the server add
 
 In the "Publish tour" dialog, upload it as a new tour (the title starts as the recording's) or add it as a new chapter to one of the workspace's tours, then press "Upload draft". The status bar shows the progress; "Cancel publishing" in the export panel stops the upload once the request in flight finishes, and a cancelled or failed upload is withdrawn from the server. Closing the editor or quitting Mythicshot cancels a publish still running. The bundle is written to a temporary folder for the upload and removed afterwards (a folder left behind by a crash is removed at the next start after a day); the tour export's limits apply unchanged.
 
+## Saved recordings as video
+
+When you publish a tour, its recording is kept on this computer so the tour can be edited later. From 0.2.8 on, Mythicshot stores such a recording again as video in the background, which on a real recording came out about five times smaller. Settings › Output has the switch, "Store kept recordings as video to save space", on by default; turning it off converts nothing back.
+
+This needs ffmpeg, and only for this and for MP4 and WebM export: it must be on the PATH as `ffmpeg.exe`, built with libx264. Mythicshot looks for it once at start, so install it and then start Mythicshot again. Without ffmpeg nothing changes: recordings stay as lossless frames, and everything works as in 0.2.7.
+
+A recording is converted a minute after start or shortly after a publish, one at a time, at low priority, and never while you record; recordings under 8 MB are left as they are. The video holds one picture per frame of the recording, in full colour resolution, and the time and pointer position of every frame stay in `recording.json` as before. Before the lossless frames are replaced, the video is read back and checked: it must hold exactly as many pictures as the recording has frames, every picture is compared with its frame (the whole picture, its worst small block, and any colour cast), and the video must be at least a fifth smaller. A video that fails any of this is thrown away and the recording keeps its frames.
+
+> [!WARNING]
+> Once a recording is stored as video its lossless frames are removed and cannot be brought back: the video is very close to the original, not identical.
+
+A recording stored as video opens with Edit only on a computer where ffmpeg is installed. Where it is not, the Tours page says so, nothing is deleted or changed, and the tour opens again once ffmpeg is installed and Mythicshot has been started again. While the editor is open, Edit needs temporary room for the expanded recording, about the size it had before it became a video; it is removed when the editor closes.
+
+Mythicshot 0.2.7 cannot read such a recording: it says the recording was "saved by a newer version" and leaves it alone.
+
+> [!WARNING]
+> Deleting such a tour in 0.2.7 removes the recording but leaves its video file, `frames.mkv`, behind in the folder; 0.2.8 clears that leftover the next time it starts.
+
+Settings › Output lists every saved recording with its size and whether it is stored as video, and "Remove recording" removes one after asking; the tour stays online, but can no longer be edited from this computer. Sizes count a file once per project, also when two projects share the same file on disk, so the total can read higher than the space really used, and removing one of the two frees nothing until both are gone. The warning limit ("Warn me when saved recordings take more than … GB") only warns: it never removes anything.
+
 ## Build
 
 Built with Rust 1.97 (the oldest working version has not been checked). On Windows, the Visual Studio C++ Build Tools (for the linker and the resource compiler).

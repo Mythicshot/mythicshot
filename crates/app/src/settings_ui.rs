@@ -159,6 +159,11 @@ fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hoo
         });
         ui.add_space(8.0);
     }
+    // A limit that was typed and then left by the click on another tab: its row is not drawn
+    // again to see the field lose its focus, so what stands in the field is saved here.
+    if state.tab != Tab::Output && state.saved.save_typed_limit(view.settings) {
+        out.push(UiAction::SettingsChanged);
+    }
     match state.tab {
         Tab::General => general(ui, view, &mut out),
         Tab::Output => output_tab(ui, view, &mut state.saved, &mut hooks, &mut out),
@@ -383,23 +388,30 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
 /// saved that is not the one saved before. Nothing is saved while it is typed: Enter or leaving
 /// the field saves what stands there when that is a limit, and Escape or anything that is no
 /// limit puts the saved one back.
+///
+/// The field can be left without this row being drawn to see it: by a click on another tab or
+/// page, or by the window closing. That something was typed is remembered, and it is saved
+/// ([`SavedRecordings::save_typed_limit`]) the next time the page finds the field without the
+/// focus.
 fn limit_row(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecordings) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(WARN_WHEN);
         let id = ui.make_persistent_id("saved-recordings-limit");
+        // Escape leaves the field too, and is the one way of leaving it that saves nothing.
+        // The focus is gone before the row is drawn then, as it is after a Tab.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            saved.limit_typed = false;
+        }
         if !ui.memory(|m| m.has_focus(id)) {
+            changed |= saved.save_typed_limit(s);
             saved.limit_text = limit_text(s.saved_recordings_warn_gb);
         }
         let field = egui::TextEdit::singleline(&mut saved.limit_text).id(id).char_limit(4).desired_width(40.0);
         let field = ui.add(field).on_hover_text(LIMIT_HOVER);
-        // Escape leaves the field too, and is the one way of leaving it that saves nothing.
-        if field.lost_focus()
-            && !ui.input(|i| i.key_pressed(egui::Key::Escape))
-            && let Some(gb) = parse_limit(&saved.limit_text).filter(|gb| *gb != s.saved_recordings_warn_gb)
-        {
-            s.saved_recordings_warn_gb = gb;
-            changed = true;
+        saved.limit_typed |= field.changed();
+        if field.lost_focus() {
+            changed |= saved.save_typed_limit(s);
         }
         ui.label(WARN_UNIT);
     });
@@ -651,6 +663,8 @@ pub struct SavedRecordings {
     drawn_in: Option<u64>,
     /// The text in the limit field while it is being typed in.
     limit_text: String,
+    /// The limit field holds something that was typed and is neither saved nor given up yet.
+    limit_typed: bool,
     /// The row whose question is showing: a folder of the list, never one from anywhere else.
     pub asking: Option<PathBuf>,
     /// The question was asked since the list was last drawn, and is to be scrolled into view.
@@ -666,6 +680,22 @@ impl SavedRecordings {
     #[cfg(test)]
     fn at(root: Option<PathBuf>) -> SavedRecordings {
         SavedRecordings { root: Some(root), ..Default::default() }
+    }
+
+    /// Save what was typed into the limit field and is not saved yet, when that is a limit;
+    /// what is no limit keeps the saved one. True when a limit was saved that is not the one
+    /// saved before. Asked when the field is found without the focus, or is not drawn at all.
+    fn save_typed_limit(&mut self, s: &mut Settings) -> bool {
+        if !std::mem::take(&mut self.limit_typed) {
+            return false;
+        }
+        match parse_limit(&self.limit_text).filter(|gb| *gb != s.saved_recordings_warn_gb) {
+            Some(gb) => {
+                s.saved_recordings_warn_gb = gb;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The folder "Open folder" shows: the store's own, never a path read from a project.
@@ -1375,6 +1405,67 @@ mod tests {
         assert_eq!(page.actions.len(), page.changes(), "the field asks for nothing but a save");
         assert!(page.removals.is_empty());
         assert_eq!((limit_text(0), limit_text(5), limit_text(9999)), (String::new(), "5".to_string(), "9999".to_string()));
+    }
+
+    #[test]
+    fn a_limit_typed_and_left_by_clicking_another_tab_is_saved() {
+        let mut page = Page::showing(listed(vec![]));
+        page.settled();
+        page.type_limit("12");
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (5, 0));
+        // The click that leaves the field shows another tab, so the field is not drawn again.
+        page.click("General");
+        assert_eq!(page.state.tab, Tab::General);
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (12, 1));
+        // Once, and the field holds it when the tab is shown again.
+        page.settled();
+        page.click("Output");
+        let texts = texts_of(&page.settled());
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (12, 1, "12"));
+        assert!(texts.iter().any(|t| t == "12"), "{texts:?}");
+    }
+
+    #[test]
+    fn letters_typed_and_left_by_clicking_another_tab_keep_the_saved_limit() {
+        let mut page = Page::showing(listed(vec![]));
+        page.settled();
+        for bad in ["ab", "5.5", "-1"] {
+            page.type_limit(bad);
+            page.click("General");
+            page.settled();
+            assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (5, 0), "{bad}");
+            page.click("Output");
+            page.settled();
+            assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (5, 0, "5"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn escape_and_then_another_tab_saves_nothing() {
+        let mut page = Page::showing(listed(vec![]));
+        page.settled();
+        page.type_limit("12");
+        page.key(egui::Key::Escape);
+        page.click("General");
+        page.settled();
+        page.click("Output");
+        page.settled();
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (5, 0, "5"));
+    }
+
+    #[test]
+    fn a_limit_typed_before_the_page_went_away_is_saved_when_the_page_is_back() {
+        let mut page = Page::showing(listed(vec![]));
+        page.settled();
+        page.type_limit("12");
+        // Another page of the window is shown, or the window is hidden: nothing of this page is drawn.
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, page.screen)), ..Default::default() };
+            let _ = page.ctx.run_ui(input, |_| {});
+        }
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (5, 0));
+        page.settled();
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (12, 1, "12"));
     }
 
     #[test]

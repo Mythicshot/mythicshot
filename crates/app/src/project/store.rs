@@ -74,11 +74,8 @@ pub const SAVING_CANCELLED: &str = "saving was cancelled.";
 pub const DISK_FULL: &str = "the disk is full.";
 
 /// The word a conversion mark carries when the video did not pass verification.
-// Written by the conversion queue; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MARK_FAILED: &str = "failed";
 /// The word a conversion mark carries when the video was not enough smaller than the frames.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MARK_NOT_SMALLER: &str = "not_smaller";
 
 /// The Mythicshot version a conversion mark is made by, and the one it holds for.
@@ -212,9 +209,16 @@ pub struct Candidate {
     /// checks again, so that neither is made on a project that was saved meanwhile.
     pub saved_at: i64,
     pub frames_bytes: u64,
-    /// The frames a tour made from the saved state shows, in order: the ones a verification
-    /// must look at.
-    pub must: Vec<usize>,
+}
+
+/// What [`Store::look`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Look {
+    /// The next project to store as video.
+    pub next: Option<Candidate>,
+    /// The projects that are kept from being the next by nothing but an editor that has them
+    /// open. Closing an editor tells nobody, so whoever waits for these has to look again.
+    pub open: Vec<ProjectKey>,
 }
 
 /// The one conversion that runs, from [`Store::begin_conversion`] until it is dropped: dropping
@@ -228,8 +232,6 @@ pub struct Converting {
 }
 
 /// What [`Store::remove_project`] did.
-// Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removed {
     /// The project's files are gone.
@@ -274,10 +276,10 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// [`VideoCodec::id`](mythicshot_recording::VideoCodec::id)), or that there is none. A
 /// [`ProjectInfo::convert`] is told for that codec: until one is named, and for a mark another
 /// codec left, every project that is kept as frames reads as not tried.
-// Called once ffmpeg was looked for; until the conversion queue is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn set_current_codec(id: Option<&str>) {
     *current_codec() = id.map(str::to_string);
+    // What a page shows of a recording was read for the codec before: it reads again.
+    EPOCH.fetch_add(1, Ordering::SeqCst);
 }
 
 fn current_codec() -> MutexGuard<'static, Option<String>> {
@@ -314,8 +316,6 @@ impl Store {
         local_data.filter(|dir| dir.is_absolute()).map(|dir| dir.join("projects"))
     }
 
-    // Only the tests ask: the app opens `default_root` itself.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -604,8 +604,6 @@ impl Store {
     /// Which form the project of `key` keeps its recording in, by its project file alone, so
     /// that a caller knows whether opening it can take long. None when there is no project
     /// there that this version can read, or it is being removed.
-    // Asked by the app before it opens a project; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn form_of(&self, key: &ProjectKey) -> Option<Form> {
         let dir = self.project_dir(key)?;
         if is_removing(&dir) {
@@ -618,44 +616,45 @@ impl Store {
     /// their frames, pass the list's check, open, are not open in an editor or being removed,
     /// have a frames file of at least `min_bytes`, and carry no mark of a try with the codec
     /// `codec_id` by this version of Mythicshot. Nothing is changed.
-    // Asked by the conversion queue; until that is built, only by the tests.
+    // Only the tests ask this way: the queue asks `look`, which skips what it has given up.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_candidate(&self, codec_id: &str, min_bytes: u64) -> Option<Candidate> {
-        self.next_candidate_but(codec_id, min_bytes, &|_, _| false)
+        self.look(codec_id, min_bytes, &|_, _| false).next
     }
 
     /// [`Store::next_candidate`] among the projects `skip` does not answer true for; it is
     /// asked with a project's key and its time of saving. For a queue that has given some
-    /// projects up and goes on with the next oldest.
-    pub fn next_candidate_but(&self, codec_id: &str, min_bytes: u64, skip: &dyn Fn(&ProjectKey, i64) -> bool) -> Option<Candidate> {
-        let mut found = Vec::new();
+    /// projects up and goes on with the next oldest. The projects that would have been looked
+    /// at too if no editor had them open are named beside the answer. Nothing is changed.
+    pub fn look(&self, codec_id: &str, min_bytes: u64, skip: &dyn Fn(&ProjectKey, i64) -> bool) -> Look {
+        let (mut found, mut open) = (Vec::new(), Vec::new());
         for (dir, site, tour, chapter) in self.chapter_folders() {
-            if is_removing(&dir) || is_open(&dir) {
+            if is_removing(&dir) {
                 continue;
             }
             let Ok(file) = read_project(&dir) else { continue };
             let belongs = site_of(&file.server) == site && file.tour_id == tour && file.chapter_id == chapter;
             if belongs && file.store.form == SavedForm::Frames && file.frames_bytes >= min_bytes && payload_ok(&dir, &file) && mark_holds(&file.store, codec_id).is_none() {
                 let key = ProjectKey { server: file.server.clone(), tour_id: file.tour_id.clone(), chapter_id: file.chapter_id.clone() };
-                if !skip(&key, file.saved_at) {
-                    found.push((file.saved_at, dir, key, file));
+                if skip(&key, file.saved_at) {
+                    continue;
+                }
+                if is_open(&dir) {
+                    open.push(key);
+                } else {
+                    found.push((file.saved_at, dir, key, file.frames_bytes));
                 }
             }
         }
         found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        found.into_iter().find_map(|(saved_at, dir, key, file)| {
-            // One whose index does not describe its frames file cannot be converted, or opened.
-            let rec = Recording::open_saved(&dir).ok()?;
-            let frames_bytes = file.frames_bytes;
-            Some(Candidate { key, must: must_frames(file, &dir, &rec), dir, saved_at, frames_bytes })
-        })
+        // One whose index does not describe its frames file cannot be converted, or opened.
+        let next = found.into_iter().find(|(_, dir, _, _)| Recording::open_saved(dir).is_ok()).map(|(saved_at, dir, key, frames_bytes)| Candidate { key, dir, saved_at, frames_bytes });
+        Look { next, open }
     }
 
     /// Start the one conversion: None when another runs, or the project is no longer what the
     /// candidate describes (it was saved again, opened, or is being removed). The conversion's
     /// folder `<root>/.converting-<time>-<random>/` is made, and the epoch is bumped.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn begin_conversion(&self, c: &Candidate) -> Option<Converting> {
         let _changing = changing();
         self.candidate_file(c)?;
@@ -711,8 +710,6 @@ impl Store {
     /// The frames file is removed only after the new project file is on the disk.
     ///
     /// The error is a reason for a log line, as [`Store::save`]'s is.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn swap_to_video(&self, c: &Candidate, conv: &Converting, video_bytes: u64) -> Result<bool, String> {
         self.swap_with(c, conv, video_bytes, &Steps { keep_frames: &|rec, dir| rec.save_into_with(dir, &|| true), rename: &patient_rename })
     }
@@ -806,8 +803,6 @@ impl Store {
     /// is not tried again by them. Only the project file is rewritten, in one rename, and its
     /// time of saving stays. `Ok(false)`, and nothing touched, when the project is open, being
     /// removed or no longer what the candidate describes.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mark_conversion(&self, c: &Candidate, state: &str, codec_id: &str) -> Result<bool, String> {
         if !matches!(state, MARK_FAILED | MARK_NOT_SMALLER) {
             return Err("the end of the conversion could not be noted.".into());
@@ -842,8 +837,6 @@ impl Store {
     /// Any other folder is left exactly as it is: a project this version cannot read, one from
     /// a newer version, a video project whose video is not whole, a frames project whose frames
     /// are not.
-    // Run by the start-up housekeeping; until the conversion queue is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finish_conversions(&self) {
         let _changing = changing();
         let mut changed = false;
@@ -874,13 +867,10 @@ impl Store {
     /// [`Store::sweep_staging`]. Real folders directly in the projects folder named
     /// `.converting-<time>-<random>` exactly, whose time (the one in the name) is at least
     /// `age` ago, and which are not the folder of the conversion that runs.
-    // Run by the start-up housekeeping; until the conversion queue is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sweep_converting(&self, age: Duration) {
         self.sweep_converting_at(age, SystemTime::now());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn sweep_converting_at(&self, age: Duration, now: SystemTime) {
         let _changing = changing();
         let now = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
@@ -946,8 +936,6 @@ impl Store {
     /// gives, spelled without a way round, and a real folder below real folders. Anything else
     /// is refused with an error and nothing is touched. A folder with such a name that is not
     /// there, or holds no project, is [`Removed::NotThere`].
-    // Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_project(&self, dir: &Path) -> Result<Removed, String> {
         const NOT_REMOVED: &str = "this saved recording could not be removed";
         let refused = || {
@@ -1106,8 +1094,6 @@ fn is_converting(dir: &Path) -> bool {
 
 /// The folder of the project that is being converted to a video right now, as its
 /// [`ProjectInfo::dir`] names it.
-// Asked by the pages that show a conversion; until they are built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn converting_now() -> Option<PathBuf> {
     converting().as_ref().map(|slot| slot.dir.clone())
 }
@@ -1130,10 +1116,10 @@ pub fn cancel_conversion_of(dir: &Path, wait: Duration) {
     }
 }
 
-// Read by the conversion queue; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 impl Converting {
     /// The conversion's own folder, in the projects folder: where the video is made and verified.
+    // Only the tests ask where it is: a conversion needs no more of it than `video_path`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn work_dir(&self) -> &Path {
         &self.work
     }
@@ -1202,16 +1188,6 @@ fn expand_failed(e: ExpandError) -> LoadError {
             LoadError::Damaged("the folder to open the recording in could not be used".into())
         }
     }
-}
-
-/// The frames a tour made from a saved state shows: every step's source frame, the frames the
-/// tour's own texts are keyed by, and every frame an annotation is pinned to; in order, each once.
-fn must_frames(file: ProjectFile, dir: &Path, rec: &Recording) -> Vec<usize> {
-    let restored = state::from_file(file, dir, rec);
-    let steps = crate::tour::plan_steps(rec, &restored.edit, &restored.events).unwrap_or_default();
-    let pins = restored.items.iter().filter_map(|item| item.pin).map(|pin| pin as usize);
-    let all: BTreeSet<usize> = steps.iter().map(|step| step.src).chain(restored.edit.tour_doc.steps.keys().copied()).chain(pins).filter(|i| *i < rec.frames.len()).collect();
-    all.into_iter().collect()
 }
 
 /// For a video project whose video is whole: what a swap had left to do. Whether anything changed.
@@ -3298,7 +3274,9 @@ mod tests {
             fn folder_link(outside: &Path, link: &Path) -> bool {
                 std::os::windows::fs::symlink_dir(outside, link).is_ok()
             }
-            let kinds: [(&str, fn(&Path, &Path) -> bool); 2] = [("junction", junction), ("folder link", folder_link)];
+            /// Makes a link at the second path to the folder at the first, and says whether it could.
+            type MakeLink = fn(&Path, &Path) -> bool;
+            let kinds: [(&str, MakeLink); 2] = [("junction", junction), ("folder link", folder_link)];
             let mut ran = Vec::new();
             for (kind, make) in kinds {
                 let w = World::new();
@@ -3635,10 +3613,15 @@ mod tests {
             // A store as the app makes one: it knows the codec the app found, and no other.
             let app_store = Store::at(w.store.root().to_path_buf());
             assert_eq!(app_store.list()[0].convert, ConvertState::NotTried);
+            let before = epoch();
             set_current_codec(Some("a-codec-of-this-test-only"));
             assert_eq!(app_store.list()[0].convert, ConvertState::Failed);
+            // What the pages show of a recording depends on the codec: they are told to read again.
+            let named = epoch();
+            assert!(named > before, "{before} {named}");
             set_current_codec(None);
             assert_eq!(app_store.list()[0].convert, ConvertState::NotTried);
+            assert!(epoch() > named);
         }
 
         #[test]
@@ -3673,7 +3656,7 @@ mod tests {
         /// What the queue holds of the project in `dir` when it starts on it.
         fn candidate(key: &ProjectKey, dir: &Path) -> Candidate {
             let file = project_file(dir);
-            Candidate { key: key.clone(), dir: dir.to_path_buf(), saved_at: file.saved_at, frames_bytes: file.frames_bytes, must: Vec::new() }
+            Candidate { key: key.clone(), dir: dir.to_path_buf(), saved_at: file.saved_at, frames_bytes: file.frames_bytes }
         }
 
         /// Start a conversion and put a finished video into its folder.
@@ -4556,10 +4539,6 @@ mod tests {
             let c = w.store.next_candidate(TEST_CODEC, 0).unwrap();
             let file = project_file(&w.dir(&oldest));
             assert_eq!((c.key.clone(), c.dir.clone(), c.saved_at, c.frames_bytes), (oldest.clone(), w.dir(&oldest), file.saved_at, 245));
-            // The frames a tour shows: the click's frame, the last kept one, and those the tour's own texts are on.
-            assert!(c.must.windows(2).all(|pair| pair[0] < pair[1]) && c.must.iter().all(|i| *i < FRAMES), "{:?}", c.must);
-            let steps: Vec<usize> = crate::tour::plan_steps(&w.rec, &w.edit, &w.events).unwrap().iter().map(|s| s.src).collect();
-            assert!(!steps.is_empty() && steps.iter().chain([2, 5].iter()).all(|i| c.must.contains(i)), "{:?} {steps:?}", c.must);
             // Asking changes nothing, and asks for the same one again.
             assert_eq!(w.store.next_candidate(TEST_CODEC, 0), Some(c.clone()));
             let conv = w.store.begin_conversion(&c).unwrap();
@@ -4582,9 +4561,9 @@ mod tests {
                 saved_later(&w.dir(k), by);
             }
             let whole = contents(w.store.root());
-            let next = |skip: &dyn Fn(&ProjectKey, i64) -> bool| w.store.next_candidate_but(TEST_CODEC, 0, skip).map(|c| c.key);
+            let next = |skip: &dyn Fn(&ProjectKey, i64) -> bool| w.store.look(TEST_CODEC, 0, skip).next.map(|c| c.key);
             assert_eq!(next(&|_, _| false), Some(oldest.clone()));
-            assert_eq!(w.store.next_candidate_but(TEST_CODEC, 0, &|_, _| false), w.store.next_candidate(TEST_CODEC, 0));
+            assert_eq!(w.store.look(TEST_CODEC, 0, &|_, _| false).next, w.store.next_candidate(TEST_CODEC, 0));
             assert_eq!(next(&|k, _| *k == oldest), Some(middle.clone()));
             assert_eq!(next(&|k, _| *k == oldest || *k == middle), Some(newest.clone()));
             assert_eq!(next(&|_, _| true), None);
@@ -4592,8 +4571,37 @@ mod tests {
             let at = project_file(&w.dir(&middle)).saved_at;
             assert_eq!(next(&|_, saved_at| saved_at != at), Some(middle.clone()));
             // The least size still counts, and nothing was changed by asking.
-            assert_eq!(w.store.next_candidate_but(TEST_CODEC, u64::MAX, &|_, _| false), None);
+            assert_eq!(w.store.look(TEST_CODEC, u64::MAX, &|_, _| false), Look::default());
             assert_eq!(contents(w.store.root()), whole);
+        }
+
+        #[test]
+        fn a_look_names_the_projects_only_an_editor_keeps_from_being_next() {
+            let w = World::new();
+            let (oldest, middle, noted, going) = (key(SITE_B, TOUR_2, CH_2), key(SITE_A, TOUR_2, CH_1), key(SITE_A, TOUR_1, CH_1), key(SITE_A, TOUR_1, CH_2));
+            for (k, by) in [(&oldest, -120_000), (&middle, -60_000), (&noted, -30_000), (&going, 0)] {
+                w.save(k);
+                saved_later(&w.dir(k), by);
+            }
+            marked(&w.dir(&noted), MARK_FAILED, TEST_CODEC, env!("CARGO_PKG_VERSION"));
+            let whole = contents(w.store.root());
+            let look = |least: u64, skip: &dyn Fn(&ProjectKey, i64) -> bool| {
+                let look = w.store.look(TEST_CODEC, least, skip);
+                (look.next.map(|c| c.key), look.open)
+            };
+            assert_eq!(look(0, &|_, _| false), (Some(oldest.clone()), vec![]));
+            // Open in an editor: not the next, and named. One that would not be next with no
+            // editor either (it carries a mark, or is being removed) is not named.
+            let (open, _noted, _going) = (loaded(&w.store, &oldest), loaded(&w.store, &noted), loaded(&w.store, &going));
+            assert_eq!(contents(w.store.root()), whole, "asking and opening change nothing");
+            mark_removing(&w.dir(&going)).unwrap();
+            assert_eq!(look(0, &|_, _| false), (Some(middle.clone()), vec![oldest.clone()]));
+            // Nor is one the caller skips, or one under the least size.
+            assert_eq!(look(0, &|k, _| *k == oldest), (Some(middle.clone()), vec![]));
+            assert_eq!(look(u64::MAX, &|_, _| false), (None, vec![]));
+            // The editor closes: it is the next again.
+            drop(open);
+            assert_eq!(look(0, &|_, _| false), (Some(oldest), vec![]));
         }
 
         #[test]
