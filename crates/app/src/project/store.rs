@@ -217,7 +217,7 @@ impl Store {
     /// before every megabyte, and a no ends the save with [`SAVING_CANCELLED`] and nothing
     /// left behind. Nothing else of a save is cut short by it.
     pub fn save_while(&self, key: &ProjectKey, snap: &Snapshot<'_>, keep_going: &dyn Fn() -> bool) -> Result<Saved, String> {
-        self.save_with(key, snap, &Steps { keep_frames: &|rec, dir| rec.save_into_with(dir, keep_going), rename: &|from, to| patiently(|| std::fs::rename(from, to)) })
+        self.save_with(key, snap, &Steps { keep_frames: &|rec, dir| rec.save_into_with(dir, keep_going).map(|kept| kept.bytes), rename: &|from, to| patiently(|| std::fs::rename(from, to)) })
     }
 
     fn save_with(&self, key: &ProjectKey, snap: &Snapshot<'_>, steps: &Steps<'_>) -> Result<Saved, String> {
@@ -415,6 +415,8 @@ impl Store {
             OpenError::Missing => LoadError::Damaged("the recording's frames are not there".into()),
             OpenError::Damaged(why) => LoadError::Damaged(why),
             OpenError::Newer(_) => LoadError::Newer,
+            // The video form is read from Task 5 on; until then it is what 0.2.7 took it for.
+            OpenError::Video => LoadError::Newer,
         })?;
         if !frames_are(&dir, file.frames_bytes) {
             return Err(LoadError::Damaged("the frames file is not the one the project was saved with".into()));
@@ -1229,7 +1231,7 @@ mod tests {
     }
 
     fn real_frames(rec: &Recording, dir: &Path) -> Result<u64, SaveError> {
-        rec.save_into_with(dir, &|| true)
+        rec.save_into_with(dir, &|| true).map(|kept| kept.bytes)
     }
 
     /// Every file and folder below `dir`, with `/`, sorted; folders end with `/`.
@@ -1510,7 +1512,7 @@ mod tests {
         let opened = std::cell::RefCell::new(None);
         let slow = |rec: &Recording, to: &Path| {
             *opened.borrow_mut() = Some(loaded(&w.store, &key_1()));
-            rec.save_into_with(to, &|| true)
+            rec.save_into_with(to, &|| true).map(|kept| kept.bytes)
         };
         let err = w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &slow, rename: &real_rename }).unwrap_err();
         assert!(err.contains("open in an editor"), "{err}");
@@ -1941,7 +1943,7 @@ mod tests {
         let seen = std::cell::RefCell::new(None);
         let look = |rec: &Recording, to: &Path| {
             *seen.borrow_mut() = to.file_name().and_then(|n| n.to_str()).map(str::to_string);
-            rec.save_into_with(to, &|| true)
+            rec.save_into_with(to, &|| true).map(|kept| kept.bytes)
         };
         let before = since_1970(SystemTime::now());
         w.store.save_with(&key_1(), &w.snap(), &Steps { keep_frames: &look, rename: &real_rename }).unwrap();
@@ -2131,7 +2133,7 @@ mod tests {
         // The new project arrives with a file of that name already in it.
         let with_a_note = |rec: &Recording, to: &Path| {
             std::fs::write(to.join("notes.txt"), b"new note").unwrap();
-            rec.save_into_with(to, &|| true)
+            rec.save_into_with(to, &|| true).map(|kept| kept.bytes)
         };
         w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &with_a_note, rename: &real_rename }).unwrap();
         assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"new note");

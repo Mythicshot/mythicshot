@@ -16,7 +16,7 @@ mod saved;
 pub use cursor::position as pointer_position;
 pub mod export;
 pub use ffmpeg::{Bound, CodecError, Ffmpeg, VideoCodec};
-pub use saved::{OpenError, SaveError, SaveStep};
+pub use saved::{ExpandError, Form, OpenError, SaveError, SaveStep, SavedAs, VIDEO_FILE, VideoIndex, expand_video, form_of, open_video_index};
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -69,6 +69,9 @@ pub struct Recording {
     pub frames: Vec<FrameMeta>,
     /// Active time when recording stopped; the last frame lasts until then.
     pub end_ms: u64,
+    /// The video these frames were expanded from and its size in bytes, for a recording made
+    /// by [`expand_video`]; None for every other recording.
+    expanded_from: Option<(PathBuf, u64)>,
 }
 
 impl Recording {
@@ -117,7 +120,7 @@ impl Recording {
     #[doc(hidden)]
     pub fn timing_only(width: u32, height: u32, times: &[u64], end_ms: u64) -> Recording {
         let frames = times.iter().map(|t| FrameMeta { offset: 0, len: 0, key: true, t_ms: *t, cursor: None }).collect();
-        Recording { dir: PathBuf::new(), owned: false, width, height, frames, end_ms }
+        Recording { dir: PathBuf::new(), owned: false, width, height, frames, end_ms, expanded_from: None }
     }
 
     /// A small real recording that owns `dir` (which must exist), as the recorder leaves one:
@@ -452,8 +455,8 @@ fn capture_loop(target: Target, fps: u32, dir: PathBuf, sh: Arc<Shared>, ready: 
 
 /// Appends frames to the frames file: keyframes whole, the rest as an XOR
 /// difference from the previous frame, all zstd-compressed.
-struct FrameWriter {
-    out: BufWriter<File>,
+struct FrameWriter<W: Write = File> {
+    out: BufWriter<W>,
     width: u32,
     height: u32,
     previous: Vec<u8>,
@@ -465,12 +468,24 @@ struct FrameWriter {
 impl FrameWriter {
     fn create(dir: &std::path::Path, width: u32, height: u32) -> Result<Self, String> {
         let file = File::create(dir.join(FRAMES_FILE)).map_err(|e| e.to_string())?;
+        Ok(Self::over(file, width, height))
+    }
+}
+
+impl<W: Write> FrameWriter<W> {
+    /// A writer that appends to `out`, which is the frames file or stands in for it.
+    fn over(out: W, width: u32, height: u32) -> Self {
         let size = (width * height * 4) as usize;
-        Ok(Self { out: BufWriter::with_capacity(4 << 20, file), width, height, previous: vec![0; size], delta: vec![0; size], frames: Vec::new(), offset: 0 })
+        Self { out: BufWriter::with_capacity(4 << 20, out), width, height, previous: vec![0; size], delta: vec![0; size], frames: Vec::new(), offset: 0 }
     }
 
     /// Add one RGBA frame of exactly `width * height * 4` bytes.
     fn push(&mut self, px: &[u8], t_ms: u64, cursor: Option<(i32, i32)>) -> Result<(), String> {
+        self.push_io(px, t_ms, cursor).map_err(|(what, e)| format!("{what}: {e}"))
+    }
+
+    /// [`FrameWriter::push`] for a caller that needs the system's error: what was being done, and the error.
+    fn push_io(&mut self, px: &[u8], t_ms: u64, cursor: Option<(i32, i32)>) -> Result<(), (&'static str, std::io::Error)> {
         let key = self.frames.len() % KEYFRAME_EVERY == 0;
         let data: &[u8] = if key {
             px
@@ -480,8 +495,8 @@ impl FrameWriter {
             }
             &self.delta
         };
-        let compressed = zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| format!("could not compress a frame: {e}"))?;
-        self.out.write_all(&compressed).map_err(|e| format!("could not write the recording: {e}"))?;
+        let compressed = zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| ("could not compress a frame", e))?;
+        self.out.write_all(&compressed).map_err(|e| ("could not write the recording", e))?;
         self.previous.copy_from_slice(px);
         self.frames.push(FrameMeta { offset: self.offset, len: compressed.len() as u32, key, t_ms, cursor });
         self.offset += compressed.len() as u64;
@@ -490,7 +505,14 @@ impl FrameWriter {
 
     fn finish(mut self, dir: PathBuf, end_ms: u64) -> Result<Recording, String> {
         self.out.flush().map_err(|e| e.to_string())?;
-        Ok(Recording { dir, owned: true, width: self.width, height: self.height, frames: self.frames, end_ms })
+        Ok(Recording { dir, owned: true, width: self.width, height: self.height, frames: self.frames, end_ms, expanded_from: None })
+    }
+
+    /// Write out what is still buffered and hand back the frames written, for a caller that
+    /// builds the recording itself and needs the system's error.
+    fn into_frames(mut self) -> std::io::Result<Vec<FrameMeta>> {
+        self.out.flush()?;
+        Ok(self.frames)
     }
 }
 
@@ -517,7 +539,7 @@ mod tests {
     #[test]
     fn two_recordings_are_the_same_only_when_every_frame_lies_and_reads_the_same() {
         let frame = |offset, len, key, t_ms, cursor| FrameMeta { offset, len, key, t_ms, cursor };
-        let rec = |width, end_ms, frames: Vec<FrameMeta>| Recording { dir: PathBuf::new(), owned: false, width, height: 80, frames, end_ms };
+        let rec = |width, end_ms, frames: Vec<FrameMeta>| Recording { dir: PathBuf::new(), owned: false, width, height: 80, frames, end_ms, expanded_from: None };
         let base = || vec![frame(0, 10, true, 0, None), frame(10, 12, false, 100, None)];
         assert!(rec(100, 200, base()).same_frames(&rec(100, 200, base())));
         // Equal times and no pointer, and still other frames: a length, where one lies, a whole frame.
