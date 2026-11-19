@@ -415,6 +415,8 @@ impl App {
                 self.refocus_at = Some(Instant::now() + Duration::from_millis(150));
                 self.session = Some(s);
                 self.draw_when_live = false;
+                // The recorder has the processor and the disk to itself: nothing is stored as video meanwhile.
+                project::set_recording(true);
                 self.hotkeys.set_recording(true);
                 self.publish_taken_keys();
             }
@@ -501,6 +503,8 @@ impl App {
         if let Ok(mut t) = self.tap.lock() {
             *t = None;
         }
+        // Recordings may be stored as video again.
+        project::set_recording(false);
         // The recording keys go back to other apps.
         self.hotkeys.set_recording(false);
         self.publish_taken_keys();
@@ -794,6 +798,7 @@ impl App {
         self.save_settings();
         publish_ui::set_server(&self.settings.publish_server);
         publish_ui::set_keep_recordings(self.settings.keep_published_recordings);
+        project::set_enabled(self.settings.store_recordings_as_video);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
@@ -1061,6 +1066,9 @@ impl eframe::App for App {
     /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A recording that is being stored as video is left as its frames: the conversion stops at
+        // its next frame and is given a moment, so that no ffmpeg runs on after the app.
+        project::shutdown(Duration::from_secs(3));
         publish_ui::shutdown(std::time::Duration::from_secs(5));
         // A delete that was noted as unfinished in the last moments is on disk before the app is gone,
         // and so is a change whose save failed earlier, if the file can be written by now.
