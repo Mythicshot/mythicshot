@@ -28,6 +28,10 @@ const BAR_OVER: Color32 = Color32::from_rgb(201, 138, 30);
 const BAR_HEIGHT: f32 = 8.0;
 /// The background of the list of saved recordings.
 const LIST_BG: Color32 = Color32::from_rgb(27, 31, 39);
+/// How long until the page looks again whether ffmpeg was found, while it is being looked for.
+const FFMPEG_LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
+/// The room a row's title keeps before the row's details go under it.
+const TITLE_MIN_WIDTH: f32 = 120.0;
 /// How tall the list of saved recordings gets before it scrolls.
 const LIST_MAX_HEIGHT: f32 = 180.0;
 
@@ -220,6 +224,11 @@ fn output_tab(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, ho
     // Everything the disk is asked happens here, before anything is drawn, and on other threads.
     saved.refresh(hooks.epoch, opened, hooks.list);
     saved.build(view.settings.store_recordings_as_video, hooks.ffmpeg, &chrono::Local::now());
+    // The search for ffmpeg ends on another thread, which does not know this page: look again
+    // shortly, so the line and the rows settle without the mouse being moved.
+    if hooks.ffmpeg == FfmpegState::Checking && view.settings.store_recordings_as_video {
+        ui.ctx().request_repaint_after(FFMPEG_LOOK_AGAIN);
+    }
     egui::ScrollArea::vertical().show(ui, |ui| output_page(ui, view, saved, hooks, out));
 }
 
@@ -390,9 +399,10 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
     changed
 }
 
-/// The limit: the words, a field of four characters, and the unit. True when a limit was typed
-/// that is not the saved one. What is typed and is no limit changes nothing: it stays in the
-/// field until the field is left, and then the saved limit stands there again.
+/// The limit: the words, a field of four characters, and the unit. True when a limit was
+/// saved that is not the one saved before. Nothing is saved while it is typed: Enter or leaving
+/// the field saves what stands there when that is a limit, and Escape or anything that is no
+/// limit puts the saved one back.
 fn limit_row(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecordings) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -402,7 +412,10 @@ fn limit_row(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecordings) -
             saved.limit_text = limit_text(s.saved_recordings_warn_gb);
         }
         let field = egui::TextEdit::singleline(&mut saved.limit_text).id(id).char_limit(4).desired_width(40.0);
-        if ui.add(field).on_hover_text(LIMIT_HOVER).changed()
+        let field = ui.add(field).on_hover_text(LIMIT_HOVER);
+        // Escape leaves the field too, and is the one way of leaving it that saves nothing.
+        if field.lost_focus()
+            && !ui.input(|i| i.key_pressed(egui::Key::Escape))
             && let Some(gb) = parse_limit(&saved.limit_text).filter(|gb| *gb != s.saved_recordings_warn_gb)
         {
             s.saved_recordings_warn_gb = gb;
@@ -437,18 +450,22 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
     }
     let mut click = None;
     {
+        // A question that was just asked is brought into view, once; after that the list is the user's to scroll.
+        let reveal = std::mem::take(&mut saved.reveal);
         let Some(listing) = saved.shown.as_ref().filter(|l| !l.rows.is_empty()) else { return };
         let (asking, busy) = (saved.asking.as_deref(), saved.removing.is_some());
         egui::Frame::new().fill(LIST_BG).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("saved-recordings").max_height(LIST_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
                 for row in &listing.rows {
+                    // A row and its question are widgets of their own, so the keyboard focus
+                    // of the button that asked is never on the button that removes.
                     if asking == Some(row.dir.as_path()) {
-                        match question(ui, row) {
+                        match ui.push_id(("question", &row.dir), |ui| question(ui, row, reveal)).inner {
                             Some(true) => click = Some(Click::Remove),
                             Some(false) => click = Some(Click::Keep),
                             None => {}
                         }
-                    } else if list_row(ui, row, !busy) {
+                    } else if ui.push_id(("row", &row.dir), |ui| list_row(ui, row, !busy)).inner {
                         click = Some(Click::Ask(row.dir.clone()));
                     }
                 }
@@ -468,27 +485,43 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
     }
 }
 
-/// One row: the title, then the day, the form and the size, then the button. True when the
-/// button was clicked.
+/// One row: the title, then the day, the form and the size, then the button. Where that
+/// would leave the title too little room, the details go under the title instead. True when
+/// the button was clicked.
 fn list_row(ui: &mut egui::Ui, row: &Row, enabled: bool) -> bool {
+    let detail = RichText::new(row.detail()).color(MUTED).size(12.0);
+    let button_width = text_width(ui, REMOVE_RECORDING, egui::TextStyle::Button.resolve(ui.style())) + 2.0 * ui.spacing().button_padding.x;
+    let detail_width = text_width(ui, &row.detail(), egui::FontId::proportional(12.0));
+    let one_line = ui.available_width() - button_width - detail_width - 2.0 * ui.spacing().item_spacing.x >= TITLE_MIN_WIDTH;
     let mut clicked = false;
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             clicked = ui.add_enabled(enabled, egui::Button::new(REMOVE_RECORDING)).clicked();
-            ui.add(egui::Label::new(RichText::new(row.detail()).color(MUTED).size(12.0)).extend());
+            if one_line {
+                ui.add(egui::Label::new(detail.clone()).extend());
+            }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add(egui::Label::new(&row.title).truncate()).on_hover_text(&row.title);
             });
         });
     });
+    if !one_line {
+        ui.add(egui::Label::new(detail).truncate());
+        ui.add_space(2.0);
+    }
     clicked
 }
 
-/// The question in the place of its row. Some(true) for "Remove recording", Some(false) for
-/// "Keep it" or Escape.
-fn question(ui: &mut egui::Ui, row: &Row) -> Option<bool> {
+/// How wide `text` is on one line in `font`.
+fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER).size().x
+}
+
+/// The question in the place of its row, scrolled into view when `reveal` says so.
+/// Some(true) for "Remove recording", Some(false) for "Keep it" or Escape.
+fn question(ui: &mut egui::Ui, row: &Row, reveal: bool) -> Option<bool> {
     let mut answer = None;
-    egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+    let frame = egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(RichText::new(remove_question(&row.title)).color(DANGER_TEXT)).wrap());
         ui.add_space(4.0);
@@ -501,6 +534,9 @@ fn question(ui: &mut egui::Ui, row: &Row) -> Option<bool> {
             }
         });
     });
+    if reveal {
+        frame.response.scroll_to_me(None);
+    }
     answer
 }
 
@@ -595,9 +631,10 @@ pub fn saved_recordings_line(t: Totals) -> String {
 
 /// Whether the conversion queue would store this recording as video: the switch is on, ffmpeg
 /// was found, and the recording is kept as frames, has nothing wrong with it, was not tried
-/// before and is large enough.
+/// before and its frames file is large enough (the folder's size, which the row shows, also
+/// counts the project file and the pictures).
 fn will_convert(p: &ProjectInfo, video_on: bool, ffmpeg: FfmpegState) -> bool {
-    video_on && ffmpeg == FfmpegState::Found && p.form == Form::Frames && p.convert == ConvertState::NotTried && p.problem.is_none() && p.bytes >= MIN_CONVERT_BYTES
+    video_on && ffmpeg == FfmpegState::Found && p.form == Form::Frames && p.convert == ConvertState::NotTried && p.problem.is_none() && p.frames_bytes >= MIN_CONVERT_BYTES
 }
 
 /// The list and the totals for what was read. Reads nothing itself.
@@ -647,6 +684,8 @@ pub struct SavedRecordings {
     limit_text: String,
     /// The row whose question is showing: a folder of the list, never one from anywhere else.
     pub asking: Option<PathBuf>,
+    /// The question was asked since the list was last drawn, and is to be scrolled into view.
+    reveal: bool,
     /// The removal that is running.
     pub removing: Option<Receiver<Removal>>,
     /// What the last removal has to say, if anything.
@@ -747,6 +786,7 @@ impl SavedRecordings {
     fn ask(&mut self, dir: &Path) {
         if self.removing.is_none() && self.lists(dir) {
             self.asking = Some(dir.to_path_buf());
+            self.reveal = true;
             self.note = None;
         }
     }
@@ -979,7 +1019,7 @@ mod tests {
     /// What the store's list says of a saved recording, with no disk behind it.
     fn info(site: &str, tour: &str, chapter: &str, tour_title: &str, title: &str, saved_at: i64, bytes: u64) -> ProjectInfo {
         let dir = Path::new("projects").join(site).join(tour).join(chapter);
-        ProjectInfo { key: key(tour, chapter), title: title.into(), tour_title: tour_title.into(), saved_at, bytes, dir, problem: None, form: Form::Frames, convert: ConvertState::NotTried }
+        ProjectInfo { key: key(tour, chapter), title: title.into(), tour_title: tour_title.into(), saved_at, bytes, frames_bytes: bytes, dir, problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     fn listed(projects: Vec<ProjectInfo>) -> Listed {
@@ -1200,6 +1240,32 @@ mod tests {
             self.frame(vec![]);
         }
 
+        /// Press and let go of a key.
+        fn key(&mut self, key: egui::Key) -> egui::FullOutput {
+            let event = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+            self.frame(vec![event(true)]);
+            self.frame(vec![event(false)]);
+            self.frame(vec![])
+        }
+
+        /// Type `text` into the limit field and press Enter.
+        fn set_limit(&mut self, text: &str) {
+            self.type_limit(text);
+            self.key(egui::Key::Enter);
+        }
+
+        /// Move the keyboard focus with Tab until it is on the widget at `at`.
+        fn focus_at(&mut self, at: egui::Pos2) {
+            for _ in 0..400 {
+                self.key(egui::Key::Tab);
+                let focused = self.ctx.memory(|m| m.focused()).and_then(|id| self.ctx.read_response(id));
+                if focused.is_some_and(|r| r.rect.contains(at)) {
+                    return;
+                }
+            }
+            panic!("the keyboard never reached {at:?}");
+        }
+
         fn changes(&self) -> usize {
             self.actions.iter().filter(|a| matches!(a, UiAction::SettingsChanged)).count()
         }
@@ -1286,34 +1352,58 @@ mod tests {
         let (words, field, unit) = (rect_of(&out, WARN_WHEN).unwrap(), rect_of(&out, "5").unwrap(), rect_of(&out, WARN_UNIT).unwrap());
         assert!(words.right() < field.left() && field.right() < unit.left(), "{words:?} {field:?} {unit:?}");
         assert!(page.actions.is_empty());
-        // A whole number is saved as it is typed.
+        // Nothing is saved while it is typed: on the way from 5 to 10 the limit is never "none" and never 1.
+        page.type_limit("");
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (5, 0, ""));
+        page.frame(vec![egui::Event::Text("1".into())]);
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (5, 0, "1"));
+        page.frame(vec![egui::Event::Text("0".into())]);
+        for _ in 0..5 {
+            page.frame(vec![]);
+        }
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (5, 0, "10"));
+        // Enter saves it, once.
+        page.key(egui::Key::Enter);
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (10, 1));
+        page.settled();
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (10, 1, "10"));
+        // Leaving the field saves it too.
         page.type_limit("12");
-        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (12, 1));
-        // Letters, a decimal and a minus sign are not a limit: the last one stays, and nothing is saved.
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (10, 1));
+        page.click(WARN_WHEN);
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (12, 2));
+        // Letters, a decimal and a minus sign are not a limit: the last one stays, nothing is
+        // saved, and the saved limit stands in the field again.
         for bad in ["ab", "5.5", "-1", "GB", "1e3"] {
             page.type_limit(bad);
-            assert_eq!((page.settings.saved_recordings_warn_gb, page.changes()), (12, 1), "{bad}");
             assert_eq!(page.state.saved.limit_text, bad, "what was typed stays in the field while it is typed in");
+            page.key(egui::Key::Enter);
+            let texts = texts_of(&page.settled());
+            assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (12, 2, "12"), "{bad}");
+            assert!(texts.iter().any(|t| t == "12"), "{bad}: {texts:?}");
         }
-        // Leaving the field puts the saved limit back into it.
-        page.click(STORE_AS_VIDEO);
-        let texts = texts_of(&page.settled());
-        assert!(page.state.saved.limit_text == "12" && texts.iter().any(|t| t == "12"), "{texts:?}");
-        assert_eq!(page.settings.saved_recordings_warn_gb, 12);
+        // Escape puts the saved limit back and saves nothing, also when a number was typed.
+        page.type_limit("3");
+        page.key(egui::Key::Escape);
+        page.settled();
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.changes(), page.state.saved.limit_text.as_str()), (12, 2, "12"));
         // The field holds four characters: what is typed past them never arrives.
-        page.type_limit("98765");
+        page.set_limit("98765");
+        page.settled();
         assert_eq!((page.settings.saved_recordings_warn_gb, page.state.saved.limit_text.as_str()), (9876, "9876"));
-        // Empty and 0 are both "no warning".
-        page.type_limit("");
-        assert_eq!((page.settings.saved_recordings_warn_gb, page.state.saved.limit_text.as_str()), (0, ""));
-        page.type_limit("7");
-        page.type_limit("0");
+        // Empty and 0 are both "no warning", and the field shows it empty.
+        page.set_limit("");
         assert_eq!(page.settings.saved_recordings_warn_gb, 0);
+        page.set_limit("7");
+        page.set_limit("0");
+        page.settled();
+        assert_eq!((page.settings.saved_recordings_warn_gb, page.state.saved.limit_text.as_str()), (0, ""));
         // The same number again saves nothing.
         let changes = page.changes();
-        page.type_limit("0");
+        page.set_limit("0");
+        page.set_limit("");
         assert_eq!(page.changes(), changes);
-        assert_eq!(page.actions.len(), page.changes(), "typing asks for nothing but a save");
+        assert_eq!(page.actions.len(), page.changes(), "the field asks for nothing but a save");
         assert!(page.removals.is_empty());
         assert_eq!((limit_text(0), limit_text(5), limit_text(9999)), (String::new(), "5".to_string(), "9999".to_string()));
     }
@@ -1331,7 +1421,7 @@ mod tests {
         assert!(page.state.saved.limit_text.is_empty() && texts.iter().any(|t| t == WARN_WHEN) && texts.iter().any(|t| t == WARN_UNIT), "{texts:?}");
         // A limit is typed: the bar and the warning come without anything being read again.
         let reads = page.reads;
-        page.type_limit("5");
+        page.set_limit("5");
         let out = page.settled();
         let texts = texts_of(&out);
         assert!(bar_of(&out).is_some() && texts.iter().any(|t| t == &over_limit_sentence(6 * GB, 5)), "{texts:?}");
@@ -1406,8 +1496,10 @@ mod tests {
             assert_eq!(forms, ["video", "not compressed", "not compressed", "not compressed", "not compressed"], "{video_on} {ffmpeg:?}");
         }
         // Exactly the smallest size the queue takes, and one byte less.
-        let edge = |bytes| listing(&Listed { projects: vec![info(SITE, "tour_a", "chap_a", "A", "A", nov_18, bytes)], converting: None }, true, FfmpegState::Found, &now).rows[0].form;
-        assert_eq!((edge(MIN_CONVERT_BYTES), edge(MIN_CONVERT_BYTES - 1), MIN_CONVERT_BYTES), ("not compressed yet", "not compressed", 8 * MB));
+        // The queue measures the frames file, not the folder with its project file and pictures.
+        let edge = |bytes, frames_bytes| listing(&Listed { projects: vec![ProjectInfo { frames_bytes, ..info(SITE, "tour_a", "chap_a", "A", "A", nov_18, bytes) }], converting: None }, true, FfmpegState::Found, &now).rows[0].form;
+        assert_eq!((edge(MIN_CONVERT_BYTES, MIN_CONVERT_BYTES), edge(MIN_CONVERT_BYTES + MB, MIN_CONVERT_BYTES - 1), MIN_CONVERT_BYTES), ("not compressed yet", "not compressed", 8 * MB));
+        assert_eq!((edge(9 * MB, MIN_CONVERT_BYTES), edge(20 * MB, 0)), ("not compressed yet", "not compressed"));
 
         // The one being stored as video when the list was read says so, whatever else is true of it.
         let converting = Listed { converting: Some(large.dir.clone()), ..listed.clone() };
@@ -1520,7 +1612,7 @@ mod tests {
         page.click(REMOVE_RECORDING);
         page.click(KEEP_IT);
         page.click(STORE_AS_VIDEO);
-        page.type_limit("7");
+        page.set_limit("7");
         assert_eq!(page.reads, 1);
         // A project is saved or removed, or a conversion starts or ends: one more read.
         page.epoch += 1;
@@ -1823,15 +1915,23 @@ mod tests {
         assert_eq!(page.removals.len(), 1);
     }
 
+    /// The page's width in the main window at its default size, and at its smallest: the
+    /// window less the navigation and the margins of the panel the page stands in.
+    const PAGE_WIDTH: f32 = 760.0 - 170.0 - 16.0;
+    const PAGE_WIDTH_MIN: f32 = 640.0 - 170.0 - 16.0;
+
     #[test]
     fn the_page_draws_the_switches_the_bar_and_the_list_at_the_default_window_size() {
+        assert_eq!((crate::main_window::SIZE[0], PAGE_WIDTH, PAGE_WIDTH_MIN), (760.0, 574.0, 454.0));
         let projects = vec![
             info(SITE, "tour_a", "chap_a", "Customer onboarding for the whole support team", "Invite your team and give everybody a role", ms("2026-11-18T09:30:00+00:00"), 172 * MB),
             info(SITE, "tour_a", "chap_b", "Customer onboarding for the whole support team", "Add a domain", ms("2026-11-02T09:30:00+00:00"), 33 * MB),
-            ProjectInfo { problem: Some(Problem::Newer), ..info(SITE, "tour_b", "chap_a", "Billing", "Billing", ms("2025-03-09T09:30:00+00:00"), 3 * MB) },
+            // The longest a row's details get: another year, the longest word, the widest size.
+            ProjectInfo { problem: Some(Problem::Newer), ..info(SITE, "tour_b", "chap_a", "Billing and invoices for the finance team", "Billing", ms("2025-12-28T09:30:00+00:00"), 161_061_273_600) },
         ];
-        // The page beside the navigation at the default window size, at the smallest, and wide.
-        for width in [590.0, 470.0, 900.0] {
+        let total = 161_061_273_600 + (172 + 33) * MB;
+        // The page at the default window size, at the smallest, a little under that, and wide.
+        for width in [PAGE_WIDTH, PAGE_WIDTH_MIN, PAGE_WIDTH_MIN - 14.0, 900.0] {
             let mut page = Page::showing(listed(projects.clone()));
             page.ffmpeg = FfmpegState::Found;
             // The first frame reads nothing itself: the line and the list come when the read is back.
@@ -1847,11 +1947,11 @@ mod tests {
             let (track, _, _) = bar_of(&out).unwrap_or_else(|| panic!("the bar is drawn at {width}"));
             let heading = rect("TOUR PUBLISHING");
             let (keep, video, ffmpeg, limit, unit) = (rect(KEEP_RECORDING), rect(STORE_AS_VIDEO), rect(FFMPEG_FOUND), rect(WARN_WHEN), rect(WARN_UNIT));
-            let (line, button) = (rect("3 saved recordings · 208 MB of 5 GB"), rect(OPEN_FOLDER));
+            let (line, warning, button) = (rect(&usage_line(3, total, 5)), rect(&over_limit_sentence(total, 5)), rect(OPEN_FOLDER));
             let title = rect("Customer onboarding for the whole support team · Invite your team and give everybody a role");
             let removes = rects_of(&out, REMOVE_RECORDING);
             // From the top, in the planned order.
-            let order = [heading, keep, video, ffmpeg, limit, track, line, button, title];
+            let order = [heading, keep, video, ffmpeg, limit, track, line, warning, button, title];
             for pair in order.windows(2) {
                 assert!(pair[0].bottom() <= pair[1].top() + 0.5, "{width}: {:?} stands above {:?}", pair[0], pair[1]);
             }
@@ -1861,21 +1961,38 @@ mod tests {
                 assert!((part.left() - keep.left()).abs() < 12.0, "{width}: under the label: {keep:?} {part:?}");
             }
             // The limit row is one row, the unit after the field.
-            assert!(unit.left() > limit.left() && unit.right() <= width, "{width}: {limit:?} {unit:?}");
-            // Nothing is cut off at the right, and no row's parts run into each other.
+            assert!(unit.left() > limit.right() && (unit.center().y - limit.center().y).abs() < 2.0, "{width}: {limit:?} {unit:?}");
+            // Nothing is cut off at the right.
             assert_eq!(removes.len(), 3, "{width}: {texts:?}");
-            for part in [keep, video, ffmpeg, limit, line, button, track].iter().chain(&removes) {
+            for part in [keep, video, ffmpeg, limit, unit, line, warning, button, track].iter().chain(&removes) {
                 assert!(part.right() <= width, "{width}: {part:?}");
             }
+            // Every row: its title has room, and its details stand after the title when they
+            // fit there and under it when they do not; nothing runs into anything else.
             let expected = listing(&listed(projects.clone()), true, FfmpegState::Found, &chrono::Local::now());
             assert_eq!(expected.rows.iter().map(|r| r.form).collect::<Vec<_>>(), ["not compressed yet", "not compressed yet", "saved by a newer version"]);
+            assert!(expected.rows[2].detail().ends_with(" 2025 · saved by a newer version · 150.0 GB"), "{}", expected.rows[2].detail());
+            let mut under = 0;
             for (row, remove) in expected.rows.iter().zip(&removes) {
-                let detail = rect(&row.detail());
-                assert!(detail.right() < remove.left() && (detail.center().y - remove.center().y).abs() < 4.0, "{width}: {detail:?} {remove:?}");
-                assert!(detail.left() > keep.left() + 60.0, "{width}: the title keeps some room: {detail:?}");
+                let (title, detail) = (rect(&row.title), rect(&row.detail()));
+                assert!(title.right() <= remove.left() && (title.center().y - remove.center().y).abs() < 4.0, "{width}: {title:?} {remove:?}");
+                assert!(detail.right() <= width && detail.left() >= title.left() - 0.5, "{width}: {detail:?}");
+                if (detail.center().y - remove.center().y).abs() < 4.0 {
+                    assert!(title.right() <= detail.left() && detail.right() < remove.left(), "{width}: {title:?} {detail:?} {remove:?}");
+                    assert!(detail.left() - title.left() >= 110.0, "{width}: the title keeps its room: {title:?} {detail:?}");
+                } else {
+                    under += 1;
+                    assert!(detail.top() >= title.bottom() - 1.0 && detail.top() >= remove.bottom() - 6.0, "{width}: {title:?} {detail:?} {remove:?}");
+                    assert!(remove.left() - title.left() >= 110.0, "{width}: the title keeps its room: {title:?} {remove:?}");
+                }
             }
-            // A title too long for its room is cut short where the details begin.
-            assert!(title.right() <= rect(&expected.rows[0].detail()).left(), "{width}: {title:?}");
+            // Wide, every row is one line; at the smallest window the longest details go under their title.
+            if width == 900.0 {
+                assert_eq!(under, 0);
+            }
+            if width <= PAGE_WIDTH_MIN {
+                assert!(under >= 1, "{width}");
+            }
             // A question takes the place of its row and fits the same width.
             page.click_nth(REMOVE_RECORDING, 0);
             let out = page.settled();
@@ -1888,15 +2005,140 @@ mod tests {
     }
 
     #[test]
+    fn the_page_draws_again_by_itself_while_ffmpeg_is_looked_for() {
+        let delay = |out: &egui::FullOutput| out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        let mut page = Page::showing(listed(vec![info(SITE, "tour_a", "chap_a", "Customer onboarding", "Customer onboarding", 1, 20 * MB)]));
+        page.ffmpeg = FfmpegState::Checking;
+        let out = page.settled();
+        assert!(texts_of(&out).iter().any(|t| t == FFMPEG_LOOKING));
+        // Soon, and not at once: the search takes a moment, and the page does not spin for it.
+        let wait = delay(&out);
+        assert!(wait >= std::time::Duration::from_millis(100) && wait <= std::time::Duration::from_millis(300), "{wait:?}");
+        // The search is over, either way: the page says so and asks for nothing more.
+        for (state, says) in [(FfmpegState::Found, FFMPEG_FOUND), (FfmpegState::NotFound, FFMPEG_NOT_FOUND)] {
+            page.ffmpeg = state;
+            let out = page.settled();
+            assert!(texts_of(&out).iter().any(|t| t == says));
+            assert!(delay(&out) > std::time::Duration::from_secs(5), "{state:?}: {:?}", delay(&out));
+        }
+        // With the video switch off the search matters to nothing on the page.
+        page.ffmpeg = FfmpegState::Checking;
+        page.settings.store_recordings_as_video = false;
+        assert!(delay(&page.settled()) > std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn escape_answers_keep_it() {
+        let project = info(SITE, "tour_a", "chap_a", "Customer onboarding", "Customer onboarding", 1, 20 * MB);
+        let mut page = Page::showing(listed(vec![project.clone()]));
+        page.answer = Some(Ok(Removed::Now));
+        page.click(REMOVE_RECORDING);
+        assert_eq!(page.state.saved.asking.as_deref(), Some(project.dir.as_path()));
+        page.key(egui::Key::Escape);
+        let texts = texts_of(&page.settled());
+        assert!(page.state.saved.asking.is_none() && page.removals.is_empty() && page.state.saved.removing.is_none());
+        assert!(!texts.iter().any(|t| t == KEEP_IT) && texts.iter().any(|t| t == REMOVE_RECORDING), "{texts:?}");
+        // Escape with no question showing does nothing.
+        page.key(egui::Key::Escape);
+        assert!(page.removals.is_empty() && page.actions.is_empty());
+    }
+
+    #[test]
+    fn a_double_click_on_a_rows_button_only_asks() {
+        let projects: Vec<ProjectInfo> = (0..3).map(|i| info(SITE, &format!("tour_{i}"), "chap_a", &format!("Recording {i}"), "Chapter", 1_000 - i, 20 * MB)).collect();
+        for width in [PAGE_WIDTH, PAGE_WIDTH_MIN, 900.0] {
+            for nth in 0..3 {
+                let mut page = Page::showing(listed(projects.clone()));
+                page.answer = Some(Ok(Removed::Now));
+                page.screen = vec2(width, 2000.0);
+                let out = page.settled();
+                let at = rects_of(&out, REMOVE_RECORDING)[nth].center();
+                // Twice and then twice more in the same place, as fast as frames come.
+                let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                page.frame(vec![egui::Event::PointerMoved(at)]);
+                for _ in 0..4 {
+                    page.frame(vec![press(true)]);
+                    page.frame(vec![press(false)]);
+                }
+                page.settled();
+                assert!(page.removals.is_empty() && page.state.saved.removing.is_none(), "{width} {nth}: {:?}", page.removals);
+                assert_eq!(page.state.saved.asking.as_deref(), Some(projects[nth].dir.as_path()), "{width} {nth}");
+                assert_eq!(page.state.saved.shown.as_ref().unwrap().rows.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn enter_after_asking_with_the_keyboard_does_not_confirm() {
+        let projects: Vec<ProjectInfo> = (0..3).map(|i| info(SITE, &format!("tour_{i}"), "chap_a", &format!("Recording {i}"), "Chapter", 1_000 - i, 20 * MB)).collect();
+        for nth in 0..3 {
+            let mut page = Page::showing(listed(projects.clone()));
+            page.answer = Some(Ok(Removed::Now));
+            let out = page.settled();
+            // Tab to the row's button and press Enter: the question shows.
+            page.focus_at(rects_of(&out, REMOVE_RECORDING)[nth].center());
+            page.key(egui::Key::Enter);
+            assert_eq!(page.state.saved.asking.as_deref(), Some(projects[nth].dir.as_path()), "{nth}");
+            // Enter and Space again, with nothing else done: no button of the question has the keyboard.
+            for key in [egui::Key::Enter, egui::Key::Enter, egui::Key::Space, egui::Key::Enter] {
+                page.key(key);
+            }
+            page.settled();
+            assert!(page.removals.is_empty() && page.state.saved.removing.is_none(), "{nth}: {:?}", page.removals);
+            assert_eq!(page.state.saved.asking.as_deref(), Some(projects[nth].dir.as_path()), "{nth}");
+        }
+    }
+
+    #[test]
+    fn the_question_scrolls_itself_into_view_inside_the_list() {
+        let projects: Vec<ProjectInfo> = (0..40).map(|i| info(SITE, &format!("tour_{i:02}"), "chap_a", &format!("Recording {i:02}"), "Chapter", 1_000_000 - i, 20 * MB)).collect();
+        let mut page = Page::showing(listed(projects.clone()));
+        let out = page.settled();
+        // Ask about the last row the list shows without scrolling: the question is taller
+        // than the row it replaces, so where the row stood its buttons would be cut off.
+        let buttons = rects_of(&out, REMOVE_RECORDING);
+        let (last, nth) = (*buttons.last().unwrap(), buttons.len() - 1);
+        let list_bottom = out.shapes.iter().find(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == "Recording 00")).unwrap().clip_rect.bottom();
+        assert!((5..12).contains(&nth) && list_bottom - last.bottom() < 30.0, "{nth}: {last:?} in a list that ends at {list_bottom}");
+        page.click_at(last.center());
+        assert_eq!(page.state.saved.asking.as_deref(), Some(projects[nth].dir.as_path()));
+        // The list glides there over some frames.
+        for _ in 0..60 {
+            page.frame(vec![]);
+        }
+        let out = page.settled();
+        // The question and both its buttons are inside what the list shows.
+        let mut seen = 0;
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape
+                && (t.galley.text() == KEEP_IT || t.galley.text().starts_with("Remove the recording of"))
+            {
+                seen += 1;
+                let rect = t.galley.rect.translate(t.pos.to_vec2());
+                assert!(clipped.clip_rect.contains_rect(rect), "{}: {rect:?} in {:?}", t.galley.text(), clipped.clip_rect);
+            }
+        }
+        assert_eq!(seen, 2, "{:?}", texts_of(&out));
+        // It is shown once and then left alone: the list can be scrolled away from it, to its end.
+        page.frame(vec![egui::Event::PointerMoved(last.center())]);
+        for _ in 0..60 {
+            page.frame(vec![wheel_down()]);
+        }
+        let out = page.settled();
+        assert!(rect_of(&out, "Recording 39").is_some() && rect_of(&out, KEEP_IT).is_none(), "{:?}", texts_of(&out));
+        assert!(page.state.saved.asking.is_some() && page.removals.is_empty());
+    }
+
+    #[test]
     fn the_section_fits_the_default_window_without_the_list_pushing_the_page_out() {
         // The page as the default window shows it: 590 wide and about 470 tall beside the navigation.
         let projects = (0..40).map(|i| info(SITE, &format!("tour_{i}"), "chap_a", &format!("Tour {i}"), "Chapter", 1_000 + i, 20 * MB)).collect();
         let mut page = Page::showing(listed(projects));
-        page.screen = vec2(590.0, 470.0);
+        page.screen = vec2(PAGE_WIDTH, 470.0);
         let out = page.settled();
         // Whatever is drawn is inside the window.
         for (text, rect) in drawn(&out) {
-            assert!(rect.right() <= 590.0 + 0.5 && rect.top() >= -0.5, "{text}: {rect:?}");
+            assert!(rect.right() <= PAGE_WIDTH + 0.5 && rect.top() >= -0.5, "{text}: {rect:?}");
         }
         // Scrolled to its end, the page shows the section whole: the list's height is bounded.
         let at = egui::pos2(300.0, 100.0);

@@ -2966,7 +2966,7 @@ mod tests {
 
     /// What the store's list says of a saved chapter of a tour on the test site, with no disk behind it.
     fn info(tour: &str, chapter: &str, title: &str, bytes: u64, problem: Option<Problem>) -> ProjectInfo {
-        ProjectInfo { key: key(&site().server, tour, chapter), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
+        ProjectInfo { key: key(&site().server, tour, chapter), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, frames_bytes: bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
     }
 
     /// A model with a loaded list and these saved recordings.

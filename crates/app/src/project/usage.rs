@@ -184,6 +184,18 @@ mod tests {
         // Past the limit the line still only counts; the warning is its own sentence.
         assert_eq!(usage_line(40, 5_798_205_850, 5), "40 saved recordings · 5.4 GB of 5 GB");
         assert_eq!(usage_line(2, 3 * MB / 2, 9999), "2 saved recordings · 1.5 MB of 9999 GB");
+        // Under a megabyte in KB; from a megabyte with one decimal; from a hundred without; from a gigabyte in GB.
+        assert_eq!(usage_line(1, 860_160, 0), "1 saved recording · 840 KB");
+        assert_eq!(usage_line(1, 0, 0), "1 saved recording · 0 KB");
+        assert_eq!(usage_line(1, 1_048_575, 0), "1 saved recording · 1024 KB");
+        assert_eq!(usage_line(1, 1_048_576, 0), "1 saved recording · 1.0 MB");
+        assert_eq!(usage_line(2, 104_752_742, 0), "2 saved recordings · 99.9 MB");
+        assert_eq!(usage_line(2, 104_857_599, 0), "2 saved recordings · 100 MB");
+        assert_eq!(usage_line(9, 1_073_741_823, 0), "9 saved recordings · 1024 MB");
+        assert_eq!(usage_line(9, 1_073_741_824, 0), "9 saved recordings · 1.0 GB");
+        assert_eq!(usage_line(90, 13_314_398_618, 0), "90 saved recordings · 12.4 GB");
+        assert_eq!(usage_line(900, 161_061_273_600, 0), "900 saved recordings · 150.0 GB");
+        assert_eq!(usage_line(900, 161_061_273_600, 100), "900 saved recordings · 150.0 GB of 100 GB");
         // Sizes are written as everywhere else in the app.
         for bytes in [0, 860_160, 13_002_342, 104_857_599, 1_073_741_823, 13_314_398_618] {
             assert_eq!(usage_line(2, bytes, 0), format!("2 saved recordings · {}", size_text(bytes)));
@@ -240,7 +252,7 @@ mod tests {
 
     fn info(tour_title: &str, title: &str) -> ProjectInfo {
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), chapter_id: "chap_cccccccccccccccccccccccc".into() };
-        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
+        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, frames_bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     #[test]

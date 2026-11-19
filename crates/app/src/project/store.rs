@@ -106,6 +106,9 @@ pub struct ProjectInfo {
     pub saved_at: i64,
     /// The size of the project's files together.
     pub bytes: u64,
+    /// The size of the frames file alone, as the project file says: what the conversion queue
+    /// measures a recording by. 0 when the project file cannot be read.
+    pub frames_bytes: u64,
     pub dir: PathBuf,
     /// Why the project cannot be opened, as far as the cheap check can tell.
     pub problem: Option<Problem>,
@@ -358,7 +361,7 @@ impl Store {
         self.bump();
         // Built from what was written: the save is done, whatever a second look at the folder says.
         let (form, convert) = (form_of_store(&file.store), convert_state(&file.store, self.codec_id().as_deref()));
-        let info = ProjectInfo { key: key.clone(), title: file.title, tour_title: file.tour_title, saved_at: file.saved_at, bytes: bytes_in(&dir), dir, problem: None, form, convert };
+        let info = ProjectInfo { key: key.clone(), title: file.title, tour_title: file.tour_title, saved_at: file.saved_at, bytes: bytes_in(&dir), frames_bytes: file.frames_bytes, dir, problem: None, form, convert };
         Ok(Saved { info, left_out })
     }
 
@@ -1742,6 +1745,10 @@ fn read_info(dir: &Path, site: &str, tour: &str, chapter: &str, server: Option<&
         Some("video") => Form::Video,
         _ => Form::Frames,
     };
+    let frames_bytes = match &parsed {
+        Some(Ok(file)) => file.frames_bytes,
+        _ => 0,
+    };
     let (named_server, title, tour_title, saved_at, problem, form, convert) = match &parsed {
         Some(Ok(file)) => {
             let belongs = site_of(&file.server) == site && file.tour_id == tour && file.chapter_id == chapter;
@@ -1758,7 +1765,7 @@ fn read_info(dir: &Path, site: &str, tour: &str, chapter: &str, server: Option<&
         _ => (word("server"), word("title"), word("tour_title"), loose_saved_at, Some(Problem::Damaged), loose_form, ConvertState::NotTried),
     };
     let server = if site_of(&named_server) == site { named_server } else { server.unwrap_or("").to_string() };
-    Some(ProjectInfo { key: ProjectKey { server, tour_id: tour.to_string(), chapter_id: chapter.to_string() }, title, tour_title, saved_at, bytes: bytes_in(dir), dir: dir.to_path_buf(), problem, form, convert })
+    Some(ProjectInfo { key: ProjectKey { server, tour_id: tour.to_string(), chapter_id: chapter.to_string() }, title, tour_title, saved_at, bytes: bytes_in(dir), frames_bytes, dir: dir.to_path_buf(), problem, form, convert })
 }
 
 /// The folder name of a site: the first 16 hex characters of the SHA-256 of its address.
