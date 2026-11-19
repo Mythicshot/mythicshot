@@ -15,29 +15,23 @@ pub use store::{LoadError, Loaded, NOT_PUT_BACK, OpenGuard, Problem, ProjectInfo
 pub use usage::{LIMIT_MAX_GB, form_text, over_limit, over_limit_sentence, parse_limit, problem_text, remove_question, row_title, usage_fraction, usage_line};
 // For the publish result screen: whether a save went past the limit.
 pub use usage::pushed_over;
-// The title of a recording without one; named outside this module by nothing.
-#[allow(unused_imports)]
-pub use usage::UNTITLED;
 // The form a recording is kept in and how storing it as video went, and what removing one
 // answers: Preferences shows them.
 pub use store::{ConvertState, Form, Removed, converting_now};
 // How a project that keeps its recording as a video is opened: the Tours page's Edit asks.
 pub use store::Expand;
-// What the conversion queue asks the store; nothing outside this module asks.
-#[allow(unused_imports)]
-pub use store::{Candidate, Converting, MARK_FAILED, MARK_NOT_SMALLER, cancel_conversion_of, set_current_codec};
 // The conversion queue: what the app tells it, and what the pages ask it.
 pub use convert::{FfmpegState, MIN_BYTES, ffmpeg_state, gate, nudge, set_enabled, set_recording, shutdown, start};
-// The queue's own parts, named outside this module by nothing.
-#[allow(unused_imports)]
-pub use convert::{AFTER_SAVE, Gate, Outcome, START_AFTER, convert_one, run};
 // The room left on a folder's disk: asked before a video is expanded for an editor.
 pub(crate) use convert::free_bytes;
 #[cfg(test)]
 pub use convert::nudges_here;
 
-// Named outside this module by tests only: the format's number, and two of the store's reasons.
+// Named outside this module by tests only: the format's number, two of the store's reasons,
+// one conversion on its own and how it ended, and what the queue tells and asks the store.
+#[cfg(test)]
+pub use convert::{Outcome, convert_one};
 #[cfg(test)]
 pub use state::FORMAT;
 #[cfg(test)]
-pub use store::{DISK_FULL, SAVING_CANCELLED};
+pub use store::{DISK_FULL, SAVING_CANCELLED, cancel_conversion_of, set_current_codec};

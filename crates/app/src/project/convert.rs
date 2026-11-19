@@ -86,6 +86,8 @@ fn state_of(found: Found) -> FfmpegState {
 }
 
 /// How the conversion of one project ended.
+// Only the tests read it, as the answer of `convert_one`: the queue reads `End`.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// The recording is kept as a video now: the size of its frames, and of the video.
@@ -457,7 +459,8 @@ fn run_with(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate, free: Fr
 /// Whatever the outcome, the conversion's folder is gone and the project is let go of when
 /// this returns, and one line is logged: fixed words with sizes and counts, never a path and
 /// never the codec's own words.
-// The queue itself asks `convert`, which also tells the two kinds of giving up apart.
+// Only the tests convert one project this way: the queue itself asks `convert`, which also
+// tells the two kinds of giving up apart.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn convert_one(store: &Store, codec: &dyn VideoCodec, candidate: &Candidate, keep_going: &dyn Fn() -> bool) -> Outcome {
     convert(store, codec, candidate, &TOLERANCE, &free_bytes, keep_going).outcome()
@@ -485,6 +488,7 @@ enum End {
 }
 
 impl End {
+    // Only the tests ask, through `convert_one`.
     #[cfg_attr(not(test), allow(dead_code))]
     fn outcome(self) -> Outcome {
         match self {

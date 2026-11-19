@@ -74,11 +74,8 @@ pub const SAVING_CANCELLED: &str = "saving was cancelled.";
 pub const DISK_FULL: &str = "the disk is full.";
 
 /// The word a conversion mark carries when the video did not pass verification.
-// Written by the conversion queue; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MARK_FAILED: &str = "failed";
 /// The word a conversion mark carries when the video was not enough smaller than the frames.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MARK_NOT_SMALLER: &str = "not_smaller";
 
 /// The Mythicshot version a conversion mark is made by, and the one it holds for.
@@ -235,8 +232,6 @@ pub struct Converting {
 }
 
 /// What [`Store::remove_project`] did.
-// Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removed {
     /// The project's files are gone.
@@ -281,8 +276,6 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// [`VideoCodec::id`](mythicshot_recording::VideoCodec::id)), or that there is none. A
 /// [`ProjectInfo::convert`] is told for that codec: until one is named, and for a mark another
 /// codec left, every project that is kept as frames reads as not tried.
-// Called once ffmpeg was looked for; until the conversion queue is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn set_current_codec(id: Option<&str>) {
     *current_codec() = id.map(str::to_string);
     // What a page shows of a recording was read for the codec before: it reads again.
@@ -323,8 +316,6 @@ impl Store {
         local_data.filter(|dir| dir.is_absolute()).map(|dir| dir.join("projects"))
     }
 
-    // Only the tests ask: the app opens `default_root` itself.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -613,8 +604,6 @@ impl Store {
     /// Which form the project of `key` keeps its recording in, by its project file alone, so
     /// that a caller knows whether opening it can take long. None when there is no project
     /// there that this version can read, or it is being removed.
-    // Asked by the app before it opens a project; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn form_of(&self, key: &ProjectKey) -> Option<Form> {
         let dir = self.project_dir(key)?;
         if is_removing(&dir) {
@@ -627,7 +616,7 @@ impl Store {
     /// their frames, pass the list's check, open, are not open in an editor or being removed,
     /// have a frames file of at least `min_bytes`, and carry no mark of a try with the codec
     /// `codec_id` by this version of Mythicshot. Nothing is changed.
-    // Asked by the conversion queue; until that is built, only by the tests.
+    // Only the tests ask this way: the queue asks `look`, which skips what it has given up.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_candidate(&self, codec_id: &str, min_bytes: u64) -> Option<Candidate> {
         self.look(codec_id, min_bytes, &|_, _| false).next
@@ -666,8 +655,6 @@ impl Store {
     /// Start the one conversion: None when another runs, or the project is no longer what the
     /// candidate describes (it was saved again, opened, or is being removed). The conversion's
     /// folder `<root>/.converting-<time>-<random>/` is made, and the epoch is bumped.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn begin_conversion(&self, c: &Candidate) -> Option<Converting> {
         let _changing = changing();
         self.candidate_file(c)?;
@@ -723,8 +710,6 @@ impl Store {
     /// The frames file is removed only after the new project file is on the disk.
     ///
     /// The error is a reason for a log line, as [`Store::save`]'s is.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn swap_to_video(&self, c: &Candidate, conv: &Converting, video_bytes: u64) -> Result<bool, String> {
         self.swap_with(c, conv, video_bytes, &Steps { keep_frames: &|rec, dir| rec.save_into_with(dir, &|| true), rename: &patient_rename })
     }
@@ -818,8 +803,6 @@ impl Store {
     /// is not tried again by them. Only the project file is rewritten, in one rename, and its
     /// time of saving stays. `Ok(false)`, and nothing touched, when the project is open, being
     /// removed or no longer what the candidate describes.
-    // Asked by the conversion queue; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mark_conversion(&self, c: &Candidate, state: &str, codec_id: &str) -> Result<bool, String> {
         if !matches!(state, MARK_FAILED | MARK_NOT_SMALLER) {
             return Err("the end of the conversion could not be noted.".into());
@@ -854,8 +837,6 @@ impl Store {
     /// Any other folder is left exactly as it is: a project this version cannot read, one from
     /// a newer version, a video project whose video is not whole, a frames project whose frames
     /// are not.
-    // Run by the start-up housekeeping; until the conversion queue is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finish_conversions(&self) {
         let _changing = changing();
         let mut changed = false;
@@ -886,13 +867,10 @@ impl Store {
     /// [`Store::sweep_staging`]. Real folders directly in the projects folder named
     /// `.converting-<time>-<random>` exactly, whose time (the one in the name) is at least
     /// `age` ago, and which are not the folder of the conversion that runs.
-    // Run by the start-up housekeeping; until the conversion queue is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sweep_converting(&self, age: Duration) {
         self.sweep_converting_at(age, SystemTime::now());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn sweep_converting_at(&self, age: Duration, now: SystemTime) {
         let _changing = changing();
         let now = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
@@ -958,8 +936,6 @@ impl Store {
     /// gives, spelled without a way round, and a real folder below real folders. Anything else
     /// is refused with an error and nothing is touched. A folder with such a name that is not
     /// there, or holds no project, is [`Removed::NotThere`].
-    // Asked for by the saved-recordings list of Preferences; until that is built, only by the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_project(&self, dir: &Path) -> Result<Removed, String> {
         const NOT_REMOVED: &str = "this saved recording could not be removed";
         let refused = || {
@@ -1118,8 +1094,6 @@ fn is_converting(dir: &Path) -> bool {
 
 /// The folder of the project that is being converted to a video right now, as its
 /// [`ProjectInfo::dir`] names it.
-// Asked by the pages that show a conversion; until they are built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn converting_now() -> Option<PathBuf> {
     converting().as_ref().map(|slot| slot.dir.clone())
 }
@@ -1142,10 +1116,10 @@ pub fn cancel_conversion_of(dir: &Path, wait: Duration) {
     }
 }
 
-// Read by the conversion queue; until that is built, only by the tests.
-#[cfg_attr(not(test), allow(dead_code))]
 impl Converting {
     /// The conversion's own folder, in the projects folder: where the video is made and verified.
+    // Only the tests ask where it is: a conversion needs no more of it than `video_path`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn work_dir(&self) -> &Path {
         &self.work
     }
@@ -3300,7 +3274,9 @@ mod tests {
             fn folder_link(outside: &Path, link: &Path) -> bool {
                 std::os::windows::fs::symlink_dir(outside, link).is_ok()
             }
-            let kinds: [(&str, fn(&Path, &Path) -> bool); 2] = [("junction", junction), ("folder link", folder_link)];
+            /// Makes a link at the second path to the folder at the first, and says whether it could.
+            type MakeLink = fn(&Path, &Path) -> bool;
+            let kinds: [(&str, MakeLink); 2] = [("junction", junction), ("folder link", folder_link)];
             let mut ran = Vec::new();
             for (kind, make) in kinds {
                 let w = World::new();
