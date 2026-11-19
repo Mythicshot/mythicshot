@@ -31,8 +31,6 @@ pub fn over_limit(bytes: u64, limit_gb: u32) -> bool {
 }
 
 /// Whether going from `before` to `after` crossed the limit: under or at it before, over it after.
-// The publish result screen is the caller; until it asks, only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn pushed_over(before: u64, after: u64, limit_gb: u32) -> bool {
     !over_limit(before, limit_gb) && over_limit(after, limit_gb)
 }

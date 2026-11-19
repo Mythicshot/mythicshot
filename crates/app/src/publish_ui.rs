@@ -67,9 +67,11 @@ struct Config {
     saved_for_change: Option<String>,
     /// The setting: an upload keeps its recording on this computer, to be edited later.
     keep_recordings: bool,
+    /// The setting: how many GB the saved recordings may take before a publish says so; 0 for never.
+    warn_gb: u32,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true });
+static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true, warn_gb: 0 });
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -87,6 +89,7 @@ pub fn init(settings: &crate::settings::Settings) {
     set_server(&settings.publish_server);
     config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
     set_keep_recordings(settings.keep_published_recordings);
+    set_warn_gb(settings.saved_recordings_warn_gb);
     project::set_enabled(settings.store_recordings_as_video);
     std::thread::spawn(refresh_token_now);
     std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
@@ -132,6 +135,18 @@ pub fn set_keep_recordings(keep: bool) {
 /// Whether an upload keeps its recording on this computer.
 pub fn keeps_recordings() -> bool {
     config().keep_recordings
+}
+
+/// The setting "warn me when saved recordings take more than": set at start-up and whenever
+/// the settings change. 0 means no warning.
+pub fn set_warn_gb(gb: u32) {
+    config().warn_gb = gb;
+}
+
+/// How many GB the saved recordings may take before a publish that goes past it says so; 0
+/// until the settings are read, and when no limit is set.
+pub fn warn_gb() -> u32 {
+    config().warn_gb
 }
 
 pub fn set_server(server: &str) {
@@ -563,9 +578,11 @@ pub fn publishing_message(images: Option<Images>) -> String {
 /// What became of keeping the recording of an upload on this computer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kept {
-    /// Saved, with what could not be saved with it in words for a sentence ("the cover logo",
-    /// "a pasted picture"); empty when everything was.
-    Saved(Vec<String>),
+    /// Saved. `left_out`: what could not be saved with it, in words for a sentence ("the cover
+    /// logo", "a pasted picture"); empty when everything was. `over`: this save took the saved
+    /// recordings past the limit, with what they take now in bytes and the limit in GB; `None`
+    /// when it did not, also when they were past it before.
+    Saved { left_out: Vec<String>, over: Option<(u64, u32)> },
     /// The setting is off: nothing was saved, and there is nothing to say.
     Off,
     /// Not saved; the reason, as the store words it (lower-case, to follow [`NOT_KEPT`]), or
@@ -639,11 +656,28 @@ pub const UPDATE_NOT_SAVED: &str = "The changes were uploaded, but the recording
 pub fn kept_note(kept: &Kept, update: bool) -> Option<String> {
     match kept {
         Kept::Off => None,
-        Kept::Saved(left_out) if left_out.is_empty() => None,
-        Kept::Saved(left_out) => Some(format!("{KEPT_WITHOUT}{}", listed(left_out))),
+        Kept::Saved { left_out, .. } if left_out.is_empty() => None,
+        Kept::Saved { left_out, .. } => Some(format!("{KEPT_WITHOUT}{}", listed(left_out))),
         Kept::Failed(reason) if reason == project::NOT_PUT_BACK => Some(reason.clone()),
         Kept::Failed(reason) if update => Some(format!("{UPDATE_NOT_SAVED}{reason}")),
         Kept::Failed(reason) => Some(format!("{NOT_KEPT}{reason}")),
+    }
+}
+
+/// What a save that worked says about the limit: `Some` with the new total and the limit only
+/// when this save crossed it. `after` is what the saved recordings take once it is saved and
+/// `added` what this save added, so what they took before is the difference; a total that was
+/// past the limit already, one still within it, and no limit (0) are all `None`.
+pub fn went_over(after: u64, added: u64, limit_gb: u32) -> Option<(u64, u32)> {
+    project::pushed_over(after.saturating_sub(added), after, limit_gb).then_some((after, limit_gb))
+}
+
+/// The result screen's sentence about the limit, when this publish took the saved recordings
+/// past it. Nothing is removed or held back because of it.
+pub fn over_note(kept: &Kept) -> Option<String> {
+    match kept {
+        Kept::Saved { over: Some((bytes, limit_gb)), .. } => Some(project::over_limit_sentence(*bytes, *limit_gb)),
+        Kept::Saved { over: None, .. } | Kept::Off | Kept::Failed(_) => None,
     }
 }
 
@@ -859,6 +893,12 @@ impl ResultDialog {
         kept_note(&self.kept, self.update)
     }
 
+    /// The sentence about the limit, when this publish went past it. An update saves over a
+    /// recording that was there already, so it never has one.
+    fn over_line(&self) -> Option<String> {
+        if self.update { None } else { over_note(&self.kept) }
+    }
+
     fn url(&self) -> Option<&str> {
         result_link(&self.done.outcome, &self.before)
     }
@@ -897,6 +937,11 @@ impl ResultDialog {
             }
             // Not an error of the upload: the tour is on the site either way.
             if let Some(note) = self.kept_line() {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap());
+            }
+            // A line of its own under it: the recording was kept, and nothing is removed.
+            if let Some(note) = self.over_line() {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap());
             }
@@ -1881,7 +1926,7 @@ pub(crate) mod tests {
 
     /// An upload whose recording was kept whole.
     fn done(steps: usize, outcome: Outcome) -> PublishDone {
-        PublishDone { finished: finished(steps, outcome), kept: Kept::Saved(vec![]) }
+        PublishDone { finished: finished(steps, outcome), kept: Kept::Saved { left_out: vec![], over: None } }
     }
 
     fn failed() -> Outcome {
@@ -1993,7 +2038,7 @@ pub(crate) mod tests {
         assert_eq!(take_retry(&mut screen, true), None);
         assert!(screen.as_ref().is_some_and(ResultDialog::can_retry));
         // Free: the screen goes and the retry names the uploaded tour, with what the next screen needs.
-        assert_eq!(take_retry(&mut screen, false), Some(Retry { title: "Demo".into(), before: was.clone(), tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 2, kept: Kept::Saved(vec![]), update: false }));
+        assert_eq!(take_retry(&mut screen, false), Some(Retry { title: "Demo".into(), before: was.clone(), tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 2, kept: Kept::Saved { left_out: vec![], over: None }, update: false }));
         assert!(screen.is_none());
         assert_eq!(take_retry(&mut screen, false), None);
         // What the first screen said about the recording goes along, so the next one says it too.
@@ -2012,7 +2057,7 @@ pub(crate) mod tests {
     fn the_result_screen_says_when_the_recording_could_not_be_kept() {
         let screen = |kept: Kept| ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, Outcome::Public { url: Some(LINK.into()) }), kept });
         // Kept whole, or the switch is off: nothing to say.
-        assert_eq!(screen(Kept::Saved(vec![])).kept_line(), None);
+        assert_eq!(screen(Kept::Saved { left_out: vec![], over: None }).kept_line(), None);
         assert_eq!(screen(Kept::Off).kept_line(), None);
         // Not kept: one sentence with the store's reason after the colon.
         let failed_to_keep = screen(Kept::Failed(project::DISK_FULL.into()));
@@ -2027,12 +2072,12 @@ pub(crate) mod tests {
         // The one reason that is a sentence of its own is shown on its own.
         assert_eq!(screen(Kept::Failed(project::NOT_PUT_BACK.into())).kept_line().as_deref(), Some(project::NOT_PUT_BACK));
         // Kept, but without something: a full sentence that says how many of a kind.
-        let without = screen(Kept::Saved(vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()]));
+        let without = screen(Kept::Saved { left_out: vec!["the cover logo".into(), "a pasted picture".into(), "a pasted picture".into()], over: None });
         assert_eq!(without.kept_line().as_deref(), Some("The recording was saved for later editing, but without the cover logo and 2 pasted pictures."));
-        assert_eq!(screen(Kept::Saved(vec!["a pasted picture".into()])).kept_line().as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
+        assert_eq!(screen(Kept::Saved { left_out: vec!["a pasted picture".into()], over: None }).kept_line().as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
         // Every case draws, with and without a link, and after a publish that failed.
         let ctx = egui::Context::default();
-        for kept in [Kept::Off, Kept::Saved(vec!["the cover logo".into()]), Kept::Failed("the disk is full.".into())] {
+        for kept in [Kept::Off, Kept::Saved { left_out: vec!["the cover logo".into()], over: None }, Kept::Failed("the disk is full.".into())] {
             for outcome in [Outcome::Public { url: Some(LINK.into()) }, Outcome::Draft, failed()] {
                 let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, outcome), kept: kept.clone() });
                 let mut out = None;
@@ -2080,6 +2125,113 @@ pub(crate) mod tests {
         set_keep_recordings(true);
         assert!(keeps_recordings());
         set_keep_recordings(was);
+    }
+
+    // ---- The notice after a publish that went past the limit ----
+
+    const GB: u64 = 1 << 30;
+    const OVER_5: &str = "Saved recordings take 5.4 GB, more than the 5 GB you set. Nothing is removed automatically: remove recordings you no longer need in Preferences.";
+
+    /// A recording kept whole by a publish that took the saved recordings to 5.4 GB with a limit of 5.
+    fn kept_past_the_limit() -> Kept {
+        Kept::Saved { left_out: vec![], over: Some((5_798_205_850, 5)) }
+    }
+
+    #[test]
+    fn the_limit_is_the_settings_until_they_change() {
+        // It leaves the shared setting as it found it.
+        let _alone = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        let was = warn_gb();
+        for gb in [5, 0, 1, 9999] {
+            set_warn_gb(gb);
+            assert_eq!(warn_gb(), gb);
+        }
+        set_warn_gb(was);
+    }
+
+    #[test]
+    fn the_result_screen_says_when_this_publish_went_past_the_limit() {
+        let screen = |kept: Kept, outcome: Outcome| ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, outcome), kept });
+        let public = || Outcome::Public { url: Some(LINK.into()) };
+        // Its own line, and no line about the recording itself: that was kept whole.
+        let over = screen(kept_past_the_limit(), public());
+        assert_eq!((over.over_line().as_deref(), over.kept_line()), (Some(OVER_5), None));
+        // Kept without something and past the limit: two lines, neither changed by the other.
+        let both = screen(Kept::Saved { left_out: vec!["the cover logo".into()], over: Some((5_798_205_850, 5)) }, public());
+        assert_eq!(both.kept_line().as_deref(), Some("The recording was saved for later editing, but without the cover logo."));
+        assert_eq!(both.over_line().as_deref(), Some(OVER_5));
+        // Whatever became of the publish step, the recording was saved all the same; the upload
+        // is reported as it went, and the screen draws with the line on it.
+        let ctx = egui::Context::default();
+        for outcome in [public(), Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled()] {
+            let mut d = screen(kept_past_the_limit(), outcome.clone());
+            assert_eq!(d.over_line().as_deref(), Some(OVER_5), "{outcome:?}");
+            assert_eq!(result_heading(&d.done.outcome, false), result_heading(&outcome, false));
+            assert_eq!(d.can_retry(), matches!(outcome, Outcome::NotPublic { cancelled: false, .. }));
+            let mut out = None;
+            ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx())).textures_delta.clear();
+            assert_eq!(out, None, "{outcome:?}");
+        }
+        // "Try again" publishes only; its result screen says what the first one said.
+        let mut first = Some(screen(kept_past_the_limit(), failed()));
+        let retry = take_retry(&mut first, false).unwrap();
+        assert_eq!(retry.kept, kept_past_the_limit());
+        let again = ResultDialog::new(retry.title, retry.before, PublishDone { finished: finished(2, public()), kept: retry.kept });
+        assert_eq!(again.over_line().as_deref(), Some(OVER_5));
+        // An update saves over a recording that was there already: its screen never has the line.
+        let update = ResultDialog::after_update("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, public()), kept: kept_past_the_limit() });
+        assert_eq!(update.over_line(), None);
+    }
+
+    #[test]
+    fn it_says_nothing_when_the_total_was_already_over_or_is_still_under_or_no_limit_is_set() {
+        const MB: u64 = 1 << 20;
+        // Under or exactly at the limit before, past it now: this publish did it.
+        assert_eq!(went_over(5 * GB + 100 * MB, 172 * MB, 5), Some((5 * GB + 100 * MB, 5)));
+        assert_eq!(went_over(5 * GB + 1, 1, 5), Some((5 * GB + 1, 5)), "exactly at the limit was not past it");
+        assert_eq!(went_over(6 * GB, 6 * GB, 5), Some((6 * GB, 5)), "the first recording alone");
+        assert_eq!(went_over(GB + 1, 2, 1), Some((GB + 1, 1)));
+        // Already past it before this publish: said in Preferences, not here again.
+        assert_eq!(went_over(6 * GB, 172 * MB, 5), None);
+        assert_eq!(went_over(5 * GB + 2, 1, 5), None);
+        // Still within it, also when exactly reaching it.
+        assert_eq!(went_over(2 * GB, 172 * MB, 5), None);
+        assert_eq!(went_over(5 * GB, 172 * MB, 5), None);
+        assert_eq!(went_over(0, 0, 5), None);
+        // No limit: never, whatever the recordings take.
+        for (after, added) in [(0, 0), (6 * GB, 172 * MB), (u64::MAX, 1), (u64::MAX, u64::MAX)] {
+            assert_eq!(went_over(after, added, 0), None);
+        }
+        // A save said to have added more than there is: before it there was nothing, never less.
+        assert_eq!(went_over(6 * GB, u64::MAX, 5), Some((6 * GB, 5)));
+        assert_eq!(went_over(GB, u64::MAX, 5), None);
+        // The largest numbers do not overflow.
+        assert_eq!(went_over(u64::MAX, 1, u32::MAX), None);
+        assert_eq!(went_over(u64::MAX, u64::MAX, u32::MAX), Some((u64::MAX, u32::MAX)));
+        // And a recording that was not saved, or one saved without crossing, has no sentence.
+        for kept in [Kept::Off, Kept::Failed("the disk is full.".into()), Kept::Failed(project::NOT_PUT_BACK.into()), Kept::Saved { left_out: vec![], over: None }, Kept::Saved { left_out: vec!["the cover logo".into()], over: None }] {
+            assert_eq!(over_note(&kept), None, "{kept:?}");
+            let screen = ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, Outcome::Draft), kept });
+            assert_eq!(screen.over_line(), None);
+        }
+    }
+
+    #[test]
+    fn the_sentence_names_the_total_and_the_limit_and_that_nothing_is_removed() {
+        assert_eq!(over_note(&kept_past_the_limit()).as_deref(), Some(OVER_5));
+        // The total as sizes are written everywhere else, and the limit as it was set.
+        assert_eq!(
+            over_note(&Kept::Saved { left_out: vec![], over: Some((1_288_490_189, 1)) }).as_deref(),
+            Some("Saved recordings take 1.2 GB, more than the 1 GB you set. Nothing is removed automatically: remove recordings you no longer need in Preferences.")
+        );
+        // It is the sentence Preferences shows past the limit, word for word.
+        for (bytes, gb) in [(5_798_205_850, 5), (GB + 1, 1), (10_000 * GB, 9999)] {
+            let note = over_note(&Kept::Saved { left_out: vec![], over: Some((bytes, gb)) }).unwrap();
+            assert_eq!(note, project::over_limit_sentence(bytes, gb));
+            assert!(note.contains(&size_text(bytes)) && note.contains(&format!("the {gb} GB you set")) && note.contains("Nothing is removed automatically"), "{note}");
+        }
+        // What the recording was saved without is the other line's business.
+        assert_eq!(over_note(&Kept::Saved { left_out: vec!["a pasted picture".into()], over: Some((5_798_205_850, 5)) }).as_deref(), Some(OVER_5));
     }
 
     #[test]
@@ -2329,7 +2481,7 @@ pub(crate) mod tests {
         let Some(PickerOutcome::Update { title, target, before }) = p.edit_outcome(&shown) else { panic!("the button does not update") };
         assert_eq!(title, "Chapter one", "the chapter's title is the recording's own");
         assert_eq!(target, EditTarget { tour_title: "Onboarding, spring edition".into(), ..edit_target() }, "the same tour and chapter, under the site's title");
-        let done = PublishDone { finished: Finished { tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 14, outcome: Outcome::Public { url: Some(LINK.into()) } }, kept: Kept::Saved(vec![]) };
+        let done = PublishDone { finished: Finished { tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 14, outcome: Outcome::Public { url: Some(LINK.into()) } }, kept: Kept::Saved { left_out: vec![], over: None } };
         let screen = ResultDialog::after_update(target.tour_title.clone(), before.clone(), done.clone());
         assert_eq!(result_line(&screen.title, &screen.done, &screen.before, true), "Onboarding, spring edition · 14 steps · public");
         assert!(draw(&mut p, egui::RawInput::default()).is_none());
@@ -2543,7 +2695,7 @@ pub(crate) mod tests {
         let mut screen = Some(updated(3, failed()));
         assert_eq!(take_retry(&mut screen, true), None, "not while another job runs");
         let retry = take_retry(&mut screen, false).unwrap();
-        assert_eq!(retry, Retry { title: "Customer onboarding".into(), before: was_public(), tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 3, kept: Kept::Saved(vec![]), update: true });
+        assert_eq!(retry, Retry { title: "Customer onboarding".into(), before: was_public(), tour_id: TOUR_ID.into(), chapter_id: CHAPTER_ID.into(), steps: 3, kept: Kept::Saved { left_out: vec![], over: None }, update: true });
         // A retry of a new upload is not one of an update.
         let mut screen = Some(ResultDialog::new("Demo".into(), was_public(), done(2, failed())));
         assert!(!take_retry(&mut screen, false).unwrap().update);
@@ -2599,8 +2751,8 @@ pub(crate) mod tests {
         );
         // The same reason after a first upload keeps its own sentence.
         assert_eq!(kept_note(&failed_save, false).as_deref(), Some("The recording could not be saved on this computer, so it can't be edited later: the project file could not be written."));
-        assert_eq!(kept_note(&Kept::Saved(vec![]), true), None);
-        assert_eq!(kept_note(&Kept::Saved(vec!["a pasted picture".into()]), true).as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
+        assert_eq!(kept_note(&Kept::Saved { left_out: vec![], over: None }, true), None);
+        assert_eq!(kept_note(&Kept::Saved { left_out: vec!["a pasted picture".into()], over: None }, true).as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
         // The screen shows it, whatever became of the publish, and the upload is reported as it went.
         for outcome in [Outcome::Public { url: Some(LINK.into()) }, Outcome::Draft, Outcome::Held, failed()] {
             let screen = ResultDialog::after_update("Demo".into(), was_public(), PublishDone { finished: finished(3, outcome.clone()), kept: failed_save.clone() });

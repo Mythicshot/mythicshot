@@ -803,6 +803,7 @@ impl App {
         self.save_settings();
         publish_ui::set_server(&self.settings.publish_server);
         publish_ui::set_keep_recordings(self.settings.keep_published_recordings);
+        publish_ui::set_warn_gb(self.settings.saved_recordings_warn_gb);
         project::set_enabled(self.settings.store_recordings_as_video);
         self.tray.sync(&self.settings);
         for (w, _) in &self.editors {

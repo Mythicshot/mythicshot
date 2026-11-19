@@ -441,7 +441,7 @@ fn one_real_pass_against_a_local_platform_server() {
     let done = publish_job(&first, TOUR_A, TOUR_A, &typed, ask, &Target::New, true, &keep, &fresh_run(), &|_| {}).unwrap();
     let publish_calls = relay.since(report.mark);
     let Outcome::Public { url: Some(link) } = done.finished.outcome.clone() else { panic!("not public with a link: {done:?}") };
-    assert_eq!((done.finished.steps, &done.kept), (3, &Kept::Saved(vec![])));
+    assert_eq!((done.finished.steps, &done.kept), (3, &Kept::Saved { left_out: vec![], over: None }));
     assert!(link.starts_with(&format!("{server}/t/")), "{link}");
     let slug = link.rsplit('/').next().unwrap().to_string();
     let (tour_a, chapter_a) = (done.finished.tour_id.clone(), done.finished.chapter_id.clone());
@@ -476,7 +476,7 @@ fn one_real_pass_against_a_local_platform_server() {
     assert_eq!(commit_of(&calls).answer.as_ref().unwrap()["publish"], "ready");
     assert_eq!(done.finished.outcome, Outcome::Public { url: Some(link.clone()) }, "the same link");
     assert_eq!((publish_ui::result_heading(&done.finished.outcome, true), publish_ui::result_status(&done.finished, &before, true).as_str()), ("Tour updated", "Tour updated: 2 steps"));
-    assert_eq!(done.kept, Kept::Saved(vec![]));
+    assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
     let live = page(&site, &slug);
     assert_eq!(live.seen(), (200, TOUR_A, vec![2], vec![EDITED, FIRST[2]]));
     pictures_are_served(&site, &live);
@@ -506,7 +506,7 @@ fn one_real_pass_against_a_local_platform_server() {
     // 5. A second chapter, uploaded as a private draft into the same tour.
     let second = recording(tmp.path(), "rec-b", SECOND);
     let done = publish_job(&second, CHAPTER_B, TOUR_A, &typed, ask, &Target::Chapter(tour_a.clone()), false, &keep, &fresh_run(), &|_| {}).unwrap();
-    assert_eq!((done.finished.tour_id.as_str(), done.finished.steps, &done.finished.outcome, &done.kept), (tour_a.as_str(), 3, &Outcome::Draft, &Kept::Saved(vec![])));
+    assert_eq!((done.finished.tour_id.as_str(), done.finished.steps, &done.finished.outcome, &done.kept), (tour_a.as_str(), 3, &Outcome::Draft, &Kept::Saved { left_out: vec![], over: None }));
     let chapter_b = done.finished.chapter_id.clone();
     assert_ne!(chapter_b, chapter_a);
     let row = listed(&typed, &token, &tour_a).unwrap();
@@ -534,7 +534,7 @@ fn one_real_pass_against_a_local_platform_server() {
     assert_eq!(publish_ui::result_note(&done.finished.outcome, &before, true), Some((publish_ui::UPDATE_HELD.to_string(), false)));
     assert_eq!(publish_ui::result_link(&done.finished.outcome, &before), Some(link.as_str()));
     assert_eq!(page(&site, &slug).seen(), live.seen(), "the public page still shows the previous version");
-    assert_eq!(done.kept, Kept::Saved(vec![]));
+    assert_eq!(done.kept, Kept::Saved { left_out: vec![], over: None });
     drop((state, loaded));
     let again = store.load(&key_a).unwrap();
     assert_eq!((card_body(&state_from(&again), 1), again.restored.items.len()), (EDITED_AGAIN, 1), "the project is rewritten");
@@ -576,7 +576,7 @@ fn one_real_pass_against_a_local_platform_server() {
     // 9. A tour that is a draft stays one through an update.
     let third = recording(tmp.path(), "rec-c", DRAFT);
     let done = publish_job(&third, TOUR_C, TOUR_C, &typed, ask, &Target::New, false, &keep, &fresh_run(), &|_| {}).unwrap();
-    assert_eq!((&done.finished.outcome, &done.kept), (&Outcome::Draft, &Kept::Saved(vec![])));
+    assert_eq!((&done.finished.outcome, &done.kept), (&Outcome::Draft, &Kept::Saved { left_out: vec![], over: None }));
     let (tour_c, chapter_c) = (done.finished.tour_id.clone(), done.finished.chapter_id.clone());
     let key_c = ProjectKey { server: server.clone(), tour_id: tour_c.clone(), chapter_id: chapter_c.clone() };
     let slug_c = slug_of(&site, &token, &tour_c);
