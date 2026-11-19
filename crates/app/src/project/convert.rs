@@ -12,6 +12,7 @@
 //! touches a project.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,32 @@ pub const AFTER_SAVE: Duration = Duration::from_secs(10);
 pub const AFTER_CANCEL: Duration = Duration::from_secs(5 * 60);
 /// After this many failures of the codec itself in a row the queue stops until the next start.
 const CODEC_FAILURES: u32 = 3;
+
+/// How the room left on a folder's disk is read: the bytes free there, or None when that
+/// cannot be told.
+type Free<'a> = &'a (dyn Fn(&Path) -> Option<u64> + Sync);
+
+/// The room left for this user on the disk `folder` is on. None when the folder is not
+/// there, the system does not say, or on a system this is not written for.
+#[cfg(windows)]
+fn free_bytes(folder: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let name: Vec<u16> = folder.as_os_str().encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return None;
+    }
+    let name: Vec<u16> = name.into_iter().chain([0]).collect();
+    let mut free = 0u64;
+    // SAFETY: `name` is a wide string that ends in a zero and outlives the call, and `free`
+    // is a u64 of this function's own that the call writes once.
+    unsafe { GetDiskFreeSpaceExW(windows::core::PCWSTR(name.as_ptr()), Some(&mut free), None, None) }.ok().map(|()| free)
+}
+
+#[cfg(not(windows))]
+fn free_bytes(_: &Path) -> Option<u64> {
+    None
+}
 
 /// What Preferences says about ffmpeg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +101,9 @@ pub enum Outcome {
     GaveUp,
     /// The work was told to stop. Nothing was changed or noted.
     Cancelled,
-    /// Nothing was changed or noted, and the project is tried again later: no room, a time
-    /// bound, a file in use, or a project that changed meanwhile.
+    /// Nothing was changed or noted, and the project is tried again later: no room (the disk
+    /// was full, or the codec failed while the disk had less room left than the frames take),
+    /// a time bound, a file in use, or a project that changed meanwhile.
     Later,
 }
 
@@ -216,10 +244,16 @@ impl Gate {
         self.state().nudged = false;
     }
 
-    /// Notes that a conversion is under way until the answer is dropped.
-    fn converting(&self) -> Busy<'_> {
-        self.change(|s| s.converting = true);
-        Busy(self)
+    /// Notes that a conversion is under way until the answer is dropped; None, and nothing
+    /// noted, when none may run. Asked and noted in one step, so that [`Gate::shutdown`]
+    /// either sees the conversion and waits for it, or the conversion never starts.
+    fn converting(&self) -> Option<Busy<'_>> {
+        let mut s = self.state();
+        if !s.may_run() {
+            return None;
+        }
+        s.converting = true;
+        Some(Busy(self))
     }
 
     #[cfg(test)]
@@ -297,26 +331,38 @@ pub fn start(store: Option<&Store>, found: Option<&Ffmpeg>, gate: &Gate) {
 ///
 /// One project at a time, the one saved longest ago first. The first look is `start_after`
 /// into the run; after that the queue rests until it is nudged (a save, the end of a recording
-/// session, the switch turned on) and looks `after_save` later. A conversion that was stopped
-/// or has to wait (no room, a time bound) is tried again after the next nudge. One that gave
-/// way to an editor or a save is looked for again every `after_cancel` as well, until a
+/// session, the switch turned on) and looks `after_save` later. A conversion that has to wait
+/// (no room, a time bound) or gave way to an editor or a save is tried again after the next
+/// nudge, and the queue goes on with the next oldest meanwhile; one the gate stopped ends the
+/// pass. A project that gave way is looked for again every `after_cancel` as well, until its
 /// conversion has ended in some other way: an editor closed without saving nudges nobody.
+/// A conversion that panics gives its project up for this run, and the queue lives on.
 ///
 /// A project this run gave up on (see [`Outcome::GaveUp`]) is not tried again in this run, and
 /// the queue goes on with the next oldest. A failure of the codec itself gives its project up
 /// too; [`CODEC_FAILURES`] of them in a row, on whatever projects, end the queue.
 pub fn run(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate) {
+    run_with(store, codec, gate, &free_bytes);
+}
+
+/// [`run`] with the read of the room left on the disk handed in.
+fn run_with(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate, free: Free<'_>) {
     let Some(codec) = codec else { return };
     let mut failures = 0;
     // By the time of saving too: a project that is saved again is another recording.
     let mut given_up: HashSet<(ProjectKey, i64)> = HashSet::new();
-    // A conversion gave way to an editor or a save, and none has ended otherwise since.
-    let mut displaced = false;
+    // Not tried again before the queue has rested: the ones that have to wait, and the ones
+    // that gave way to an editor or a save.
+    let mut not_now: HashSet<(ProjectKey, i64)> = HashSet::new();
+    // The projects whose conversion gave way and has not ended in another way since: while
+    // there is one, the queue looks again without a nudge.
+    let mut gave_way: HashSet<ProjectKey> = HashSet::new();
     let mut pause = gate.start_after;
     loop {
         if !gate.rest(pause) {
             return;
         }
+        not_now.clear();
         loop {
             match gate.wait_allowed() {
                 None => return,
@@ -326,16 +372,30 @@ pub fn run(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate) {
                 Some(false) => {}
             }
             gate.looking();
-            let Some(candidate) = store.next_candidate_but(codec.id(), gate.min_bytes, &|key, saved_at| given_up.contains(&(key.clone(), saved_at))) else { break };
-            let end = {
-                let _busy = gate.converting();
-                convert(store, codec, &candidate, &TOLERANCE, &|| gate.allowed())
+            let skip = |key: &ProjectKey, saved_at: i64| {
+                let project = (key.clone(), saved_at);
+                given_up.contains(&project) || not_now.contains(&project)
             };
-            displaced = end == End::Displaced;
+            let Some(candidate) = store.next_candidate_but(codec.id(), gate.min_bytes, &skip) else { break };
+            let end = {
+                // Not noted when the gate has closed meanwhile: a quit must not wait for a
+                // conversion that will not start.
+                let Some(_busy) = gate.converting() else { continue };
+                let work = std::panic::AssertUnwindSafe(|| convert(store, codec, &candidate, &TOLERANCE, free, &|| gate.allowed()));
+                // A panic has let go of the project and removed the conversion's folder on its way out.
+                std::panic::catch_unwind(work).unwrap_or_else(|_| {
+                    say("Saved recordings: storing a recording as video broke off because of an internal error; it is not tried again until Mythicshot starts again.".to_string());
+                    End::NotThisRun
+                })
+            };
+            let project = (candidate.key, candidate.saved_at);
+            if end != End::Displaced {
+                gave_way.remove(&project.0);
+            }
             match end {
                 End::Swapped { .. } | End::Marked(_) => failures = 0,
                 End::CodecFailed => {
-                    given_up.insert((candidate.key, candidate.saved_at));
+                    given_up.insert(project);
                     failures += 1;
                     if failures >= CODEC_FAILURES {
                         say(format!("Saved recordings: ffmpeg failed {failures} times in a row, so no more recordings are stored as video until Mythicshot starts again."));
@@ -343,12 +403,21 @@ pub fn run(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate) {
                     }
                 }
                 End::NotThisRun => {
-                    given_up.insert((candidate.key, candidate.saved_at));
+                    given_up.insert(project);
                 }
-                End::Cancelled | End::Displaced | End::Later => break,
+                // The gate closed: nothing else may run either.
+                End::Cancelled => break,
+                // The others need not wait for this one.
+                End::Displaced => {
+                    gave_way.insert(project.0.clone());
+                    not_now.insert(project);
+                }
+                End::Later => {
+                    not_now.insert(project);
+                }
             }
         }
-        pause = match gate.wait_nudge(displaced.then_some(gate.after_cancel)) {
+        pause = match gate.wait_nudge((!gave_way.is_empty()).then_some(gate.after_cancel)) {
             None => return,
             Some(true) => gate.after_save,
             // The rest after a conversion gave way is over: look at once.
@@ -369,12 +438,12 @@ pub fn run(store: &Store, codec: Option<&dyn VideoCodec>, gate: &Gate) {
 // The queue itself asks `convert`, which also tells the two kinds of giving up apart.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn convert_one(store: &Store, codec: &dyn VideoCodec, candidate: &Candidate, keep_going: &dyn Fn() -> bool) -> Outcome {
-    convert(store, codec, candidate, &TOLERANCE, keep_going).outcome()
+    convert(store, codec, candidate, &TOLERANCE, &free_bytes, keep_going).outcome()
 }
 
 #[cfg(test)]
 fn convert_with(store: &Store, codec: &dyn VideoCodec, candidate: &Candidate, tol: &Tolerance, keep_going: &dyn Fn() -> bool) -> Outcome {
-    convert(store, codec, candidate, tol, keep_going).outcome()
+    convert(store, codec, candidate, tol, &free_bytes, keep_going).outcome()
 }
 
 /// [`Outcome`], with the two kinds of [`Outcome::GaveUp`] told apart for the queue.
@@ -406,7 +475,7 @@ impl End {
     }
 }
 
-fn convert(store: &Store, codec: &dyn VideoCodec, c: &Candidate, tol: &Tolerance, keep_going: &dyn Fn() -> bool) -> End {
+fn convert(store: &Store, codec: &dyn VideoCodec, c: &Candidate, tol: &Tolerance, free: Free<'_>, keep_going: &dyn Fn() -> bool) -> End {
     let before = c.frames_bytes;
     let Some(conv) = store.begin_conversion(c) else {
         say("Saved recordings: a recording could not be started on now (it changed, is open, or another is being stored); it is tried again later.".to_string());
@@ -465,8 +534,13 @@ fn convert(store: &Store, codec: &dyn VideoCodec, c: &Candidate, tol: &Tolerance
                 CodecError::TimedOut { bound: Bound::Stall } => ("ffmpeg was stopped at its stall bound".to_string(), End::Later),
                 CodecError::TimedOut { bound: Bound::Total } => ("ffmpeg was stopped at its total bound".to_string(), End::Later),
                 CodecError::TooLarge => ("the video grew past its bound".to_string(), End::Later),
-                CodecError::Failed { exit: Some(code) } => (format!("ffmpeg ended with exit code {code}"), End::CodecFailed),
-                CodecError::Failed { exit: None } => ("ffmpeg could not do the work and gave no exit code".to_string(), End::CodecFailed),
+                CodecError::Failed { exit } => {
+                    let how = exit.map_or("ffmpeg could not do the work and gave no exit code".to_string(), |code| format!("ffmpeg ended with exit code {code}"));
+                    // The program ends like this when the disk fills, too. A video never needs
+                    // more room than the frames it is made of: with less than that left, the
+                    // disk is taken for the reason. When the room cannot be told, the program is.
+                    if free(store.root()).is_some_and(|room| room < before) { (format!("{how}, and the disk has less room than the recording takes"), End::Later) } else { (how, End::CodecFailed) }
+                }
                 CodecError::WrongFrames { got } => (format!("ffmpeg handled {got} frames"), End::CodecFailed),
                 // The text is the caller's and can hold anything: never logged.
                 CodecError::Caller(_) => ("the frames could not be handed over".to_string(), End::CodecFailed),
@@ -536,13 +610,74 @@ mod tests {
             return test();
         }
         let path = format!("{}::{name}", module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest));
-        let out = std::process::Command::new(std::env::current_exe().unwrap()).args([path.as_str(), "--exact", "--nocapture", "--test-threads=1"]).env(ALONE, "1").output().unwrap();
-        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([path.as_str(), "--exact", "--nocapture", "--test-threads=1"]).env(ALONE, "1");
+        let (status, stdout, stderr) = within(cmd, ALONE_AT_MOST).unwrap_or_else(|(stdout, stderr)| panic!("{path} on its own did not end within {ALONE_AT_MOST:?} and was stopped:\n{stdout}\n{stderr}"));
         // What a test that could not run said, wherever on its line the test runner put it.
         for said in stdout.lines().filter_map(|line| line.find("skipped:").map(|at| &line[at..])) {
             println!("{said}");
         }
-        assert!(out.status.success() && stdout.contains("1 passed"), "{path} on its own:\n{stdout}\n{stderr}");
+        assert!(status.success() && stdout.contains("1 passed"), "{path} on its own:\n{stdout}\n{stderr}");
+    }
+
+    /// The longest one test may take in its own process before it is stopped and has failed.
+    const ALONE_AT_MOST: Duration = Duration::from_secs(120);
+
+    /// Run `cmd` to its end and answer how it ended and what it printed; when it has not
+    /// ended within `at_most`, stop it and answer only what it printed until then.
+    fn within(mut cmd: std::process::Command, at_most: Duration) -> Result<(std::process::ExitStatus, String, String), (String, String)> {
+        use std::io::Read;
+        use std::process::Stdio;
+        let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // Read on threads of their own, so that a child that prints much never waits for this one.
+        let read = |mut from: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let _ = from.read_to_end(&mut text);
+                String::from_utf8_lossy(&text).to_string()
+            })
+        };
+        let (out, err) = (read(Box::new(child.stdout.take().unwrap())), read(Box::new(child.stderr.take().unwrap())));
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status),
+                None if started.elapsed() >= at_most => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
+        status.map(|status| (status, stdout.clone(), stderr.clone())).ok_or((stdout, stderr))
+    }
+
+    #[test]
+    fn a_test_on_its_own_that_hangs_is_stopped_and_has_failed() {
+        // This test binary, asked for a test there is none of, ends at once and well.
+        let mut quick = std::process::Command::new(std::env::current_exe().unwrap());
+        quick.args(["no test has this name", "--exact"]);
+        let (status, stdout, _) = within(quick, LONG).expect("it ended in time");
+        assert!(status.success() && stdout.contains("0 passed"), "{stdout}");
+        // And asked for the stand-in below, which never ends, is stopped.
+        let mut hangs = std::process::Command::new(std::env::current_exe().unwrap());
+        hangs.args([format!("{}::hang", module_path!().split_once("::").unwrap().1).as_str(), "--exact", "--ignored", "--nocapture"]).env(ALONE, "hang");
+        let started = Instant::now();
+        let (stdout, _) = within(hangs, Duration::from_millis(1500)).expect_err("it was stopped");
+        assert!(started.elapsed() < LONG / 2 && stdout.contains("running 1 test"), "{stdout}");
+    }
+
+    /// The stand-in for a test that hangs. Does nothing unless the test above asks for it.
+    #[test]
+    #[ignore = "a stand-in another test runs"]
+    fn hang() {
+        if std::env::var_os(ALONE).is_some_and(|how| how == "hang") {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
     }
 
     // ---- A store, and a codec that does what it is told ----
@@ -761,6 +896,10 @@ mod tests {
 
     /// The queue on a thread of its own for as long as `test` runs; then it is told to quit.
     fn queue(w: &World, codec: &dyn VideoCodec, gate: &Gate, test: impl FnOnce()) {
+        queue_with(w, codec, gate, &free_bytes, test);
+    }
+
+    fn queue_with(w: &World, codec: &dyn VideoCodec, gate: &Gate, free: Free<'_>, test: impl FnOnce()) {
         struct Quit<'a>(&'a Gate);
         impl Drop for Quit<'_> {
             fn drop(&mut self) {
@@ -769,7 +908,7 @@ mod tests {
         }
         std::thread::scope(|scope| {
             let _quit = Quit(gate);
-            scope.spawn(|| run(&w.store, Some(codec), gate));
+            scope.spawn(|| run_with(&w.store, Some(codec), gate, free));
             test();
         });
     }
@@ -902,7 +1041,192 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_codec_that_fails_when_the_disk_has_no_room_for_the_recording_is_tried_again_later() {
+        alone("a_codec_that_fails_when_the_disk_has_no_room_for_the_recording_is_tried_again_later", || {
+            let w = World::new();
+            let saved = w.save(CH_A);
+            let whole = files(&saved.dir);
+            let c = w.next().unwrap();
+            let asked = Mutex::new(Vec::new());
+            let ended = |why: fn() -> CodecError, room: Option<u64>| {
+                let free = |folder: &Path| {
+                    asked.lock().unwrap().push(folder.to_path_buf());
+                    room
+                };
+                convert(&w.store, &Fake::that(How::Fails(why)), &c, &TOLERANCE, &free, &go).outcome()
+            };
+            // Less room than the frames take: the program most likely failed for that. A video
+            // never needs more than the frames, so with that much room it failed by itself.
+            for why in [exit_1 as fn() -> CodecError, no_exit] {
+                assert_eq!(ended(why, Some(c.frames_bytes - 1)), Outcome::Later);
+                assert_eq!(ended(why, Some(0)), Outcome::Later);
+                assert_eq!(ended(why, Some(c.frames_bytes)), Outcome::GaveUp);
+                // The room cannot be told: as a failure of the program.
+                assert_eq!(ended(why, None), Outcome::GaveUp);
+            }
+            // It is the room of the projects folder that is asked for, and only after such a failure.
+            assert!(asked.lock().unwrap().iter().all(|folder| folder == w.store.root()) && asked.lock().unwrap().len() == 8);
+            assert_eq!(ended(caller, Some(0)), Outcome::GaveUp);
+            assert_eq!(ended(stalled, Some(0)), Outcome::Later);
+            assert_eq!(asked.lock().unwrap().len(), 8);
+            assert_eq!((files(&saved.dir) == whole, w.info(CH_A).convert, w.converting_folders()), (true, ConvertState::NotTried, 0));
+            let lines = lines_without_names(&w);
+            assert!(lines.iter().any(|line| line.contains("exit code 1") && line.contains("room") && line.ends_with("tried again later.")), "{lines:#?}");
+
+            // The real read: this disk has room for a few kilobytes, so the failure is the program's.
+            if cfg!(windows) {
+                let room = free_bytes(w.store.root()).expect("the room on the disk of the temporary folder can be read");
+                assert!(room > c.frames_bytes, "{room}");
+                assert_eq!(free_bytes(&w.store.root().join("no such folder")), None);
+            }
+            assert_eq!(convert_one(&w.store, &Fake::that(How::Fails(exit_1)), &c, &go), Outcome::GaveUp);
+
+            // In the queue: neither counted nor given up. Every project is tried once in a
+            // pass, the oldest does not hold the others back, and a nudge tries all three again.
+            let w = World::new();
+            let dirs = [CH_A, CH_B, CH_C].map(|chapter| w.save(chapter).dir);
+            let (fake, gate) = (Fake::that(How::Fails(exit_1)), open_gate());
+            queue_with(&w, &fake, &gate, &|_| Some(0), || {
+                until("the queue to have tried all three", || fake.encodes() == 3 && gate.parked());
+                gate.nudge();
+                until("the queue to have tried all three again", || fake.encodes() == 6 && gate.parked());
+                assert_eq!(*fake.tried.lock().unwrap(), [&dirs[..], &dirs[..]].concat());
+            });
+        });
+    }
+
     // ---- The queue ----
+
+    #[test]
+    fn the_switch_turned_off_stops_a_conversion_and_turned_on_again_starts_it_again() {
+        alone("the_switch_turned_off_stops_a_conversion_and_turned_on_again_starts_it_again", || {
+            let w = World::new();
+            let saved = w.save(CH_A);
+            let whole = files(&saved.dir);
+            let gate = open_gate();
+            let met = AtomicBool::new(false);
+            let fake = Fake::during(|i| {
+                if i == 2 && !met.swap(true, Ordering::SeqCst) {
+                    gate.set_enabled(false);
+                }
+            });
+            queue(&w, &fake, &gate, || {
+                until("the conversion to be stopped by the switch", || fake.encodes() == 1 && gate.parked());
+                assert_eq!((files(&saved.dir) == whole, w.converting_folders(), converting_now(), w.info(CH_A).convert), (true, 0, None, ConvertState::NotTried));
+                // Nothing but the switch wakes the queue here: no save, no session.
+                gate.set_enabled(true);
+                until("the recording to be stored as video", || w.info(CH_A).form == Form::Video);
+                assert_eq!(fake.encodes(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn a_save_over_a_project_whose_frames_the_queue_is_reading_goes_through() {
+        alone("a_save_over_a_project_whose_frames_the_queue_is_reading_goes_through", || {
+            let w = World::new();
+            let saved = w.save(CH_A);
+            // The conversion stands at its third frame, its frames file open, until the save is on its way.
+            let (reached, saving, once) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
+            let fake = Fake::during(|i| {
+                if i == 2 && !once.swap(true, Ordering::SeqCst) {
+                    reached.store(true, Ordering::SeqCst);
+                    until("the save", || saving.load(Ordering::SeqCst));
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            });
+            let gate = open_gate();
+            queue(&w, &fake, &gate, || {
+                until("the conversion to be under way", || reached.load(Ordering::SeqCst));
+                assert_eq!(converting_now(), Some(saved.dir.clone()));
+                // Another recording for the same chapter, saved from this thread: the whole project is replaced.
+                let dir = w.tmp.path().join("recorded again");
+                std::fs::create_dir_all(&dir).unwrap();
+                let rec = Recording::synthetic_in(&dir, 64, 48, &[0, 100, 200, 300, 400], 500).unwrap();
+                saving.store(true, Ordering::SeqCst);
+                let again = w.save_recording(CH_A, &rec);
+                assert_eq!((again.form, again.problem, again.dir.clone()), (Form::Frames, None, saved.dir.clone()));
+                assert_eq!(Recording::open_saved(&saved.dir).unwrap().frames.len(), 5, "the project is the one just saved");
+                until("the conversion to have let go", || converting_now().is_none());
+                // What a publish does after it kept its recording: the new one is converted.
+                gate.nudge();
+                until("the new recording to be stored as video", || w.info(CH_A).form == Form::Video);
+                let loaded = open(&w, CH_A, &fake, "edit");
+                assert_eq!(pictures(&loaded.rec), pictures(&rec));
+            });
+            assert_eq!((fake.encodes(), w.converting_folders(), w.store.list().len()), (2, 0, 1));
+        });
+    }
+
+    #[test]
+    fn a_conversion_that_breaks_off_gives_its_project_up_and_the_queue_lives_on() {
+        alone("a_conversion_that_breaks_off_gives_its_project_up_and_the_queue_lives_on", || {
+            let w = World::new();
+            let (old, young) = (w.save(CH_B), w.save(CH_A));
+            let whole = files(&old.dir);
+            let fake = Fake::during(|i| {
+                if i == 1 && converting_now().as_ref() == Some(&old.dir) {
+                    panic!("the codec of the tests broke off, as this test asks it to");
+                }
+            });
+            let gate = open_gate();
+            queue(&w, &fake, &gate, || {
+                until("the younger recording to be stored as video", || w.info(CH_A).form == Form::Video && gate.parked());
+                gate.nudge();
+                std::thread::sleep(Duration::from_millis(30));
+                until("the queue to rest", || gate.parked());
+                assert_eq!(*fake.tried.lock().unwrap(), [old.dir.clone(), young.dir.clone()]);
+                // A quit does not wait for a conversion that is long over.
+                let started = Instant::now();
+                gate.shutdown(LONG);
+                assert!(started.elapsed() < LONG / 2);
+            });
+            assert_eq!((files(&old.dir) == whole, w.info(CH_B).convert, w.converting_folders(), converting_now()), (true, ConvertState::NotTried, 0, None));
+            let lines = lines_without_names(&w);
+            assert!(lines.iter().any(|line| line.contains("internal error")), "{lines:#?}");
+        });
+    }
+
+    #[test]
+    fn a_younger_project_is_not_held_back_by_an_older_one_that_has_to_wait() {
+        alone("a_younger_project_is_not_held_back_by_an_older_one_that_has_to_wait", || {
+            let w = World::new();
+            let (old, young) = (w.save(CH_B), w.save(CH_A));
+            // The first encode of every pass meets a full disk; the others work.
+            let fake = Fake::that(How::FailsWhen(|nth| nth == 0, no_room));
+            let gate = open_gate();
+            queue(&w, &fake, &gate, || {
+                until("the younger recording to be stored as video", || w.info(CH_A).form == Form::Video && gate.parked());
+                assert_eq!((w.info(CH_B).form, w.info(CH_B).convert), (Form::Frames, ConvertState::NotTried));
+                assert_eq!(*fake.tried.lock().unwrap(), [old.dir.clone(), young.dir.clone()]);
+                // The next nudge tries the older one again.
+                gate.nudge();
+                until("the older recording to be stored as video", || w.info(CH_B).form == Form::Video);
+            });
+            assert_eq!(fake.encodes(), 3);
+        });
+    }
+
+    #[test]
+    fn while_an_editor_has_one_project_the_others_are_converted() {
+        alone("while_an_editor_has_one_project_the_others_are_converted", || {
+            let w = World::new();
+            let (old, young) = (w.save(CH_B), w.save(CH_A));
+            let (opened, once): (Mutex<Option<Loaded>>, AtomicBool) = (Mutex::new(None), AtomicBool::new(false));
+            let fake = Fake::during(|i| {
+                if i == 1 && !once.swap(true, Ordering::SeqCst) {
+                    *opened.lock().unwrap() = Some(w.store.load(&key(CH_B)).unwrap_or_else(|e| panic!("{e:?}")));
+                }
+            });
+            let gate = open_gate();
+            queue(&w, &fake, &gate, || {
+                until("the younger recording to be stored as video", || w.info(CH_A).form == Form::Video && gate.parked());
+                assert_eq!(*fake.tried.lock().unwrap(), [old.dir.clone(), young.dir.clone()]);
+                assert_eq!(w.info(CH_B).form, Form::Frames);
+            });
+        });
+    }
 
     #[test]
     fn with_the_switch_off_or_without_a_codec_nothing_is_converted() {
@@ -1388,6 +1712,27 @@ mod tests {
         assert_eq!((MIN_BYTES, START_AFTER, AFTER_SAVE), (8 * 1024 * 1024, Duration::from_secs(60), Duration::from_secs(10)));
         assert_eq!((gate().start_after, gate().after_save, gate().after_cancel, gate().min_bytes), (START_AFTER, AFTER_SAVE, AFTER_CANCEL, MIN_BYTES));
         assert_eq!(AFTER_CANCEL, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_conversion_is_noted_as_under_way_only_while_the_gate_lets_one_run() {
+        let under_way = |gate: &Gate| gate.state().converting;
+        let gate = Gate::new(Duration::ZERO, Duration::ZERO, NEVER, 0);
+        // The switch is off, a session runs, the app is closing: none is noted, so a quit waits for nothing.
+        assert!(gate.converting().is_none() && !under_way(&gate));
+        gate.set_enabled(true);
+        gate.set_recording(true);
+        assert!(gate.converting().is_none() && !under_way(&gate));
+        gate.set_recording(false);
+        let busy = gate.converting().expect("the gate lets one run");
+        assert!(under_way(&gate));
+        drop(busy);
+        assert!(!under_way(&gate));
+        gate.shutdown(Duration::ZERO);
+        assert!(gate.converting().is_none() && !under_way(&gate));
+        let started = Instant::now();
+        gate.shutdown(LONG);
+        assert!(started.elapsed() < LONG / 2);
     }
 
     #[test]

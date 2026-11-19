@@ -463,6 +463,11 @@ impl App {
             }
             BarAction::Restart => {
                 if let Some(Err(e)) = self.session.as_mut().map(|s| s.restart()) {
+                    // The session is over. Left in place it would wait in its countdown and start
+                    // the recorder on a later tick, after everything was told that no session runs.
+                    if let Some(s) = self.session.take() {
+                        s.discard();
+                    }
                     self.end_session(ctx);
                     self.notify(e);
                 }
