@@ -16,7 +16,7 @@ pub use usage::{LIMIT_MAX_GB, form_text, over_limit, over_limit_sentence, parse_
 // The form a recording is kept in and how storing it as video went, and what the conversion
 // queue and the pages that show it ask the store; nothing outside this module asks yet.
 #[allow(unused_imports)]
-pub use store::{ConvertState, Form, MARK_FAILED, MARK_NOT_SMALLER, set_current_codec};
+pub use store::{Candidate, ConvertState, Converting, Expand, Form, LOAD_CANCELLED, LOAD_NEEDS_FFMPEG, LOAD_NO_ROOM, LOAD_VIDEO_DAMAGED, MARK_FAILED, MARK_NOT_SMALLER, cancel_conversion_of, converting_now, set_current_codec};
 // What removing one saved recording answers; nothing outside this module asks for one yet.
 #[allow(unused_imports)]
 pub use store::Removed;

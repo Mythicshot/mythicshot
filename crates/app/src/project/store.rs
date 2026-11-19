@@ -4141,7 +4141,11 @@ mod tests {
             std::fs::write(too_high.join(VIDEO_FILE), VIDEO).unwrap();
             let a_folder_named_so = root.join(site_of(SITE_A)).join("tour_5").join(CH_1);
             std::fs::create_dir_all(a_folder_named_so.join(VIDEO_FILE)).unwrap();
-            let kept: Vec<PathBuf> = vec![with_a_note, with_frames, with_a_folder, misnamed, too_high, a_folder_named_so, w.dir(&key(SITE_B, TOUR_2, CH_2))];
+            // One file only, and it is not a video: somebody's note, and a frames file without its project.
+            let (only_a_note, only_frames) = (folder("tour_6", CH_1), folder("tour_7", CH_1));
+            std::fs::rename(only_a_note.join(VIDEO_FILE), only_a_note.join("notes.txt")).unwrap();
+            std::fs::rename(only_frames.join(VIDEO_FILE), only_frames.join(FRAMES_FILE)).unwrap();
+            let kept: Vec<PathBuf> = vec![with_a_note, with_frames, with_a_folder, misnamed, too_high, a_folder_named_so, only_a_note, only_frames, w.dir(&key(SITE_B, TOUR_2, CH_2))];
             let before: Vec<_> = kept.iter().map(|d| tree(d)).collect();
             let epoch = changes(&w.store);
 
