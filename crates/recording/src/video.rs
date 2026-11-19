@@ -2,9 +2,10 @@
 //!
 //! [`Recording::archive_video`] feeds every frame to a [`VideoCodec`], one at a time, and then
 //! reads the video back and walks the recording again in step: the video must hold exactly as
-//! many pictures as the recording has frames, and the sampled pictures must be the frames they
-//! stand for, within a [`Tolerance`]. Only then is the video left at its place; on any failure
-//! or a cancel nothing is left there. Nothing else is ever written.
+//! many pictures as the recording has frames, and every picture must be the frame it stands
+//! for, within a [`Tolerance`]. Only then is the video synced to the disk and left at its
+//! place; on any failure, a cancel or a panic nothing is left there. Nothing else is ever
+//! written.
 //!
 //! The measures are pure functions of two RGBA pictures: the PSNR of the whole frame over red,
 //! green and blue, the PSNR of the worst block (a frame measure alone hides one broken block),
@@ -15,7 +16,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::ffmpeg::{CodecError, GOP, VideoCodec};
+use crate::ffmpeg::{CodecError, VideoCodec};
 use crate::{FRAMES_FILE, Recording, xor_into};
 
 /// What a video must keep of the recording to replace its frames.
@@ -48,9 +49,6 @@ pub struct Tolerance {
 /// `measure_a_real_recording` on the owner's recording.
 pub const TOLERANCE: Tolerance = Tolerance { frame_db: 40.0, block_db: 30.0, block: 64, mean_shift: 1.5, smaller_by: 0.20 };
 
-/// A recording of up to this many frames is checked whole.
-const CHECK_ALL_UP_TO: usize = 600;
-
 /// Which pass of [`Recording::archive_video`] is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -63,7 +61,7 @@ pub enum Stage {
 pub struct Archived {
     /// The size of the video file.
     pub bytes: u64,
-    /// How many frames were compared with their pictures.
+    /// How many frames were compared with their pictures: every one of the recording.
     pub checked: usize,
     /// The lowest frame PSNR among them, in dB; infinite when every one came back exactly.
     pub worst_frame_db: f64,
@@ -153,22 +151,6 @@ pub fn mean_shift(a: &[u8], b: &[u8]) -> [f64; 3] {
     sums.map(|sum| sum as f64 / (a.len() / 4) as f64)
 }
 
-/// Which frames of a recording of `frames` frames are compared with their pictures, in
-/// order: every frame of a short recording; of a long one the first, the last, the last of
-/// every group of pictures (where drift is largest) and every frame in `must` that exists.
-pub fn sample(frames: usize, must: &[usize]) -> Vec<usize> {
-    if frames <= CHECK_ALL_UP_TO {
-        return (0..frames).collect();
-    }
-    let group = GOP as usize;
-    let mut picked: Vec<usize> = (group - 1..frames).step_by(group).collect();
-    picked.extend([0, frames - 1]);
-    picked.extend(must.iter().copied().filter(|i| *i < frames));
-    picked.sort_unstable();
-    picked.dedup();
-    picked
-}
-
 /// The most a video of a recording whose frames take `lossless` bytes may take.
 fn allowed_bytes(lossless: u64, smaller_by: f64) -> u64 {
     // A float that is not a number, or a part of more than the whole, leaves nothing; the
@@ -223,15 +205,17 @@ fn measure(a: &[u8], b: &[u8], width: u32, height: u32, block: u32) -> Option<Me
     Some(Measured { frame_db: db(total, (w * h * 3) as u64), block_db: worst, shift: sums.map(|sum| sum as f64 / (w * h) as f64), opaque })
 }
 
-/// Whether what was measured is within the tolerance, and if not, what is wrong first.
+/// Whether what was measured is within the tolerance, and if not, what is wrong first. Every
+/// comparison is written so that a number that is not one, measured or asked for, fails.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn check(frame: usize, m: &Measured, tol: &Tolerance) -> Result<(), Mismatch> {
     if !m.opaque {
         Err(Mismatch::Alpha { frame })
-    } else if m.frame_db < tol.frame_db {
+    } else if !(m.frame_db >= tol.frame_db) {
         Err(Mismatch::Frame { frame, db: m.frame_db })
-    } else if m.block_db < tol.block_db {
+    } else if !(m.block_db >= tol.block_db) {
         Err(Mismatch::Block { frame, db: m.block_db })
-    } else if m.shift.iter().any(|s| s.abs() > tol.mean_shift) {
+    } else if !m.shift.iter().all(|s| s.abs() <= tol.mean_shift) {
         Err(Mismatch::Shift { frame })
     } else {
         Ok(())
@@ -240,52 +224,85 @@ fn check(frame: usize, m: &Measured, tol: &Tolerance) -> Result<(), Mismatch> {
 
 impl Recording {
     /// Write this recording to `out` as a video and verify it: one picture per frame, in
-    /// order, and the frames in [`sample`]`(frames, must)` compared with their pictures
-    /// against `tol`. `keep_going` is told the pass and how many frames of it are done, at
+    /// order, and every picture compared with its frame against `tol`, however long the
+    /// recording is. `keep_going` is told the pass and how many frames of it are done, at
     /// least before every frame, and stops the work by answering false.
     ///
-    /// One frame is held at a time in both passes. On any error, a cancel included, nothing
-    /// is left at `out` (what stood there before is gone too), and nothing but `out` is ever
-    /// written. `out` must not be the recording's own frames file: that is refused, and the
-    /// frames stay.
+    /// `must` no longer decides anything: it named the frames a sample had to hold when only
+    /// a sample was compared. It stays for the callers that pass it.
+    ///
+    /// One frame is held at a time in both passes. An `Ok` means the video was verified whole
+    /// and its data was synced to the disk. On any error, a cancel or a panic, nothing is left
+    /// at `out` (what stood there before is gone too), and nothing but `out` is ever written.
+    /// `out` must not be the recording's own frames file: that is refused, and the frames
+    /// stay.
     pub fn archive_video(&self, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<Archived, ArchiveError> {
         archive(self, codec, out, must, tol, keep_going).map(|(archived, _)| archived)
     }
 }
 
 /// [`Recording::archive_video`], and with it the largest mean shift of any channel of any
-/// frame that was compared.
+/// frame.
 fn archive(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
+    archive_with(rec, codec, out, must, tol, keep_going, &sync_file)
+}
+
+/// Removes the output when it is dropped, on any way out and a panic included, unless the
+/// archive ended well.
+struct Unfinished<'a> {
+    out: &'a Path,
+    done: bool,
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Whatever the codec left, or whatever stood here before: it is not this recording.
+            let _ = std::fs::remove_file(self.out);
+        }
+    }
+}
+
+/// [`archive`] with the sync to the disk handed in.
+#[allow(clippy::too_many_arguments)]
+fn archive_with(rec: &Recording, codec: &dyn VideoCodec, out: &Path, _must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool, sync: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(Archived, f64), ArchiveError> {
     // The one file that must never be written over or removed here: the frames themselves.
-    let frames_file = std::fs::canonicalize(rec.dir.join(FRAMES_FILE));
-    if frames_file.is_ok_and(|frames| std::fs::canonicalize(out).is_ok_and(|out| out == frames)) {
+    // Asked before the guard below is armed, so that a refusal leaves them alone.
+    if is_the_frames_file(&rec.dir.join(FRAMES_FILE), out, &|p| std::fs::canonicalize(p), &|p| std::fs::symlink_metadata(p).is_ok()) {
         return Err(ArchiveError::Unusable("the video cannot take the place of the frames"));
     }
-    let result = encode_and_verify(rec, codec, out, must, tol, keep_going);
-    if result.is_err() {
-        // Whatever the codec left, or whatever stood here before: it is not this recording.
-        let _ = std::fs::remove_file(out);
-    }
+    let mut unfinished = Unfinished { out, done: false };
+    let result = encode_and_verify(rec, codec, out, tol, keep_going, sync);
+    unfinished.done = result.is_ok();
     result
+}
+
+/// Whether `out` is, or cannot be told from, the frames file. When in doubt, yes: the same
+/// path as written; the same file once both are resolved; and an output that exists while
+/// either of the two cannot be resolved.
+fn is_the_frames_file(frames: &Path, out: &Path, resolve: &dyn Fn(&Path) -> std::io::Result<std::path::PathBuf>, exists: &dyn Fn(&Path) -> bool) -> bool {
+    if out == frames {
+        return true;
+    }
+    if !exists(out) {
+        return false;
+    }
+    match (resolve(frames), resolve(out)) {
+        (Ok(frames), Ok(out)) => frames == out,
+        (Err(_), _) => exists(frames),
+        (Ok(_), Err(_)) => true,
+    }
+}
+
+/// Have the file's data written through to the disk.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 const FRAMES_UNREADABLE: &str = "the frames could not be read";
 const FRAME_TOO_LARGE: &str = "a frame in the index is larger than a frame can be";
 
-#[allow(clippy::too_many_arguments)]
-fn archive_with(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool, _sync: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(Archived, f64), ArchiveError> {
-    archive(rec, codec, out, must, tol, keep_going)
-}
-
-fn sync_file(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-fn is_the_frames_file(_frames: &Path, _out: &Path, _resolve: &dyn Fn(&Path) -> std::io::Result<std::path::PathBuf>, _exists: &dyn Fn(&Path) -> bool) -> bool {
-    false
-}
-
-fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: &[usize], tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool) -> Result<(Archived, f64), ArchiveError> {
+fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, tol: &Tolerance, keep_going: &dyn Fn(Stage, usize, usize) -> bool, sync: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(Archived, f64), ArchiveError> {
     let n = rec.frames.len();
     if n == 0 {
         return Err(ArchiveError::Unusable("the recording has no frames"));
@@ -340,11 +357,11 @@ fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: 
         return Err(ArchiveError::NotSmaller);
     }
 
-    // The second pass: the video read back, and the frames walked again in step.
-    let picked = sample(n, must);
+    // The second pass: the video read back, the frames walked again in step, and every
+    // picture compared with its frame.
     let mut frames = Frames::open(rec, len).map_err(ArchiveError::Unusable)?;
     let mut stopped = None;
-    let (mut seen, mut at, mut checked) = (0usize, 0usize, 0usize);
+    let (mut seen, mut checked) = (0usize, 0usize);
     let (mut worst_frame_db, mut worst_block_db, mut worst_shift) = (f64::INFINITY, f64::INFINITY, 0.0f64);
     let mut each = |i: usize, picture: &[u8]| -> Result<(), String> {
         let mut verdict = || -> Result<(), ArchiveError> {
@@ -360,10 +377,6 @@ fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: 
             }
             let frame = frames.next().map_err(ArchiveError::Unusable)?;
             seen += 1;
-            if picked.get(at) != Some(&i) {
-                return Ok(());
-            }
-            at += 1;
             let m = measure(frame, picture, w, h, tol.block).ok_or(ArchiveError::Unusable("the picture size is not usable"))?;
             checked += 1;
             worst_frame_db = worst_frame_db.min(m.frame_db);
@@ -390,6 +403,12 @@ fn encode_and_verify(rec: &Recording, codec: &dyn VideoCodec, out: &Path, must: 
         Err(CodecError::WrongFrames { got }) => return Err(ArchiveError::Verify(Mismatch::Count { got })),
         Err(e) => return Err(ArchiveError::Codec(e)),
     }
+    // Not one frame went by without its picture being compared.
+    if checked != n {
+        return Err(ArchiveError::Verify(Mismatch::Count { got: checked }));
+    }
+    // The frames may be removed on the strength of this answer: the video is on the disk first.
+    sync(out).map_err(|e| ArchiveError::Codec(CodecError::Io(e)))?;
     Ok((Archived { bytes, checked, worst_frame_db, worst_block_db }, worst_shift))
 }
 
@@ -404,6 +423,8 @@ struct Frames<'a> {
     /// The difference that made it out of the one before.
     delta: Buf,
     packed: Vec<u8>,
+    /// The most a compressed frame can take.
+    packed_max: usize,
     at: usize,
 }
 
@@ -411,7 +432,7 @@ impl<'a> Frames<'a> {
     fn open(rec: &'a Recording, len: usize) -> Result<Frames<'a>, &'static str> {
         let file = File::open(rec.dir.join(FRAMES_FILE)).map_err(|_| FRAMES_UNREADABLE)?;
         let file_len = file.metadata().map_err(|_| FRAMES_UNREADABLE)?.len();
-        Ok(Frames { rec, file, file_len, px: Buf::new(len), delta: Buf::new(len), packed: Vec::new(), at: 0 })
+        Ok(Frames { rec, file, file_len, px: Buf::new(len), delta: Buf::new(len), packed: Vec::new(), packed_max: zstd::zstd_safe::compress_bound(len), at: 0 })
     }
 
     /// The next frame, as RGBA. An error when there is none, or it cannot be read whole.
@@ -420,6 +441,10 @@ impl<'a> Frames<'a> {
         // An index that points past the file is not followed into a huge buffer.
         if m.offset.checked_add(m.len as u64).is_none_or(|end| end > self.file_len) {
             return Err(FRAMES_UNREADABLE);
+        }
+        // Nor one that claims more than a whole frame can compress to.
+        if m.len as usize > self.packed_max {
+            return Err(FRAME_TOO_LARGE);
         }
         self.packed.resize(m.len as usize, 0);
         self.file.seek(SeekFrom::Start(m.offset)).and_then(|_| self.file.read_exact(&mut self.packed)).map_err(|_| FRAMES_UNREADABLE)?;
@@ -1703,9 +1728,8 @@ mod tests {
         let lossless = std::fs::metadata(rec.dir.join(FRAMES_FILE)).unwrap().len();
         let out_dir = tempfile::tempdir().unwrap();
         let out = out_dir.path().join("frames.mkv");
-        let every: Vec<usize> = (0..n).collect();
         let started = std::time::Instant::now();
-        let (archived, shift) = archive(&rec, ffmpeg, &out, &every, &MEASURE_ONLY, &|_, _, _| true).expect("the recording archives");
+        let (archived, shift) = archive(&rec, ffmpeg, &out, &[], &MEASURE_ONLY, &|_, _, _| true).expect("the recording archives");
         println!("{} × {}, {n} frames, {} ms: frames {lossless} bytes, video {} bytes ({:.1} times smaller), {:.1} s for both passes", rec.width, rec.height, rec.end_ms, archived.bytes, lossless as f64 / archived.bytes as f64, started.elapsed().as_secs_f64());
         println!("worst frame {:.2} dB (at least {} asked), worst block of {} {:.2} dB (at least {} asked), worst mean shift {:.3} levels (at most {} asked), {} frames compared", archived.worst_frame_db, TOLERANCE.frame_db, TOLERANCE.block, archived.worst_block_db, TOLERANCE.block_db, shift, TOLERANCE.mean_shift, archived.checked);
         let passes = archived.worst_frame_db >= TOLERANCE.frame_db && archived.worst_block_db >= TOLERANCE.block_db && shift <= TOLERANCE.mean_shift && archived.bytes <= allowed_bytes(lossless, TOLERANCE.smaller_by);
