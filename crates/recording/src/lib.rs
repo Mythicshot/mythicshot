@@ -10,10 +10,12 @@
 //! leaves the pointer out; the overlay renderer draws it back in at export.
 
 mod cursor;
+pub mod ffmpeg;
 mod saved;
 
 pub use cursor::position as pointer_position;
 pub mod export;
+pub use ffmpeg::{Bound, CodecError, Ffmpeg, VideoCodec};
 pub use saved::{OpenError, SaveError, SaveStep};
 
 use std::fs::File;

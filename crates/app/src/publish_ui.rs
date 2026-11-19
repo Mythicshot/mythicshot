@@ -88,6 +88,9 @@ pub fn init(settings: &crate::settings::Settings) {
     // The saved recordings' folder is looked at off the UI thread, whatever the switch says:
     // what an earlier run could not finish is finished either way.
     std::thread::spawn(|| {
+        // Look for ffmpeg once per run, here and never on the UI thread: the MP4 and WebM
+        // exports are offered only when this has found one.
+        mythicshot_recording::ffmpeg::find_now();
         if let Some(root) = Store::default_root() {
             tidy_saved_recordings(&Store::at(root));
         }
