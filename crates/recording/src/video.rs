@@ -1403,7 +1403,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A file large enough for what the index claims, and nothing a frame of 8 × 8 can be.
         std::fs::write(dir.path().join(FRAMES_FILE), vec![0u8; 1 << 20]).unwrap();
-        let claims = |len: u32| Recording { dir: dir.path().to_path_buf(), owned: false, width: w, height: h, frames: vec![crate::FrameMeta { offset: 0, len, key: true, t_ms: 0, cursor: None }], end_ms: 1 };
+        let claims = |len: u32| Recording { dir: dir.path().to_path_buf(), owned: false, width: w, height: h, frames: vec![crate::FrameMeta { offset: 0, len, key: true, t_ms: 0, cursor: None }], end_ms: 1, expanded_from: None };
         let bound = zstd::zstd_safe::compress_bound(256) as u32;
         let rec = claims(bound + 1);
         let mut frames = Frames::open(&rec, 256).unwrap();
@@ -1484,9 +1484,9 @@ mod tests {
         // A recording that cannot be archived at all: no frames, a size of nothing, frames
         // that are gone or cut short. Nothing is left, and nothing was asked of the codec.
         let codec = Fake::new(Fault::None);
-        let empty = Recording { dir: b.rec.dir.clone(), owned: false, width: w, height: h, frames: Vec::new(), end_ms: 0 };
-        let flat = Recording { dir: b.rec.dir.clone(), owned: false, width: 0, height: h, frames: b.rec.frames.clone(), end_ms: 0 };
-        let gone = Recording { dir: b.out_dir.path().join("nowhere"), owned: false, width: w, height: h, frames: b.rec.frames.clone(), end_ms: 0 };
+        let empty = Recording { dir: b.rec.dir.clone(), owned: false, width: w, height: h, frames: Vec::new(), end_ms: 0, expanded_from: None };
+        let flat = Recording { dir: b.rec.dir.clone(), owned: false, width: 0, height: h, frames: b.rec.frames.clone(), end_ms: 0, expanded_from: None };
+        let gone = Recording { dir: b.out_dir.path().join("nowhere"), owned: false, width: w, height: h, frames: b.rec.frames.clone(), end_ms: 0, expanded_from: None };
         for unusable in [&empty, &flat, &gone] {
             std::fs::write(&b.out, b"an older video").unwrap();
             let result = unusable.archive_video(&codec, &b.out, &[], &ANY_SIZE, &|_, _, _| true);
@@ -1497,14 +1497,14 @@ mod tests {
         // Frames cut short are found while encoding.
         let cut_dir = tempfile::tempdir().unwrap();
         std::fs::write(cut_dir.path().join(FRAMES_FILE), &before[..before.len() / 2]).unwrap();
-        let cut = Recording { dir: cut_dir.path().to_path_buf(), owned: false, width: w, height: h, frames: b.rec.frames.clone(), end_ms: 0 };
+        let cut = Recording { dir: cut_dir.path().to_path_buf(), owned: false, width: w, height: h, frames: b.rec.frames.clone(), end_ms: 0, expanded_from: None };
         for tidy in [true, false] {
             let result = cut.archive_video(&Fake { tidy, ..Fake::new(Fault::None) }, &b.out, &[], &ANY_SIZE, &|_, _, _| true);
             assert!(matches!(result, Err(ArchiveError::Unusable(_))), "{result:?}");
             assert!(!b.out.exists());
         }
         // Another picture size than the frames were written with: refused, not misread.
-        let other = Recording { dir: b.rec.dir.clone(), owned: false, width: w + 1, height: h, frames: b.rec.frames.clone(), end_ms: 0 };
+        let other = Recording { dir: b.rec.dir.clone(), owned: false, width: w + 1, height: h, frames: b.rec.frames.clone(), end_ms: 0, expanded_from: None };
         let result = other.archive_video(&Fake::new(Fault::None), &b.out, &[], &ANY_SIZE, &|_, _, _| true);
         assert!(matches!(result, Err(ArchiveError::Unusable(_))), "{result:?}");
         assert!(!b.out.exists());

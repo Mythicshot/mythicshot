@@ -1423,7 +1423,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(kept.join(INDEX_FILE)).unwrap()).unwrap();
         assert_eq!(json["format"], 2);
         assert_eq!((json["width"].as_u64(), json["height"].as_u64(), json["end_ms"].as_u64()), (Some(W as u64), Some(H as u64), Some(N as u64 * 66)));
-        assert_eq!(json["video"], serde_json::json!({"bytes": 4321, "fps": 25, "codec": "x264-444-crf10-medium-g30"}));
+        assert_eq!(json["video"], serde_json::json!({"bytes": 4321, "fps": 25, "codec": "x264-444-crf8-medium-g30"}));
         assert_eq!(json["frames"].as_array().unwrap().len(), N);
         assert_eq!(json["frames"][0], serde_json::json!([0, null, null]));
         assert_eq!(json["frames"][1], serde_json::json!([66, -4, 7]));
