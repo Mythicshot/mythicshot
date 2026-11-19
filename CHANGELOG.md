@@ -2,6 +2,17 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.8 (2026-11-19)
+
+- Saved recordings take less space: when ffmpeg is on the computer, a saved recording is stored again as video in the background. On a real recording that came out about five times smaller. Every frame of the video is checked against the original before the original is replaced, and the tour still opens with Edit as before.
+- Preferences has a switch for this, "Store kept recordings as video to save space". Without ffmpeg nothing changes, and recordings stay as they are.
+- Preferences lists the saved recordings with their size and form, and each has a "Remove recording" button that asks first.
+- Preferences has a warning limit for saved recordings. It only warns and never deletes anything.
+- After a publish, the result says when that publish took the saved recordings past the limit.
+- The Tours page shows "compressing…" while a recording is being stored as video, and "Opening the recording…" with Cancel while Edit opens one.
+- Fixed: the switch "Keep the recording when I publish a tour" did not stay off in 0.2.7.
+- A tour whose recording is stored as video needs ffmpeg and Mythicshot 0.2.8 or newer to edit.
+
 ## 0.2.7 (2026-11-18)
 
 - Edit a published tour: the Tours page has an Edit button that reopens the tour's recording in the editor, as you left it. Publish from there and choose "Update" to change the tour over the same link; only pictures that changed are sent.
