@@ -444,6 +444,40 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_request_still_reaches_the_app_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Tours);
+        let key = |tour: &str| ProjectKey { server: "https://tours.example.com".into(), tour_id: tour.into(), chapter_id: "ch_aaaaaaaaaaaaaaaaaaaaaaaa".into() };
+        let (first, second) = (key("tour_aaaaaaaaaaaaaaaaaaaaaaaa"), key("tour_bbbbbbbbbbbbbbbbbbbbbbbb"));
+        let ctx = egui::Context::default();
+        // The app took a request and is opening that recording on its own thread: the window
+        // goes on being drawn, and the request is not asked a second time.
+        s.take(PageOut { edit_project: Some(first.clone()), ..Default::default() });
+        assert_eq!(s.edit_project.take(), Some(first.clone()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(s.tours.begin_open(&first, cancel.clone()));
+        s.tours.open_rows().progress(&first, 1, 3);
+        drawn(&ctx, &mut s);
+        assert_eq!(s.edit_project, None);
+        // Edit on another tour meanwhile: that request reaches the app, once, like any other.
+        s.take(PageOut { edit_project: Some(second.clone()), ..Default::default() });
+        s.take(PageOut::default());
+        drawn(&ctx, &mut s);
+        assert_eq!(s.edit_project.take(), Some(second.clone()));
+        drawn(&ctx, &mut s);
+        assert_eq!(s.edit_project.take(), None);
+        // The page, not the window, says that only one recording opens at a time.
+        assert!(!s.tours.begin_open(&second, Arc::default()));
+        assert!(!cancel.load(Ordering::SeqCst), "drawing and asking stopped nothing");
+        s.tours.open_ended(&first);
+        assert!(s.tours.begin_open(&second, Arc::default()));
+        assert_eq!((s.nav.page(), s.capture), (Page::Tours, None));
+    }
+
+    #[test]
     fn opening_an_open_window_focuses_it_and_switches_page() {
         let mut nav = Nav::default();
         assert!(!nav.is_open() && !nav.take_focus());

@@ -39,6 +39,7 @@ mod video_editor;
 mod workspace_ui;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -66,6 +67,77 @@ enum AppEvent {
     Key(rdev::EventType),
     /// A key or click logged for the recording in progress.
     Input(mythicshot_editor::overlays::InputEvent),
+    /// The thread that expanded a recording kept as a video has ended: the project it was asked
+    /// to open, and the recording ready for an editor or why there is none.
+    ProjectOpened(Box<(project::ProjectKey, Result<project::Loaded, project::LoadError>)>),
+}
+
+/// A recording kept as a video that is being expanded for an editor, on a thread of its own.
+/// At most one at a time: the Tours page refuses a second ([`tours_ui::Model::begin_open`]).
+struct Opening {
+    /// Set by Cancel on the tour's row, and when the app closes.
+    cancel: Arc<AtomicBool>,
+    /// The folder the frames are expanded into.
+    temp: PathBuf,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// What the thread that expands a recording is given.
+struct OpenJob {
+    /// The folder of saved recordings; None when this user has none.
+    store: Option<project::Store>,
+    key: project::ProjectKey,
+    /// What reads the video, asked on the thread: the answer can wait for the search for ffmpeg.
+    codec: Box<dyn FnOnce() -> Option<&'static dyn mythicshot_recording::VideoCodec> + Send>,
+    /// The room left on the disk a folder is on.
+    free: fn(&Path) -> Option<u64>,
+    temp: PathBuf,
+    cancel: Arc<AtomicBool>,
+    /// Where the frames done are reported: the tour's row.
+    rows: tours_ui::OpenRows,
+    tx: Sender<AppEvent>,
+    /// Wakes the app once the event is sent.
+    wake: Box<dyn Fn() + Send>,
+}
+
+/// Expand a recording kept as a video on a thread of its own. What comes of it arrives as one
+/// [`AppEvent::ProjectOpened`]; the window never waits for it.
+fn start_opening(job: OpenJob) -> Opening {
+    let (cancel, temp) = (job.cancel.clone(), job.temp.clone());
+    let thread = std::thread::spawn(move || {
+        let OpenJob { store, key, codec, free, temp, cancel, rows, tx, wake } = job;
+        let codec = codec();
+        let open = tours_ui::VideoOpen { store: store.as_ref(), codec, temp: &temp, cancel: &cancel, free: &free };
+        tours_ui::open_video(&open, &key, &rows, |result| {
+            // Nobody is left to take it: the frames it was expanded into go with it.
+            if let Err(mpsc::SendError(AppEvent::ProjectOpened(lost))) = tx.send(AppEvent::ProjectOpened(Box::new((key.clone(), result))))
+                && let Ok(loaded) = &lost.1
+            {
+                loaded.rec.delete_files();
+            }
+        });
+        wake();
+    });
+    Opening { cancel, temp, thread }
+}
+
+/// When the app closes: stop the expansion that runs, give it `wait` to let go, and remove the
+/// folder it wrote into, also when the recording was ready and no editor had taken it yet.
+fn stop_opening(opening: Opening, rx: &Receiver<AppEvent>, wait: Duration) {
+    opening.cancel.store(true, Ordering::SeqCst);
+    let until = Instant::now() + wait;
+    while !opening.thread.is_finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::ProjectOpened(done) = event
+            && let Ok(loaded) = &done.1
+        {
+            loaded.rec.delete_files();
+        }
+    }
+    // What a thread that has not ended in time still holds stays, and goes at a later start.
+    tours_ui::remove_edit_folder(&opening.temp);
 }
 
 struct App {
@@ -117,6 +189,8 @@ struct App {
     wake: mpsc::Sender<()>,
     /// Draw was pressed during the countdown.
     draw_when_live: bool,
+    /// The recording kept as a video that is being expanded for an editor.
+    opening: Option<Opening>,
 }
 
 impl App {
@@ -155,6 +229,9 @@ impl App {
             save_retry.record(&settings.save(), Instant::now());
         }
         publish_ui::init(&settings);
+        // Start-up housekeeping, off the UI thread: what expansions for an editor left in the
+        // temporary folder when an earlier run was cut off.
+        std::thread::spawn(|| tours_ui::sweep_stale_edits(&tours_ui::edit_base(), std::process::id(), tours_ui::EDIT_STALE_AFTER));
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
         for a in Action::ALL {
@@ -222,6 +299,7 @@ impl App {
             hidden_at_start: false,
             started: Instant::now(),
             draw_when_live: false,
+            opening: None,
             wake: {
                 let (wake, woken) = mpsc::channel::<()>();
                 let relay = ctx.clone();
@@ -278,6 +356,10 @@ impl App {
                     }
                 }
                 AppEvent::Key(ev) => self.record_key(&ev),
+                AppEvent::ProjectOpened(done) => {
+                    let (key, result) = *done;
+                    self.project_opened(key, result);
+                }
                 AppEvent::Input(ev) => {
                     if self.session.is_some() {
                         self.rec_events.push(ev);
@@ -676,16 +758,63 @@ impl App {
 
     /// Open the recording saved on this computer for a tour's chapter in the editor it was
     /// published from: Edit on the Tours page. When it cannot be opened, the Tours page says
-    /// why on that tour's row.
-    fn open_saved_project(&mut self, key: project::ProjectKey) {
+    /// why on that tour's row. A recording kept as frames opens at once. One kept as a video is
+    /// expanded first, on a thread of its own, with its progress on the row; the editor opens
+    /// when [`AppEvent::ProjectOpened`] arrives.
+    fn open_saved_project(&mut self, ctx: &egui::Context, key: project::ProjectKey) {
         let store = project::Store::default_root().map(project::Store::at);
-        match open_saved(store.as_ref(), &key, &self.settings) {
-            Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
-            Err(sentence) => {
-                if let Ok(s) = self.window.lock() {
-                    s.tours.edit_failed(&key, sentence);
+        if !needs_thread(store.as_ref(), &key) {
+            match open_saved(store.as_ref(), &key, &self.settings) {
+                Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+                Err(sentence) => self.edit_failed(&key, sentence),
+            }
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The page refuses a second recording while one opens, and says so on the row.
+        let Some(rows) = self.window.lock().ok().and_then(|s| s.tours.begin_open(&key, cancel.clone()).then(|| s.tours.open_rows())) else { return };
+        let wake = ctx.clone();
+        self.opening = Some(start_opening(OpenJob {
+            store,
+            key,
+            // The one search of this run: when it has not ended yet, the thread waits for it.
+            codec: Box::new(|| mythicshot_recording::ffmpeg::find_now().filter(|ffmpeg| ffmpeg.can_archive()).map(|ffmpeg| ffmpeg as &dyn mythicshot_recording::VideoCodec)),
+            free: project::free_bytes,
+            temp: tours_ui::new_edit_folder(&tours_ui::edit_base()),
+            cancel,
+            rows,
+            tx: self.tx.clone(),
+            wake: Box::new(move || wake.request_repaint()),
+        }));
+    }
+
+    /// The expansion of a recording kept as a video has ended: open it in an editor, say on the
+    /// tour's row why it did not open, or do nothing after a cancel.
+    fn project_opened(&mut self, key: project::ProjectKey, result: Result<project::Loaded, project::LoadError>) {
+        let cancelled = self.opening.take().is_some_and(|opening| opening.cancel.load(Ordering::SeqCst));
+        if let Ok(s) = self.window.lock() {
+            s.tours.open_ended(&key);
+        }
+        match result {
+            // Cancel was pressed when the last frame was already through.
+            Ok(loaded) if cancelled => loaded.rec.delete_files(),
+            Ok(loaded) => match open_loaded(loaded, &self.settings) {
+                Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+                Err(sentence) => self.edit_failed(&key, sentence),
+            },
+            // Whatever a cancelled open ended with: it was stopped, and nothing is said.
+            Err(_) if cancelled => {}
+            Err(e) => {
+                if let Some(sentence) = tours_ui::load_sentence(&e) {
+                    self.edit_failed(&key, sentence);
                 }
             }
+        }
+    }
+
+    fn edit_failed(&mut self, key: &project::ProjectKey, sentence: &str) {
+        if let Ok(s) = self.window.lock() {
+            s.tours.edit_failed(key, sentence);
         }
     }
 
@@ -1006,7 +1135,7 @@ impl App {
         }
         // Edit on the Tours page: the saved recording opens in an editor; the window stays.
         if let Some(key) = edit_project {
-            self.open_saved_project(key);
+            self.open_saved_project(ctx, key);
         }
         // A Home tile: close the window so it is not in the picture, then capture. It stays
         // closed afterwards, so it never comes back over the overlay or the editor.
@@ -1059,6 +1188,11 @@ impl eframe::App for App {
     /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A recording that is being expanded for an editor stops at its next frame, and the
+        // folder it was expanded into is removed.
+        if let Some(opening) = self.opening.take() {
+            stop_opening(opening, &self.rx, Duration::from_secs(2));
+        }
         // A recording that is being stored as video is left as its frames: the conversion stops at
         // its next frame and is given a moment, so that no ffmpeg runs on after the app.
         project::shutdown(Duration::from_secs(3));
@@ -1143,15 +1277,31 @@ fn root_window(_frame: &eframe::Frame) -> Option<platform::WindowId> {
     None
 }
 
-/// Open the recording saved for `key` in an editor, as [`App::open_saved_project`] does. `store`
-/// is the folder of saved recordings, None when this user has none. The error is the sentence
-/// for the tour's row on the Tours page; a recording that is already open in an editor opens
-/// nothing new.
+/// Whether opening the recording saved for `key` can take long, and so runs on a thread of its
+/// own: when it is kept as a video. A recording kept as frames, and one that is not there or
+/// cannot be read, is answered at once.
+fn needs_thread(store: Option<&project::Store>, key: &project::ProjectKey) -> bool {
+    store.is_some_and(|store| store.form_of(key) == Some(project::Form::Video))
+}
+
+/// Open the recording saved for `key` in an editor, as [`App::open_saved_project`] does for a
+/// recording kept as frames. `store` is the folder of saved recordings, None when this user has
+/// none. The error is the sentence for the tour's row on the Tours page; a recording that is
+/// already open in an editor opens nothing new.
 fn open_saved(store: Option<&project::Store>, key: &project::ProjectKey, settings: &Settings) -> Result<editor_ui::Editor, &'static str> {
-    let loaded = store.ok_or(project::LoadError::NotSaved).and_then(|store| store.load(key)).map_err(|e| tours_ui::load_sentence(&e))?;
-    let title = loaded.restored.title.clone();
-    // A recording that cannot be read after all: the editor has let go of the project again.
-    editor_ui::Editor::open_project(loaded, settings.editor_keys.clone(), settings.dest_context(&title), settings.overlays, settings.editor.clone()).map_err(|_| tours_ui::SAVED_DAMAGED)
+    let loaded = store.ok_or(project::LoadError::NotSaved).and_then(|store| store.load(key)).map_err(|e| tours_ui::load_sentence(&e).unwrap_or(tours_ui::SAVED_DAMAGED))?;
+    open_loaded(loaded, settings)
+}
+
+/// Put a loaded project into an editor. The error is the sentence for the tour's row.
+fn open_loaded(loaded: project::Loaded, settings: &Settings) -> Result<editor_ui::Editor, &'static str> {
+    let (title, rec) = (loaded.restored.title.clone(), loaded.rec.clone());
+    // A recording that cannot be read after all: the editor has let go of the project again,
+    // and frames that were expanded for it are removed (a saved recording's own are not its to remove).
+    editor_ui::Editor::open_project(loaded, settings.editor_keys.clone(), settings.dest_context(&title), settings.overlays, settings.editor.clone()).map_err(|_| {
+        rec.delete_files();
+        tours_ui::SAVED_DAMAGED
+    })
 }
 
 /// Write panics to `crash.log` next to the settings file; release builds have
@@ -1205,4 +1355,104 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Mythicshot", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tours_ui::tests::{FakeCodec, temp_store, video_project};
+
+    const SITE: &str = "https://tours.example.com";
+    const TOUR: &str = "tour_bbbbbbbbbbbbbbbbbbbbbbbb";
+    const CHAPTER: &str = "ch_aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The job the app starts for Edit on a recording kept as a video, with a codec of the test's.
+    fn job(store: &project::Store, key: &project::ProjectKey, codec: FakeCodec, temp: &Path, tx: Sender<AppEvent>) -> OpenJob {
+        let codec: &'static FakeCodec = Box::leak(Box::new(codec));
+        OpenJob { store: Some(store.clone()), key: key.clone(), codec: Box::new(move || Some(codec as &dyn mythicshot_recording::VideoCodec)), free: |_| None, temp: temp.to_path_buf(), cancel: Arc::default(), rows: tours_ui::OpenRows::default(), tx, wake: Box::new(|| {}) }
+    }
+
+    #[test]
+    fn an_open_that_runs_when_the_app_closes_is_cancelled_and_its_folder_removed() {
+        let (tmp, store) = temp_store();
+        let saved = video_project(&store, SITE, TOUR, CHAPTER, "Testing");
+        let temp = tours_ui::new_edit_folder(&tmp.path().join("edits"));
+
+        // The expansion is in the middle of its work when the app closes.
+        let (tx, rx) = mpsc::channel();
+        let (reached, waiting) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)));
+        let (at_work, hold) = (reached.clone(), waiting.clone());
+        let slow = FakeCodec {
+            during: Some(Box::new(move |i| {
+                at_work.store(true, Ordering::SeqCst);
+                // The second picture takes as long as the test says, a minute at most.
+                let until = Instant::now() + Duration::from_secs(60);
+                while i == 1 && hold.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })),
+            ..FakeCodec::default()
+        };
+        let opening = start_opening(job(&store, &saved.key, slow, &temp, tx));
+        until("the expansion is at work", || reached.load(Ordering::SeqCst) && temp.is_dir());
+        assert!(!opening.thread.is_finished(), "the app's thread never waited for it");
+        let (cancel, started) = (opening.cancel.clone(), Instant::now());
+        // The picture is done right after the app said stop: the next one is never read.
+        let release = waiting.clone();
+        std::thread::spawn(move || {
+            until("the app said stop", || cancel.load(Ordering::SeqCst));
+            release.store(false, Ordering::SeqCst);
+        });
+        stop_opening(opening, &rx, Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(1), "it stopped within a second: {:?}", started.elapsed());
+        assert!(!temp.exists(), "the folder it was expanded into is removed");
+        assert!(rx.try_recv().is_err(), "nothing is left waiting for an app that is gone");
+
+        // The recording was ready and no editor had taken it yet when the app closes.
+        let (tx, rx) = mpsc::channel();
+        let opening = start_opening(job(&store, &saved.key, FakeCodec::default(), &temp, tx));
+        until("the expansion has ended", || opening.thread.is_finished());
+        assert!(temp.join("frames.zst").is_file());
+        stop_opening(opening, &rx, Duration::ZERO);
+        assert!(!temp.exists());
+
+        // The app is gone before the expansion ends: the thread removes what it made.
+        let (tx, rx) = mpsc::channel();
+        waiting.store(true, Ordering::SeqCst);
+        let hold = waiting.clone();
+        let late = FakeCodec {
+            during: Some(Box::new(move |_| {
+                let until = Instant::now() + Duration::from_secs(60);
+                while hold.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })),
+            ..FakeCodec::default()
+        };
+        let opening = start_opening(job(&store, &saved.key, late, &temp, tx));
+        until("the expansion is at work", || temp.is_dir());
+        drop(rx);
+        waiting.store(false, Ordering::SeqCst);
+        until("the expansion has ended", || opening.thread.is_finished());
+        assert!(!temp.exists());
+
+        // None of it changed the project or left it open: it opens once more, and reaches the app as one event.
+        let (tx, rx) = mpsc::channel();
+        let opening = start_opening(job(&store, &saved.key, FakeCodec::default(), &temp, tx));
+        until("the expansion has ended", || opening.thread.is_finished());
+        let Ok(AppEvent::ProjectOpened(done)) = rx.try_recv() else { panic!("the app was not told") };
+        assert!(rx.try_recv().is_err(), "it is told once");
+        let (key, result) = *done;
+        let loaded = result.expect("the recording opens");
+        assert_eq!((key, loaded.rec.frames.len()), (saved.key.clone(), 3));
+        loaded.rec.delete_files();
+    }
 }
