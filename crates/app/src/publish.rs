@@ -33,7 +33,11 @@
 //! as idempotent (a repeated commit answers with the first one's result).
 //!
 //! Sharing a single image or clip with a link is its own protocol on the same client: see [`share`].
+//!
+//! Signing in (this computer gets its own token after a code is confirmed in the browser) is
+//! another, on a client that sends no credential: see [`connect`].
 
+pub mod connect;
 pub mod share;
 
 use std::fmt;
@@ -633,9 +637,72 @@ impl Default for Timeouts {
 #[derive(Debug)]
 struct Client {
     base: String,
-    token: Token,
+    /// None for the requests that carry no credential (signing in); see [`Client::anonymous`].
+    token: Option<Token>,
     agent: AgentDebug,
     timeouts: Timeouts,
+}
+
+/// Adds the `Authorization` header when the client has a token, and nothing otherwise.
+trait WithAuth {
+    fn with_auth(self, client: &Client) -> Self;
+}
+
+impl<B> WithAuth for ureq::RequestBuilder<B> {
+    fn with_auth(self, client: &Client) -> Self {
+        match &client.token {
+            Some(token) => self.header("Authorization", format!("Bearer {}", token.0)),
+            None => self,
+        }
+    }
+}
+
+/// The tokens a site refused (401), so that the windows stop saying "Connected" for a token
+/// that was revoked on the site. Kept only as SHA-256 fingerprints, never the token, and only a
+/// few; a later answer that accepts the same token takes it off. See [`is_refused`].
+mod refused {
+    use std::sync::Mutex;
+
+    /// More than enough: there is one saved token at a time.
+    const KEEP: usize = 8;
+
+    static REFUSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn list() -> std::sync::MutexGuard<'static, Vec<String>> {
+        REFUSED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn rejected(token: &super::Token) {
+        let fingerprint = super::token_fingerprint(&token.0);
+        let mut list = list();
+        list.retain(|f| *f != fingerprint);
+        list.push(fingerprint);
+        let over = list.len().saturating_sub(KEEP);
+        list.drain(..over);
+    }
+
+    pub(super) fn accepted(token: &super::Token) {
+        let mut list = list();
+        if !list.is_empty() {
+            let fingerprint = super::token_fingerprint(&token.0);
+            list.retain(|f| *f != fingerprint);
+        }
+    }
+
+    pub(super) fn is(fingerprint: &str) -> bool {
+        list().iter().any(|f| f == fingerprint)
+    }
+}
+
+/// A fingerprint of `token` (its SHA-256), for telling whether it is the one a site refused
+/// without keeping the token itself.
+pub fn token_fingerprint(token: &str) -> String {
+    sha256_hex(token.trim().as_bytes())
+}
+
+/// Whether the token with this fingerprint is the one a site last refused with 401.
+pub fn is_refused(fingerprint: &str) -> bool {
+    refused::is(fingerprint)
 }
 
 /// The agent, with a `Debug` that prints nothing of its state.
@@ -678,8 +745,18 @@ enum Method {
 
 impl Client {
     fn new(server: &str, token: &str, timeouts: Timeouts) -> Result<Client, String> {
-        let base = check_server(server)?;
         let token = Token::parse(token)?;
+        Self::build(server, Some(token), timeouts)
+    }
+
+    /// A client that sends no credential at all: for the sign-in requests, which come before
+    /// there is a token. Same rules otherwise: the configured server only, no redirects.
+    fn anonymous(server: &str, timeouts: Timeouts) -> Result<Client, String> {
+        Self::build(server, None, timeouts)
+    }
+
+    fn build(server: &str, token: Option<Token>, timeouts: Timeouts) -> Result<Client, String> {
+        let base = check_server(server)?;
         let plain_local = base.starts_with("http://");
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(timeouts.connect))
@@ -700,19 +777,18 @@ impl Client {
     fn send(&self, method: Method, path: &str, body: Option<(&str, &[u8])>) -> Result<Reply, Transport> {
         debug_assert!(path.starts_with('/'));
         let url = format!("{}{}", self.base, path);
-        let auth = format!("Bearer {}", self.token.0);
         let a = &self.agent.0;
         // Sending the body counts against the timeout, so a bigger body gets more time.
         let limit = Some(request_timeout(self.timeouts.request, body.map_or(0, |(_, d)| d.len())));
         let result = match (method, body) {
-            (Method::Get, _) => a.get(&url).config().timeout_global(limit).build().header("Authorization", &auth).call(),
-            (Method::Delete, _) => a.delete(&url).config().timeout_global(limit).build().header("Authorization", &auth).call(),
-            (Method::Post, None) => a.post(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
-            (Method::Put, None) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
-            (Method::Post, Some((ct, data))) => a.post(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
-            (Method::Put, Some((ct, data))) => a.put(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
-            (Method::Patch, None) => a.patch(&url).config().timeout_global(limit).build().header("Authorization", &auth).send_empty(),
-            (Method::Patch, Some((ct, data))) => a.patch(&url).config().timeout_global(limit).build().header("Authorization", &auth).header("Content-Type", ct).send(data),
+            (Method::Get, _) => a.get(&url).config().timeout_global(limit).build().with_auth(self).call(),
+            (Method::Delete, _) => a.delete(&url).config().timeout_global(limit).build().with_auth(self).call(),
+            (Method::Post, None) => a.post(&url).config().timeout_global(limit).build().with_auth(self).send_empty(),
+            (Method::Put, None) => a.put(&url).config().timeout_global(limit).build().with_auth(self).send_empty(),
+            (Method::Post, Some((ct, data))) => a.post(&url).config().timeout_global(limit).build().with_auth(self).header("Content-Type", ct).send(data),
+            (Method::Put, Some((ct, data))) => a.put(&url).config().timeout_global(limit).build().with_auth(self).header("Content-Type", ct).send(data),
+            (Method::Patch, None) => a.patch(&url).config().timeout_global(limit).build().with_auth(self).send_empty(),
+            (Method::Patch, Some((ct, data))) => a.patch(&url).config().timeout_global(limit).build().with_auth(self).header("Content-Type", ct).send(data),
         };
         let mut resp = result.map_err(|e| transport(&e))?;
         let status = resp.status().as_u16();
@@ -729,8 +805,18 @@ impl Client {
 
     fn check(&self, what: &str, reply: Reply) -> Result<Reply, String> {
         match reply.status {
-            200..=299 => Ok(reply),
-            401 => Err(REJECTED_TOKEN.into()),
+            200..=299 => {
+                if let Some(token) = &self.token {
+                    refused::accepted(token);
+                }
+                Ok(reply)
+            }
+            401 => {
+                if let Some(token) = &self.token {
+                    refused::rejected(token);
+                }
+                Err(REJECTED_TOKEN.into())
+            }
             300..=399 => Err(format!("{what}: the server answered with a redirect (HTTP {}), which is not followed. Check the server address.", reply.status)),
             429 if reply.error_code().as_deref() == Some("too_many_uploads") => Err(format!(
                 "{what}: the server already has too many unfinished uploads for this workspace. Wait for another upload to finish{}, then try again.",
@@ -758,7 +844,11 @@ impl Client {
         let v = reply.json()?;
         let text = v.get("detail").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str))?;
         let clean: String = text.chars().filter(|&c| !c.is_control() && !is_invisible(c)).take(MAX_DETAIL_CHARS).collect();
-        let clean = clean.replace(&self.token.0, "[token]").replace("dp_", "dp-");
+        let clean = match &self.token {
+            Some(token) => clean.replace(&token.0, "[token]"),
+            None => clean,
+        };
+        let clean = clean.replace("dp_", "dp-");
         let clean = clean.trim().to_string();
         (!clean.is_empty()).then_some(clean)
     }
@@ -1524,6 +1614,10 @@ pub(crate) mod tests {
         }
         pub(crate) fn requests(&self) -> Vec<Req> {
             self.log.lock().unwrap().clone()
+        }
+        /// The live list of requests, for a test that must see them from another closure.
+        pub(crate) fn requests_handle(&self) -> Arc<Mutex<Vec<Req>>> {
+            self.log.clone()
         }
     }
 
@@ -3018,6 +3112,24 @@ pub(crate) mod tests {
         assert_eq!(seen.first(), Some(&0.0));
         assert_eq!(seen.last(), Some(&1.0));
         assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+    }
+
+    #[test]
+    fn a_token_the_site_refuses_is_remembered_by_its_fingerprint_until_the_site_takes_it_again() {
+        // A token of this test's own, so that tests running beside it cannot change the answer.
+        const MINE: &str = "dp_abad1deaabad1deaabad1deaabad1deaabad1dea";
+        let fingerprint = token_fingerprint(MINE);
+        assert!(!fingerprint.contains(MINE) && fingerprint.len() == 64);
+        assert_eq!(token_fingerprint(&format!(" {MINE}\n")), fingerprint);
+        assert_ne!(token_fingerprint(TOKEN), fingerprint);
+        assert!(!is_refused(&fingerprint));
+        let refuses = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
+        assert_eq!(workspace(&refuses.base, MINE).unwrap_err(), REJECTED_TOKEN);
+        assert!(is_refused(&fingerprint));
+        // Taken again: no longer refused.
+        let takes = stub(|_, _| reply(200, r#"{"workspace":"Acme"}"#));
+        workspace(&takes.base, MINE).unwrap();
+        assert!(!is_refused(&fingerprint));
     }
 
     #[test]
