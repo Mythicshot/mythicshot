@@ -90,7 +90,6 @@ fn pending_then_connected_answers_the_token_asking_every_interval_without_a_cred
     assert_eq!(started.server, s.base);
     let connected = wait_with(&anon(&s), &started, &|| false, &clock).unwrap();
     assert_eq!(connected.token.expose(), NEW_TOKEN);
-    assert_eq!(connected.workspace.as_deref(), Some("Cowfee"));
     assert_eq!(*times.lock().unwrap(), secs(&[5, 10, 15]), "one ask per interval, the first after one interval");
     assert_eq!(s.lines(), [START, ASK, ASK, ASK]);
     no_credential_sent(&s);

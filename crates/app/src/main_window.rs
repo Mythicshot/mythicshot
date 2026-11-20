@@ -821,7 +821,7 @@ mod tests {
         // Workspace, with nothing set up: the rows are there and no site is asked.
         s.nav.go(Page::Workspace);
         let workspace = drawn(&ctx, &mut s);
-        for word in ["Site address", "Token", "Site version", "Test connection", "Open site"] {
+        for word in ["Site", "Status", "Token", "Test connection", "Open site"] {
             assert!(workspace.lines().any(|l| l == word), "Workspace is missing {word:?} in:\n{workspace}");
         }
         assert!(!workspace.contains("Recent"));

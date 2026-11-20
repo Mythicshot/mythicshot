@@ -110,11 +110,11 @@ pub fn minutes_text(d: Duration) -> Option<String> {
     }
 }
 
-/// The code was confirmed: the token, and the workspace's name when the site said it.
+/// The code was confirmed: the token. (The workspace's name in the same answer is not kept: the
+/// Workspace page asks the site for it with the new token, like for a pasted one.)
 #[derive(Debug)]
 pub struct Connected {
     pub token: Secret,
-    pub workspace: Option<String>,
 }
 
 /// Why this computer was not connected.
@@ -158,7 +158,20 @@ pub trait Clock {
     fn sleep(&self, d: Duration);
 }
 
-struct RealClock(std::time::Instant);
+/// The real clock, from the moment it is made.
+pub struct RealClock(std::time::Instant);
+
+impl RealClock {
+    pub fn new() -> RealClock {
+        RealClock(std::time::Instant::now())
+    }
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Clock for RealClock {
     fn now(&self) -> Duration {
@@ -229,10 +242,11 @@ pub fn start(server: &str, device_name: &str) -> Result<Started, ConnectError> {
 }
 
 /// Ask the site whether the code of `started` was confirmed until it says, the time is up or
-/// `cancelled` says so. Blocks for as long as that takes: run it off the UI thread.
-pub fn wait(started: &Started, cancelled: &dyn Fn() -> bool) -> Result<Connected, ConnectError> {
+/// `cancelled` says so, going by `clock` ([`RealClock`] outside tests). Blocks for as long as
+/// that takes: run it off the UI thread.
+pub fn wait(started: &Started, cancelled: &dyn Fn() -> bool, clock: &dyn Clock) -> Result<Connected, ConnectError> {
     let client = Client::anonymous(&started.server, Timeouts::default()).map_err(ConnectError::Failed)?;
-    wait_with(&client, started, cancelled, &RealClock(std::time::Instant::now()))
+    wait_with(&client, started, cancelled, clock)
 }
 
 /// [`start`] on a client.
@@ -292,14 +306,13 @@ fn wait_with(client: &Client, started: &Started, cancelled: &dyn Fn() -> bool, c
                     Some("connected") => {
                         // A token that is not one is never stored, and never said.
                         let token = v.get("token").and_then(Value::as_str).and_then(|t| Token::parse(t).ok()).map(|t| Secret(t.0));
-                        let workspace = v.get("workspace").and_then(|w| w.get("name")).and_then(Value::as_str).map(share::plain_text).filter(|n| !n.is_empty());
                         // The answer held the token: its bytes are overwritten now.
                         for b in reply.body.iter_mut() {
                             // SAFETY: `b` is a valid, aligned, exclusive reference into the body.
                             unsafe { std::ptr::write_volatile(b, 0) };
                         }
                         let token = token.ok_or_else(|| ConnectError::Failed(not_understood()))?;
-                        return Ok(Connected { token, workspace });
+                        return Ok(Connected { token });
                     }
                     _ => return Err(ConnectError::Failed(not_understood())),
                 }
