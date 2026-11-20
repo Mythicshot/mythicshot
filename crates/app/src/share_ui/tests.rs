@@ -14,7 +14,7 @@ fn image_form() -> ShareDialog {
 
 fn clip_form(media: MediaType) -> ShareDialog {
     let gif = media == MediaType::Gif;
-    ShareDialog::new(Kind::Clip, SERVER.into(), "Sending a note to the raid", format!("12 s · 960 × 540 · {}", media.label()), gif, None, None)
+    ShareDialog::new(Kind::Clip, SERVER.into(), "Sending a note to the raid", clip_details(12_000, 960, 540, media, None), gif, None, None)
 }
 
 /// What a copy function was given.
@@ -33,7 +33,7 @@ fn held_job(kind: Kind, result: Result<Shared, ShareError>) -> (ShareJob, std::s
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let job = ShareJob::spawn(kind, move |r| {
         while rx.recv_timeout(Duration::from_millis(20)).is_err() {
-            if !r.uploading(0, 0) {
+            if r.cancelled() {
                 return Err(ShareError::Cancelled);
             }
         }
@@ -85,6 +85,34 @@ fn the_destination_line_names_the_host_until_the_workspace_is_known() {
     assert_eq!(to_line(Some("Acme"), "not an address"), None);
     // Before the site answers, the window says only where it goes.
     assert_eq!(image_form().view().lines[0], Line::Muted("To tours.example.com".into()));
+}
+
+#[test]
+fn the_recording_window_says_what_the_mockup_says_with_and_without_ffmpeg() {
+    let v = clip_form(MediaType::Mp4).view();
+    assert_eq!((v.caption, v.heading.as_str()), ("Publish recording", "Share this recording with a link"));
+    assert_eq!(
+        v.lines[1..],
+        [
+            Line::Title,
+            Line::Muted("12 s · 960 × 540 · MP4".into()),
+            Line::Warning("Anyone who has the link can open the clip. It stays online until you delete it in the dashboard.".into()),
+        ]
+    );
+    let v = clip_form(MediaType::Gif).view();
+    assert_eq!(
+        v.lines[2..],
+        [
+            Line::Muted("12 s · 960 × 540 · GIF".into()),
+            Line::Muted("Mythicshot did not find the video tool (ffmpeg) on this computer, so the clip is sent as a GIF. With it, the same clip is far smaller.".into()),
+            Line::Warning("Anyone who has the link can open the clip. It stays online until you delete it in the dashboard.".into()),
+        ]
+    );
+    assert_eq!(v.buttons, vec![Button::Cancel, Button::Publish]);
+    // An estimate is shown only when there is one; there is never a made-up one.
+    assert_eq!(clip_details(12_000, 960, 540, MediaType::Mp4, Some(18 * 1_048_576)), "12 s · 960 × 540 · MP4 · about 18.0 MB");
+    assert_eq!(clip_details(6_400, 640, 360, MediaType::Gif, None), "6 s · 640 × 360 · GIF");
+    assert_eq!(clip_details(120, 640, 360, MediaType::Gif, None), "1 s · 640 × 360 · GIF");
 }
 
 #[test]
@@ -151,6 +179,7 @@ fn the_bytes_sent_are_written_in_the_totals_unit_and_never_read_as_done_too_soon
 fn cancel_while_uploading_waits_for_the_clean_up_then_closes_with_a_sentence() {
     let mut d = image_form();
     let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None }));
+    let waiter = job.waiter();
     d.start(job);
     let (log, copy) = copier(true);
     assert_eq!(d.press(Button::Cancel, &mut |t| copy(&log, t)), None);
@@ -158,6 +187,7 @@ fn cancel_while_uploading_waits_for_the_clean_up_then_closes_with_a_sentence() {
     let v = d.view();
     assert_eq!((v.heading.as_str(), v.buttons.is_empty()), ("Cancelling…", true));
     assert_eq!(settle(&mut d, &mut |t| copy(&log, t)), Some(ShareAction::Closed(Some("Publishing was cancelled. Nothing was left online.".into()))));
+    assert!(waiter.is_finished());
     assert!(log.borrow().is_empty());
 }
 
@@ -267,19 +297,13 @@ fn publish_runs_the_starter_once_with_the_cleaned_title_and_the_server() {
 
 #[test]
 fn closing_the_window_cancels_its_job() {
-    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let seen = ended.clone();
     let mut d = image_form();
-    d.start(ShareJob::spawn(Kind::Image, move |r| {
-        while r.uploading(0, 0) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        seen.store(true, std::sync::atomic::Ordering::SeqCst);
-        Err(ShareError::Cancelled)
-    }));
+    let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None }));
+    let waiter = job.waiter();
+    d.start(job);
     drop(d);
     for _ in 0..200 {
-        if ended.load(std::sync::atomic::Ordering::SeqCst) {
+        if waiter.is_finished() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -368,6 +392,30 @@ fn every_stage_draws_and_escape_and_enter_stand_for_its_buttons() {
     assert_eq!((out.clone(), d.stage().clone()), (None, Stage::Uploading { sent: 0, total: 0 }));
     ctx.run_ui(key(egui::Key::Escape), |ui| out = d.show(ui.ctx(), &mut |t| copy(&log, t))).textures_delta.clear();
     assert_eq!(d.stage(), &Stage::Cancelling);
+}
+
+#[test]
+fn only_old_clip_folders_with_the_exact_name_holding_a_clip_are_swept() {
+    let temp = tempfile::tempdir().unwrap();
+    let make = |name: &str, files: &[&str]| {
+        let dir = temp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        dir
+    };
+    let old = make("mythicshot-share-a1B2c3", &["clip.mp4"]);
+    let gif = make("mythicshot-share-zzzzzz", &["clip.gif"]);
+    let empty = make("mythicshot-share-000000", &[]);
+    let other = make("mythicshot-share-a1B2c3x", &["clip.mp4"]);
+    let foreign = make("mythicshot-share-qwerty", &["notes.txt"]);
+    sweep_stale(temp.path(), Duration::from_secs(3600));
+    assert!(old.exists() && gif.exists(), "young folders stay");
+    sweep_stale(temp.path(), Duration::ZERO);
+    assert!(!old.exists() && !gif.exists() && !empty.exists());
+    assert!(other.exists() && foreign.exists());
+    assert!(is_temp_dir_name("mythicshot-share-abc123") && !is_temp_dir_name("mythicshot-publish-abc123"));
 }
 
 fn image_editor(img: image::RgbaImage) -> Editor {

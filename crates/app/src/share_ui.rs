@@ -11,6 +11,7 @@
 //! clean-up DELETE like a tour's, and closing the editor cancels it too. The token is loaded by
 //! the job itself and never reaches the UI thread.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,8 @@ const WARNING_TEXT: Color32 = Color32::from_rgb(245, 214, 150);
 
 /// The entry in the image editor's "Send to" menu and in the recording editor's Export menu.
 pub const MENU_ENTRY: &str = "Publish to…";
+/// The heading of that entry's part of the Export menu.
+pub const EXPORT_HEADING: &str = "Share";
 pub const TITLE_LABEL: &str = "Title (optional)";
 pub const UPLOADING: &str = "Uploading…";
 pub const PREPARING: &str = "Preparing the clip…";
@@ -38,6 +41,8 @@ pub const COPIED: &str = "The link was copied. Paste it to whoever should see it
 pub const NO_FFMPEG: &str = "Mythicshot did not find the video tool (ffmpeg) on this computer, so the clip is sent as a GIF. With it, the same clip is far smaller.";
 /// The status line after a cancel. The wording is proposed and waits for the owner's approval.
 pub const CANCELLED: &str = "Publishing was cancelled. Nothing was left online.";
+/// Prefix of the temporary folder a recording's clip is prepared in.
+pub const TEMP_PREFIX: &str = "mythicshot-share-";
 /// What a panic in the job becomes.
 const BROKE_OFF: &str = "Publishing failed because of an internal error.";
 
@@ -84,6 +89,16 @@ pub fn to_line(workspace: Option<&str>, server: &str) -> Option<String> {
 /// "1920 × 1080 · PNG · 1.4 MB".
 pub fn image_details(width: u32, height: u32, media: MediaType, bytes: u64) -> String {
     format!("{width} × {height} · {} · {}", media.label(), publish_ui::size_text(bytes))
+}
+
+/// "12 s · 960 × 540 · MP4 · about 18 MB"; without "about …" when there is no estimate.
+pub fn clip_details(duration_ms: u64, width: u32, height: u32, media: MediaType, estimate: Option<u64>) -> String {
+    let seconds = ((duration_ms + 500) / 1000).max(1);
+    let base = format!("{seconds} s · {width} × {height} · {}", media.label());
+    match estimate {
+        Some(bytes) => format!("{base} · about {}", publish_ui::size_text(bytes)),
+        None => base,
+    }
 }
 
 /// "0.9 of 1.4 MB": what is sent, in the unit and with the decimals the total is written with
@@ -155,9 +170,33 @@ impl Reporter {
         !self.run.is_cancelled()
     }
 
+    /// The clip is being prepared, `done` of 1; false once cancelled.
+    pub fn preparing(&self, done: f32) -> bool {
+        self.set(Progress::Preparing(done.clamp(0.0, 1.0)))
+    }
+
     /// `sent` of `total` bytes are uploaded; false once cancelled.
     pub fn uploading(&self, sent: u64, total: u64) -> bool {
         self.set(Progress::Uploading(sent, total))
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.run.is_cancelled()
+    }
+
+    /// The temporary folder the job writes into, for quitting to remove should the job not end in time.
+    pub fn keep_dir(&self, dir: Option<PathBuf>) {
+        self.run.set_dir(dir);
+    }
+}
+
+/// Tells whether a job has ended, for whoever must wait for it (a closed editor's recording).
+#[derive(Clone)]
+pub struct JobWaiter(Arc<Mutex<JobState>>);
+
+impl JobWaiter {
+    pub fn is_finished(&self) -> bool {
+        self.0.lock().map(|s| s.finished).unwrap_or(true)
     }
 }
 
@@ -185,6 +224,10 @@ impl ShareJob {
 
     fn cancel(&self) {
         self.run.cancel();
+    }
+
+    pub fn waiter(&self) -> JobWaiter {
+        JobWaiter(self.state.clone())
     }
 
     /// The progress, and the result once the job has ended (taken once).
@@ -415,6 +458,11 @@ impl ShareDialog {
             Progress::Uploading(sent, total) => Stage::Uploading { sent, total },
         };
         self.job = Some(job);
+    }
+
+    /// The running job's waiter, for a recording that must outlive the editor until the job ends.
+    pub fn waiter(&self) -> Option<JobWaiter> {
+        self.job.as_ref().map(ShareJob::waiter)
     }
 
     /// Take in what the job did. When it shared the item, the link goes on the clipboard
@@ -656,6 +704,10 @@ impl Editor {
                     Some(why) => d.update_blocked(Some(why)),
                     None => d.begin(),
                 }
+                let waiter = d.waiter();
+                if let (Some(v), Some(w)) = (self.video.as_mut(), waiter) {
+                    v.share_waiter = Some(w);
+                }
             }
             Some(ShareAction::Closed(status)) => {
                 self.share = None;
@@ -675,6 +727,41 @@ impl Editor {
                 eprintln!("Publish to: {status}");
                 self.notify(status);
             }
+        }
+    }
+}
+
+/// Remove `dir`, trying again for a moment while a program that wrote into it (ffmpeg, just
+/// stopped) still holds a file there.
+pub fn remove_soon(dir: &Path) {
+    for _ in 0..20 {
+        if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A folder name `tempfile` gives a clip being prepared: the prefix and six letters or digits.
+pub fn is_temp_dir_name(name: &str) -> bool {
+    name.strip_prefix(TEMP_PREFIX).is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Remove clip folders in `temp` older than `age` that a crash or a forced quit left behind:
+/// only real folders (not links) with exactly that name, holding nothing but a clip file.
+pub fn sweep_stale(temp: &Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(temp) else { return };
+    for e in entries.flatten() {
+        if !e.file_name().to_str().is_some_and(is_temp_dir_name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !meta.is_dir() || meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|a| a < age) {
+            continue;
+        }
+        let only_clip = std::fs::read_dir(e.path()).map(|inner| inner.flatten().all(|i| i.file_name() == "clip.mp4" || i.file_name() == "clip.gif")).unwrap_or(false);
+        if only_clip {
+            let _ = std::fs::remove_dir_all(e.path());
         }
     }
 }
