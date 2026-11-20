@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 const START: &str = "POST /api/v1/connect/start";
 const ASK: &str = "POST /api/v1/connect/token";
-const DEVICE_CODE: &str = "dc_Zm9vYmFyYmF6cXV4LXNlY3JldC1kZXZpY2UtY29kZQ";
+const DEVICE_CODE: &str = "dpd_5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
 const USER_CODE: &str = "K7QM-2HXD";
 /// A token in the platform's form, used by these tests only.
 const NEW_TOKEN: &str = "dp_feedfacefeedfacefeedfacefeedfacefeedface";
@@ -41,21 +41,44 @@ fn connected_body() -> String {
 
 const PENDING: &str = r#"{"status":"pending"}"#;
 
-/// The stand-in site: start answers a code (600 s, every 5 s); each code check is answered by
-/// `asks`, given how many came before, with the fake clock's time noted.
+/// What the platform answers an ask within 4 seconds of the one before.
+const SLOW_DOWN: &str = r#"{"error":"slow_down","detail":"Ask less often."}"#;
+
+/// The stand-in site: start answers a code (600 s, every 5 s). Like the platform, it records
+/// every code check it takes, and answers `slow_down` (retry-after 5) to one within 4 seconds of
+/// the last it took, without taking it. Every other check is answered by `asks`, given how many
+/// it took before, with the fake clock's time noted.
 fn site(asks: impl Fn(usize) -> Answer + Send + 'static) -> (Stub, FakeClock, Arc<Mutex<Vec<Duration>>>) {
+    site_with(600, asks).0
+}
+
+/// [`site`] with the code's time, and how many asks it answered `slow_down`.
+#[allow(clippy::type_complexity)]
+fn site_with(expires_in: u64, asks: impl Fn(usize) -> Answer + Send + 'static) -> ((Stub, FakeClock, Arc<Mutex<Vec<Duration>>>), Arc<Mutex<usize>>) {
     let clock = FakeClock::default();
     let times: Arc<Mutex<Vec<Duration>>> = Arc::default();
-    let (c, t) = (clock.clone(), times.clone());
-    let s = stub(move |req: &Req, seen| match req.line.as_str() {
-        START => reply(201, &started_body(600, 5, "https://app.example.com/connections")),
+    let slowed: Arc<Mutex<usize>> = Arc::default();
+    let (c, t, sl) = (clock.clone(), times.clone(), slowed.clone());
+    let last: Mutex<Option<Duration>> = Mutex::new(None);
+    let taken = Mutex::new(0usize);
+    let s = stub(move |req: &Req, _| match req.line.as_str() {
+        START => reply(201, &started_body(expires_in, 5, "https://app.example.com/connections")),
         ASK => {
-            t.lock().unwrap().push(c.at());
-            asks(seen)
+            let now = c.at();
+            let mut last = last.lock().unwrap();
+            if last.is_some_and(|l| now < l + Duration::from_secs(4)) {
+                *sl.lock().unwrap() += 1;
+                return Answer::Reply(429, SLOW_DOWN.into(), vec![("retry-after", "5".into())]);
+            }
+            *last = Some(now);
+            t.lock().unwrap().push(now);
+            let mut n = taken.lock().unwrap();
+            *n += 1;
+            asks(*n - 1)
         }
         _ => reply(404, r#"{"error":"not_found"}"#),
     });
-    (s, clock, times)
+    ((s, clock, times), slowed)
 }
 
 fn anon(s: &Stub) -> Client {
@@ -81,7 +104,7 @@ fn no_credential_sent(s: &Stub) {
 
 #[test]
 fn pending_then_connected_answers_the_token_asking_every_interval_without_a_credential() {
-    let (s, clock, times) = site(|seen| if seen < 2 { reply(200, PENDING) } else { reply(200, &connected_body()) });
+    let ((s, clock, times), slowed) = site_with(600, |seen| if seen < 2 { reply(200, PENDING) } else { reply(200, &connected_body()) });
     let started = start_with(&anon(&s), "ALEX-DESKTOP").unwrap();
     assert_eq!(started.user_code, USER_CODE);
     assert_eq!(started.page.as_deref(), Some("https://app.example.com/connections"));
@@ -92,6 +115,7 @@ fn pending_then_connected_answers_the_token_asking_every_interval_without_a_cred
     assert_eq!(connected.token.expose(), NEW_TOKEN);
     assert_eq!(*times.lock().unwrap(), secs(&[5, 10, 15]), "one ask per interval, the first after one interval");
     assert_eq!(s.lines(), [START, ASK, ASK, ASK]);
+    assert_eq!(*slowed.lock().unwrap(), 0, "never asked sooner than the site allows");
     no_credential_sent(&s);
     // What each request carried: the computer's name, then the device code and nothing else.
     let reqs = s.requests();
@@ -157,35 +181,53 @@ fn the_sites_times_are_kept_within_sane_bounds() {
 fn slow_down_makes_the_asks_further_apart() {
     let (s, clock, times) = site(|seen| match seen {
         0 => reply(200, PENDING),
-        1 => Answer::Reply(429, r#"{"error":"slow_down"}"#.into(), vec![("retry-after", "12".into())]),
-        2 => Answer::Reply(429, r#"{"error":"slow_down"}"#.into(), vec![]),
+        1 => Answer::Reply(429, SLOW_DOWN.into(), vec![("retry-after", "12".into())]),
+        2 => Answer::Reply(429, SLOW_DOWN.into(), vec![]),
         3 => reply(200, PENDING),
         _ => reply(200, &connected_body()),
     });
     assert_eq!(sign_in(&s, &clock).unwrap().token.expose(), NEW_TOKEN);
     // 5, 10; then the site asks for 12 s (the interval is 10 by then); then 15, 15.
     assert_eq!(*times.lock().unwrap(), secs(&[5, 10, 22, 37, 52]));
-    // Never further apart than 30 seconds, whatever the site says.
-    let (s, clock, times) = site(|seen| if seen < 4 { Answer::Reply(429, r#"{"error":"slow_down"}"#.into(), vec![("retry-after", "3600".into())]) } else { reply(200, &connected_body()) });
-    assert!(sign_in(&s, &clock).is_ok());
-    assert_eq!(*times.lock().unwrap(), secs(&[5, 35, 65, 95, 125]));
 }
 
 #[test]
-fn a_lost_answer_is_asked_once_more_and_a_second_loss_ends_with_a_sentence() {
-    let (s, clock, times) = site(|seen| if seen == 0 { Answer::Drop } else { reply(200, &connected_body()) });
+fn a_wait_the_site_asks_for_is_never_cut_short_and_one_past_the_deadline_ends_the_wait() {
+    // Too often for the site: wait all of it (more than 30 s), and the interval stays as it was.
+    let (s, clock, times) = site(|seen| match seen {
+        0 => Answer::Reply(429, r#"{"error":"rate_limited"}"#.into(), vec![("retry-after", "90".into())]),
+        1 => reply(200, PENDING),
+        _ => reply(200, &connected_body()),
+    });
+    assert!(sign_in(&s, &clock).is_ok());
+    assert_eq!(*times.lock().unwrap(), secs(&[5, 95, 100]));
+    // A wait longer than the code has left: the sign-in ends with the site's wait said, and nothing more is asked.
+    let (s, clock, _) = site(|_| Answer::Reply(429, r#"{"error":"rate_limited","detail":"Too many."}"#.into(), vec![("retry-after", "600".into())]));
+    let e = sign_in(&s, &clock).unwrap_err();
+    assert_eq!(e, ConnectError::Busy(Some(600)));
+    assert_eq!(e.text().unwrap().1, "Could not sign in: the site asks to wait 600 seconds. Sign in again later.");
+    assert_eq!(s.lines(), [START, ASK]);
+    assert_eq!(clock.at(), Duration::from_secs(5), "it did not wait for what it would not use");
+}
+
+#[test]
+fn a_lost_answer_is_asked_once_more_an_interval_later_and_a_second_loss_ends_with_a_sentence() {
+    // The site takes the first check (and notes when) but its answer never arrives.
+    let ((s, clock, times), slowed) = site_with(600, |seen| if seen == 0 { Answer::Drop } else { reply(200, &connected_body()) });
     assert_eq!(sign_in(&s, &clock).unwrap().token.expose(), NEW_TOKEN);
     assert_eq!(s.lines(), [START, ASK, ASK]);
-    assert_eq!(*times.lock().unwrap(), secs(&[5, 5]), "the resend goes at once");
+    assert_eq!(*times.lock().unwrap(), secs(&[5, 10]), "the resend waits one full interval");
+    assert_eq!(*slowed.lock().unwrap(), 0, "so the site never answers slow_down to it");
 
     // Lost per ask, not per sign-in: a later loss gets its own resend.
-    let (s, clock, _) = site(|seen| match seen {
+    let ((s, clock, _), slowed) = site_with(600, |seen| match seen {
         0 | 2 => Answer::Drop,
         1 => reply(200, PENDING),
         _ => reply(200, &connected_body()),
     });
     assert!(sign_in(&s, &clock).is_ok());
     assert_eq!(s.lines().len(), 5);
+    assert_eq!(*slowed.lock().unwrap(), 0);
 
     let (s, clock, _) = site(|_| Answer::Drop);
     let ConnectError::Failed(e) = sign_in(&s, &clock).unwrap_err() else { panic!("not a failure") };
@@ -195,6 +237,30 @@ fn a_lost_answer_is_asked_once_more_and_a_second_loss_ends_with_a_sentence() {
     let s = stub(|_, _| Answer::Drop);
     assert!(matches!(start_with(&anon(&s), "PC"), Err(ConnectError::Failed(e)) if e.starts_with("Could not sign in: ")));
     assert_eq!(s.lines(), [START]);
+}
+
+#[test]
+fn a_410_after_a_lost_answer_says_the_site_may_have_connected_this_computer() {
+    // The lost answer held the token: the code is collected, so the resend gets 410.
+    let (s, clock, _) = site(|seen| if seen == 0 { Answer::Drop } else { reply(410, r#"{"error":"expired_code"}"#) });
+    let e = sign_in(&s, &clock).unwrap_err();
+    assert_eq!(e, ConnectError::LostAnswer);
+    assert_eq!(
+        e.text(),
+        Some(("This computer was not connected", "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again.".to_string()))
+    );
+    assert!(e.can_try_again());
+    // The time running out before the resend says the same.
+    let ((s, clock, _), _) = site_with(8, |_| Answer::Drop);
+    assert_eq!(sign_in(&s, &clock).unwrap_err(), ConnectError::LostAnswer);
+    assert_eq!(s.lines(), [START, ASK]);
+    // A loss with an answer after it that is not 410 is forgotten: a later 410 is the usual one.
+    let (s, clock, _) = site(|seen| match seen {
+        0 => Answer::Drop,
+        1 => reply(200, PENDING),
+        _ => reply(410, r#"{"error":"expired_code"}"#),
+    });
+    assert_eq!(sign_in(&s, &clock).unwrap_err(), ConnectError::NotConnected);
 }
 
 #[test]
@@ -251,8 +317,19 @@ fn an_answer_that_makes_no_sense_is_refused() {
         json!({ "device_code": DEVICE_CODE, "expires_in": 600, "interval": 5 }).to_string(),
         json!({ "device_code": DEVICE_CODE, "user_code": USER_CODE, "interval": 5 }).to_string(),
         json!({ "device_code": "has space", "user_code": USER_CODE, "expires_in": 600 }).to_string(),
+        json!({ "device_code": "dc_Zm9vYmFyYmF6cXV4LXNlY3JldC1kZXZpY2UtY29kZQ", "user_code": USER_CODE, "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE.to_uppercase().replace("DPD_", "dpd_"), "user_code": USER_CODE, "expires_in": 600 }).to_string(),
+        json!({ "device_code": &DEVICE_CODE[..43], "user_code": USER_CODE, "expires_in": 600 }).to_string(),
+        json!({ "device_code": format!("{DEVICE_CODE}0"), "user_code": USER_CODE, "expires_in": 600 }).to_string(),
+        json!({ "device_code": 12345, "user_code": USER_CODE, "expires_in": 600 }).to_string(),
         json!({ "device_code": DEVICE_CODE, "user_code": "k7qm<script>", "expires_in": 600 }).to_string(),
         json!({ "device_code": DEVICE_CODE, "user_code": "----", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "k7qm-2hxd", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "K7QM2HXD", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "K7QM-2HX", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "K7QM-2HXDX", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "K7Q-M2HXD", "expires_in": 600 }).to_string(),
+        json!({ "device_code": DEVICE_CODE, "user_code": "K7QM 2HXD", "expires_in": 600 }).to_string(),
         json!({ "device_code": "x".repeat(513), "user_code": USER_CODE, "expires_in": 600 }).to_string(),
     ] {
         let s = stub(move |_, _| reply(201, &body));
@@ -349,4 +426,59 @@ fn the_computers_name_is_cleaned_and_cut_to_60_characters() {
     // This computer's own name reads as something, cleaned.
     let name = device_name();
     assert!(!name.is_empty() && name.chars().count() <= 60 && name == clean_device_name(&name));
+}
+
+#[test]
+fn a_name_the_site_refuses_is_tried_once_more_as_this_computer() {
+    let bad_name = || reply(400, r#"{"error":"bad_device_name","detail":"The name is not allowed."}"#);
+    let s = stub(move |req: &Req, _| {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        if body["device_name"] == "This computer" { reply(201, &started_body(600, 5, "/c")) } else { bad_name() }
+    });
+    assert_eq!(start_with(&anon(&s), "ALEX-DESKTOP").unwrap().user_code, USER_CODE);
+    let names: Vec<Value> = s.requests().iter().map(|r| serde_json::from_slice::<Value>(&r.body).unwrap()["device_name"].clone()).collect();
+    assert_eq!(names, [json!("ALEX-DESKTOP"), json!("This computer")]);
+    // Refused again: the general failure, and no third try.
+    let s = stub(move |_, _| bad_name());
+    assert_eq!(start_with(&anon(&s), "ALEX-DESKTOP").unwrap_err(), ConnectError::Failed("Could not sign in: the server answered HTTP 400.".into()));
+    assert_eq!(s.lines(), [START, START]);
+    // Already the fallback: tried once.
+    let s = stub(move |_, _| bad_name());
+    assert!(start_with(&anon(&s), "This computer").is_err());
+    assert_eq!(s.lines(), [START]);
+    // Another 400 is not a name problem: no second try.
+    let s = stub(|_, _| reply(400, r#"{"error":"credentials_not_allowed"}"#));
+    assert_eq!(start_with(&anon(&s), "PC").unwrap_err(), ConnectError::Failed("Could not sign in: the server answered HTTP 400.".into()));
+    assert_eq!(s.lines(), [START]);
+}
+
+#[test]
+fn the_account_that_confirmed_the_code_comes_back_cleaned_and_an_older_site_still_works() {
+    for (account, want) in [
+        (json!({ "username": "alex" }), Some("alex")),
+        (json!({ "username": "  mallory\u{202e}\u{200b} " }), Some("mallory")),
+        (json!({ "username": null }), None),
+        (json!({ "username": "" }), None),
+        (json!(null), None),
+        (json!({}), None),
+    ] {
+        let body = json!({ "status": "connected", "token": NEW_TOKEN, "workspace": { "name": "Cowfee" }, "account": account }).to_string();
+        let (s, clock, _) = site(move |_| reply(200, &body));
+        assert_eq!(sign_in(&s, &clock).unwrap().account.as_deref(), want, "{account}");
+    }
+    // No account field at all: an older site.
+    let (s, clock, _) = site(|_| reply(200, &connected_body()));
+    assert_eq!(sign_in(&s, &clock).unwrap().account, None);
+}
+
+#[test]
+fn a_secret_is_moved_out_of_the_answer_and_nothing_of_it_is_left_there() {
+    let mut v = json!({ "token": NEW_TOKEN, "device_code": "not one", "other": 1 });
+    let token = take_secret(&mut v, "token", crate::publish::is_token).unwrap();
+    assert_eq!(token.expose(), NEW_TOKEN);
+    assert_eq!(v["token"], Value::Null, "the answer keeps no copy");
+    assert!(take_secret(&mut v, "device_code", is_device_code).is_none());
+    assert_eq!(v["device_code"], Value::Null, "what was refused is taken out too");
+    assert!(take_secret(&mut v, "other", is_device_code).is_none() && take_secret(&mut v, "missing", is_device_code).is_none());
+    assert!(!v.to_string().contains("dp_"));
 }

@@ -541,8 +541,19 @@ struct Token(String);
 impl Token {
     fn parse(text: &str) -> Result<Token, String> {
         let t = text.trim();
-        let ok = t.len() == 43 && t.starts_with("dp_") && t[3..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if ok { Ok(Token(t.to_string())) } else { Err("That is not an API token. A token starts with dp_ and comes from the server's setup page.".into()) }
+        if is_token(t) { Ok(Token(t.to_string())) } else { Err("That is not an API token. A token starts with dp_ and comes from the server's setup page.".into()) }
+    }
+}
+
+/// Whether `text` is an API token as it is: `dp_` and 40 lowercase hex characters, nothing around it.
+fn is_token(text: &str) -> bool {
+    text.len() == 43 && text.starts_with("dp_") && text[3..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl Drop for Token {
+    /// The token's bytes are overwritten when it goes, like a typed one.
+    fn drop(&mut self) {
+        crate::publish_ui::wipe(&mut self.0);
     }
 }
 
@@ -604,10 +615,14 @@ impl SecretStore for OsStore {
 fn load_token_from(store: &dyn SecretStore) -> Result<Option<String>, String> {
     match store.get()? {
         None => Ok(None),
-        Some(stored) => match Token::parse(&stored) {
-            Ok(t) => Ok(Some(t.0)),
-            Err(_) => Err("Could not use the credential store: the stored token could not be read. Forget it and save the token again.".into()),
-        },
+        Some(mut stored) => {
+            let parsed = Token::parse(&stored);
+            crate::publish_ui::wipe(&mut stored);
+            match parsed {
+                Ok(mut t) => Ok(Some(std::mem::take(&mut t.0))),
+                Err(_) => Err("Could not use the credential store: the stored token could not be read. Forget it and save the token again.".into()),
+            }
+        }
     }
 }
 

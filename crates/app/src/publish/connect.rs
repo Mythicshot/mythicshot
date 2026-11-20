@@ -8,9 +8,12 @@
 //! cancels. Neither request carries a credential ([`Client::anonymous`]), and like every other
 //! request they go to the configured site only and never follow a redirect.
 //!
-//! What is asked a second time, and only once per ask: a code check that got no answer at all.
-//! A `slow_down` (429) makes the asks further apart. Nothing is ever asked after the code's time
-//! is up, and the time is never longer than [`MAX_DEADLINE`] whatever the site says.
+//! What is asked a second time, and only once per ask: a code check that got no answer at all,
+//! one full interval later; and the start, once, with [`FALLBACK_DEVICE_NAME`] when the site
+//! refuses the computer's name. A `slow_down` (429) makes the asks further apart, and no ask is
+//! ever sent sooner than a 429's `retry-after` allows: a wait past the code's time ends the
+//! sign-in. Nothing is ever asked after the code's time is up, and the time is never longer than
+//! [`MAX_DEADLINE`] whatever the site says.
 //!
 //! The device code and the token are secrets: they live only in memory ([`Secret`], wiped when
 //! dropped), are never part of an error, a log line or a `Debug` print, and never reach the
@@ -26,7 +29,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{Client, Method, Reply, Timeouts, Token, share};
+use super::{Client, Method, Reply, Timeouts, share};
 
 pub const START_PATH: &str = "/api/v1/connect/start";
 pub const TOKEN_PATH: &str = "/api/v1/connect/token";
@@ -42,16 +45,14 @@ pub const DEVICE_NAME_MAX: usize = 60;
 pub const FALLBACK_DEVICE_NAME: &str = "This computer";
 /// How often cancel is looked at while waiting.
 const WAIT_STEP: Duration = Duration::from_millis(100);
-/// The longest device code taken from the site.
-const MAX_DEVICE_CODE: usize = 512;
-/// The longest short code taken from the site.
-const MAX_USER_CODE: usize = 16;
 
 /// The sentence for a site that has no Sign in (an older site: 404 or 405).
 pub const NOT_OFFERED: &str = "This site does not offer Sign in yet. Paste a token instead.";
 /// The heading and the sentence for a code that ran out or was turned down.
 pub const NOT_CONNECTED_HEADING: &str = "This computer was not connected";
 pub const NOT_CONNECTED_TEXT: &str = "The code ran out or was turned down in the browser. Nothing was changed.";
+/// When an answer was lost and the code was gone after it: the site may have connected this computer.
+pub const LOST_ANSWER_TEXT: &str = "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again.";
 /// What every other failure starts with.
 const WHAT: &str = "Could not sign in";
 
@@ -110,11 +111,13 @@ pub fn minutes_text(d: Duration) -> Option<String> {
     }
 }
 
-/// The code was confirmed: the token. (The workspace's name in the same answer is not kept: the
-/// Workspace page asks the site for it with the new token, like for a pasted one.)
+/// The code was confirmed: the token, and the account that confirmed it when the site named one
+/// (cleaned as plain text; None from an older site). The workspace's name in the same answer is
+/// not kept: the Workspace page asks the site for it with the new token, like for a pasted one.
 #[derive(Debug)]
 pub struct Connected {
     pub token: Secret,
+    pub account: Option<String>,
 }
 
 /// Why this computer was not connected.
@@ -124,6 +127,9 @@ pub enum ConnectError {
     NotOffered,
     /// The code ran out, was turned down, or its time is up: [`NOT_CONNECTED_TEXT`].
     NotConnected,
+    /// After an answer was lost on the way the site said the code is no longer open (or the time
+    /// ran out): the lost answer may have held the token. [`LOST_ANSWER_TEXT`].
+    LostAnswer,
     /// The site asked to wait (429 when a code is asked for): the seconds, when it said.
     Busy(Option<u32>),
     Cancelled,
@@ -138,6 +144,7 @@ impl ConnectError {
             ConnectError::Cancelled => return None,
             ConnectError::NotOffered => NOT_OFFERED.to_string(),
             ConnectError::NotConnected => NOT_CONNECTED_TEXT.to_string(),
+            ConnectError::LostAnswer => LOST_ANSWER_TEXT.to_string(),
             ConnectError::Busy(Some(s)) => format!("{WHAT}: the site asks to wait {} seconds. Sign in again later.", (*s).min(3600)),
             ConnectError::Busy(None) => format!("{WHAT}: the site is busy. Sign in again later."),
             ConnectError::Failed(text) => text.clone(),
@@ -249,37 +256,76 @@ pub fn wait(started: &Started, cancelled: &dyn Fn() -> bool, clock: &dyn Clock) 
     wait_with(&client, started, cancelled, clock)
 }
 
-/// [`start`] on a client.
+/// [`start`] on a client. A name the site refuses (400 `bad_device_name`) is tried once more as
+/// [`FALLBACK_DEVICE_NAME`].
 fn start_with(client: &Client, device_name: &str) -> Result<Started, ConnectError> {
     let name = clean_device_name(device_name);
-    let body = serde_json::to_vec(&json!({ "device_name": name })).map_err(|_| ConnectError::Failed(not_understood()))?;
-    let reply = client.send(Method::Post, START_PATH, Some(("application/json", &body))).map_err(|t| ConnectError::Failed(format!("{WHAT}: {}.", t.0)))?;
+    let mut reply = ask_for_code(client, &name)?;
+    if reply.status == 400 && reply.error_code().as_deref() == Some("bad_device_name") && name != FALLBACK_DEVICE_NAME {
+        reply = ask_for_code(client, FALLBACK_DEVICE_NAME)?;
+    }
     match reply.status {
         200..=299 => {}
         404 | 405 => return Err(ConnectError::NotOffered),
         429 => return Err(ConnectError::Busy(reply.retry_after)),
         s => return Err(ConnectError::Failed(status_text(s))),
     }
-    let v = reply.json().ok_or_else(|| ConnectError::Failed(not_understood()))?;
+    let mut v = take_json(&mut reply).ok_or_else(|| ConnectError::Failed(not_understood()))?;
+    // The device code is taken out of the answer into a secret; what is not one is wiped.
+    let device_code = take_secret(&mut v, "device_code", is_device_code).ok_or_else(|| ConnectError::Failed(not_understood()))?;
     let text = |key: &str| v.get(key).and_then(Value::as_str);
-    let device_code = text("device_code").filter(|c| is_device_code(c)).ok_or_else(|| ConnectError::Failed(not_understood()))?;
     let user_code = text("user_code").filter(|c| is_user_code(c)).ok_or_else(|| ConnectError::Failed(not_understood()))?.to_string();
     let seconds = |key: &str| v.get(key).and_then(Value::as_u64).filter(|s| *s > 0);
     let expires_in = Duration::from_secs(seconds("expires_in").ok_or_else(|| ConnectError::Failed(not_understood()))?.min(MAX_DEADLINE.as_secs()));
     // A site that names no interval gets the slowest one the contract allows for, not the fastest.
     let interval = Duration::from_secs(seconds("interval").unwrap_or(5).min(MAX_INTERVAL.as_secs())).max(MIN_INTERVAL);
     let page = text("verify_url").and_then(|u| verify_page(&client.base, u, &user_code));
-    Ok(Started { server: client.base.clone(), user_code, page, expires_in, interval, device_code: Secret(device_code.to_string()) })
+    Ok(Started { server: client.base.clone(), user_code, page, expires_in, interval, device_code })
+}
+
+/// One `start` request for `name`. Never sent again after a lost answer: that would be a second code.
+fn ask_for_code(client: &Client, name: &str) -> Result<Reply, ConnectError> {
+    let body = serde_json::to_vec(&json!({ "device_name": name })).map_err(|_| ConnectError::Failed(not_understood()))?;
+    client.send(Method::Post, START_PATH, Some(("application/json", &body))).map_err(|t| ConnectError::Failed(format!("{WHAT}: {}.", t.0)))
+}
+
+/// The reply's body as JSON; the body's bytes are overwritten once read, since it may hold a secret.
+fn take_json(reply: &mut Reply) -> Option<Value> {
+    let v = reply.json();
+    for b in reply.body.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference into the body.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    v
+}
+
+/// The string at `key`, moved out of `v` (nothing is left behind there) into a [`Secret`] when
+/// `ok` accepts it; otherwise it is wiped and None is answered.
+fn take_secret(v: &mut Value, key: &str, ok: fn(&str) -> bool) -> Option<Secret> {
+    match v.get_mut(key).map(Value::take) {
+        Some(Value::String(text)) => {
+            let secret = Secret(text);
+            ok(secret.expose()).then_some(secret)
+        }
+        _ => None,
+    }
 }
 
 /// [`wait`] on a client and a clock.
+///
+/// A code check that got no answer at all is sent once more, one full interval later (sooner,
+/// the site answers `slow_down`). When the answer after such a loss is 410, or the time runs out
+/// before it, the lost answer may have held the token: the site may have connected this
+/// computer already, and [`ConnectError::LostAnswer`] says so.
 fn wait_with(client: &Client, started: &Started, cancelled: &dyn Fn() -> bool, clock: &dyn Clock) -> Result<Connected, ConnectError> {
     let deadline = clock.now() + started.expires_in;
     let mut interval = started.interval;
     let mut next = interval;
-    let body = serde_json::to_vec(&json!({ "device_code": started.device_code.expose() })).map_err(|_| ConnectError::Failed(not_understood()))?;
-    // The body holds the device code: it is overwritten when this function ends, however it ends.
-    let body = Secret(String::from_utf8(body).map_err(|_| ConnectError::Failed(not_understood()))?);
+    // The body holds the device code (checked to be `dpd_` and hex, so it needs no escaping): it
+    // is overwritten when this function ends, however it ends.
+    let body = Secret(format!("{{\"device_code\":\"{}\"}}", started.device_code.expose()));
+    // The last code check got no answer.
+    let mut lost = false;
     loop {
         // Wait, looking at cancel every tenth of a second, and never past the deadline.
         let until = (clock.now() + next).min(deadline);
@@ -294,46 +340,51 @@ fn wait_with(client: &Client, started: &Started, cancelled: &dyn Fn() -> bool, c
             clock.sleep((until - now).min(WAIT_STEP));
         }
         if clock.now() >= deadline {
-            return Err(ConnectError::NotConnected);
+            return Err(if lost { ConnectError::LostAnswer } else { ConnectError::NotConnected });
         }
-        let mut reply = ask(client, body.expose().as_bytes())?;
         next = interval;
+        let mut reply = match client.send(Method::Post, TOKEN_PATH, Some(("application/json", body.expose().as_bytes()))) {
+            Err(t) if lost => return Err(ConnectError::Failed(format!("{WHAT}: {}.", t.0))),
+            Err(_) => {
+                lost = true;
+                continue;
+            }
+            Ok(reply) => reply,
+        };
+        let after_loss = std::mem::take(&mut lost);
         match reply.status {
             200 => {
-                let v = reply.json().ok_or_else(|| ConnectError::Failed(not_understood()))?;
+                let mut v = take_json(&mut reply).ok_or_else(|| ConnectError::Failed(not_understood()))?;
                 match v.get("status").and_then(Value::as_str) {
                     Some("pending") => {}
                     Some("connected") => {
-                        // A token that is not one is never stored, and never said.
-                        let token = v.get("token").and_then(Value::as_str).and_then(|t| Token::parse(t).ok()).map(|t| Secret(t.0));
-                        // The answer held the token: its bytes are overwritten now.
-                        for b in reply.body.iter_mut() {
-                            // SAFETY: `b` is a valid, aligned, exclusive reference into the body.
-                            unsafe { std::ptr::write_volatile(b, 0) };
-                        }
-                        let token = token.ok_or_else(|| ConnectError::Failed(not_understood()))?;
-                        return Ok(Connected { token });
+                        // A token that is not one is never stored, and never said; either way no copy is left in the answer.
+                        let token = take_secret(&mut v, "token", super::is_token).ok_or_else(|| ConnectError::Failed(not_understood()))?;
+                        // A missing account, or one without a name, is no name: an older site still works.
+                        let account = v.get("account").and_then(|a| a.get("username")).and_then(Value::as_str).map(share::plain_text).filter(|n| !n.is_empty());
+                        return Ok(Connected { token, account });
                     }
                     _ => return Err(ConnectError::Failed(not_understood())),
                 }
             }
+            410 if after_loss => return Err(ConnectError::LostAnswer),
             410 => return Err(ConnectError::NotConnected),
-            // Asked too fast: one more interval from now on, and at least the wait the site asks for.
+            // Asked too fast, or too often: never sooner than the site allows. A wait that goes past
+            // the code's time ends here, with the site's wait said.
             429 => {
-                interval = (interval + started.interval).min(MAX_INTERVAL);
-                let asked = reply.retry_after.map(|s| Duration::from_secs(u64::from(s)).min(MAX_INTERVAL)).unwrap_or(Duration::ZERO);
+                if reply.error_code().as_deref() != Some("rate_limited") {
+                    interval = (interval + started.interval).min(MAX_INTERVAL);
+                }
+                let asked = reply.retry_after.map(|s| Duration::from_secs(u64::from(s))).unwrap_or(Duration::ZERO);
+                if clock.now() + asked > deadline {
+                    return Err(ConnectError::Busy(reply.retry_after));
+                }
                 next = interval.max(asked);
             }
             404 | 405 => return Err(ConnectError::NotOffered),
             s => return Err(ConnectError::Failed(status_text(s))),
         }
     }
-}
-
-/// One code check, sent once more when the first got no answer at all.
-fn ask(client: &Client, body: &[u8]) -> Result<Reply, ConnectError> {
-    let send = || client.send(Method::Post, TOKEN_PATH, Some(("application/json", body)));
-    send().or_else(|_| send()).map_err(|t| ConnectError::Failed(format!("{WHAT}: {}.", t.0)))
 }
 
 /// A status the routine has no answer for, in Mythicshot's words; never the site's sentence.
@@ -348,14 +399,16 @@ fn not_understood() -> String {
     super::not_understood(WHAT)
 }
 
-/// A device code as the site gives it: printable ASCII without spaces, at most 512 characters.
+/// A device code as the site makes it: `dpd_` and 40 lowercase hex characters.
 fn is_device_code(code: &str) -> bool {
-    (1..=MAX_DEVICE_CODE).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_graphic())
+    code.strip_prefix("dpd_").is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 
-/// A short code: capital letters, digits and hyphens (`K7QM-2HXD`), at most 16 characters.
+/// A short code: four capital letters or digits, a hyphen, four more (`K7QM-2HXD`).
 fn is_user_code(code: &str) -> bool {
-    (1..=MAX_USER_CODE).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-') && code.bytes().any(|b| b != b'-')
+    let b = code.as_bytes();
+    let part = |p: &[u8]| p.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    b.len() == 9 && b[4] == b'-' && part(&b[..4]) && part(&b[5..])
 }
 
 #[cfg(test)]
