@@ -76,6 +76,7 @@ fn until_code(d: &mut SignInDialog) {
 }
 
 /// End the newest job with `result` and poll until the dialog has taken it in.
+#[allow(clippy::type_complexity)]
 fn finish(d: &mut SignInDialog, sender: &Mutex<Option<std::sync::mpsc::Sender<Result<Option<String>, ConnectError>>>>, result: Result<Option<String>, ConnectError>) -> Option<SignInAction> {
     sender.lock().unwrap().as_ref().unwrap().send(result).unwrap();
     for _ in 0..500 {

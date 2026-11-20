@@ -70,7 +70,9 @@ Guide cards, the cover, the end card, the buttons, the hotspot and the progress 
 
 First connect Mythicshot on the Workspace page of the main window: enter the site address (`https://`, or `http://` for `localhost` only) and press "Sign in". Your browser opens the Connections page of your dashboard; type the code Mythicshot shows there and press Connect, and this computer is connected, under its Windows computer name. The code works for the time the window says (10 minutes on a standard site), and "Cancel" stops waiting without changing anything. On a site that does not offer Sign in yet, "Paste a token instead" takes the API token from the server's setup page, as before. "Test connection" shows the workspace's name or what went wrong.
 
-"Sign out" removes the token from this computer. It does not disconnect the computer on the site; do that on the dashboard's Connections page. A token the site no longer accepts (disconnected there) reads as not connected everywhere in Mythicshot, with a pointer to the Workspace page to sign in again.
+After signing in, the page shows "Signed in as" the account that confirmed the code (on a site that says it), with "Not you? Sign out" for a code someone else confirmed. Sign in is offered when there is no token for the address or the site refused it, not when the site is just unreachable, so that no second connection is made.
+
+"Sign out" removes the token from this computer. It does not disconnect the computer on the site; do that on the dashboard's Connections page. Replacing a token means "Sign out" first, then Sign in or "Paste a token instead". Cancelling at the very last moment, or an answer lost on the way, can leave an unused connection listed on the dashboard's Connections page; disconnect it there. A token the site no longer accepts (disconnected there) reads as not connected everywhere in Mythicshot, with a pointer to the Workspace page to sign in again.
 
 > [!WARNING]
 > The API token is a password for your whole workspace: it is kept in Windows Credential Manager, never in `settings.toml`, and is never shown again after you save it.

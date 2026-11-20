@@ -2,6 +2,16 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.14 (2026-11-20)
+
+- Sign in no longer asks the site again at once after an answer was lost: it waits one interval, as the site expects. When the code is gone after a lost answer, the window says "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again."
+- When the site asks Sign in to wait, Mythicshot waits all of it; when the wait is longer than the code has left, it says so instead of waiting.
+- The Sign in window says when Mythicshot could not open the browser, and still offers "Open the page" and the page's address, in full and selectable.
+- After signing in, the Workspace page shows "Signed in as" the account that confirmed the code, with "Not you? Sign out", until the page is closed or the token changes. A site that does not name the account shows nothing extra.
+- Sign in is offered only without a token for this address or when the site refused the token, not when the site is just unreachable: signing in again then would add a second connection.
+- A computer name the site does not take is sent as "This computer" instead.
+- Cancelling at the very last moment, or an answer lost on the way, can leave an unused connection on the dashboard's Connections page; disconnect it there. Replacing a token now means "Sign out" first.
+
 ## 0.2.13 (2026-11-20)
 
 - "Sign in" on the Workspace page connects this computer without copying a token: the browser opens the Connections page of the dashboard, you type the short code Mythicshot shows and press Connect, and Mythicshot finishes by itself. The token is kept in Windows Credential Manager, as a pasted one is, and belongs to the site address the sign-in was started for.
