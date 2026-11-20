@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.12 (2026-11-20)
+
+- "Publish to" follows the site's own size limits: an image or clip over the usual 10 MB or 50 MB goes to a site set to take more, and a site that does not take it says its limit, in Mythicshot's words, before any part is sent.
+- A very large screenshot no longer holds up the editor while "Publish to" opens: its size is worked out in the background, and "Publish" can be pressed once it is shown. An image wider or taller than any site takes is refused at once.
+- When the site gives a link Mythicshot cannot open, the item's own address on the site is offered instead.
+- When Cancel comes too late to stop the upload, the window shows the link, but nothing is put on the clipboard. After a cancel the status bar says "Publishing was cancelled. Nothing was shared."
+- "Copy link" says so when the link could not be copied.
+
 ## 0.2.11 (2026-11-20)
 
 - "Publish to…" in the recording editor's Export menu, under "Share", shares the recording as a clip with a link, the same way as an image. The clip uses the size, quality and trim chosen in Export.
