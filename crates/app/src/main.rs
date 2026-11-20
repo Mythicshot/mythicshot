@@ -27,6 +27,7 @@ mod publish_ui;
 mod recorder_ui;
 mod settings;
 mod settings_ui;
+mod sign_in_ui;
 mod share_ui;
 mod site;
 mod site_ui;

@@ -2,6 +2,25 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.14 (2026-11-20)
+
+- Sign in no longer asks the site again at once after an answer was lost: it waits one interval, as the site expects. When the code is gone after a lost answer, the window says "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again."
+- When the site asks Sign in to wait, Mythicshot waits all of it; when the wait is longer than the code has left, it says so instead of waiting.
+- The Sign in window says when Mythicshot could not open the browser, and still offers "Open the page" and the page's address, in full and selectable.
+- After signing in, the Workspace page shows "Signed in as" the account that confirmed the code, with "Not you? Sign out", until the page is closed or the token changes. A site that does not name the account shows nothing extra.
+- Sign in is offered only without a token for this address or when the site refused the token, not when the site is just unreachable: signing in again then would add a second connection.
+- A computer name the site does not take is sent as "This computer" instead.
+- Cancelling at the very last moment, or an answer lost on the way, can leave an unused connection on the dashboard's Connections page; disconnect it there. Replacing a token now means "Sign out" first.
+
+## 0.2.13 (2026-11-20)
+
+- "Sign in" on the Workspace page connects this computer without copying a token: the browser opens the Connections page of the dashboard, you type the short code Mythicshot shows and press Connect, and Mythicshot finishes by itself. The token is kept in Windows Credential Manager, as a pasted one is, and belongs to the site address the sign-in was started for.
+- The code works for 10 minutes on a standard site. "Cancel", closing the window or quitting stops waiting, and nothing is saved. A code that ran out or was turned down says so, with "Try again".
+- "Paste a token instead" keeps the token field for sites without Sign in. Such a site says "This site does not offer Sign in yet. Paste a token instead."
+- The Workspace page shows "Connected to" the workspace and this computer's name with "Sign out", which removes the token from this computer. It does not disconnect the computer on the site.
+- A token the site no longer accepts no longer reads as connected: the menu says "Not connected", and "Publish tour", "Publish to" and the Tours page say "The server rejected the API token." and point to the Workspace page.
+- Needs a site that offers Sign in. Pasting a token works on every site, as before.
+
 ## 0.2.12 (2026-11-20)
 
 - "Publish to" follows the site's own size limits: an image or clip over the usual 10 MB or 50 MB goes to a site set to take more, and a site that does not take it says its limit, in Mythicshot's words, before any part is sent.

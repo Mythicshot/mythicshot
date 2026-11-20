@@ -306,9 +306,10 @@ pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
 /// The host name for the "Connected to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
 /// `bound` is the address the token was saved for: with another address set, the token is not
-/// used there, so that is not a connection.
-pub fn connected_host(server: &str, token: &TokenStatus, bound: Option<&str>) -> Option<String> {
-    if *token != TokenStatus::Saved || publish_ui::binding_problem(bound, server).is_some() {
+/// used there, so that is not a connection. Nor is a token the site refused the last time it
+/// was sent (`refused`, [`publish_ui::token_refused`]): it was revoked on the site.
+pub fn connected_host(server: &str, token: &TokenStatus, bound: Option<&str>, refused: bool) -> Option<String> {
+    if *token != TokenStatus::Saved || refused || publish_ui::binding_problem(bound, server).is_some() {
         return None;
     }
     crate::publish::host_of(server)
@@ -375,7 +376,7 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
     if token == TokenStatus::Checking {
         ui.ctx().request_repaint_after(Duration::from_millis(200));
     }
-    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref());
+    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref(), publish_ui::token_refused());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         ui.add_space(8.0);
         match host {
@@ -679,12 +680,14 @@ mod tests {
     #[test]
     fn the_connection_line_names_the_host_only_when_a_server_and_token_are_saved() {
         // The token saved for the very address that is asked about.
-        let connected_host = |server: &str, token: &TokenStatus| super::connected_host(server, token, crate::publish::check_server(server).ok().as_deref());
+        let connected_host = |server: &str, token: &TokenStatus| super::connected_host(server, token, crate::publish::check_server(server).ok().as_deref(), false);
         let saved = TokenStatus::Saved;
         // A token saved for another address, or for none, is not a connection to this one.
-        assert_eq!(super::connected_host("https://tours.example.co", &saved, Some("https://tours.example.com")), None);
-        assert_eq!(super::connected_host("https://tours.example.com", &saved, None), None);
-        assert_eq!(super::connected_host("https://tours.example.com", &saved, Some("https://tours.example.com")).as_deref(), Some("tours.example.com"));
+        assert_eq!(super::connected_host("https://tours.example.co", &saved, Some("https://tours.example.com"), false), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, None, false), None);
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, Some("https://tours.example.com"), false).as_deref(), Some("tours.example.com"));
+        // A token the site refused (revoked there) is not a connection either.
+        assert_eq!(super::connected_host("https://tours.example.com", &saved, Some("https://tours.example.com"), true), None);
         assert_eq!(connected_host("https://tours.example.com", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host(" https://Tours.Example.com/demo/ ", &saved).as_deref(), Some("tours.example.com"));
         assert_eq!(connected_host("http://localhost:8787", &saved).as_deref(), Some("localhost"));
@@ -818,7 +821,7 @@ mod tests {
         // Workspace, with nothing set up: the rows are there and no site is asked.
         s.nav.go(Page::Workspace);
         let workspace = drawn(&ctx, &mut s);
-        for word in ["Site address", "Token", "Site version", "Test connection", "Open site"] {
+        for word in ["Site", "Status", "Token", "Test connection", "Open site"] {
             assert!(workspace.lines().any(|l| l == word), "Workspace is missing {word:?} in:\n{workspace}");
         }
         assert!(!workspace.contains("Recent"));

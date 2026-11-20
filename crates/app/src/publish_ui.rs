@@ -69,9 +69,12 @@ struct Config {
     keep_recordings: bool,
     /// The setting: how many GB the saved recordings may take before a publish says so; 0 for never.
     warn_gb: u32,
+    /// A fingerprint of the saved token ([`publish::token_fingerprint`]), never the token: tells
+    /// whether it is the one a site refused.
+    fingerprint: Option<String>,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true, warn_gb: 0 });
+static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true, warn_gb: 0, fingerprint: None });
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -189,15 +192,37 @@ pub fn refresh_token_now() {
         c.token = TokenStatus::Checking;
         c.generation
     };
-    let status = match publish::load_token() {
-        Ok(Some(_)) => TokenStatus::Saved,
-        Ok(None) => TokenStatus::Missing,
-        Err(e) => TokenStatus::Unavailable(e),
+    let (status, fingerprint) = match publish::load_token() {
+        Ok(Some(mut token)) => {
+            let fingerprint = publish::token_fingerprint(&token);
+            wipe(&mut token);
+            (TokenStatus::Saved, Some(fingerprint))
+        }
+        Ok(None) => (TokenStatus::Missing, None),
+        Err(e) => (TokenStatus::Unavailable(e), None),
     };
     let mut c = config();
     if c.generation == generation {
         c.token = status;
+        c.fingerprint = fingerprint;
     }
+}
+
+/// Whether the site refused the saved token (401) the last time it was sent: it was revoked
+/// or disconnected on the site. Such a token is saved but does not connect; the windows say
+/// so and point to the Workspace page. Cleared when the site accepts it again, or when
+/// another token is saved.
+pub fn token_refused() -> bool {
+    let fingerprint = config().fingerprint.clone();
+    fingerprint.is_some_and(|f| publish::is_refused(&f))
+}
+
+/// What the windows add to [`publish::REJECTED_TOKEN`] for a token the site no longer takes.
+pub const SIGN_IN_AGAIN: &str = "Sign in again on the Workspace page of the main window.";
+
+/// The whole sentence for a token the site refused: the existing one, and where to fix it.
+pub fn refused_reason() -> String {
+    format!("{} {SIGN_IN_AGAIN}", publish::REJECTED_TOKEN)
 }
 
 // ---- The token belongs to one site ----
@@ -428,13 +453,21 @@ pub enum Blocked {
     Store(String),
     /// The saved token belongs to another address than the configured one.
     OtherSite(String),
+    /// The site refused the saved token (401) the last time it was sent.
+    Refused,
 }
 
 pub const ADD_SERVER_AND_TOKEN: &str = "Add a site address and a token on the Workspace page of the main window to publish.";
 
 /// What stops a publish, in the order the user would fix it; None when it can start.
-/// `bound` is the address the saved token belongs to ([`token_site`]).
+/// `bound` is the address the saved token belongs to ([`token_site`]). A token the site has
+/// refused ([`token_refused`]) blocks it too.
 pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus, bound: Option<&str>) -> Option<Blocked> {
+    publish_blocked_with(exporting, has_steps, server, token, bound, token_refused())
+}
+
+/// [`publish_blocked`] with whether the site refused the saved token given.
+pub fn publish_blocked_with(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus, bound: Option<&str>, refused: bool) -> Option<Blocked> {
     if exporting {
         return Some(Blocked::Exporting);
     }
@@ -448,7 +481,7 @@ pub fn publish_blocked(exporting: bool, has_steps: bool, server: &str, token: &T
         return Some(Blocked::BadServer(e));
     }
     match token {
-        TokenStatus::Saved => binding_problem(bound, server).map(|p| Blocked::OtherSite(format!("{p} {FIX_ON_WORKSPACE}"))),
+        TokenStatus::Saved => binding_problem(bound, server).map(|p| Blocked::OtherSite(format!("{p} {FIX_ON_WORKSPACE}"))).or(refused.then_some(Blocked::Refused)),
         TokenStatus::Missing => Some(Blocked::NoToken),
         TokenStatus::Checking => Some(Blocked::Checking),
         TokenStatus::Unavailable(e) => Some(Blocked::Store(e.clone())),
@@ -464,6 +497,7 @@ impl Blocked {
             Blocked::NoServer | Blocked::NoToken => Some(ADD_SERVER_AND_TOKEN.to_string()),
             Blocked::BadServer(e) | Blocked::Store(e) | Blocked::OtherSite(e) => Some(e.clone()),
             Blocked::Checking => Some("Checking for a saved token…".to_string()),
+            Blocked::Refused => Some(refused_reason()),
         }
     }
 
@@ -1820,8 +1854,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_token_the_site_refused_blocks_publishing_and_sharing_and_points_to_the_workspace_page() {
+        let ok = "https://tours.example.com";
+        let saved = TokenStatus::Saved;
+        assert_eq!(publish_blocked_with(false, true, ok, &saved, Some(ok), true), Some(Blocked::Refused));
+        assert_eq!(publish_blocked_with(false, true, ok, &saved, Some(ok), false), None);
+        // The existing sentence, and where to fix it.
+        assert_eq!(Blocked::Refused.reason().as_deref(), Some("The server rejected the API token. Sign in again on the Workspace page of the main window."));
+        assert_eq!(Blocked::Refused.refusal(), refused_reason());
+        // What comes first still comes first: an export, an address, a token tied elsewhere.
+        assert_eq!(publish_blocked_with(true, true, ok, &saved, Some(ok), true), Some(Blocked::Exporting));
+        assert!(matches!(publish_blocked_with(false, true, ok, &saved, Some("https://other.example.com"), true), Some(Blocked::OtherSite(_))));
+        assert_eq!(publish_blocked_with(false, true, ok, &TokenStatus::Missing, Some(ok), true), Some(Blocked::NoToken));
+    }
+
+    #[test]
     fn a_refused_upload_always_says_why() {
-        let all = [Blocked::Exporting, Blocked::NoSteps, Blocked::NoServer, Blocked::BadServer("Bad address.".into()), Blocked::NoToken, Blocked::Checking, Blocked::Store("Locked.".into())];
+        let all = [Blocked::Exporting, Blocked::NoSteps, Blocked::NoServer, Blocked::BadServer("Bad address.".into()), Blocked::NoToken, Blocked::Checking, Blocked::Store("Locked.".into()), Blocked::Refused];
         for b in all {
             assert!(!b.refusal().is_empty(), "{b:?}");
         }
