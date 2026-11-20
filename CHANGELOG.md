@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.10 (2026-11-20)
+
+- "Publish to…" at the end of the image editor's "Send to" menu shares the edited image with a link: it goes to the connected workspace as PNG, with an optional title, and the link is put on the clipboard. "Open" opens it in the browser.
+- The image stays online until it is deleted in the site's dashboard. Anyone who has the link can open it, and the window says so before anything is sent.
+- An image over the site's limits (10 MB, 8192 pixels on a side) is refused before anything is uploaded, and a workspace without room says how much the image needs and how much is left. Cancel removes what was sent so far.
+- Needs a site running platform 0.1.21 or newer: 0.1.20 takes shared images, and 0.1.21 has the page their link opens.
+
 ## 0.2.9 (2026-11-19)
 
 - A publish or an update that would take the workspace past its storage allowance now says how much room the tour needs and how much is left, under the heading "The tour was not uploaded". Tours that are already online are not affected.
