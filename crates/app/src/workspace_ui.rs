@@ -46,6 +46,17 @@ pub const SIGN_IN_HINT: &str = "Sign in opens your browser. You confirm a short 
 pub const PASTE_INSTEAD: &str = "Paste a token instead";
 pub const THIS_COMPUTER: &str = "This computer";
 pub const SIGN_OUT: &str = "Sign out";
+/// After "Signed in as …": the same as Sign out, for a code someone else confirmed.
+pub const NOT_YOU: &str = "Not you? Sign out";
+/// The most characters of an account name "Signed in as" shows.
+pub const ACCOUNT_SHOWN_MAX: usize = 30;
+
+/// "Signed in as alex.": the account that confirmed the code, cleaned as plain text and at most
+/// [`ACCOUNT_SHOWN_MAX`] characters. None when there is nothing to show.
+pub fn signed_in_as(account: &str) -> Option<String> {
+    let name = publish::share::plain_text(account);
+    (!name.is_empty()).then(|| format!("Signed in as {}.", publish_ui::short_title(&name, ACCOUNT_SHOWN_MAX)))
+}
 /// What a row shows when there is nothing to say yet.
 const NOTHING: &str = "—";
 
@@ -167,21 +178,26 @@ pub fn token_row(token: &TokenStatus, pasting: bool) -> TokenRow {
 pub struct Rows {
     /// "This computer", with its name and Sign out: a token is saved.
     pub this_computer: bool,
-    /// "Sign in" and "Token", and the hint under the page: not connected.
+    /// "Sign in" and "Token", and the hint under the page: there is no token for this address, or
+    /// the site refused it. Not for a saved token whose site is merely unreachable or failing:
+    /// signing in again would make a second connection on the site.
     pub sign_in: bool,
     /// "Tours" and "Site version": connected.
     pub details: bool,
 }
 
-/// The rows for this token, `connected` when the site answered for it, `checking` while it is asked.
-pub fn rows(token: &TokenStatus, connected: bool, checking: bool) -> Rows {
+/// The rows for this token: `connected` when the site answered for it, `checking` while it is
+/// asked, `refused` when the site refused it (401), `for_here` when it belongs to this address.
+pub fn rows(token: &TokenStatus, connected: bool, checking: bool, refused: bool, for_here: bool) -> Rows {
     let saved = *token == TokenStatus::Saved;
-    Rows {
-        this_computer: saved,
-        // While a saved token is being checked the page waits for the answer instead of offering to sign in.
-        sign_in: !connected && !(saved && checking),
-        details: connected,
-    }
+    let sign_in = match token {
+        _ if connected => false,
+        TokenStatus::Checking => false,
+        // While it is being checked the page waits for the answer instead of offering to sign in.
+        TokenStatus::Saved => !for_here || (refused && !checking),
+        TokenStatus::Missing | TokenStatus::Unavailable(_) => true,
+    };
+    Rows { this_computer: saved, sign_in, details: connected }
 }
 
 /// Whether "Sign in" can be pressed: nothing else is running, no sign-in is open, and the
@@ -229,6 +245,11 @@ impl Check {
     fn was_asked(&self, site: &Site) -> bool {
         self.done.as_ref().is_some_and(|(asked, _)| asked == site)
     }
+
+    /// Whether `site` refused the token (401) when it was last asked.
+    fn rejected(&self, site: Option<&Site>) -> bool {
+        matches!((&self.done, site), (Some((asked, Err(e))), Some(site)) if asked == site && e == publish::REJECTED_TOKEN)
+    }
 }
 
 /// Where a check gets the token for the address it is about to ask.
@@ -275,7 +296,7 @@ fn after_forget(forgotten: Result<(), String>, bind: &Bind) -> Result<String, St
 /// it): ask for a code, show it, wait for it to be confirmed, then store the token through the
 /// same path as Save, tied to `server`. A cancel that comes before the token is stored stores
 /// nothing. The token never leaves this thread.
-fn sign_in_work(server: String, vault: Vault, bind: Bind, clock: Arc<dyn Clock + Send + Sync>) -> impl FnOnce(&Reporter) -> Result<(), ConnectError> + Send + 'static {
+fn sign_in_work(server: String, vault: Vault, bind: Bind, clock: Arc<dyn Clock + Send + Sync>) -> impl FnOnce(&Reporter) -> Result<Option<String>, ConnectError> + Send + 'static {
     move |r| {
         let started = connect::start(&server, &connect::device_name())?;
         r.code(Code::of(&started));
@@ -285,9 +306,10 @@ fn sign_in_work(server: String, vault: Vault, bind: Bind, clock: Arc<dyn Clock +
         }
         // The token belongs to the address the sign-in was started for, whatever the field holds now.
         let result = after_save((vault.store)(connected.token.expose()), Some(started.server.clone()), &bind);
+        let account = connected.account.clone();
         drop(connected);
         (vault.refresh)();
-        result.map(drop).map_err(ConnectError::Failed)
+        result.map(|_| account).map_err(ConnectError::Failed)
     }
 }
 
@@ -309,6 +331,9 @@ pub struct WorkspaceState {
     auto: Option<Site>,
     /// The "Sign in" window, while it is open. Dropping it cancels its sign-in.
     sign_in: Option<SignInDialog>,
+    /// After a sign-in: the account the site said confirmed the code, and the token epoch it
+    /// belongs to (taken on the first frame after the sign-in). Shown until the page is left or the token changes; never stored.
+    account: Option<(String, Option<u64>)>,
     token: TokenSource,
     bind: Bind,
     vault: Vault,
@@ -328,6 +353,7 @@ impl Default for WorkspaceState {
             check: Arc::default(),
             auto: None,
             sign_in: None,
+            account: None,
             token: Arc::new(publish_ui::token_for),
             bind: Arc::new(publish_ui::bind_token),
             vault: Vault::default(),
@@ -386,6 +412,7 @@ impl WorkspaceState {
         self.pasting = false;
         self.auto = None;
         self.sign_in = None;
+        self.account = None;
     }
 
     /// Whether the "Sign in" window is open.
@@ -510,9 +537,20 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         (c.running, c.info_for(site.as_ref()).cloned(), site.as_ref().is_some_and(|s| c.was_asked(s)))
     };
     // A token the site refused is not a connection, whatever an earlier answer said.
-    let info = info.filter(|_| !conn.refused);
+    let refused = conn.refused || lock(&p.check).rejected(site.as_ref());
+    let info = info.filter(|_| !refused);
     let connected = info.is_some();
-    let rows = rows(&conn.token, connected, checking);
+    let rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    // "Signed in as" belongs to the token the sign-in saved, and goes when it changes.
+    if conn.token != TokenStatus::Checking
+        && let Some((_, epoch)) = p.account.as_mut()
+    {
+        match epoch {
+            None if conn.token == TokenStatus::Saved => *epoch = Some(conn.epoch),
+            Some(e) if *e == conn.epoch && conn.token == TokenStatus::Saved => {}
+            _ => p.account = None,
+        }
+    }
     if busy || checking || conn.token == TokenStatus::Checking {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
@@ -561,8 +599,16 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             egui::Frame::new().fill(bg).corner_radius(egui::CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
                 ui.label(RichText::new(label).color(fg));
             });
-            if conn.refused && conn.token == TokenStatus::Saved {
+            if refused && conn.token == TokenStatus::Saved {
                 ui.add(egui::Label::new(RichText::new(publish::REJECTED_TOKEN).color(WARN_TEXT).size(12.0)).wrap());
+            }
+            if let Some(line) = p.account.as_ref().and_then(|(name, _)| signed_in_as(name)) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(line).color(MUTED).size(12.0));
+                    if ui.add_enabled(!busy, egui::Link::new(RichText::new(NOT_YOU).size(12.0))).clicked() {
+                        sign_out(ui.ctx(), p);
+                    }
+                });
             }
         });
         ui.end_row();
@@ -574,14 +620,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 ui.label(RichText::new("·").color(MUTED));
                 // Today's "forget the token": it is removed from this computer; nothing changes on the site.
                 if ui.add_enabled(!busy, egui::Link::new(SIGN_OUT)).clicked() {
-                    p.clear_token_field(ui.ctx());
-                    p.pasting = false;
-                    let (bind, vault) = (p.bind.clone(), p.vault.clone());
-                    p.run(None, move || {
-                        let result = after_forget((vault.forget)(), &bind);
-                        (vault.refresh)();
-                        result
-                    });
+                    sign_out(ui.ctx(), p);
                 }
             });
             ui.end_row();
@@ -668,10 +707,28 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             None => {}
             Some(SignInAction::Closed) => p.sign_in = None,
             // The token is saved and tied to the address the sign-in was for: the page asks the site again by itself.
-            Some(SignInAction::Connected) => p.sign_in = None,
+            Some(SignInAction::Connected(account)) => {
+                p.sign_in = None;
+                // The token was looked up again before the window heard of it: the next frame's epoch is the new token's.
+                p.account = account.map(|name| (name, None));
+            }
         }
     }
     changed
+}
+
+/// Sign out (and "Not you? Sign out"): today's "forget the token". It is removed from this
+/// computer and untied from its address; nothing changes on the site.
+fn sign_out(ctx: &egui::Context, p: &mut WorkspaceState) {
+    p.clear_token_field(ctx);
+    p.pasting = false;
+    p.account = None;
+    let (bind, vault) = (p.bind.clone(), p.vault.clone());
+    p.run(None, move || {
+        let result = after_forget((vault.forget)(), &bind);
+        (vault.refresh)();
+        result
+    });
 }
 
 /// The "Token" row: the way to paste a token, or the field to paste one into.
@@ -873,14 +930,20 @@ mod tests {
         assert_eq!(status(&saved, false, Some(&"x".repeat(80))), format!("Connected to {}…", "x".repeat(39)));
         assert!(!is_connected_status(NOT_CONNECTED) && !is_connected_status(CHECKING));
 
+        // rows(token, connected, checking, refused, for this address)
         // Connected: this computer, and the site's details; no Sign in.
-        assert_eq!(rows(&saved, true, false), Rows { this_computer: true, sign_in: false, details: true });
-        // A saved token that does not connect (refused, another address, a failing site): Sign in again, or Sign out.
-        assert_eq!(rows(&saved, false, false), Rows { this_computer: true, sign_in: true, details: false });
+        assert_eq!(rows(&saved, true, false, false, true), Rows { this_computer: true, sign_in: false, details: true });
+        // Refused by the site, or saved for another address: Sign in again, or Sign out.
+        assert_eq!(rows(&saved, false, false, true, true), Rows { this_computer: true, sign_in: true, details: false });
+        assert_eq!(rows(&saved, false, false, false, false), Rows { this_computer: true, sign_in: true, details: false });
+        // Saved for this address but the site is unreachable or failing: no Sign in, which would make a second connection.
+        assert_eq!(rows(&saved, false, false, false, true), Rows { this_computer: true, sign_in: false, details: false });
         // While it is checked, the page waits.
-        assert_eq!(rows(&saved, false, true), Rows { this_computer: true, sign_in: false, details: false });
-        assert_eq!(rows(&TokenStatus::Missing, false, false), Rows { this_computer: false, sign_in: true, details: false });
-        assert_eq!(rows(&TokenStatus::Unavailable("locked".into()), false, false), Rows { this_computer: false, sign_in: true, details: false });
+        assert_eq!(rows(&saved, false, true, true, true), Rows { this_computer: true, sign_in: false, details: false });
+        assert_eq!(rows(&saved, false, true, false, true), Rows { this_computer: true, sign_in: false, details: false });
+        assert_eq!(rows(&TokenStatus::Missing, false, false, false, true), Rows { this_computer: false, sign_in: true, details: false });
+        assert_eq!(rows(&TokenStatus::Unavailable("locked".into()), false, false, false, true), Rows { this_computer: false, sign_in: true, details: false });
+        assert_eq!(rows(&TokenStatus::Checking, false, false, false, true), Rows { this_computer: false, sign_in: false, details: false });
 
         assert_eq!(token_row(&saved, false), TokenRow::Link);
         assert_eq!(token_row(&saved, true), TokenRow::Paste { replacing: true });
@@ -1246,7 +1309,7 @@ mod tests {
     /// The stand-in site for Sign in: a code whose page is `/connections`, then `asks` for each code check.
     fn connect_stub(asks: impl Fn(usize) -> crate::publish::tests::Answer + Send + 'static) -> Stub {
         stub(move |req, seen| match req.line.as_str() {
-            "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dc_secretsecretsecret","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+            "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
             "POST /api/v1/connect/token" => asks(seen),
             _ => reply(404, r#"{"error":"not_found"}"#),
         })
@@ -1288,9 +1351,9 @@ mod tests {
         assert_eq!(*record.opened.lock().unwrap(), [format!("{}/connections", s.base)]);
         // No request carried a credential, and the page never showed the token or the device code.
         assert!(s.requests().iter().all(|r| r.auth.is_none()), "{:?}", s.requests().iter().map(|r| &r.line).collect::<Vec<_>>());
-        assert!(!seen_code.contains("dp_") && !seen_code.contains("dc_secret"), "{seen_code}");
+        assert!(!seen_code.contains("dp_") && !seen_code.contains("dpd_"), "{seen_code}");
         let text = drawn(&ctx, &mut p, &mut server, &c);
-        assert!(!text.contains("dp_") && !text.contains("dc_secret") && !text.contains(CODE), "{text}");
+        assert!(!text.contains("dp_") && !text.contains("dpd_") && !text.contains(CODE), "{text}");
     }
 
     #[test]
@@ -1376,5 +1439,99 @@ mod tests {
         let (ctx, mut p) = (egui::Context::default(), signing_page(&record));
         p.begin_sign_in(&ctx, "https://");
         assert!(!p.is_signing_in());
+    }
+
+    #[test]
+    fn sign_in_is_offered_without_a_token_or_for_a_refused_one_but_not_for_an_unreachable_site() {
+        let ctx = egui::Context::default();
+        // 1. No token.
+        let s = site_stub(r#"{"workspace":"Acme"}"#);
+        let (mut p, mut server) = (page(), s.base.clone());
+        let text = drawn(&ctx, &mut p, &mut server, &conn(TokenStatus::Missing));
+        assert!(has_line(&text, SIGN_IN) && has_line(&text, PASTE_INSTEAD) && has_line(&text, SIGN_IN_HINT), "{text}");
+        // 2. A saved token the site refuses.
+        let s = stub(|_, _| reply(401, r#"{"error":"unauthorized"}"#));
+        let (mut p, mut server, c) = (page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
+        let text = until(&ctx, &mut p, &mut server, &c, |t| has_line(t, SIGN_IN));
+        assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, publish::REJECTED_TOKEN) && has_line(&text, SIGN_OUT), "{text}");
+        // 3. A saved token whose site answers errors, or cannot be reached: as before, Not connected
+        // with Sign out and Test connection, and no Sign in that would make a second connection.
+        for s in [stub(|_, _| reply(503, r#"{"error":"down"}"#)), stub(|_, _| crate::publish::tests::Answer::Drop)] {
+            let (mut p, mut server, c) = (page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
+            let check = p.check.clone();
+            drawn(&ctx, &mut p, &mut server, &c);
+            until(&ctx, &mut p, &mut server, &c, |_| !lock(&check).running && lock(&check).done.is_some());
+            let text = drawn(&ctx, &mut p, &mut server, &c);
+            assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, SIGN_OUT) && has_line(&text, "Test connection"), "{text}");
+            for word in [SIGN_IN, PASTE_INSTEAD, SIGN_IN_HINT, publish::REJECTED_TOKEN] {
+                assert!(!has_line(&text, word), "an unreachable site shows {word:?}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_in_as_names_the_account_until_the_token_changes_and_not_you_signs_out() {
+        assert_eq!(signed_in_as("alex").as_deref(), Some("Signed in as alex."));
+        assert_eq!(signed_in_as(" mallory\u{202e}\u{200b}\n").as_deref(), Some("Signed in as mallory."));
+        assert_eq!(signed_in_as(&"a".repeat(40)).as_deref(), Some(format!("Signed in as {}….", "a".repeat(29)).as_str()));
+        assert_eq!(signed_in_as(&"a".repeat(30)).as_deref(), Some(format!("Signed in as {}.", "a".repeat(30)).as_str()));
+        assert_eq!(signed_in_as(" \u{200b}"), None);
+        assert_eq!(NOT_YOU, "Not you? Sign out");
+
+        let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
+        let forgot = Arc::new(Mutex::new(0usize));
+        let f = forgot.clone();
+        let vault = Vault { store: Arc::new(|_| Ok(())), forget: Arc::new(move || { *f.lock().unwrap() += 1; Ok(()) }), refresh: Arc::new(|| {}) };
+        let (ctx, mut p, c) = (egui::Context::default(), WorkspaceState { vault, bind: Arc::new(|_| {}), ..page() }, bound_to(&s, TokenStatus::Saved));
+        let mut server = s.base.clone();
+        // What the window hands the page after a sign-in the site named an account for.
+        p.account = Some(("alex".into(), None));
+        let text = until(&ctx, &mut p, &mut server, &c, connected);
+        assert!(has_line(&text, "Signed in as alex.") && has_line(&text, NOT_YOU), "{text}");
+        // Still there on later frames with the same token.
+        let text = drawn(&ctx, &mut p, &mut server, &c);
+        assert!(has_line(&text, "Signed in as alex."), "{text}");
+        // Another token (saved, replaced or forgotten): gone.
+        let other = Conn { epoch: 2, ..c.clone() };
+        let text = drawn(&ctx, &mut p, &mut server, &other);
+        assert!(!text.contains("Signed in as") && !has_line(&text, NOT_YOU), "{text}");
+        // Leaving the page: gone too.
+        p.account = Some(("alex".into(), None));
+        drawn(&ctx, &mut p, &mut server, &c);
+        p.leave(&ctx);
+        let text = drawn(&ctx, &mut p, &mut server, &c);
+        assert!(!text.contains("Signed in as"), "{text}");
+        // No account named: nothing extra.
+        assert!(!drawn(&ctx, &mut p, &mut server, &c).contains("Not you"));
+        // "Not you? Sign out" is Sign out.
+        p.account = Some(("mallory".into(), None));
+        drawn(&ctx, &mut p, &mut server, &c);
+        sign_out(&ctx, &mut p);
+        assert!(p.account.is_none());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *forgot.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "the token was not forgotten");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_sign_in_whose_answer_named_an_account_shows_it_on_the_page() {
+        let s = connect_stub(|_| reply(200, &format!(r#"{{"status":"connected","token":"{NEW_TOKEN}","workspace":{{"name":"Cowfee"}},"account":{{"username":"alex"}}}}"#)));
+        let record = Arc::new(Record::default());
+        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let mut server = s.base.clone();
+        p.begin_sign_in(&ctx, &server);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while p.is_signing_in() {
+            drawn(&ctx, &mut p, &mut server, &c);
+            assert!(Instant::now() < deadline, "the sign-in did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(p.account.as_ref().map(|(n, _)| n.as_str()), Some("alex"));
+        // The page now holds the saved token (the fake store does not change the status, so the test does).
+        let saved = Conn { bound: Some(s.base.clone()), ..conn(TokenStatus::Saved) };
+        let text = drawn(&ctx, &mut p, &mut server, &saved);
+        assert!(has_line(&text, "Signed in as alex.") && has_line(&text, NOT_YOU), "{text}");
     }
 }

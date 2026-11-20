@@ -25,6 +25,8 @@ const WARNING_TEXT: Color32 = Color32::from_rgb(245, 214, 150);
 pub const CAPTION: &str = "Sign in";
 pub const HEADING: &str = "Type this code in your browser";
 pub const OPENED: &str = "Your browser opened the Connections page of your dashboard. Type the code there and press Connect.";
+/// When the browser could not be opened at the page.
+pub const NOT_OPENED: &str = "Mythicshot could not open your browser. Open the Connections page of your dashboard yourself, type the code there and press Connect.";
 /// When the site named no page Mythicshot can open. The wording is proposed and waits for the owner's approval.
 pub const NO_PAGE: &str = "Mythicshot cannot open the page for this. Open the Connections page of your dashboard yourself, type the code there and press Connect.";
 /// While the site is asked for a code. The wording is proposed and waits for the owner's approval.
@@ -74,7 +76,7 @@ impl Code {
 #[derive(Default)]
 struct JobState {
     code: Option<Code>,
-    result: Option<Result<(), ConnectError>>,
+    result: Option<Result<Option<String>, ConnectError>>,
 }
 
 /// A sign-in running on a thread of its own.
@@ -104,7 +106,7 @@ impl Reporter {
 impl SignInJob {
     /// Run `work` on a thread of its own. A panic in it is a failure with a sentence; either way
     /// the run is marked finished, for quitting to stop waiting for it.
-    pub fn spawn(work: impl FnOnce(&Reporter) -> Result<(), ConnectError> + Send + 'static) -> SignInJob {
+    pub fn spawn(work: impl FnOnce(&Reporter) -> Result<Option<String>, ConnectError> + Send + 'static) -> SignInJob {
         let run = Run::begin();
         let state: Arc<Mutex<JobState>> = Arc::default();
         let reporter = Reporter { run: run.clone(), state: state.clone() };
@@ -123,7 +125,7 @@ impl SignInJob {
     }
 
     /// The code once there is one, and the result once the job has ended (taken once).
-    fn take(&self) -> (Option<Code>, Option<Result<(), ConnectError>>) {
+    fn take(&self) -> (Option<Code>, Option<Result<Option<String>, ConnectError>>) {
         match self.state.lock() {
             Ok(mut s) => (s.code.clone(), s.result.take()),
             Err(_) => (None, Some(Err(ConnectError::Failed(BROKE_OFF.to_string())))),
@@ -206,7 +208,8 @@ pub enum SignInAction {
     /// The window closed without connecting.
     Closed,
     /// This computer is connected: the token is saved for the address the window was opened for.
-    Connected,
+    /// The account that confirmed the code, when the site named it.
+    Connected(Option<String>),
 }
 
 /// Starts the work for an address: called when the window opens and for "Try again".
@@ -224,6 +227,8 @@ pub struct SignInDialog {
     open: Opener,
     /// The browser was asked to open the page of the code shown.
     opened: bool,
+    /// The last time the browser was asked to open the page, it could not.
+    open_failed: bool,
 }
 
 impl Drop for SignInDialog {
@@ -238,7 +243,7 @@ impl Drop for SignInDialog {
 impl SignInDialog {
     /// Open the window for `server` and start asking the site for a code.
     pub fn open(server: String, starter: Starter, open: Opener) -> SignInDialog {
-        let mut d = SignInDialog { server, stage: Stage::Starting, job: None, starter, open, opened: false };
+        let mut d = SignInDialog { server, stage: Stage::Starting, job: None, starter, open, opened: false, open_failed: false };
         d.begin();
         d
     }
@@ -246,6 +251,7 @@ impl SignInDialog {
     fn begin(&mut self) {
         self.stage = Stage::Starting;
         self.opened = false;
+        self.open_failed = false;
         self.job = Some((self.starter)(self.server.clone()));
     }
 
@@ -270,17 +276,15 @@ impl SignInDialog {
                 && !self.opened
             {
                 self.opened = true;
-                // A browser that did not open is what the "Browser did not open?" line is for.
-                if let Err(e) = (self.open)(page) {
-                    eprintln!("Sign in: could not open the browser: {e}");
-                }
+                let page = page.clone();
+                self.open_at(&page);
             }
             self.stage = Stage::Waiting(code);
         }
         let result = result?;
         self.job = None;
         match result {
-            Ok(()) => Some(SignInAction::Connected),
+            Ok(account) => Some(SignInAction::Connected(account)),
             Err(ConnectError::Cancelled) => Some(SignInAction::Closed),
             Err(e) => {
                 // Never a secret: the sentences are Mythicshot's own.
@@ -292,12 +296,22 @@ impl SignInDialog {
         }
     }
 
+    /// Open `page` in the browser, and keep whether that worked: the window says so.
+    fn open_at(&mut self, page: &str) {
+        self.open_failed = match (self.open)(page) {
+            Ok(()) => false,
+            Err(e) => {
+                eprintln!("Sign in: could not open the browser: {e}");
+                true
+            }
+        };
+    }
+
     /// "Open the page" in the help line: the page again.
     pub fn open_page(&mut self) {
-        if let Stage::Waiting(Code { page: Some(page), .. }) = &self.stage
-            && let Err(e) = (self.open)(page)
-        {
-            eprintln!("Sign in: could not open the browser: {e}");
+        if let Stage::Waiting(Code { page: Some(page), .. }) = &self.stage {
+            let page = page.clone();
+            self.open_at(&page);
         }
     }
 
@@ -333,7 +347,12 @@ impl SignInDialog {
         match &self.stage {
             Stage::Starting => View { heading: STARTING.to_string(), lines: Vec::new(), code: None, buttons: vec![Button::Cancel] },
             Stage::Waiting(code) => {
-                let mut lines = vec![Line::Text(if code.page.is_some() { OPENED } else { NO_PAGE }.to_string()), Line::Muted(waiting(code.minutes.as_deref()))];
+                let first = match (&code.page, self.open_failed) {
+                    (None, _) => NO_PAGE,
+                    (Some(_), true) => NOT_OPENED,
+                    (Some(_), false) => OPENED,
+                };
+                let mut lines = vec![Line::Text(first.to_string()), Line::Muted(waiting(code.minutes.as_deref()))];
                 if let Some(page) = &code.page {
                     lines.push(Line::Help { address: connect::shown_address(page) });
                 }
@@ -384,7 +403,8 @@ impl SignInDialog {
                             if ui.link(OPEN_THE_PAGE).clicked() {
                                 open_page = true;
                             }
-                            ui.label(RichText::new(go_to(address)).color(MUTED));
+                            // The address in full, never shortened, and selectable so it can be copied.
+                            ui.add(egui::Label::new(RichText::new(go_to(address)).color(MUTED)).selectable(true).wrap());
                         });
                     }
                 }

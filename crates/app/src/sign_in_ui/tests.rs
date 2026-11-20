@@ -24,11 +24,11 @@ fn opener() -> (Arc<Mutex<Vec<String>>>, Opener) {
 /// sends, or with a cancel. `cancelled` notes that it saw the cancel.
 struct Script {
     code: Option<Code>,
-    release: std::sync::mpsc::Receiver<Result<(), ConnectError>>,
+    release: std::sync::mpsc::Receiver<Result<Option<String>, ConnectError>>,
     cancelled: Arc<AtomicBool>,
 }
 
-fn run_script(s: Script, r: &Reporter) -> Result<(), ConnectError> {
+fn run_script(s: Script, r: &Reporter) -> Result<Option<String>, ConnectError> {
     if let Some(c) = s.code {
         r.code(c);
     }
@@ -46,8 +46,8 @@ fn run_script(s: Script, r: &Reporter) -> Result<(), ConnectError> {
 /// A dialog whose jobs report `code` and end when told. Answers the dialog, the sender that ends
 /// the newest job, how many jobs were started, whether the last one saw a cancel, and the opener's log.
 #[allow(clippy::type_complexity)]
-fn dialog(code: Option<Code>) -> (SignInDialog, Arc<Mutex<Option<std::sync::mpsc::Sender<Result<(), ConnectError>>>>>, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>) {
-    let sender: Arc<Mutex<Option<std::sync::mpsc::Sender<Result<(), ConnectError>>>>> = Arc::default();
+fn dialog(code: Option<Code>) -> (SignInDialog, Arc<Mutex<Option<std::sync::mpsc::Sender<Result<Option<String>, ConnectError>>>>>, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>) {
+    let sender: Arc<Mutex<Option<std::sync::mpsc::Sender<Result<Option<String>, ConnectError>>>>> = Arc::default();
     let started = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
     let (s, n, c) = (sender.clone(), started.clone(), cancelled.clone());
@@ -76,7 +76,7 @@ fn until_code(d: &mut SignInDialog) {
 }
 
 /// End the newest job with `result` and poll until the dialog has taken it in.
-fn finish(d: &mut SignInDialog, sender: &Mutex<Option<std::sync::mpsc::Sender<Result<(), ConnectError>>>>, result: Result<(), ConnectError>) -> Option<SignInAction> {
+fn finish(d: &mut SignInDialog, sender: &Mutex<Option<std::sync::mpsc::Sender<Result<Option<String>, ConnectError>>>>, result: Result<Option<String>, ConnectError>) -> Option<SignInAction> {
     sender.lock().unwrap().as_ref().unwrap().send(result).unwrap();
     for _ in 0..500 {
         let action = d.poll();
@@ -151,7 +151,11 @@ fn without_a_page_the_window_says_where_to_go_and_opens_nothing() {
 fn a_confirmed_code_closes_the_window_as_connected() {
     let (mut d, tx, _, _, _) = dialog(Some(code(Some(PAGE), Some("10 minutes"))));
     until_code(&mut d);
-    assert_eq!(finish(&mut d, &tx, Ok(())), Some(SignInAction::Connected));
+    assert_eq!(finish(&mut d, &tx, Ok(None)), Some(SignInAction::Connected(None)));
+    // With the account the site named, which the page shows.
+    let (mut d, tx, _, _, _) = dialog(Some(code(Some(PAGE), Some("10 minutes"))));
+    until_code(&mut d);
+    assert_eq!(finish(&mut d, &tx, Ok(Some("alex".into()))), Some(SignInAction::Connected(Some("alex".into()))));
 }
 
 #[test]
@@ -177,6 +181,7 @@ fn other_failures_are_said_in_mythicshots_words() {
     for (error, text, retry) in [
         (ConnectError::NotOffered, "This site does not offer Sign in yet. Paste a token instead.", false),
         (ConnectError::Busy(Some(40)), "Could not sign in: the site asks to wait 40 seconds. Sign in again later.", true),
+        (ConnectError::LostAnswer, "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again.", true),
         (ConnectError::Busy(None), "Could not sign in: the site is busy. Sign in again later.", true),
         (ConnectError::Failed("Could not sign in: could not connect to the server.".into()), "Could not sign in: could not connect to the server.", true),
         (ConnectError::Failed("Could not use the credential store: the credential store is locked or not reachable.".into()), "Could not use the credential store: the credential store is locked or not reachable.", true),
@@ -249,4 +254,51 @@ fn a_job_that_panics_ends_with_a_sentence() {
 #[test]
 fn tests_never_reach_the_real_browser() {
     assert!(open_in_browser("https://app.example.com/connections").is_err());
+}
+
+#[test]
+fn a_browser_that_did_not_open_is_said_and_the_page_can_still_be_opened() {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let t = tries.clone();
+    // The first open fails, the second works.
+    let open: Opener = Arc::new(move |_: &str| if t.fetch_add(1, Ordering::SeqCst) == 0 { Err("Windows could not open the link (code 2)".into()) } else { Ok(()) });
+    let c = code(Some(PAGE), Some("10 minutes"));
+    let starter: Starter = Arc::new(move |_| {
+        let c = c.clone();
+        SignInJob::spawn(move |r| {
+            r.code(c);
+            while !r.cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(ConnectError::Cancelled)
+        })
+    });
+    let mut d = SignInDialog::open(SERVER.into(), starter, open);
+    until_code(&mut d);
+    assert_eq!(
+        d.view().texts(),
+        [
+            "Sign in",
+            "Type this code in your browser",
+            "Mythicshot could not open your browser. Open the Connections page of your dashboard yourself, type the code there and press Connect.",
+            "Waiting for you to confirm… The code works for 10 minutes.",
+            "Browser did not open? Open the page or go to app.mythicshot.example/connections.",
+            "K7QM-2HXD",
+            "Cancel",
+        ]
+    );
+    // "Open the page" worked this time: the window says the browser opened.
+    d.open_page();
+    assert_eq!(d.view().lines[0], Line::Text(OPENED.into()));
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn the_page_on_another_host_is_shown_in_full() {
+    let long = "https://connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections";
+    let (mut d, _tx, _, _, _) = dialog(Some(code(Some(long), Some("10 minutes"))));
+    until_code(&mut d);
+    let v = d.view();
+    assert_eq!(v.lines[2], Line::Help { address: "connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections".into() });
+    assert!(v.texts().iter().any(|t| t.ends_with("or go to connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections.")));
 }
