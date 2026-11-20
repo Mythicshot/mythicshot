@@ -338,6 +338,9 @@ pub struct Editor {
     /// When the property panel last checkpointed, so one slider drag is one undo step.
     prop_checkpoint: Option<(u64, Instant)>,
     last_canvas: CanvasGeom,
+    /// The "Publish image" or "Publish recording" window, while it is open. Declared before
+    /// `video`: dropping it cancels its job before the recording is let go of.
+    pub(crate) share: Option<crate::share_ui::ShareDialog>,
     /// Set when the editor holds a recording instead of a still image.
     pub(crate) video: Option<crate::video_editor::VideoState>,
     /// Remembered styles and choices; the app saves them when `prefs_changed`.
@@ -379,6 +382,7 @@ impl Editor {
             shift: false,
             prop_checkpoint: None,
             last_canvas: CanvasGeom { min: pos2(0.0, 0.0), zoom: 1.0 },
+            share: None,
             video: None,
             prefs,
             prefs_changed: false,
@@ -559,8 +563,8 @@ impl Editor {
         }
         // A press off the guide card ends typing on it; noted now, done once this frame's keys reached the card.
         let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
-        // While the "Publish tour" or "Add to site" dialog is open it gets the keys, and the editor behind it is inert.
-        let modal = self.publish_picker_open() || self.site_dialog_open();
+        // While the "Publish tour", "Add to site" or "Publish to" window is open it gets the keys, and the editor behind it is inert.
+        let modal = self.publish_picker_open() || self.site_dialog_open() || self.share.is_some();
         if !modal {
             self.video_keys(&ctx);
             self.shortcuts(&ctx);
@@ -577,6 +581,7 @@ impl Editor {
         // After the canvas, so a key typed in the same frame as the press still reaches the card first.
         self.end_card_typing_on_press(&ctx, press);
         self.text_editor(&ctx);
+        self.share_window(&ctx);
         if self.confirm_close {
             self.confirm_close_dialog(&ctx);
         }
@@ -957,6 +962,11 @@ impl Editor {
                                 self.send(d);
                                 ui.close();
                             }
+                        }
+                        ui.separator();
+                        if icons::menu_row(ui, Icon::Export, crate::share_ui::MENU_ENTRY).clicked() {
+                            self.open_share_image();
+                            ui.close();
                         }
                     });
                     if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {

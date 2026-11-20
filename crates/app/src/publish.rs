@@ -31,7 +31,10 @@
 //! after a transport failure (no answer at all): a step image, where the server answers
 //! 409 `already_sent` if the first copy did arrive, and commit, which the server treats
 //! as idempotent (a repeated commit answers with the first one's result).
+//!
+//! Sharing a single image or clip with a link is its own protocol on the same client: see [`share`].
 
+pub mod share;
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -852,7 +855,7 @@ impl Client {
         let id = answer.get("upload_id").and_then(Value::as_str).filter(|id| is_upload_id(id)).ok_or_else(|| not_understood(what))?.to_string();
 
         // From here every exit but a successful commit, a panic included, sends exactly one abort.
-        let guard = AbortGuard { client: self, id: &id, armed: true };
+        let guard = AbortGuard::new(self, format!("/api/v1/uploads/{id}"));
         let parts = if replace { Parts::of_replace(&answer, &bundle).ok_or_else(|| not_understood(what))? } else { Parts { have: Vec::new(), logo: bundle.logo.is_some() } };
         let total = (bundle.steps.len() - parts.have.len() + usize::from(parts.logo) + 2) as f32;
         let mut done = 1.0;
@@ -1258,14 +1261,19 @@ fn is_invisible(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
 }
 
-/// Sends the upload's abort when dropped, unless disarmed after a successful commit.
+/// Sends one DELETE to `path` (an upload's, or a shared item's) when dropped, unless disarmed
+/// after a successful commit.
 struct AbortGuard<'a> {
     client: &'a Client,
-    id: &'a str,
+    path: String,
     armed: bool,
 }
 
-impl AbortGuard<'_> {
+impl<'a> AbortGuard<'a> {
+    fn new(client: &'a Client, path: String) -> AbortGuard<'a> {
+        AbortGuard { client, path, armed: true }
+    }
+
     fn disarm(mut self) {
         self.armed = false;
     }
@@ -1277,9 +1285,8 @@ impl Drop for AbortGuard<'_> {
             self.armed = false;
             // Whatever it answers. After a commit that did land, the server ignores it. A panic
             // here while already unwinding would abort the process, so it is caught.
-            let path = format!("/api/v1/uploads/{}", self.id);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = self.client.send(Method::Delete, &path, None);
+                let _ = self.client.send(Method::Delete, &self.path, None);
             }));
         }
     }
