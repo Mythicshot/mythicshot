@@ -198,6 +198,8 @@ fn video(rec: Arc<Recording>, job: &Job, path: &Path, decorate: Decorate, progre
         .arg(format!("{}x{}", job.width, job.height))
         .args(["-r", &fps.to_string(), "-i", "-"])
         .args(codec)
+        // Video only: the input has no sound, and no audio track is ever written.
+        .arg("-an")
         // Most players need even dimensions and 4:2:0 colour.
         .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p"])
         .arg(path)

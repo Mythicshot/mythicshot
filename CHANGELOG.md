@@ -2,6 +2,28 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.12 (2026-11-20)
+
+- "Publish to" follows the site's own size limits: an image or clip over the usual 10 MB or 50 MB goes to a site set to take more, and a site that does not take it says its limit, in Mythicshot's words, before any part is sent.
+- A very large screenshot no longer holds up the editor while "Publish to" opens: its size is worked out in the background, and "Publish" can be pressed once it is shown. An image wider or taller than any site takes is refused at once.
+- When the site gives a link Mythicshot cannot open, the item's own address on the site is offered instead.
+- When Cancel comes too late to stop the upload, the window shows the link, but nothing is put on the clipboard. After a cancel the status bar says "Publishing was cancelled. Nothing was shared."
+- "Copy link" says so when the link could not be copied.
+
+## 0.2.11 (2026-11-20)
+
+- "Publish to…" in the recording editor's Export menu, under "Share", shares the recording as a clip with a link, the same way as an image. The clip uses the size, quality and trim chosen in Export.
+- With ffmpeg on the computer the clip is sent as MP4; without it, as a GIF, and the window says that the same clip is far smaller with ffmpeg.
+- The clip is prepared in a temporary folder first ("Preparing the clip…"), which is removed afterwards, also after a failure or a cancel. A clip over the site's limit (50 MB) is refused before anything is uploaded.
+- Shared clips and MP4 exports never have a sound track.
+
+## 0.2.10 (2026-11-20)
+
+- "Publish to…" at the end of the image editor's "Send to" menu shares the edited image with a link: it goes to the connected workspace as PNG, with an optional title, and the link is put on the clipboard. "Open" opens it in the browser.
+- The image stays online until it is deleted in the site's dashboard. Anyone who has the link can open it, and the window says so before anything is sent.
+- An image over the site's limits (10 MB, 8192 pixels on a side) is refused before anything is uploaded, and a workspace without room says how much the image needs and how much is left. Cancel removes what was sent so far.
+- Needs a site running platform 0.1.21 or newer: 0.1.20 takes shared images, and 0.1.21 has the page their link opens.
+
 ## 0.2.9 (2026-11-19)
 
 - A publish or an update that would take the workspace past its storage allowance now says how much room the tour needs and how much is left, under the heading "The tour was not uploaded". Tours that are already online are not affected.

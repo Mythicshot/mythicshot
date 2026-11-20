@@ -18,7 +18,7 @@ use mythicshot_recording::{FrameReader, Recording};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
-use crate::publish::{Published, Target};
+use crate::publish::{Published, Target, share};
 use crate::publish_ui::{self, Before, EditTarget, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
@@ -528,6 +528,82 @@ fn update_job_with(
     })
 }
 
+/// What a shared clip is prepared from: the recording as the editor has it, and the export
+/// menu's choices.
+pub(crate) struct ClipSpec {
+    pub rec: Arc<Recording>,
+    pub items: Vec<mythicshot_editor::Item>,
+    pub events: Vec<InputEvent>,
+    pub edit: Edit,
+    pub media: share::MediaType,
+    /// GIF quality, as chosen in the export menu.
+    pub quality: u8,
+    /// MP4 frame rate, as chosen in the export menu.
+    pub fps: u32,
+}
+
+/// A shared clip is an MP4 when ffmpeg is there, else a GIF.
+fn clip_media(ffmpeg: bool) -> share::MediaType {
+    if ffmpeg { share::MediaType::Mp4 } else { share::MediaType::Gif }
+}
+
+/// How long a clip of these output frames runs, from its first frame to its end; at least 1 ms.
+fn clip_duration_ms(frames: &[mythicshot_recording::export::OutFrame], end_ms: u64) -> u64 {
+    end_ms.saturating_sub(frames.first().map_or(0, |f| f.t_ms)).max(1)
+}
+
+/// Prepare the clip in a new folder in `temp` through the export, check its real size against
+/// what any site can take (the configured site's own limit is said by its answer to the
+/// create, before any part is sent), then share it with its first frame as the preview. The folder is removed
+/// whatever happens. The MP4 has no sound: Mythicshot records none, and the export asks ffmpeg
+/// for a video stream only.
+pub(crate) fn share_clip_job(clip: &ClipSpec, temp: &Path, server: &str, title: String, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
+    use share::ShareError;
+    let dir = tempfile::Builder::new().prefix(crate::share_ui::TEMP_PREFIX).tempdir_in(temp).map_err(|_| ShareError::Failed("Could not make a temporary folder for the clip.".to_string()))?;
+    let dir_path = dir.path().to_path_buf();
+    r.keep_dir(Some(dir_path.clone()));
+    let result = prepare_and_share(clip, &dir_path, server, title, token, r);
+    r.keep_dir(None);
+    drop(dir);
+    crate::share_ui::remove_soon(&dir_path);
+    result
+}
+
+fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
+    use mythicshot_recording::export::{self, Job};
+    use share::ShareError;
+    let format = match clip.media {
+        share::MediaType::Mp4 => Format::Mp4,
+        _ => Format::Gif,
+    };
+    let path = dir.join(format!("clip.{}", format.extension()));
+    let (frames, end_ms) = video::plan(&clip.rec, &clip.edit);
+    let (width, height) = video::output_size(&clip.rec, &clip.edit);
+    let duration_ms = clip_duration_ms(&frames, end_ms);
+    let first = frames.first().map(|f| f.src);
+    // The page plays a clip in a loop, so a GIF loops too.
+    let job = Job { frames, end_ms, width, height, format, quality: clip.quality, loop_forever: true, video_fps: clip.fps };
+    let (rec, items, events, edit) = (&clip.rec, &clip.items, &clip.events, &clip.edit);
+    let exported = export::export(clip.rec.clone(), &job, &path, |src, img| video::decorate(rec, src, img, items, events, edit, true), |f| r.preparing(f));
+    if r.cancelled() {
+        return Err(ShareError::Cancelled);
+    }
+    let bytes = exported.map_err(|e| ShareError::Failed(format!("Could not prepare the clip: {e}")))?;
+    if let Some(t) = share::too_large(share::Kind::Clip, Some(bytes), true, width, height, Some(duration_ms)) {
+        return Err(ShareError::TooLarge(t));
+    }
+    let data = std::fs::read(&path).map_err(|_| ShareError::Failed("Could not read the prepared clip.".to_string()))?;
+    // The preview is the clip's first frame as it plays; a clip without one goes without.
+    let preview = first.and_then(|src| {
+        let mut reader = FrameReader::new(rec.clone()).ok()?;
+        let img = video::decorate(rec, src, reader.get(src).ok()?, items, events, edit, true);
+        share::preview_of(&img)
+    });
+    let token = token().map_err(ShareError::Failed)?;
+    let item = share::Item { media: clip.media, data, width, height, duration_ms: Some(duration_ms), title, preview };
+    share::share(server, &token, &item, |sent, total| r.uploading(sent, total))
+}
+
 /// What "Update tour" replaces for an editor opened from the project `origin`.
 fn edit_target(origin: &Origin) -> EditTarget {
     EditTarget { tour_id: origin.key.tour_id.clone(), chapter_id: origin.key.chapter_id.clone(), tour_title: origin.tour_title.clone() }
@@ -753,6 +829,8 @@ pub struct VideoState {
     last_overlays: OverlayStyle,
     /// Where an update that outlives this editor says how it ended.
     notices: Notices,
+    /// A "Publish to" job of this recording, until it has ended: the recording's files stay until then.
+    pub(crate) share_waiter: Option<crate::share_ui::JobWaiter>,
     /// The saved project this editor was opened from; None for a new recording. Declared last:
     /// it lets go of the project only after the reader above has closed the frames file.
     pub origin: Option<Origin>,
@@ -773,23 +851,30 @@ impl Drop for VideoState {
         // this editor's reader and a job still running have stopped reading it.
         let open = self.origin.as_ref().map(|o| o.open.clone());
         let notices = self.notices.clone();
+        // A "Publish to" job was cancelled with its window; it may still be reading frames.
+        let share = self.share_waiter.take().filter(|w| !w.is_finished());
         match self.job.take() {
-            None => rec.delete_files(),
-            Some(job) => {
+            None if share.is_none() => rec.delete_files(),
+            job => {
                 std::thread::spawn(move || {
-                    let result = loop {
-                        match job.take_result() {
-                            Some(result) => break result,
-                            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    if let Some(job) = job {
+                        let result = loop {
+                            match job.take_result() {
+                                Some(result) => break result,
+                                None => std::thread::sleep(std::time::Duration::from_millis(200)),
+                            }
+                        };
+                        // An update ran on without its editor: how it ended goes to the log, and to
+                        // the app's notification, since a release build shows no log.
+                        if let Some(msg) = outlived_message(&result, job.update_title()) {
+                            eprintln!("Update tour, after its editor was closed: {msg}");
+                            notices.post(msg);
                         }
-                    };
-                    // An update ran on without its editor: how it ended goes to the log, and to
-                    // the app's notification, since a release build shows no log.
-                    if let Some(msg) = outlived_message(&result, job.update_title()) {
-                        eprintln!("Update tour, after its editor was closed: {msg}");
-                        notices.post(msg);
+                        drop(result);
                     }
-                    drop(result);
+                    while share.as_ref().is_some_and(|w| !w.is_finished()) {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     rec.delete_files();
                     drop(rec);
                     drop(open);
@@ -847,6 +932,7 @@ impl Editor {
             fps,
             last_overlays: overlays,
             notices: background_notices(),
+            share_waiter: None,
             job: None,
             picker: None,
             picker_left: None,
@@ -1352,6 +1438,38 @@ impl Editor {
         });
     }
 
+    /// "Publish to…" in the Export menu: share the clip with a link. It is prepared with the
+    /// size, quality, frame rate and trim chosen in the menu, as MP4 when ffmpeg was found and as
+    /// a GIF otherwise, and the window says why a GIF is larger. A clip over the site's limits
+    /// on its sides or its length is refused before anything is prepared; its size is known
+    /// only once it is ([`share_clip_job`]).
+    fn open_share_clip(&mut self) {
+        let title = self.title().to_string();
+        if self.share.is_some() {
+            return;
+        }
+        let Some(v) = self.video.as_ref() else { return };
+        if v.job.is_some() {
+            return;
+        }
+        let media = clip_media(ffmpeg_available());
+        let (width, height) = video::output_size(&v.rec, &v.edit);
+        let (frames, end_ms) = video::plan(&v.rec, &v.edit);
+        let duration_ms = clip_duration_ms(&frames, end_ms);
+        let clip = ClipSpec { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone(), media, quality: v.quality, fps: v.fps };
+        let starter: crate::share_ui::Starter = Box::new(move |server, title| {
+            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, || publish_ui::token_for(&server), r))
+        });
+        let server = publish_ui::server();
+        let blocked = crate::share_ui::blocked_reason(&server);
+        let details = crate::share_ui::clip_details(duration_ms, width, height, media, None);
+        let mut d = crate::share_ui::ShareDialog::open(share::Kind::Clip, server, &title, details, media == share::MediaType::Gif, blocked, starter);
+        if let Some(t) = share::too_large(share::Kind::Clip, None, false, width, height, Some(duration_ms)) {
+            d.refuse(&share::ShareError::TooLarge(t));
+        }
+        self.share = Some(d);
+    }
+
     /// The dialog again after a publish or an update ended with `error` and nothing uploaded:
     /// see [`publish_ui::dialog_after_refusal`]. `left` is the dialog the upload was started from.
     fn bring_dialog_back(&mut self, left: Option<Picker>, error: String, updating: bool) {
@@ -1552,6 +1670,12 @@ impl Editor {
                 ui.close();
             }
         });
+        ui.separator();
+        ui.label(RichText::new(crate::share_ui::EXPORT_HEADING).strong());
+        if ui.add_enabled(!exporting, egui::Button::new(crate::share_ui::MENU_ENTRY)).clicked() {
+            self.open_share_clip();
+            ui.close();
+        }
         ui.separator();
         ui.label(RichText::new("Tour").strong());
         ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
@@ -3447,6 +3571,9 @@ mod tests {
         let ed = editor_of(&state(tmp.path()));
         assert!(Arc::ptr_eq(&ed.video.as_ref().unwrap().notices.0, &background_notices().0));
     }
+
+    /// "Publish to" for a recording: the clip job against a stand-in site.
+    mod share_clip;
 
     /// One real pass against a platform server running on this computer; ignored unless asked for.
     mod e2e_platform;

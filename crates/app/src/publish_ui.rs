@@ -92,7 +92,11 @@ pub fn init(settings: &crate::settings::Settings) {
     set_warn_gb(settings.saved_recordings_warn_gb);
     project::set_enabled(settings.store_recordings_as_video);
     std::thread::spawn(refresh_token_now);
-    std::thread::spawn(|| sweep_stale(&std::env::temp_dir(), STALE_AFTER));
+    std::thread::spawn(|| {
+        let temp = std::env::temp_dir();
+        sweep_stale(&temp, STALE_AFTER);
+        crate::share_ui::sweep_stale(&temp, STALE_AFTER);
+    });
     // Look for ffmpeg once per run, on a thread of its own and never on the UI thread (it runs
     // the program twice): the MP4 and WebM exports are offered only when this has found one,
     // and neither it nor the tidying below waits for the other.
