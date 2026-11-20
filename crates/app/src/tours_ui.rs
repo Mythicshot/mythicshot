@@ -618,6 +618,9 @@ impl Model {
         }
         match &self.listing {
             Listing::NotLoaded => View::Loading,
+            // A token the site refused (revoked there): not connected, with the way to the
+            // Workspace page, instead of a Retry that would be refused again.
+            Listing::Failed(e) if e == publish::REJECTED_TOKEN => View::NotConnected(publish_ui::refused_reason()),
             Listing::Failed(e) => View::Failed(e.clone()),
             Listing::Loaded if self.tours.is_empty() => View::Empty,
             Listing::Loaded => View::List,
@@ -2207,6 +2210,11 @@ pub(crate) mod tests {
         m.finish_load(generation, Err("Could not list the tours: the server did not answer in time.".into()), Instant::now());
         assert_eq!(m.view(&saved), View::Failed("Could not list the tours: the server did not answer in time.".into()));
         assert!(!m.wants_load(Instant::now()), "a failure waits for Retry instead of asking in a loop");
+        // A token the site refused (revoked there) reads as not connected, with the way to the Workspace page.
+        let (generation, _) = m.refresh().unwrap();
+        m.finish_load(generation, Err(publish::REJECTED_TOKEN.into()), Instant::now());
+        assert_eq!(m.view(&saved), View::NotConnected("The server rejected the API token. Sign in again on the Workspace page of the main window.".into()));
+        assert!(!m.wants_load(Instant::now()), "and nothing is asked again on its own");
         // Retry.
         let (generation, _) = m.refresh().unwrap();
         m.finish_load(generation, Ok(vec![]), Instant::now());
