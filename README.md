@@ -77,12 +77,14 @@ In the "Publish tour" dialog, upload it as a new tour (the title starts as the r
 
 ## Publish to
 
-"Publish to…" shares one screenshot with a link: it is at the end of the image editor's "Send to" menu. The window says where it goes, takes an optional title (up to 120 characters), and shows the image's size before anything is sent. "Publish" uploads the image as you see it in the editor, as PNG; once it is online the link is on the clipboard, and "Open" opens it in the browser. It uses the same site address and token as "Publish tour", and without them the window says what to set up first.
+"Publish to…" shares one screenshot or one recording with a link: it is at the end of the image editor's "Send to" menu, and under "Share" in the recording editor's Export menu. The window says where it goes, takes an optional title (up to 120 characters), and shows the image's size before anything is sent. "Publish" uploads the image as you see it in the editor, as PNG; once it is online the link is on the clipboard, and "Open" opens it in the browser. It uses the same site address and token as "Publish tour", and without them the window says what to set up first.
 
 > [!WARNING]
-> Anyone who has the link can open the image, and it stays online until you delete it in the site's dashboard.
+> Anyone who has the link can open the image or clip, and it stays online until you delete it in the site's dashboard.
 
-An image larger than the site takes (by default 10 MB, or 8192 pixels on a side) is refused before anything is uploaded. "Cancel" during the upload removes what was sent so far, and so does closing the editor or quitting Mythicshot.
+A recording goes as a clip with the size, quality and trim chosen in Export: as MP4 when ffmpeg is installed, else as a GIF, which is far larger. It is prepared in a temporary folder first, removed afterwards, and has no sound.
+
+An image larger than the site takes (by default 10 MB, or 8192 pixels on a side) is refused before anything is uploaded, and so is a clip over 50 MB once it is prepared. "Cancel" during the upload removes what was sent so far, and so does closing the editor or quitting Mythicshot.
 
 ## Saved recordings as video
 
@@ -145,7 +147,7 @@ The wizard's banner images come from `installer/make_images.py`. The MSI is not 
 
 ## Privacy
 
-Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to": then that tour or that one image goes to the server you set in Settings, and nothing else. Key presses are only logged while you record with Keys turned on, stay in memory, and are deleted with the recording. Recordings are kept in the temp folder until you export or discard them.
+Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to": then that tour, image or clip goes to the server you set in Settings, and nothing else. Key presses are only logged while you record with Keys turned on, stay in memory, and are deleted with the recording. Recordings are kept in the temp folder until you export or discard them.
 
 ## Licence
 
