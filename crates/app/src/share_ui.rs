@@ -39,10 +39,18 @@ pub const PREPARING: &str = "Preparing the clip…";
 pub const CANCELLING: &str = "Cancelling…";
 pub const COPIED: &str = "The link was copied. Paste it to whoever should see it.";
 pub const NO_FFMPEG: &str = "Mythicshot did not find the video tool (ffmpeg) on this computer, so the clip is sent as a GIF. With it, the same clip is far smaller.";
-/// The status line after a cancel. The wording is proposed and waits for the owner's approval.
-pub const CANCELLED: &str = "Publishing was cancelled. Nothing was left online.";
+/// The status line after a cancel. True also when the clean-up could not reach the site: an
+/// item that was never finished is never online.
+pub const CANCELLED: &str = "Publishing was cancelled. Nothing was shared.";
+/// When "Copy link" could not set the clipboard. The wording is proposed and waits for the owner's approval.
+pub const COPY_FAILED: &str = "Could not copy the link. Select it and copy it yourself.";
 /// Prefix of the temporary folder a recording's clip is prepared in.
 pub const TEMP_PREFIX: &str = "mythicshot-share-";
+/// The PNG file of an image being shared, once the thread that makes it is done.
+type Encoded = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+
+/// When the image could not be turned into a PNG file. The wording is proposed and waits for the owner's approval.
+pub const NOT_ENCODED: &str = "Mythicshot could not make a PNG file of the image.";
 /// What a panic in the job becomes.
 const BROKE_OFF: &str = "Publishing failed because of an internal error.";
 
@@ -79,7 +87,7 @@ pub fn no_link(kind: Kind) -> String {
 /// address that is not one.
 pub fn to_line(workspace: Option<&str>, server: &str) -> Option<String> {
     let host = publish::host_of(server)?;
-    let name = workspace.map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>()).map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let name = workspace.map(share::plain_text).filter(|n| !n.is_empty());
     Some(match name {
         Some(name) => format!("To {} at {host}", publish_ui::short_title(&name, publish_ui::ROW_TITLE_MAX)),
         None => format!("To {host}"),
@@ -306,6 +314,8 @@ pub struct View {
     pub link: Option<String>,
     /// From left to right; the last one is the main button.
     pub buttons: Vec<Button>,
+    /// A button shown but not usable yet.
+    pub disabled: Option<Button>,
 }
 
 impl View {
@@ -341,6 +351,10 @@ pub enum ShareAction {
 /// Makes the job when Publish is pressed: given the server and the cleaned title.
 pub type Starter = Box<dyn FnOnce(String, String) -> ShareJob + Send>;
 
+/// Asked every frame while the file is still being made off the UI thread: None until it is,
+/// then the details line with its size, or why it cannot be shared.
+pub type Measure = Box<dyn FnMut() -> Option<Result<String, ShareError>> + Send>;
+
 /// The "Publish image" or "Publish recording" window.
 pub struct ShareDialog {
     kind: Kind,
@@ -355,8 +369,12 @@ pub struct ShareDialog {
     gif_note: bool,
     stage: Stage,
     starter: Option<Starter>,
+    /// Set while the file is being made: Publish waits for it.
+    measure: Option<Measure>,
     job: Option<ShareJob>,
     copied_at: Option<Instant>,
+    /// The last "Copy link" could not set the clipboard.
+    copy_failed: bool,
 }
 
 impl Drop for ShareDialog {
@@ -378,7 +396,7 @@ impl ShareDialog {
             Some(why) => Stage::Blocked(why),
             None => Stage::Form,
         };
-        ShareDialog { kind, server, workspace: Arc::new(Mutex::new(None)), asks_site: false, asked: false, title, details, gif_note, stage, starter, job: None, copied_at: None }
+        ShareDialog { kind, server, workspace: Arc::new(Mutex::new(None)), asks_site: false, asked: false, title, details, gif_note, stage, starter, measure: None, job: None, copied_at: None, copy_failed: false }
     }
 
     /// The window as the editors open it: it asks the site for the workspace's name, off the UI thread, once the form shows.
@@ -387,6 +405,13 @@ impl ShareDialog {
         d.asks_site = true;
         d.ask_site();
         d
+    }
+
+    /// The file is still being made: until `measure` says it is ready, the details line shows
+    /// what is known and Publish waits.
+    pub fn measuring(mut self, measure: Measure) -> ShareDialog {
+        self.measure = Some(measure);
+        self
     }
 
     #[cfg(test)]
@@ -443,7 +468,7 @@ impl ShareDialog {
 
     /// Publish: make the job with the starter and follow it. Only from the form, and only once.
     pub fn begin(&mut self) {
-        if self.stage != Stage::Form {
+        if self.stage != Stage::Form || self.measure.is_some() {
             return;
         }
         let Some(starter) = self.starter.take() else { return };
@@ -468,6 +493,14 @@ impl ShareDialog {
     /// Take in what the job did. When it shared the item, the link goes on the clipboard
     /// through `copy` (false when it could not be set). Some when the editor has something to do.
     pub fn poll(&mut self, copy: &mut dyn FnMut(&str) -> bool) -> Option<ShareAction> {
+        if let Some(measured) = self.measure.as_mut().and_then(|m| m()) {
+            self.measure = None;
+            match measured {
+                Ok(details) => self.details = details,
+                // Before anything is sent: shown in the window, nothing for the status bar.
+                Err(e) => self.refuse(&e),
+            }
+        }
         let job = self.job.as_ref()?;
         let (progress, result) = job.take();
         let Some(result) = result else {
@@ -482,7 +515,10 @@ impl ShareDialog {
         self.job = None;
         match result {
             Ok(shared) => {
-                let copied = shared.link.as_deref().is_some_and(&mut *copy);
+                // Cancel was pressed, but the commit had already gone: the item is online. The
+                // clipboard is left as it was; the link is shown with its buttons.
+                let cancelled = self.stage == Stage::Cancelling;
+                let copied = !cancelled && shared.link.as_deref().is_some_and(&mut *copy);
                 self.stage = Stage::Online { link: shared.link, copied };
                 Some(ShareAction::Status(online_heading(self.kind)))
             }
@@ -505,13 +541,13 @@ impl ShareDialog {
                 self.stage = Stage::Cancelling;
                 None
             }
-            (Button::Publish, Stage::Form) => Some(ShareAction::Publish),
+            (Button::Publish, Stage::Form) if self.measure.is_none() => Some(ShareAction::Publish),
             (Button::Close, Stage::Refused(_) | Stage::Blocked(_)) | (Button::Done, Stage::Online { .. }) => Some(ShareAction::Closed(None)),
             (Button::Open, Stage::Online { link: Some(link), .. }) => Some(ShareAction::Open(link.clone())),
             (Button::CopyLink, Stage::Online { link: Some(link), .. }) => {
-                if copy(link) {
-                    self.copied_at = Some(Instant::now());
-                }
+                let copied = copy(link);
+                self.copied_at = copied.then(Instant::now);
+                self.copy_failed = !copied;
                 None
             }
             _ => None,
@@ -532,7 +568,7 @@ impl ShareDialog {
     /// What the window shows now.
     pub fn view(&self) -> View {
         let kind = self.kind;
-        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new() };
+        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new(), disabled: None };
         match &self.stage {
             Stage::Form => {
                 let name = self.workspace.lock().ok().and_then(|n| n.clone());
@@ -544,6 +580,9 @@ impl ShareDialog {
                 }
                 v.lines.push(Line::Warning(warning(kind)));
                 v.buttons = vec![Button::Cancel, Button::Publish];
+                if self.measure.is_some() {
+                    v.disabled = Some(Button::Publish);
+                }
             }
             Stage::Blocked(why) => {
                 v.lines.push(Line::Text(why.clone()));
@@ -576,6 +615,9 @@ impl ShareDialog {
                         if let Some(note) = publish_ui::copied_note(self.copied_at.map(|t| t.elapsed())) {
                             v.lines.push(Line::Muted(note.to_string()));
                         }
+                        if self.copy_failed {
+                            v.lines.push(Line::Muted(COPY_FAILED.to_string()));
+                        }
                         v.buttons = vec![Button::Open, Button::CopyLink, Button::Done];
                     }
                     None => {
@@ -601,7 +643,7 @@ impl ShareDialog {
         }
         let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        let mut pressed = if escape || enter { self.key_button(escape) } else { None };
+        let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         egui::Modal::new(egui::Id::unique("share-window")).frame(frame).show(ctx, |ui| {
@@ -648,13 +690,13 @@ impl ShareDialog {
                 for (i, button) in view.buttons.iter().enumerate().rev() {
                     let main = i + 1 == view.buttons.len();
                     let b = if main { egui::Button::new(RichText::new(button.label()).strong()).fill(PRIMARY) } else { egui::Button::new(button.label()) };
-                    if ui.add(b).clicked() {
+                    if ui.add_enabled(view.disabled != Some(*button), b).clicked() {
                         pressed = Some(*button);
                     }
                 }
             });
         });
-        if self.job.is_some() || self.copied_at.is_some() {
+        if self.job.is_some() || self.measure.is_some() || self.copied_at.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
         pressed.and_then(|b| self.press(b, copy))
@@ -665,31 +707,60 @@ impl ShareDialog {
 
 impl Editor {
     /// "Publish to…" in the image editor: the edited image as "Save" would write it, as PNG.
-    /// An image over the site's default limits is refused before anything is sent.
     pub(crate) fn open_share_image(&mut self) {
+        self.open_share_image_with(share::png_bytes);
+    }
+
+    /// [`Editor::open_share_image`] with the encoder given. An image over a limit that needs no
+    /// file (its sides) is refused at once and never encoded; any other is encoded on a thread
+    /// of its own, and the window shows its size once it is known.
+    pub(crate) fn open_share_image_with(&mut self, encode: fn(&image::RgbaImage) -> Result<Vec<u8>, String>) {
         if self.share.is_some() {
             return;
         }
         let img = self.doc.flatten();
-        let png = match share::png_bytes(&img) {
-            Ok(png) => png,
-            Err(e) => return self.notify(e),
-        };
-        let (width, height, bytes) = (img.width(), img.height(), png.len() as u64);
+        let (width, height) = (img.width(), img.height());
         let server = publish_ui::server();
+        let blocked = blocked_reason(&server);
+        let known = format!("{width} × {height} · {}", MediaType::Png.label());
+        if let Some(t) = share::too_large(Kind::Image, None, true, width, height, None) {
+            let mut d = ShareDialog::new(Kind::Image, server, self.title(), known, false, blocked, None);
+            d.refuse(&ShareError::TooLarge(t));
+            self.share = Some(d);
+            return;
+        }
+        let img = Arc::new(img);
+        let encoded: Encoded = Arc::new(Mutex::new(None));
+        let (source, slot) = (img.clone(), encoded.clone());
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode(&source))).unwrap_or_else(|_| Err(String::new()));
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(result);
+            }
+        });
+        let ready = encoded.clone();
+        let measure: Measure = Box::new(move || {
+            let slot = ready.lock().ok()?;
+            Some(match slot.as_ref()? {
+                Ok(png) => {
+                    let bytes = png.len() as u64;
+                    match share::too_large(Kind::Image, Some(bytes), true, width, height, None) {
+                        Some(t) => Err(ShareError::TooLarge(t)),
+                        None => Ok(image_details(width, height, MediaType::Png, bytes)),
+                    }
+                }
+                Err(_) => Err(ShareError::Failed(NOT_ENCODED.to_string())),
+            })
+        });
         let starter: Starter = Box::new(move |server, title| {
             ShareJob::spawn(Kind::Image, move |r| {
+                let png = encoded.lock().ok().and_then(|mut s| s.take()).and_then(Result::ok).ok_or_else(|| ShareError::Failed(NOT_ENCODED.to_string()))?;
                 let token = publish_ui::token_for(&server).map_err(ShareError::Failed)?;
                 let item = Item { media: MediaType::Png, data: png, width, height, duration_ms: None, title, preview: share::preview_of(&img) };
                 share::share(&server, &token, &item, |sent, total| r.uploading(sent, total))
             })
         });
-        let blocked = blocked_reason(&server);
-        let mut d = ShareDialog::open(Kind::Image, server, self.title(), image_details(width, height, MediaType::Png, bytes), false, blocked, starter);
-        if let Some(t) = share::too_large(Kind::Image, Some(bytes), true, width, height, None) {
-            d.refuse(&ShareError::TooLarge(t));
-        }
-        self.share = Some(d);
+        self.share = Some(ShareDialog::open(Kind::Image, server, self.title(), known, false, blocked, starter).measuring(measure));
     }
 
     /// The share window, while it is open: draw it and do what it asks.

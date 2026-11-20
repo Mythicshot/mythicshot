@@ -10,6 +10,9 @@ const COMMIT: &str = "POST /api/v1/media/med_0123456789abcdef01234567/commit";
 const PREVIEW: &str = "PUT /api/v1/media/med_0123456789abcdef01234567/preview";
 const DELETE: &str = "DELETE /api/v1/media/med_0123456789abcdef01234567";
 const LINK_ID: &str = "abcdefghijklmnopqrst";
+/// The site's default limits.
+const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const CLIP_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 fn part(n: usize) -> String {
     format!("PUT /api/v1/media/{MED}/parts/{n}")
@@ -287,20 +290,52 @@ fn a_full_workspace_without_numbers_keeps_the_sites_sentence_as_a_tour_does() {
 }
 
 #[test]
-fn an_item_over_the_default_limits_is_refused_before_anything_is_sent() {
+fn only_what_no_site_can_take_is_refused_before_anything_is_sent() {
     let s = platform_site();
-    let big = Item { data: png(IMAGE_MAX_BYTES as usize + 1), ..image(0) };
+    let big = Item { data: png(MOST_BYTES as usize + 1), ..image(0) };
     let r = run(&s, &big, |_, _| true);
-    assert_eq!(r.result, Err(ShareError::TooLarge(TooLarge::Bytes { bytes: IMAGE_MAX_BYTES + 1, max: IMAGE_MAX_BYTES, exact: true })));
-    let wide = Item { width: 9000, height: 3000, ..image(100) };
-    assert_eq!(run(&s, &wide, |_, _| true).result, Err(ShareError::TooLarge(TooLarge::Side { width: 9000, height: 3000, max: 8192 })));
+    assert_eq!(r.result, Err(ShareError::TooLarge(TooLarge::Bytes { bytes: MOST_BYTES + 1, max: MOST_BYTES, exact: true })));
+    let wide = Item { width: 70_000, height: 3000, ..image(100) };
+    assert_eq!(run(&s, &wide, |_, _| true).result, Err(ShareError::TooLarge(TooLarge::Side { width: 70_000, height: 3000, max: 65_535 })));
+    let wide_clip = Item { width: 9000, height: 3000, ..clip(10) };
+    assert_eq!(run(&s, &wide_clip, |_, _| true).result, Err(ShareError::TooLarge(TooLarge::Side { width: 9000, height: 3000, max: 8192 })));
     let long = Item { duration_ms: Some(CLIP_MAX_DURATION_MS + 1), ..clip(10) };
     assert_eq!(run(&s, &long, |_, _| true).result, Err(ShareError::TooLarge(TooLarge::Duration { ms: 600_001, max: 600_000 })));
     assert!(s.lines().is_empty(), "{:?}", s.lines());
-    // A clip may be as large as 50 MiB; an image of that size may not.
-    assert_eq!(too_large(Kind::Clip, Some(CLIP_MAX_BYTES), true, 960, 540, Some(12_000)), None);
-    assert!(too_large(Kind::Image, Some(CLIP_MAX_BYTES), true, 960, 540, None).is_some());
-    assert_eq!(too_large(Kind::Clip, None, false, 960, 540, Some(600_000)), None, "no size known yet, and ten minutes is allowed");
+    // Over the default limits but within what a site can be set to: the site decides.
+    assert_eq!(too_large(Kind::Image, Some(IMAGE_MAX_BYTES + 1), true, 9000, 3000, None), None);
+    assert_eq!(too_large(Kind::Clip, Some(CLIP_MAX_BYTES + 1), true, 960, 540, Some(12_000)), None);
+    assert_eq!(too_large(Kind::Clip, Some(MOST_BYTES), true, 960, 540, Some(600_000)), None, "the ceiling itself and ten minutes are allowed");
+    assert_eq!(too_large(Kind::Image, None, true, 65_535, 65_535, None), None);
+}
+
+#[test]
+fn an_image_over_the_default_limit_goes_to_a_site_that_takes_it_and_is_refused_with_the_number_of_one_that_does_not() {
+    let item = Item { data: png(IMAGE_MAX_BYTES as usize + 1), width: 9000, ..image(0) };
+    let roomy = platform_site();
+    assert!(run(&roomy, &item, |_, _| true).result.is_ok(), "a site set to take more takes it");
+    let strict = site(2_000_000, "/i/x", |req, _| {
+        (req.line == CREATE).then(|| reply(413, &format!(r#"{{"error":"media_too_large","detail":"x","max_bytes":{IMAGE_MAX_BYTES},"max_side":8192}}"#)))
+    });
+    let r = run(&strict, &item, |_, _| true);
+    assert_eq!(r.result, Err(ShareError::TooLarge(TooLarge::Bytes { bytes: IMAGE_MAX_BYTES + 1, max: IMAGE_MAX_BYTES, exact: true })));
+    assert_eq!(strict.lines(), vec![CREATE.to_string()], "no part is sent and nothing is deleted");
+}
+
+#[test]
+fn the_parts_answer_must_add_up_and_stay_within_999_parts() {
+    let answer = |parts: u64, part_bytes: u64| json!({ "parts": parts, "part_bytes": part_bytes });
+    assert_eq!(parts_of(&answer(1, 2_000_000), 10), Some(2_000_000));
+    assert_eq!(parts_of(&answer(3, 4), 10), Some(4));
+    assert_eq!(parts_of(&answer(0, 4), 0), None, "no parts");
+    assert_eq!(parts_of(&answer(0, 4), 10), None);
+    assert_eq!(parts_of(&answer(999, 1), 999), Some(1));
+    assert_eq!(parts_of(&answer(1000, 1), 1000), None, "more than 999 parts");
+    assert_eq!(parts_of(&answer(u64::MAX, 1), u64::MAX), None);
+    assert_eq!(parts_of(&answer(1, u64::MAX), 10), usize::try_from(u64::MAX).ok(), "one part as long as can be");
+    assert_eq!(parts_of(&answer(1, 0), 10), None, "parts of no length");
+    assert_eq!(parts_of(&json!({ "parts": 1 }), 10), None);
+    assert_eq!(parts_of(&json!({ "parts": -1, "part_bytes": 4 }), 10), None);
 }
 
 #[test]
@@ -334,6 +369,8 @@ fn the_too_large_sentences_are_mythicshots_own() {
     assert_eq!(r.text, "It is 10.1 MB, and a shared image can be at most 10.0 MB. Crop it, or make it smaller, and publish again.");
     let r = refusal(Kind::Image, TooLarge::Side { width: 9000, height: 3000, max: 8192 });
     assert_eq!(r.text, "It is 9000 × 3000 pixels, and a shared image can be at most 8192 pixels on a side. Crop it, or make it smaller, and publish again.");
+    let r = refusal(Kind::Image, TooLarge::Bytes { bytes: 80_000_000, max: MOST_BYTES, exact: true });
+    assert_eq!(r.text, "It is 76.3 MB, and a shared image can be at most 72.4 MB. Crop it, or make it smaller, and publish again.");
     let r = refusal(Kind::Clip, TooLarge::Side { width: 9000, height: 3000, max: 8192 });
     assert_eq!(r.text, "It is 9000 × 3000 pixels, and a shared clip can be at most 8192 pixels on a side. Lower the size in Export, and publish again.");
     let r = refusal(Kind::Clip, TooLarge::Duration { ms: 650_200, max: CLIP_MAX_DURATION_MS });
@@ -483,10 +520,42 @@ fn every_link_form_the_site_may_answer_with() {
     assert_eq!(crate::publish::public_url(server, Some("https://img.example.com/t/abc"), None), None);
 }
 
+/// A site whose commit answers `link` (left out when None) and `path`.
+fn committing(link: Option<&'static str>, path: &'static str) -> Stub {
+    site(2_000_000, "unused", move |req, _| {
+        (req.line == COMMIT).then(|| {
+            let mut v = json!({ "id": MED, "link_id": LINK_ID, "kind": "image", "path": path });
+            if let Some(link) = link {
+                v["link"] = json!(link);
+            }
+            reply(200, &v.to_string())
+        })
+    })
+}
+
+#[test]
+fn a_link_mythicshot_cannot_use_falls_back_to_the_path_on_the_configured_server() {
+    let long: &'static str = Box::leak(format!("https://img.example.com/i/{}", "a".repeat(400)).into_boxed_str());
+    for bad in ["http://img.example.com/i/abcdefghijklmnopqrst", long, "javascript:alert(1)"] {
+        let s = committing(Some(bad), "/i/abcdefghijklmnopqrst");
+        assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: Some(format!("{}/i/{LINK_ID}", s.base)) }), "{bad:?}");
+    }
+    // A usable link comes first, before the path.
+    let s = committing(Some("https://img.example.com/i/abcdefghijklmnopqrst"), "/i/abcdefghijklmnopqrst");
+    assert_eq!(run(&s, &image(100), |_, _| true).result.unwrap().link.as_deref(), Some("https://img.example.com/i/abcdefghijklmnopqrst"));
+    // No link at all: the path.
+    let s = committing(None, "/i/abcdefghijklmnopqrst");
+    assert_eq!(run(&s, &image(100), |_, _| true).result.unwrap().link, Some(format!("{}/i/{LINK_ID}", s.base)));
+    // Neither usable: no link, and the item is still shared.
+    let s = committing(Some("http://img.example.com/i/x"), "//evil.example/i/x");
+    assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: None }));
+    assert_eq!(count(&s.lines(), DELETE), 0);
+}
+
 #[test]
 fn a_link_mythicshot_cannot_use_still_leaves_the_item_shared_and_not_deleted() {
     for link in ["javascript:alert(1)", "http://img.example.com/i/abc", "https://u@img.example.com/i/abc", "https://img.example.com/i/\u{1b}[0m"] {
-        let s = site(2_000_000, Box::leak(link.to_string().into_boxed_str()), |_, _| None);
+        let s = committing(Some(Box::leak(link.to_string().into_boxed_str())), "//evil.example/i/x");
         let r = run(&s, &image(100), |_, _| true);
         assert_eq!(r.result, Ok(Shared { id: MED.into(), link: None }), "{link:?}");
         assert_eq!(count(&s.lines(), DELETE), 0);

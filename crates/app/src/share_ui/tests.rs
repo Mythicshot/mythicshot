@@ -186,7 +186,7 @@ fn cancel_while_uploading_waits_for_the_clean_up_then_closes_with_a_sentence() {
     assert_eq!(d.stage(), &Stage::Cancelling);
     let v = d.view();
     assert_eq!((v.heading.as_str(), v.buttons.is_empty()), ("Cancelling…", true));
-    assert_eq!(settle(&mut d, &mut |t| copy(&log, t)), Some(ShareAction::Closed(Some("Publishing was cancelled. Nothing was left online.".into()))));
+    assert_eq!(settle(&mut d, &mut |t| copy(&log, t)), Some(ShareAction::Closed(Some("Publishing was cancelled. Nothing was shared.".into()))));
     assert!(waiter.is_finished());
     assert!(log.borrow().is_empty());
 }
@@ -237,7 +237,7 @@ fn a_link_mythicshot_cannot_open_says_where_to_find_the_item() {
 #[test]
 fn refusals_are_shown_with_their_heading_sentence_and_note_and_close() {
     let mut d = image_form();
-    d.refuse(&ShareError::TooLarge(share::TooLarge::Bytes { bytes: 14 * 1_048_576, max: share::IMAGE_MAX_BYTES, exact: true }));
+    d.refuse(&ShareError::TooLarge(share::TooLarge::Bytes { bytes: 14 * 1_048_576, max: 10 * 1_048_576, exact: true }));
     let v = d.view();
     assert_eq!(v.caption, "Publish image");
     assert_eq!(v.heading, "This image is too large to share");
@@ -247,7 +247,7 @@ fn refusals_are_shown_with_their_heading_sentence_and_note_and_close() {
     assert_eq!(d.press(Button::Close, &mut |t| copy(&log, t)), Some(ShareAction::Closed(None)));
 
     let mut d = clip_form(MediaType::Mp4);
-    d.refuse(&ShareError::TooLarge(share::TooLarge::Bytes { bytes: 74 * 1_048_576, max: share::CLIP_MAX_BYTES, exact: false }));
+    d.refuse(&ShareError::TooLarge(share::TooLarge::Bytes { bytes: 74 * 1_048_576, max: 50 * 1_048_576, exact: false }));
     let v = d.view();
     assert_eq!((v.caption, v.heading.as_str()), ("Publish recording", "This clip is too large to share"));
     assert_eq!(v.lines, vec![Line::Text("It would be 74.0 MB, and a shared clip can be at most 50.0 MB. Trim it, or lower the size or quality in Export, and publish again.".into())]);
@@ -424,7 +424,7 @@ fn image_editor(img: image::RgbaImage) -> Editor {
 }
 
 #[test]
-fn publish_to_opens_the_image_window_and_refuses_an_image_over_the_limits_at_once() {
+fn publish_to_opens_the_image_window_and_measures_the_png_off_the_ui_thread() {
     let mut ed = image_editor(image::RgbaImage::from_pixel(40, 30, image::Rgba([1, 2, 3, 255])));
     ed.open_share_image();
     let v = ed.share.as_ref().expect("the window is open").view();
@@ -433,10 +433,95 @@ fn publish_to_opens_the_image_window_and_refuses_an_image_over_the_limits_at_onc
     ed.open_share_image();
     assert!(ed.share.is_some());
 
-    let mut ed = image_editor(image::RgbaImage::new(9000, 10));
-    ed.open_share_image();
+    // The size comes from the PNG made off the UI thread, once it is there.
+    let d = ed.share.as_mut().unwrap();
+    assert_eq!(d.details, "40 × 30 · PNG");
+    for _ in 0..500 {
+        d.poll(&mut |_| false);
+        if d.measure.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let size = publish_ui::size_text(share::png_bytes(&image::RgbaImage::from_pixel(40, 30, image::Rgba([1, 2, 3, 255]))).unwrap().len() as u64);
+    assert_eq!(d.details, format!("40 × 30 · PNG · {size}"));
+}
+
+static WIDE_ENCODED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn wide_encoder(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
+    WIDE_ENCODED.store(true, std::sync::atomic::Ordering::SeqCst);
+    share::png_bytes(img)
+}
+
+#[test]
+fn an_image_too_wide_for_any_site_is_refused_at_once_and_never_encoded() {
+    let mut ed = image_editor(image::RgbaImage::new(70_000, 1));
+    ed.open_share_image_with(wide_encoder);
     let v = ed.share.as_ref().unwrap().view();
     assert_eq!(v.heading, "This image is too large to share");
-    assert_eq!(v.lines, vec![Line::Text("It is 9000 × 10 pixels, and a shared image can be at most 8192 pixels on a side. Crop it, or make it smaller, and publish again.".into())]);
+    assert_eq!(v.lines, vec![Line::Text("It is 70000 × 1 pixels, and a shared image can be at most 65535 pixels on a side. Crop it, or make it smaller, and publish again.".into())]);
     assert_eq!(v.buttons, vec![Button::Close]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!WIDE_ENCODED.load(std::sync::atomic::Ordering::SeqCst), "the encoder was never asked");
+}
+
+#[test]
+fn publish_waits_until_the_file_is_made_and_a_file_that_cannot_be_made_is_said() {
+    let ready = Arc::new(Mutex::new(None::<Result<String, ShareError>>));
+    let slot = ready.clone();
+    let mut d = image_form().measuring(Box::new(move || slot.lock().unwrap().take()));
+    d.details = "1920 × 1080 · PNG".into();
+    let (log, copy) = copier(true);
+    let v = d.view();
+    assert_eq!((v.lines[2].clone(), v.disabled), (Line::Muted("1920 × 1080 · PNG".into()), Some(Button::Publish)));
+    assert_eq!(d.press(Button::Publish, &mut |t| copy(&log, t)), None, "Publish waits");
+    *ready.lock().unwrap() = Some(Ok(image_details(1920, 1080, MediaType::Png, BYTES)));
+    assert_eq!(d.poll(&mut |t| copy(&log, t)), None);
+    let v = d.view();
+    assert_eq!((v.lines[2].clone(), v.disabled), (Line::Muted("1920 × 1080 · PNG · 1.4 MB".into()), None));
+    assert_eq!(d.press(Button::Publish, &mut |t| copy(&log, t)), Some(ShareAction::Publish));
+
+    let mut d = image_form().measuring(Box::new(|| Some(Err(ShareError::Failed(NOT_ENCODED.into())))));
+    d.poll(&mut |t| copy(&log, t));
+    let v = d.view();
+    assert_eq!((v.heading.as_str(), v.lines.clone()), ("The image was not uploaded", vec![Line::Text("Mythicshot could not make a PNG file of the image.".into())]));
+}
+
+#[test]
+fn a_commit_that_lands_after_cancel_shows_the_link_but_leaves_the_clipboard_alone() {
+    let link = "https://img.example.com/i/abcdefghijklmnopqrst";
+    let mut d = image_form();
+    // The job has already sent the commit: it ends with the link whatever cancel says.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    d.start(ShareJob::spawn(Kind::Image, move |_| {
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        Ok(Shared { id: "x".into(), link: Some(link.into()) })
+    }));
+    let (log, copy) = copier(true);
+    d.press(Button::Cancel, &mut |t| copy(&log, t));
+    tx.send(()).unwrap();
+    assert_eq!(settle(&mut d, &mut |t| copy(&log, t)), Some(ShareAction::Status("The image is online".into())));
+    assert!(log.borrow().is_empty(), "nothing was put on the clipboard");
+    let v = d.view();
+    assert_eq!((v.heading.as_str(), v.link.as_deref(), v.lines.clone()), ("The image is online", Some(link), vec![]));
+    assert_eq!(v.buttons, vec![Button::Open, Button::CopyLink, Button::Done]);
+}
+
+#[test]
+fn a_copy_that_fails_says_to_copy_the_link_by_hand() {
+    let mut d = image_form();
+    d.stage = Stage::Online { link: Some("https://img.example.com/i/a".into()), copied: false };
+    let (log, copy) = copier(false);
+    assert_eq!(d.press(Button::CopyLink, &mut |t| copy(&log, t)), None);
+    assert_eq!(d.view().lines, vec![Line::Muted("Could not copy the link. Select it and copy it yourself.".into())]);
+    let (log, copy) = copier(true);
+    d.press(Button::CopyLink, &mut |t| copy(&log, t));
+    assert_eq!(d.view().lines, vec![Line::Muted("Link copied".into())], "a copy that works takes the line away");
+}
+
+#[test]
+fn the_destination_line_drops_invisible_and_bidi_characters() {
+    assert_eq!(to_line(Some("Acme\u{202e}moc.live\u{200b}"), SERVER).as_deref(), Some("To Acmemoc.live at tours.example.com"));
+    assert_eq!(to_line(Some("\u{2066}\u{feff}"), SERVER).as_deref(), Some("To tours.example.com"));
 }

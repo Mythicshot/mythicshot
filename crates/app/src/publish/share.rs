@@ -30,11 +30,13 @@ use serde_json::{Value, json};
 
 use super::{AbortGuard, Client, Method, Reply, Timeouts, check_server, is_id, is_invisible, not_understood, safe_link, size_rounded};
 
-/// The site's default limits for an image: 10 MiB and 8,192 pixels on a side.
-pub const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
-pub const IMAGE_MAX_SIDE: u32 = 8192;
-/// The site's default limit for a clip: 50 MiB, and at most 8,192 pixels on a side.
-pub const CLIP_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// The largest image or clip any site can be set to take: 38 parts of 2,000,000 bytes. A
+/// site's own limit (by default 10 MiB for an image and 50 MiB for a clip) is lower or equal,
+/// and is said by its `media_too_large` answer; only past this one is an item refused here.
+pub const MOST_BYTES: u64 = 76_000_000;
+/// The most pixels on a side any site can be set to take for an image.
+pub const IMAGE_MOST_SIDE: u32 = 65_535;
+/// The most pixels on a side a clip may have on every site: a fixed ceiling, not a setting.
 pub const CLIP_MAX_SIDE: u32 = 8192;
 /// The longest clip the site takes: 10 minutes.
 pub const CLIP_MAX_DURATION_MS: u64 = 600_000;
@@ -213,16 +215,18 @@ fn duration_words(ms: u64, up: bool) -> String {
     }
 }
 
-/// Whether an item of `kind` is over one of the site's default limits: its size in bytes
-/// (`exact` false when that is an estimate; None when not known yet), its sides, and a clip's
-/// duration. None when it is within them all.
+/// Whether an item of `kind` is over a limit no site can be set past: its size in bytes
+/// ([`MOST_BYTES`]; `exact` false when that is an estimate, None when not known yet), its sides
+/// and a clip's duration. None when it is within them all: whether it is within the configured
+/// site's own limits only the site's answer can say. Needs no encoding: the sides alone can be
+/// checked before the file exists.
 pub fn too_large(kind: Kind, bytes: Option<u64>, exact: bool, width: u32, height: u32, duration_ms: Option<u64>) -> Option<TooLarge> {
-    let (max_bytes, max_side) = match kind {
-        Kind::Image => (IMAGE_MAX_BYTES, IMAGE_MAX_SIDE),
-        Kind::Clip => (CLIP_MAX_BYTES, CLIP_MAX_SIDE),
+    let max_side = match kind {
+        Kind::Image => IMAGE_MOST_SIDE,
+        Kind::Clip => CLIP_MAX_SIDE,
     };
-    if let Some(bytes) = bytes.filter(|b| *b > max_bytes) {
-        return Some(TooLarge::Bytes { bytes, max: max_bytes, exact });
+    if let Some(bytes) = bytes.filter(|b| *b > MOST_BYTES) {
+        return Some(TooLarge::Bytes { bytes, max: MOST_BYTES, exact });
     }
     if width > max_side || height > max_side {
         return Some(TooLarge::Side { width, height, max: max_side });
@@ -233,11 +237,16 @@ pub fn too_large(kind: Kind, bytes: Option<u64>, exact: bool, width: u32, height
     }
 }
 
-/// The title as it is sent: without control or invisible characters, trimmed, and at most
-/// [`TITLE_MAX`] characters. Empty means no title.
+/// The title as it is sent: [`plain_text`], at most [`TITLE_MAX`] characters. Empty means no title.
 pub fn clean_title(title: &str) -> String {
-    let plain: String = title.chars().filter(|&c| !c.is_control() && !is_invisible(c)).collect();
-    plain.trim().chars().take(TITLE_MAX).collect::<String>().trim_end().to_string()
+    plain_text(title).chars().take(TITLE_MAX).collect::<String>().trim_end().to_string()
+}
+
+/// `text` without control characters and without characters that show nothing but can hide or
+/// reorder text (bidi controls, zero-width marks), trimmed.
+pub fn plain_text(text: &str) -> String {
+    let plain: String = text.chars().filter(|&c| !c.is_control() && !is_invisible(c)).collect();
+    plain.trim().to_string()
 }
 
 /// The link to a shared item from the commit's answer, which came from the configured `server`
@@ -378,7 +387,10 @@ impl Sharing<'_> {
         }
         let answer = self.commit(&id)?;
         guard.disarm();
-        let link = answer.get("link").or_else(|| answer.get("path")).and_then(Value::as_str).and_then(|l| item_link(&self.client.base, l));
+        // A link Mythicshot cannot use (plain http on another host, too long) falls back to the
+        // path on the configured server, which serves the item's page too.
+        let usable = |key: &str| answer.get(key).and_then(Value::as_str).and_then(|l| item_link(&self.client.base, l));
+        let link = usable("link").or_else(|| usable("path"));
         Ok(Shared { id, link })
     }
 

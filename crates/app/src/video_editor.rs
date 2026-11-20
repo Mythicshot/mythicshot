@@ -553,7 +553,8 @@ fn clip_duration_ms(frames: &[mythicshot_recording::export::OutFrame], end_ms: u
 }
 
 /// Prepare the clip in a new folder in `temp` through the export, check its real size against
-/// the site's limits, then share it with its first frame as the preview. The folder is removed
+/// what any site can take (the configured site's own limit is said by its answer to the
+/// create, before any part is sent), then share it with its first frame as the preview. The folder is removed
 /// whatever happens. The MP4 has no sound: Mythicshot records none, and the export asks ffmpeg
 /// for a video stream only.
 pub(crate) fn share_clip_job(clip: &ClipSpec, temp: &Path, server: &str, title: String, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
