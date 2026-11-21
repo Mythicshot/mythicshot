@@ -1,35 +1,32 @@
-# Build the Windows installer and publish a GitHub release when a version tag
-# such as v0.2.0 is pushed. It can also be run by hand from the Actions tab
-# for a tag that already exists, to make a release that was missed.
-name: Release
+# Builds an UNSIGNED Windows installer for testing, by hand only (Actions tab, "Run workflow").
+# It never publishes anything: the result is a workflow artifact named
+# mythicshot-<version>-unsigned-not-for-release. Releases for the download page are made with
+# scripts/release/release.mjs, which signs and checks them (docs/release.md).
+name: Unsigned installer (not for release)
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing tag to release, for example v0.1.0"
+      ref:
+        description: "Branch, tag or commit to build, for example main"
         required: true
+        default: main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     runs-on: windows-latest
-    env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ github.event.inputs.ref }}
 
-      - name: Check the tag matches the version in Cargo.toml
+      - name: Read the version from Cargo.toml
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match version $version in Cargo.toml" }
           "VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
@@ -37,10 +34,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release -p mythicshot
+        run: cargo build --release --locked -p mythicshot
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # WiX 5, as on the development PC (v6 needs a separate licence accepted).
       - name: Install WiX
@@ -55,18 +52,13 @@ jobs:
         working-directory: installer
         run: |
           New-Item -ItemType Directory -Force ../dist | Out-Null
-          wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=$env:VERSION -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-$env:VERSION-x64.msi
-          wix msi validate ../dist/Mythicshot-$env:VERSION-x64.msi
+          wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=$env:VERSION -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-$env:VERSION-x64-UNSIGNED.msi
+          wix msi validate ../dist/Mythicshot-$env:VERSION-x64-UNSIGNED.msi
 
-      - name: Publish the release
-        uses: softprops/action-gh-release@v2
+      - name: Keep the unsigned installer as a workflow artifact (not a release)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.TAG }}
-          name: Mythicshot ${{ env.VERSION }}
-          generate_release_notes: true
-          body: |
-            Windows installer: download `Mythicshot-${{ env.VERSION }}-x64.msi` below. It installs for your user only, with no admin prompt.
-
-            The installer is not code-signed yet, so Windows SmartScreen warns the first time: choose **More info**, then **Run anyway**.
-          files: dist/Mythicshot-${{ env.VERSION }}-x64.msi
-          fail_on_unmatched_files: true
+          name: mythicshot-${{ env.VERSION }}-unsigned-not-for-release
+          path: dist/Mythicshot-${{ env.VERSION }}-x64-UNSIGNED.msi
+          if-no-files-found: error
+          retention-days: 7

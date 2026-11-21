@@ -134,13 +134,13 @@ cd installer
 wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.1 -d Exe=../target/release/mythicshot.exe -o ../dist/Mythicshot-0.1.1-x64.msi
 ```
 
-Releases are built on GitHub: pushing a tag such as `v0.2.0` (matching the version in `Cargo.toml`) builds and tests the app, builds the MSI and publishes a release with it attached (`.github/workflows/release.yml`). For a tag that already exists, run the Release workflow by hand from the Actions tab and give it the tag.
+Releases are not built on GitHub: they are signed and checked on the signing machine, see [docs/release.md](docs/release.md). The GitHub workflow `.github/workflows/release.yml` only builds an unsigned MSI for testing, when run by hand from the Actions tab; it keeps it as a workflow artifact named `mythicshot-<version>-unsigned-not-for-release` and never publishes a release.
 
-The wizard's banner images come from `installer/make_images.py`. The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
+The wizard's banner images come from `installer/make_images.py`. An MSI built by hand as above is not code-signed, so Windows shows a SmartScreen warning the first time.
 
 ### Signed release for the download page
 
-`node scripts/release/release.mjs` builds the program, signs it, builds the installer from the signed program, signs that, checks both signatures strictly and leaves `dist/release/` with the installer, `release.json` for the front page and a summary. It refuses, and leaves nothing behind, without a complete signing configuration or when any step or check fails. `--to-site <site checkout>` hands the release to the front page and runs its checks without publishing. How to cut a release, what the toolchain needs, the configuration file and every refusal: [docs/release.md](docs/release.md). Its tests: `node --test "scripts/release/test/*.test.mjs"`.
+`node scripts/release/release.mjs` builds the program, signs it, builds the installer from the signed program, signs that, checks both signatures strictly and leaves `dist/release/` with the installer, `release.json` for the front page, `build.json` with the commit it was built from, and a summary. It first deletes its own earlier output, and refuses, leaving no release at all, without a complete signing configuration or when any step or check fails. `--to-site <site checkout>` hands the release to the front page and runs its checks without publishing. How to cut a release, what the toolchain needs, the configuration file and every refusal: [docs/release.md](docs/release.md). Its tests: `node --test "scripts/release/test/*.test.mjs"`.
 
 ## Layout
 
