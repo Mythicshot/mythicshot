@@ -155,7 +155,7 @@ Each tool is found once, at the start, as an absolute path, and run by that path
 - Node 24 and Windows PowerShell 5.1, both used with their standard parts only.
 - A code signing certificate, chaining to a root trusted on the signing machine, its issuing CA's thumbprint, and its timestamp server. Without them the command refuses every time.
 
-The full build runs every time, in a fresh folder (two and a half to three and a half minutes on the development PC).
+The full build runs every time, in a fresh folder (two to three and a half minutes on the development PC; measured: 126, 142 and 198 seconds).
 
 ## The GitHub workflow
 
@@ -170,7 +170,7 @@ Some facts can only be seen with the real certificate. On the first run with it,
 - [ ] Windows reports the MSI's signature type as `Authenticode` (`(Get-AuthenticodeSignature <msi>).SignatureType`), as for the exe.
 - [ ] The timestamp signer named in `SUMMARY.txt` ("Timestamped by") is the timestamp authority of the configured `timestampUrl`.
 - [ ] `wix msi decompile -x` still puts the program at `File\MythicshotExe` (the `File` table's Id of `mythicshot.exe` in `installer\mythicshot.wxs`); if that changes, every release is refused with "does not hold the signed mythicshot.exe".
-- [ ] The whole run, with its fresh build (two and a half to three and a half minutes on the development PC, more on a slower machine), fits in the time limit of the job that runs it unattended.
+- [ ] The whole run, with its fresh build (two to three and a half minutes on the development PC, more on a slower machine), fits in the time limit of the job that runs it unattended.
 - [ ] The chain the verifier builds offline reports nothing but `NotTimeValid` at most (an intermediate missing from the signature would show as `PartialChain` and refuse).
 
 ## Tests
