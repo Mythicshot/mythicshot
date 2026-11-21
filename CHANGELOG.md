@@ -2,6 +2,25 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.16 (2026-11-21)
+
+- One command makes a release for the download page: `node scripts/release/release.mjs` builds Mythicshot, signs it, builds the installer from the signed program, signs the installer and checks both signatures before anything is written to `dist/release/`, next to the front page's `release.json` and a short summary.
+- It refuses, with one line saying why and nothing left behind, without a complete signing configuration, when signing fails, when a signature is not trusted, has no timestamp, does not match the file or is not from the expected publisher, and when Cargo.toml, the program and the installer disagree on the version.
+- `--to-site <site checkout>` copies the installer and `release.json` into the front page and runs its own checks, without publishing. `--check-config` says whether the signing configuration is complete without signing anything.
+- The signing certificate is chosen in a small file outside the repository; no value from it is ever shown. See docs/release.md.
+- A run first deletes its own earlier release, so a failed run leaves no release at all, never an older one. `build.json` records the commit the release was built from.
+- The signature check also requires the code signing usage, an issuing CA from the configured `issuerThumbprints`, optionally one exact certificate and extra usages, an embedded Authenticode signature and a SHA-256 digest. The file that ships is the file that was checked.
+- The program is built in a fresh folder with `--locked`, without build-changing environment variables, and only when no cargo configuration file could change it and the checkout is clean and unmoved before and after the build.
+- `--to-site` accepts only a release of the workspace version built from the current commit, never an older version than the site's, and the same version only with the same installer. It keeps the owner's "requires" and "installs" words, and puts the site back when anything refuses.
+- The GitHub workflow can no longer publish: it builds an unsigned installer by hand only, kept as a workflow artifact marked not for release. Every workflow now has read-only permissions, and a test checks all of them.
+- `--to-site` survives being killed: it writes a journal under the site's `preview/` folder, checks the new installer before moving anything old, keeps the old files and `dist/` aside, and the next run puts an interrupted site back. A site `release.json` that is neither `{}` nor a valid release is refused, and the same version is accepted only with the same file, size and checksum; then the site's check and package steps still run.
+- The build also loses the Visual Studio and C compiler variables (`LINK`, `CL`, `CC`, `CFLAGS`, `LIB`, `INCLUDE` and more) and `RUSTUP_HOME`; inline tables and `include` in cargo configuration are refused; git runs without `GIT_*` variables, and files git is told to ignore changes in are refused.
+- Tools are run by absolute path only, never from the checkout, the site or the current folder; the signature check also refuses a certificate chain with any problem other than a since-expired certificate; and a short secret after `/p`, `/kc` or `/csp` is refused.
+- Only one run at a time: a release run locks its output folder and `--to-site` locks the site; a second run refuses (exit 10) while the first one's process is alive, and a lock left by a killed run is taken over.
+- `--to-site` trusts a journal only when it is exactly its own (format 1, known state, every field, this site's path), and otherwise leaves everything for a person. Putting the site back never writes through a link, and is itself safe to interrupt.
+- A cargo configuration with a multi-line string is refused; a release run from a Visual Studio Developer Prompt builds exactly like one from a plain shell; tools are compared by their real paths; npm's shell is always System32's cmd.exe.
+- docs/release.md says plainly that revocation is not checked by this command.
+
 ## 0.2.15 (2026-11-21)
 
 - The window that says an image or a clip is online is roomier and shows the link on one row with "Copy link" joined to it on the right. A link too long for the row is cut short with "…"; the whole link shows when you point at it.
