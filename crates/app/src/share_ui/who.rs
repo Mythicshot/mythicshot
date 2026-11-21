@@ -57,6 +57,9 @@ pub const STILL_THERE: &str = "The draft is still on the site. Delete it on the 
 pub const DRAFT_PUBLIC_IF_PUBLISHED: &str = "The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link.";
 /// After a restricted publish the site accepted and that did not finish. Proposed, awaits approval.
 pub const STAYS_AS_CHOSEN: &str = "The draft is uploaded. Who can view stays as you chose.";
+/// After an upload whose commit answer was lost or not understood, during a restricted publish:
+/// a draft may be on the site, and its id is not known. Proposed, awaits approval.
+pub const DRAFT_MAY_APPEAR: &str = "If a draft appears on the Tours page, publishing it there makes it visible to anyone with the link.";
 /// The result screen's heading when the tour was deleted again. Proposed, awaits approval.
 pub const NOT_PUBLISHED_HEADING: &str = "The tour was not published";
 /// The Tours page's question before a plain Publish of a tour whose restriction was not applied. Approved.

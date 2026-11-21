@@ -1804,6 +1804,23 @@ impl Picker {
         }
     }
 
+    /// Whether the main button would publish for anyone a tour whose restricted publish did not
+    /// finish: the button then says so and the line under "Publish now" is the question's text,
+    /// so the click is the informed choice (Enter does not stand for it).
+    fn opens_remembered(&self) -> bool {
+        false
+    }
+
+    /// The main button's label.
+    fn main_label(&self) -> &'static str {
+        self.mode.button()
+    }
+
+    /// The line under a mode.
+    fn hint_line(&self, mode: Mode, into: Goes, restricted: bool) -> Option<&'static str> {
+        mode_hint(mode, into, restricted)
+    }
+
     /// The line about the dashboard: for a tour published now, or published before.
     fn dashboard_line(&self) -> &'static str {
         match self.chosen_tour() {
@@ -3592,5 +3609,50 @@ pub(crate) mod tests {
         // A publish that was never restricted says what it said before.
         let plain = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(refused()));
         assert_eq!(plain.note(), Some((format!("{cannot} The draft is uploaded, but it is not public."), true)));
+    }
+
+    // ---- The picker and a tour whose restriction was not applied ----
+
+    fn picker_with_draft(id: &str) -> Picker {
+        let mut p = restricted_picker();
+        let mut draft = tour("Draft", 1, 2, "draft");
+        draft.id = id.to_string();
+        *p.list.lock().unwrap() = ListState::Loaded(vec![draft]);
+        p.choice = Choice::Tour(id.into());
+        p
+    }
+
+    #[test]
+    fn publishing_a_remembered_tour_for_anyone_from_the_picker_says_so_on_the_button() {
+        let id = "tour_9a9a9a9a9a9a9a9a9a9a0001";
+        note_unfinished_restriction(id);
+        let mut p = picker_with_draft(id);
+        assert!(p.opens_remembered());
+        assert_eq!(p.main_label(), "Publish for anyone");
+        assert_eq!(p.hint_line(Mode::PublishNow, Goes::DraftTour, false), Some(who::CONFIRM_TEXT));
+        assert_eq!(p.hint_line(Mode::Draft, Goes::DraftTour, false), Some("Nothing goes public."));
+        // Enter does not stand for that button: nothing starts until it is clicked.
+        assert!(draw(&mut p, key_press(egui::Key::Enter)).is_none());
+        // The click publishes it for anyone.
+        assert!(matches!(p.try_upload(), Some(PickerOutcome::Upload { access: Access::Public, mode: Mode::PublishNow, .. })));
+        // A restriction chosen, or a draft upload: the button is as before.
+        p.who.choose(who::Choice::OnlyMe);
+        assert!(!p.opens_remembered());
+        assert_eq!(p.main_label(), "Publish");
+        p.who.choose(who::Choice::Anyone);
+        p.mode = Mode::Draft;
+        assert!(!p.opens_remembered());
+        assert_eq!(p.main_label(), "Upload draft");
+        settle_restriction(id);
+    }
+
+    #[test]
+    fn a_tour_that_is_not_remembered_reads_and_behaves_in_the_picker_as_before() {
+        let id = "tour_9a9a9a9a9a9a9a9a9a9a0002";
+        let mut p = picker_with_draft(id);
+        assert!(!p.opens_remembered());
+        assert_eq!(p.main_label(), "Publish");
+        assert_eq!(p.hint_line(Mode::PublishNow, Goes::DraftTour, false), Some("Publishes the whole tour with this chapter. Anyone with the link can view it."));
+        assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Upload { access: Access::Public, .. })));
     }
 }

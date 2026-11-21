@@ -5438,4 +5438,82 @@ pub(crate) mod tests {
         assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Publish, listed: true });
         assert_eq!(m.edit(), &Edit::None);
     }
+
+    /// One frame of the page with a key pressed.
+    fn key_frame(ctx: &egui::Context, state: &mut ToursState, conn: &Conn, key: egui::Key) {
+        let mut page_out = PageOut::default();
+        let events = vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), events, ..Default::default() };
+        ctx.run_ui(input, |ui| super::ui(ui, state, conn, &mut page_out)).textures_delta.clear();
+    }
+
+    /// The rectangle of the one piece of text equal to `text` one frame draws.
+    fn text_rect(ctx: &egui::Context, state: &mut ToursState, conn: &Conn, text: &str) -> egui::Rect {
+        fn collect(shape: &egui::Shape, text: &str, into: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => into.push(egui::Rect::from_min_size(t.pos, t.galley.size())),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, text, into)),
+                _ => {}
+            }
+        }
+        let mut page_out = PageOut::default();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| super::ui(ui, state, conn, &mut page_out));
+        out.textures_delta.clear();
+        let mut found = Vec::new();
+        out.shapes.iter().for_each(|c| collect(&c.shape, text, &mut found));
+        assert_eq!(found.len(), 1, "{text}");
+        found[0]
+    }
+
+    #[test]
+    fn the_question_before_publishing_a_remembered_tour_for_anyone_is_drawn_and_cancel_is_the_default() {
+        const ID: &str = "tour_ffffffffffffffffffff0002";
+        let list = format!(r#"{{"tours":[{{"id":"{ID}","title":"Restricted draft","status":"draft","slug":"x1","url":null,"chapters":1,"steps":3,"updated_at":1763424000000,"published_at":null}}]}}"#);
+        let publish_line = format!("POST /api/v1/tours/{ID}/publish");
+        let s = stub(move |req, _| if req.line == "GET /api/v1/tours" { reply(200, &list) } else { reply(200, r#"{"slug":"x1","url":"/t/x1","steps":3,"access":"public","viewers":0}"#) });
+        crate::publish_ui::note_unfinished_restriction(ID);
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        let sent = || s.lines().iter().filter(|l| **l == publish_line).count();
+        let asking = |state: &ToursState| lock(&state.model).edit() == &Edit::ConfirmPublish { id: ID.into() };
+        let publish = places(&ctx, &mut state, &conn, "Publish")[0];
+        // Publish: the question, and nothing sent.
+        click(&ctx, &mut state, &conn, publish);
+        assert!(asking(&state));
+        let (text, _) = drawn(&ctx, &mut state, &conn);
+        for line in [crate::share_ui::who::CONFIRM_HEADING, "Cancel", "Publish for anyone"] {
+            assert!(has_line(&text, line), "{line:?} in:\n{text}");
+        }
+        assert!(text.replace('\n', " ").contains(crate::share_ui::who::CONFIRM_TEXT), "{text}");
+        assert!(!has_line(&text, "Publish"), "the row's own buttons give way to the question:\n{text}");
+        // The confirming button is never where the row's Publish was: a double click cannot reach it.
+        let confirm = text_rect(&ctx, &mut state, &conn, "Publish for anyone").expand(12.0);
+        assert!(!confirm.contains(publish), "{confirm:?} holds {publish:?}");
+        // Enter and Escape choose Cancel.
+        key_frame(&ctx, &mut state, &conn, egui::Key::Enter);
+        assert!(!asking(&state));
+        click(&ctx, &mut state, &conn, publish);
+        key_frame(&ctx, &mut state, &conn, egui::Key::Escape);
+        assert!(!asking(&state));
+        // A click on Cancel closes it.
+        click(&ctx, &mut state, &conn, publish);
+        let cancel = places(&ctx, &mut state, &conn, "Cancel")[0];
+        click(&ctx, &mut state, &conn, cancel);
+        assert!(!asking(&state));
+        // A second press where Publish was, while the question shows, publishes nothing.
+        click(&ctx, &mut state, &conn, publish);
+        click(&ctx, &mut state, &conn, publish);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sent(), 0, "nothing was published by any of that");
+        assert!(crate::publish_ui::restriction_unfinished(ID));
+        // Only "Publish for anyone" publishes.
+        if !asking(&state) {
+            click(&ctx, &mut state, &conn, publish);
+        }
+        let anyone = places(&ctx, &mut state, &conn, "Publish for anyone")[0];
+        click(&ctx, &mut state, &conn, anyone);
+        until(&ctx, &mut state, &conn, |_, _| sent() == 1);
+        assert!(!crate::publish_ui::restriction_unfinished(ID));
+    }
 }

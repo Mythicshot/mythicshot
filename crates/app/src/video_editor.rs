@@ -3828,4 +3828,106 @@ mod tests {
         assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::StillThere));
         assert!(crate::publish_ui::restriction_unfinished(tour));
     }
+
+    /// A site that takes the upload of `tour` (its commit answered by `commit` when given),
+    /// answers the first publish call with `first`, deletes on request, and calls `on_commit`
+    /// when the commit comes.
+    fn site_with(tour: &'static str, first: Answer, commit: Option<Answer>, on_commit: impl Fn() + Send + 'static) -> Stub {
+        let first = std::sync::Mutex::new(Some(first));
+        let commit = std::sync::Mutex::new(commit);
+        stub(move |req, seen| {
+            let l = req.line.as_str();
+            if l == format!("POST /api/v1/tours/{tour}/publish") {
+                return first.lock().unwrap().take().unwrap_or_else(|| reply(500, r#"{"error":"internal"}"#));
+            }
+            if l == format!("DELETE /api/v1/tours/{tour}") {
+                return reply(200, r#"{"deleted":true}"#);
+            }
+            if l.ends_with("/commit") {
+                on_commit();
+                if let Some(answer) = commit.lock().unwrap().as_ref() {
+                    return match answer {
+                        Answer::Drop => Answer::Drop,
+                        Answer::Hang => Answer::Hang,
+                        Answer::Reply(s, b, h) => Answer::Reply(*s, b.clone(), h.clone()),
+                    };
+                }
+                return reply(201, &format!(r#"{{"tour_id":"{tour}","chapter_id":"{CH}","steps":2}}"#));
+            }
+            platform(req, seen)
+        })
+    }
+
+    fn job_at(s: &Stub, state: &PublishState, target: &Target, access: &Access, run: &Arc<Run>) -> Result<PublishDone, String> {
+        let limit = Limit { warn_gb: 0, totals: &Store::totals };
+        let base = s.base.clone();
+        let delete = move |token: &str, id: &str| crate::publish::delete_tour(&base, token, id, |_| {}).is_ok();
+        publish_job_full(state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), target, true, access, &Keeping::Off, run, &|_| {}, &store_save, &limit, &delete)
+    }
+
+    #[test]
+    fn no_answer_to_the_first_publish_call_is_taken_as_a_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        // A new tour: deleted again.
+        let tour = "tour_efefefefefefefefefef0001";
+        let s = site_with(tour, Answer::Drop, None, || {});
+        let run = Arc::new(Run::default());
+        let done = job_at(&s, &state, &Target::New, &Access::Me, &run).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: false, .. }));
+        assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::Deleted));
+        assert!(s.lines().contains(&format!("DELETE /api/v1/tours/{tour}")));
+        assert!(!crate::publish_ui::restriction_unfinished(tour));
+        // A draft that was there: remembered, never deleted.
+        let tour = "tour_efefefefefefefefefef0002";
+        let s = site_with(tour, Answer::Drop, None, || {});
+        let run = Arc::new(Run::default());
+        job_at(&s, &state, &Target::Chapter(tour.into()), &Access::Me, &run).unwrap();
+        assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::Draft));
+        assert!(!s.lines().iter().any(|l| l.starts_with("DELETE")));
+        assert!(crate::publish_ui::restriction_unfinished(tour));
+        crate::publish_ui::settle_restriction(tour);
+    }
+
+    #[test]
+    fn a_cancel_after_the_upload_and_before_the_first_publish_call_deletes_the_new_tour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let tour = "tour_efefefefefefefefefef0003";
+        let run = Arc::new(Run::default());
+        let cancel = run.clone();
+        let s = site_with(tour, reply(500, "{}"), None, move || cancel.cancel());
+        let done = job_at(&s, &state, &Target::New, &Access::Me, &run).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: true, .. }), "{:?}", done.finished.outcome);
+        assert!(!s.lines().iter().any(|l| l.ends_with("/publish")), "no publish call was sent");
+        assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::Deleted));
+        assert!(s.lines().contains(&format!("DELETE /api/v1/tours/{tour}")));
+    }
+
+    #[test]
+    fn a_lost_commit_answer_during_a_restricted_publish_warns_about_a_draft_that_may_appear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let tour = "tour_efefefefefefefefefef0004";
+        let s = site_with(tour, reply(500, "{}"), Some(Answer::Drop), || {});
+        let e = job_at(&s, &state, &Target::New, &Access::Me, &Arc::new(Run::default())).unwrap_err();
+        assert!(e.starts_with("Could not finish the upload") && e.ends_with(" If a draft appears on the Tours page, publishing it there makes it visible to anyone with the link."), "{e}");
+        // Without a restriction the error is as before.
+        let s = site_with(tour, reply(500, "{}"), Some(Answer::Drop), || {});
+        let plain = job_at(&s, &state, &Target::New, &Access::Public, &Arc::new(Run::default())).unwrap_err();
+        assert!(plain.starts_with("Could not finish the upload") && plain.ends_with("Check the tour list before uploading again."), "{plain}");
+        assert_eq!(e, format!("{plain} {}", crate::share_ui::who::DRAFT_MAY_APPEAR));
+    }
+
+    #[test]
+    fn a_tour_published_for_anyone_is_no_longer_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let tour = "tour_efefefefefefefefefef0005";
+        crate::publish_ui::note_unfinished_restriction(tour);
+        let s = site_with(tour, reply(200, LIVE), None, || {});
+        let done = job_at(&s, &state, &Target::Chapter(tour.into()), &Access::Public, &Arc::new(Run::default())).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::Public { .. }));
+        assert!(!crate::publish_ui::restriction_unfinished(tour));
+    }
 }
