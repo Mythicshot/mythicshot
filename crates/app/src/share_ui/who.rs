@@ -16,44 +16,42 @@ use crate::publish::access::{self, Access, Granted, Refused, Viewers};
 pub const LABEL: &str = "Who can view";
 pub const ADDRESSES_LABEL: &str = "Email addresses";
 pub const PEOPLE_HELP: &str = "One per line. Each person gets a one-time link by email when they open it. There is no password.";
-/// Under the choice "Only me". The wording is proposed and waits for the owner's approval.
+/// Under the choice "Only me".
 pub const ONLY_ME: &str = "Only you can open it, signed in to the dashboard.";
 /// Under the choice when the site is older than 0.1.51 or tells no version, and only "Anyone with
-/// the link" is offered. The wording is proposed and waits for the owner's approval.
+/// the link" is offered.
 pub const TOO_OLD: &str = "This site is too old to restrict who can view. Update it to choose.";
-/// "Publish tour", for a tour that is already published. The wording is proposed and waits for
-/// the owner's approval.
+/// "Publish tour", for a tour that is already published.
 pub const CHANGE_IN_DASHBOARD: &str = "This tour is already published, so who can view is changed in the dashboard.";
-/// Why Publish waits: no address yet. The wording is proposed and waits for the owner's approval.
+/// Why Publish waits: no address yet.
 pub const NO_ADDRESS: &str = "Add at least one email address.";
 /// Why Publish waits: more addresses than a site takes.
 pub const TOO_MANY: &str = "At most 200 addresses.";
 /// The end of a refusal of an image or a clip.
 pub const NOTHING_SHARED: &str = "Nothing was shared.";
-/// The end of a refusal of a tour. The wording is proposed and waits for the owner's approval.
+/// The end of a refusal of a tour.
 pub const NOTHING_PUBLISHED: &str = "Nothing was published.";
 /// An image or a clip the site created without what was asked; it was deleted before anything
-/// was sent. The wording is proposed and waits for the owner's approval.
+/// was sent.
 pub const NOT_APPLIED: &str = "The site did not apply who can view, so nothing was shared.";
-/// A tour whose publish the site started without what was asked; it was not driven on. The
-/// wording is proposed and waits for the owner's approval.
+/// A tour whose publish the site started without what was asked; it was not driven on.
 pub const TOUR_NOT_APPLIED: &str = "The site did not apply who can view, so the tour was not published.";
-/// The same, when the site finished the publish at once and taking it down again failed. The
-/// wording is proposed and waits for the owner's approval.
+/// The same, when the site finished the publish at once and taking it down again failed.
 pub const TOUR_NOT_APPLIED_PUBLIC: &str = "The site did not apply who can view, and the tour is public now. Unpublish it on the Tours page.";
-/// "Publish tour", for a tour that was published once and is not now. The wording is approved.
+/// "Publish tour", for a tour that was published once and is not now.
 pub const PUBLISHED_BEFORE: &str = "This tour was published before, so who can view is changed in the dashboard.";
-/// Why Publish waits: the addresses would not fit in a request. The wording is approved.
+/// Why Publish waits: the addresses would not fit in a request. On its own, without "Nothing
+/// was shared.", the wording is proposed and awaits the owner's approval.
 pub const LIST_TOO_LONG: &str = "The list of addresses is too long.";
-/// Under the single choice when the site could not be asked. The wording is approved.
+/// Under the single choice when the site could not be asked.
 pub const COULD_NOT_ASK: &str = "Could not ask the site whether it can restrict who can view.";
-/// A 200 without the restriction, taken off the web again. The wording is approved.
+/// A 200 without the restriction, taken off the web again.
 pub const TOUR_UNPUBLISHED_AGAIN: &str = "The site did not apply who can view. The tour was online for a moment and has been unpublished.";
-/// After a refused restricted publish of a tour this publish created, deleted again. Approved.
+/// After a refused restricted publish of a tour this publish created, deleted again.
 pub const NOTHING_LEFT: &str = "Nothing was left on the site.";
-/// The same, when the delete did not go through. Approved.
+/// The same, when the delete did not go through.
 pub const STILL_THERE: &str = "The draft is still on the site. Delete it on the Tours page, or publish it there only if anyone with the link may see it.";
-/// After a refused restricted publish of a tour that was there before. Approved.
+/// After a refused restricted publish of a tour that was there before.
 pub const DRAFT_PUBLIC_IF_PUBLISHED: &str = "The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link.";
 /// After a restricted publish the site accepted and that did not finish. Proposed, awaits approval.
 pub const STAYS_AS_CHOSEN: &str = "The draft is uploaded. Who can view stays as you chose.";
@@ -62,13 +60,13 @@ pub const STAYS_AS_CHOSEN: &str = "The draft is uploaded. Who can view stays as 
 pub const DRAFT_MAY_APPEAR: &str = "If a draft appears on the Tours page, publishing it there makes it visible to anyone with the link.";
 /// The result screen's heading when the tour was deleted again. Proposed, awaits approval.
 pub const NOT_PUBLISHED_HEADING: &str = "The tour was not published";
-/// The Tours page's question before a plain Publish of a tour whose restriction was not applied. Approved.
+/// The Tours page's question before a plain Publish of a tour whose restriction was not applied.
 pub const CONFIRM_HEADING: &str = "Publish for anyone with the link?";
 pub const CONFIRM_TEXT: &str = "You chose to restrict who can view this tour, and that was not applied. Publishing here makes it visible to anyone with the link.";
 pub const CONFIRM_CANCEL: &str = "Cancel";
 pub const CONFIRM_PUBLISH: &str = "Publish for anyone";
 
-/// The result screen's last words for a restricted tour. The wording is proposed and waits for the owner's approval.
+/// The result screen's last words for a restricted tour.
 pub const ONLY_PEOPLE_WORDS: &str = "only the people you chose";
 pub const ONLY_ME_WORDS: &str = "only you";
 
@@ -93,8 +91,7 @@ impl Choice {
     }
 }
 
-/// "Address 3 is not an email address.": the third address (blank lines not counted). The
-/// wording is proposed and waits for the owner's approval.
+/// "Address 3 is not an email address.": the third entry as split (blank entries not counted).
 pub fn bad_address(n: usize) -> String {
     format!("Address {n} is not an email address.")
 }
@@ -126,8 +123,7 @@ impl Ending {
 }
 
 /// The one sentence for a refusal of who can view, about a `noun` ("image", "clip", "tour").
-/// Those for a site too old (413 to a padded request), `bad_viewer` without a number, `bad_access`, `bad_request`, `already_published`
-/// and `access_already_set` are proposed and wait for the owner's approval.
+/// Every one of them is approved wording.
 pub fn refused_text(r: Refused, noun: &str, ending: Ending) -> String {
     let nothing = ending.words();
     match r {

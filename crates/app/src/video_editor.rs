@@ -458,6 +458,17 @@ fn publish_job_as(
     publish_job_full(state, title, tour_title, server, token, target, publish_now, access, keeping, worker, progress, &store_save, &limit, &delete)
 }
 
+/// An upload error during a restricted publish whose commit answer was lost or not understood:
+/// a draft may be on the site with an id nobody knows, so it cannot be remembered or deleted.
+/// Only then the error says what publishing such a draft from the Tours page would do.
+fn lost_commit_note(error: String, restricted: bool) -> String {
+    if restricted && error.starts_with("Could not finish the upload") {
+        format!("{error} {}", crate::share_ui::who::DRAFT_MAY_APPEAR)
+    } else {
+        error
+    }
+}
+
 /// What a restricted publish that did not finish leaves on the site, and what is done about it:
 /// a tour this publish created (`Target::New`) whose first publish call the site did not
 /// accept is deleted again through `delete` (true when nothing is left); a tour the site took
@@ -545,7 +556,12 @@ fn publish_job_full(
                 worker.set_publishing(images);
                 !worker.is_cancelled()
             },
-        )?;
+        )
+        .map_err(|e| lost_commit_note(e, restricted))?;
+        // A tour that went public as asked is no longer one to ask about, however it was published.
+        if matches!(finished.outcome, crate::publish::Outcome::Public { .. }) {
+            publish_ui::settle_restriction(&finished.tour_id);
+        }
         let left = settle_restricted(restricted, target, &finished, first, &|tour_id| delete(&token, tour_id));
         worker.set_viewing(publish_ui::Viewing { restricted, granted: first.granted, left });
         Ok(PublishDone { finished, kept })
@@ -1326,6 +1342,7 @@ impl Editor {
                         }
                         Exported::Published(done, title, before, update) => {
                             // Never the link itself in the log: the result screen shows it.
+                            // The status line here is proposed and awaits the owner's approval.
                             let msg = if viewing.left == Some(publish_ui::Left::Deleted) {
                                 format!("{}. {}", crate::share_ui::who::NOT_PUBLISHED_HEADING, crate::share_ui::who::NOTHING_LEFT)
                             } else {

@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 pub const SINCE: (u32, u32, u32) = (0, 1, 51);
 /// The most addresses one item or tour may have, once repeats are left out.
 pub const MAX_VIEWERS: usize = 200;
-/// The most entries a list may have before repeats are left out.
+/// The most entries a list may have before repeats are left out: the site refuses more than
+/// this many raw `viewers` entries as `too_many_viewers` before it checks any of them.
 pub const MAX_ENTRIES: usize = 1_000;
 
 /// Whether a site of this version takes who can view; None (a site that tells none) is a no.

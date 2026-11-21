@@ -371,7 +371,9 @@ pub enum Left {
     StillThere,
     /// A draft that was there before: publishing it plainly makes it public.
     Draft,
-    /// The site took who can view before the publish stopped: the draft keeps it.
+    /// The site took who can view before the publish stopped: the draft keeps it. The site
+    /// retires such a publish after 15 minutes (at the workspace's next publish, unpublish, tour
+    /// list or item create), and the tour stays a restricted draft.
     Restricted,
     /// The site published it for anyone, and taking it down again failed.
     Online,
@@ -1808,16 +1810,26 @@ impl Picker {
     /// finish: the button then says so and the line under "Publish now" is the question's text,
     /// so the click is the informed choice (Enter does not stand for it).
     fn opens_remembered(&self) -> bool {
-        false
+        // Only an existing tour of this dialog's list can be remembered. A dialog opened through
+        // Edit publishes no existing draft: its Update publishes only a tour that is public already.
+        let Choice::Tour(id) = &self.choice else { return false };
+        self.edit.is_none()
+            && self.mode == Mode::PublishNow
+            && restriction_unfinished(id)
+            && self.who_shown(&Shown::OnlyNew(None)) == WhoShown::Choice
+            && self.who.chosen() == who::Choice::Anyone
     }
 
     /// The main button's label.
     fn main_label(&self) -> &'static str {
-        self.mode.button()
+        if self.opens_remembered() { who::CONFIRM_PUBLISH } else { self.mode.button() }
     }
 
     /// The line under a mode.
     fn hint_line(&self, mode: Mode, into: Goes, restricted: bool) -> Option<&'static str> {
+        if mode == Mode::PublishNow && self.opens_remembered() {
+            return Some(who::CONFIRM_TEXT);
+        }
         mode_hint(mode, into, restricted)
     }
 
@@ -1917,7 +1929,7 @@ impl Picker {
                 if ui.radio(self.mode == mode, mode.label()).clicked() {
                     self.mode = mode;
                 }
-                if let Some(hint) = mode_hint(mode, into, restricted) {
+                if let Some(hint) = self.hint_line(mode, into, restricted) {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
                         ui.add(egui::Label::new(RichText::new(hint).color(MUTED).size(12.0)).wrap());
@@ -1991,7 +2003,7 @@ impl Picker {
             ui.add_space(16.0);
             let can_upload = self.can_upload();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let upload = egui::Button::new(RichText::new(self.mode.button()).strong()).fill(PRIMARY);
+                let upload = egui::Button::new(RichText::new(self.main_label()).strong()).fill(PRIMARY);
                 if ui.add_enabled(can_upload, upload).clicked() {
                     outcome = self.try_upload();
                 }
@@ -2000,7 +2012,8 @@ impl Picker {
                 }
             });
         });
-        if outcome.is_none() && enter && self.can_upload() {
+        // Publishing a remembered tour for anyone takes a click on the button that says so.
+        if outcome.is_none() && enter && self.can_upload() && !self.opens_remembered() {
             outcome = self.try_upload();
         }
         if retry {
