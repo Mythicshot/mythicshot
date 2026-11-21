@@ -868,11 +868,6 @@ pub fn result_status(done: &Finished, before: &Before, update: bool) -> String {
     }
 }
 
-/// Whether a copy button still says "Copied", `since_copy` after a copy that worked.
-pub fn shows_copied(since_copy: Option<Duration>) -> bool {
-    since_copy.is_some_and(|d| d < COPIED_FOR)
-}
-
 /// What the user chose on the result screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultAction {
@@ -918,12 +913,28 @@ pub struct ResultDialog {
     kept: Kept,
     /// A chapter was replaced over the same link, as opposed to a new tour or a new chapter.
     update: bool,
+    /// When Copy last put the link on the clipboard, by [`ResultDialog::clock`].
     copied: Option<Instant>,
+    /// The time "Copied" is measured by; the tests move their own.
+    clock: Box<dyn Fn() -> Instant + Send>,
 }
 
 impl ResultDialog {
     pub fn new(title: String, before: Before, done: PublishDone) -> ResultDialog {
-        ResultDialog { title, before, done: done.finished, kept: done.kept, update: false, copied: None }
+        ResultDialog { title, before, done: done.finished, kept: done.kept, update: false, copied: None, clock: Box::new(Instant::now) }
+    }
+
+    /// The screen on another clock than the real one.
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + 'static) -> ResultDialog {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// How long Copy still says "Copied"; None when it does not.
+    fn copied_left(&self) -> Option<Duration> {
+        let since = (self.clock)().saturating_duration_since(self.copied?);
+        COPIED_FOR.checked_sub(since).filter(|left| !left.is_zero())
     }
 
     /// The screen after "Update tour", and after "Try again" for an update.
@@ -969,7 +980,7 @@ impl ResultDialog {
             return Some(ResultAction::Done);
         }
         let mut action = None;
-        let copied_for = self.copied.map(|t| t.elapsed());
+        let copied = self.copied_left().is_some();
         egui::Modal::new(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(share_ui::WINDOW_WIDTH);
             share_ui::heading_label(ui, result_heading(&self.done.outcome, self.update));
@@ -994,9 +1005,11 @@ impl ResultDialog {
                 if self.link_is_older() {
                     ui.label(RichText::new("The public version's link:").color(MUTED).size(12.0));
                 }
-                if share_ui::link_row(ui, url, COPY, shows_copied(copied_for)).clicked() {
+                if share_ui::link_row(ui, url, COPY, copied).clicked() {
                     ctx.copy_text(url.clone());
-                    self.copied = Some(Instant::now());
+                    self.copied = Some((self.clock)());
+                    // This frame still says Copy: the next one, now, says Copied.
+                    ctx.request_repaint();
                 }
             }
             share_ui::gap(ui, share_ui::BLOCK_GAP);
@@ -1021,9 +1034,10 @@ impl ResultDialog {
                 action = Some(ResultAction::Done);
             }
         });
-        // A frame for when "Copied" goes back.
-        if let Some(left) = copied_for.and_then(|d| COPIED_FOR.checked_sub(d)).filter(|left| !left.is_zero()) {
-            ctx.request_repaint_after(left);
+        // A frame for when "Copied" goes back, worked out after a click on Copy; none after that.
+        match self.copied_left() {
+            Some(left) => ctx.request_repaint_after(left),
+            None => self.copied = None,
         }
         action
     }
@@ -2392,14 +2406,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn copied_shows_for_a_moment() {
-        assert!(!shows_copied(None));
-        assert!(shows_copied(Some(Duration::from_millis(100))));
-        assert!(shows_copied(Some(COPIED_FOR - Duration::from_millis(1))));
-        assert!(!shows_copied(Some(COPIED_FOR)));
-    }
-
-    #[test]
     fn the_result_screen_draws_and_enter_or_escape_is_done() {
         let ctx = egui::Context::default();
         let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
@@ -2435,7 +2441,11 @@ pub(crate) mod tests {
     #[test]
     fn the_result_screen_shows_its_link_in_the_share_windows_link_row_and_action_row() {
         use crate::share_ui::tests::{button_rect, content_rect, fills_on, near, text_rect};
-        use crate::share_ui::{BUTTON_GAP, BUTTON_HEIGHT, LINK_ROW_HEIGHT, WINDOW_WIDTH};
+        // The mockup's measures, written out: the content width, the link row, the buttons and the gap between them.
+        const WINDOW_WIDTH: f32 = 520.0;
+        const LINK_ROW_HEIGHT: f32 = 46.0;
+        const BUTTON_HEIGHT: f32 = 44.0;
+        const BUTTON_GAP: f32 = 12.0;
         let ctx = egui::Context::default();
         // Published: the link with Copy on its row, then Open in browser and Done, as wide as each other.
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
@@ -2465,6 +2475,66 @@ pub(crate) mod tests {
         let only = button_rect(&out, "Done");
         assert!(near(only.width(), WINDOW_WIDTH) && near(only.height(), BUTTON_HEIGHT) && fills_on(&out, only).contains(&PRIMARY));
         assert!(text_rect(&out, COPY).is_none() && text_rect(&out, "Open in browser").is_none());
+    }
+
+    #[test]
+    fn copy_on_the_result_screen_says_copied_for_two_seconds_on_its_clock_and_asks_for_the_frames() {
+        use crate::share_ui::tests::{button_rect, click_events, copied_texts, field_rect, frame_with, repaint_delay, text_rect};
+        let ctx = egui::Context::default();
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let shared = now.clone();
+        let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) })).with_clock(move || *shared.lock().unwrap());
+        let advance = |ms: u64| *now.lock().unwrap() += Duration::from_millis(ms);
+        let out = draw_result(&ctx, &mut d);
+        let copy_at = button_rect(&out, COPY).center();
+        let field = field_rect(&ctx, &out);
+        // A click on Copy: the link goes on the clipboard, and the next frame comes at once.
+        let mut copies = Vec::new();
+        let mut release = None;
+        for events in click_events(copy_at) {
+            let out = frame_with(&ctx, events, 0.05, &mut |c| assert_eq!(d.show(c), None));
+            copies.extend(copied_texts(&out));
+            release = Some(out);
+        }
+        assert_eq!(copies, vec![LINK.to_string()]);
+        assert_eq!(repaint_delay(&release.unwrap()), Duration::ZERO);
+        let out = frame_with(&ctx, vec![], 0.05, &mut |c| {
+            d.show(c);
+        });
+        assert!(text_rect(&out, "Copied").is_some() && text_rect(&out, COPY).is_none());
+        assert!(repaint_delay(&out) <= COPIED_FOR, "a frame for when it goes back");
+        advance(1999);
+        assert!(text_rect(&draw_result(&ctx, &mut d), "Copied").is_some());
+        advance(1);
+        let out = draw_result(&ctx, &mut d);
+        assert!(text_rect(&out, COPY).is_some() && text_rect(&out, "Copied").is_none());
+        assert!(repaint_delay(&out) > Duration::from_secs(60), "no repaint loop once it went back");
+        // The field copies the whole link with Ctrl+C once it has focus, as in the share window.
+        for events in click_events(field.center()) {
+            frame_with(&ctx, events, 0.05, &mut |c| {
+                d.show(c);
+            });
+        }
+        let out = frame_with(&ctx, vec![egui::Event::Copy], 0.05, &mut |c| {
+            d.show(c);
+        });
+        assert_eq!(copied_texts(&out), vec![LINK.to_string()]);
+    }
+
+    #[test]
+    fn clicks_on_open_in_browser_and_done_on_the_result_screen_reach_the_editor() {
+        use crate::share_ui::tests::{button_rect, click_events, frame_with};
+        let ctx = egui::Context::default();
+        let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
+        let out = draw_result(&ctx, &mut d);
+        for (button, expected) in [("Open in browser", ResultAction::Open(LINK.into())), ("Done", ResultAction::Done)] {
+            let at = button_rect(&out, button).center();
+            let mut asked = Vec::new();
+            for events in click_events(at) {
+                frame_with(&ctx, events, 0.05, &mut |c| asked.extend(d.show(c)));
+            }
+            assert_eq!(asked, vec![expected]);
+        }
     }
 
     #[test]

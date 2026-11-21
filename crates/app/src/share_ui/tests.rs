@@ -699,7 +699,7 @@ pub(crate) fn window_rect(ctx: &egui::Context, out: &egui::FullOutput) -> egui::
 
 /// What the window holds: inside its frame, its stroke and its padding.
 pub(crate) fn content_rect(ctx: &egui::Context, out: &egui::FullOutput) -> egui::Rect {
-    window_rect(ctx, out).shrink(WINDOW_PADDING + ctx.global_style().visuals.window_stroke().width)
+    window_rect(ctx, out).shrink(28.0 + ctx.global_style().visuals.window_stroke().width)
 }
 
 /// A few frames of the window on a large screen, a second apart so it has faded in (a new
@@ -730,7 +730,7 @@ fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below(
         d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
         let out = draw(&ctx, &mut d);
         let window = content_rect(&ctx, &out);
-        assert!(near(window.width(), WINDOW_WIDTH), "{kind:?}: {window:?}");
+        assert!(near(window.width(), 520.0), "{kind:?}: {window:?}");
         // The link and the button are on one line, the button on the right, closing the row.
         let link = text_rect(&out, LINK).expect("the link is drawn");
         let copy_text = text_rect(&out, "Copy link").unwrap();
@@ -738,16 +738,16 @@ fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below(
         assert!(near(link.center().y, copy.center().y), "{link:?} {copy:?}");
         assert!(link.right() < copy.left(), "the link stays left of the button");
         assert!(copy.contains(copy_text.center()));
-        assert!(near(copy.height(), LINK_ROW_HEIGHT));
+        assert!(near(copy.height(), 46.0));
         assert!(near(copy.right(), window.right()), "{copy:?} {window:?}");
         // Open in browser and Done: one line below, equal widths, 12 apart, across the whole width.
         let open = button_rect(&out, "Open in browser");
         let done = button_rect(&out, "Done");
         assert!(near(open.top(), done.top()) && open.top() > copy.bottom(), "{open:?} {done:?} {copy:?}");
-        assert!(near(open.width(), done.width()) && near(open.height(), BUTTON_HEIGHT) && near(done.height(), BUTTON_HEIGHT), "{open:?} {done:?}");
-        assert!(near(done.left() - open.right(), BUTTON_GAP));
+        assert!(near(open.width(), done.width()) && near(open.height(), 44.0) && near(done.height(), 44.0), "{open:?} {done:?}");
+        assert!(near(done.left() - open.right(), 12.0));
         assert!(near(open.left(), window.left()) && near(done.right(), window.right()), "{open:?} {done:?} {window:?}");
-        assert!(near(open.top() - copy.bottom(), BLOCK_GAP), "{open:?} {copy:?}");
+        assert!(near(open.top() - copy.bottom(), 20.0), "{open:?} {copy:?}");
         // Neither action has the accent: it belongs to Copy link.
         assert!(fills_on(&out, copy).contains(&PRIMARY));
         assert!(!fills_on(&out, open).contains(&PRIMARY) && !fills_on(&out, done).contains(&PRIMARY));
@@ -809,7 +809,7 @@ fn every_other_stage_draws_at_the_same_width_with_buttons_as_high() {
             let out = draw(&ctx, &mut d);
             assert!(near(window_rect(&ctx, &out).width(), width), "{stage:?}");
             for b in *buttons {
-                assert!(near(button_rect(&out, b).height(), BUTTON_HEIGHT), "{stage:?}: {b}");
+                assert!(near(button_rect(&out, b).height(), 44.0), "{stage:?}: {b}");
             }
             // Every sentence of the view is drawn, as it is.
             for t in d.view().texts() {
@@ -817,4 +817,215 @@ fn every_other_stage_draws_at_the_same_width_with_buttons_as_high() {
             }
         }
     }
+}
+
+// ---- The wiring: real pointer and key events into a test's own egui context (nothing reaches the computer) ----
+
+/// One frame with `events`, `dt` seconds after the last one, running `ui`.
+pub(crate) fn frame_with(ctx: &egui::Context, events: Vec<egui::Event>, dt: f64, ui: &mut dyn FnMut(&egui::Context)) -> egui::FullOutput {
+    let time = ctx.input(|i| i.time) + dt;
+    let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), events, ..Default::default() };
+    let mut out = ctx.run_ui(input, |u| ui(u.ctx()));
+    out.textures_delta.clear();
+    out
+}
+
+/// The events of a primary click at `at`, one frame each: move there, press, release.
+pub(crate) fn click_events(at: egui::Pos2) -> [Vec<egui::Event>; 3] {
+    let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]]
+}
+
+/// A key pressed with `modifiers`.
+pub(crate) fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+}
+
+/// What the frame put on the clipboard through egui.
+pub(crate) fn copied_texts(out: &egui::FullOutput) -> Vec<String> {
+    out.platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn repaint_delay(out: &egui::FullOutput) -> Duration {
+    out.viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay
+}
+
+/// The rectangle of the field the link is on.
+pub(crate) fn field_rect(ctx: &egui::Context, out: &egui::FullOutput) -> egui::Rect {
+    let fill = ctx.global_style().visuals.extreme_bg_color;
+    shapes_of(out)
+        .into_iter()
+        .find_map(|s| match s {
+            egui::Shape::Rect(r) if r.fill == fill && near(r.rect.height(), 46.0) => Some(r.rect),
+            _ => None,
+        })
+        .expect("the link field was drawn")
+}
+
+/// The rectangle of the widget that has keyboard focus.
+pub(crate) fn focused_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).map(|r| r.rect)
+}
+
+/// Click at `at` through the share window's `show`: what it asked of the editor, and the frame of the release.
+fn click_share(ctx: &egui::Context, d: &mut ShareDialog, at: egui::Pos2, copy: &mut dyn FnMut(&str) -> bool) -> (Vec<ShareAction>, egui::FullOutput) {
+    let mut asked = Vec::new();
+    let mut last = None;
+    for events in click_events(at) {
+        let out = frame_with(ctx, events, 0.05, &mut |c| asked.extend(d.show(c, copy)));
+        last = Some(out);
+    }
+    (asked, last.unwrap())
+}
+
+#[test]
+fn a_click_on_copy_link_copies_and_the_very_next_frame_says_copied() {
+    for works in [true, false] {
+        let ctx = egui::Context::default();
+        let (mut d, _now) = clocked(image_form());
+        d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
+        let copy_at = button_rect(&draw(&ctx, &mut d), "Copy link").center();
+        let (log, copier_fn) = copier(works);
+        let (asked, release) = click_share(&ctx, &mut d, copy_at, &mut |t| copier_fn(&log, t));
+        assert!(asked.is_empty(), "Copy link asks nothing of the editor");
+        assert_eq!(log.borrow().as_slice(), [LINK.to_string()], "the click reached the copy");
+        assert_eq!(repaint_delay(&release), Duration::ZERO, "the label changes on the next frame, not on the next mouse move");
+        let out = frame_with(&ctx, vec![], 0.05, &mut |c| {
+            d.show(c, &mut |_| false);
+        });
+        if works {
+            assert!(text_rect(&out, "Copied").is_some() && text_rect(&out, "Copy link").is_none());
+        } else {
+            assert!(text_rect(&out, "Copy link").is_some() && text_rect(&out, COPY_FAILED).is_some());
+        }
+    }
+}
+
+#[test]
+fn clicks_on_open_in_browser_and_done_reach_the_editor() {
+    let ctx = egui::Context::default();
+    let mut d = clip_form(MediaType::Mp4);
+    d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
+    let out = draw(&ctx, &mut d);
+    let (open, done) = (button_rect(&out, "Open in browser").center(), button_rect(&out, "Done").center());
+    let (log, copier_fn) = copier(true);
+    let (asked, _) = click_share(&ctx, &mut d, open, &mut |t| copier_fn(&log, t));
+    assert_eq!(asked, vec![ShareAction::Open(LINK.into())]);
+    let (asked, _) = click_share(&ctx, &mut d, done, &mut |t| copier_fn(&log, t));
+    assert_eq!(asked, vec![ShareAction::Closed(None)]);
+    assert!(log.borrow().is_empty(), "neither copies");
+}
+
+#[test]
+fn once_copied_has_gone_the_window_asks_for_no_more_frames() {
+    let ctx = egui::Context::default();
+    let (mut d, now) = clocked(image_form());
+    d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
+    let (log, copier_fn) = copier(true);
+    d.press(Button::CopyLink, &mut |t| copier_fn(&log, t));
+    advance(&now, 1000);
+    let out = draw(&ctx, &mut d);
+    assert!(repaint_delay(&out) <= Duration::from_millis(1000));
+    advance(&now, 1000);
+    for _ in 0..3 {
+        let out = draw(&ctx, &mut d);
+        assert!(repaint_delay(&out) > Duration::from_secs(60), "no repaint loop: {:?}", repaint_delay(&out));
+        assert!(text_rect(&out, "Copy link").is_some());
+    }
+}
+
+#[test]
+fn tab_goes_from_the_link_field_to_copy_link_to_open_in_browser_to_done() {
+    let ctx = egui::Context::default();
+    let mut d = image_form();
+    d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
+    let out = draw(&ctx, &mut d);
+    let order = [field_rect(&ctx, &out), button_rect(&out, "Copy link"), button_rect(&out, "Open in browser"), button_rect(&out, "Done")];
+    for (i, expected) in order.iter().enumerate() {
+        frame_with(&ctx, vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)], 0.05, &mut |c| {
+            d.show(c, &mut |_| false);
+        });
+        frame_with(&ctx, vec![], 0.05, &mut |c| {
+            d.show(c, &mut |_| false);
+        });
+        assert_eq!(focused_rect(&ctx), Some(*expected), "Tab {}", i + 1);
+    }
+}
+
+#[test]
+fn ctrl_c_on_the_focused_link_field_copies_the_whole_link_never_the_part_that_shows() {
+    let ctx = egui::Context::default();
+    let long_link = format!("https://img.example.com/i/{}", "abcdefghij".repeat(200));
+    let mut d = image_form();
+    d.stage = Stage::Online { link: Some(long_link.clone()), copied: false };
+    let out = draw(&ctx, &mut d);
+    let field = field_rect(&ctx, &out);
+    // Without focus, Ctrl+C copies nothing of it.
+    let out = frame_with(&ctx, vec![egui::Event::Copy], 0.05, &mut |c| {
+        d.show(c, &mut |_| false);
+    });
+    assert!(copied_texts(&out).is_empty());
+    // A double-click selects it whole and copies nothing by itself.
+    let mut copies = Vec::new();
+    for events in click_events(field.center()).into_iter().chain(click_events(field.center())) {
+        let out = frame_with(&ctx, events, 0.05, &mut |c| {
+            d.show(c, &mut |_| false);
+        });
+        copies.extend(copied_texts(&out));
+    }
+    assert!(copies.is_empty(), "{copies:?}");
+    assert_eq!(focused_rect(&ctx), Some(field));
+    let out = frame_with(&ctx, vec![], 0.05, &mut |c| {
+        d.show(c, &mut |_| false);
+    });
+    let selection = ctx.global_style().visuals.selection.bg_fill;
+    assert!(shapes_of(&out).iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == selection && field.contains_rect(r.rect))), "drawn as selected");
+    // Ctrl+C now: the whole link.
+    let out = frame_with(&ctx, vec![egui::Event::Copy], 0.05, &mut |c| {
+        d.show(c, &mut |_| false);
+    });
+    assert_eq!(copied_texts(&out), vec![long_link.clone()]);
+    // Reached by keyboard only, the same.
+    let mut d = image_form();
+    d.stage = Stage::Online { link: Some(long_link.clone()), copied: false };
+    let ctx = egui::Context::default();
+    draw(&ctx, &mut d);
+    frame_with(&ctx, vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)], 0.05, &mut |c| {
+        d.show(c, &mut |_| false);
+    });
+    let out = frame_with(&ctx, vec![egui::Event::Copy], 0.05, &mut |c| {
+        d.show(c, &mut |_| false);
+    });
+    assert_eq!(copied_texts(&out), vec![long_link]);
+}
+
+#[test]
+fn the_frame_that_sees_the_upload_end_draws_the_link_at_once() {
+    let ctx = egui::Context::default();
+    let (mut d, _now) = clocked(image_form());
+    let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(LINK.into()) }));
+    let waiter = job.waiter();
+    d.start(job);
+    let out = draw(&ctx, &mut d);
+    assert!(text_rect(&out, "Uploading…").is_some());
+    tx.send(()).unwrap();
+    for _ in 0..500 {
+        if waiter.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (log, copier_fn) = copier(true);
+    let mut asked = None;
+    let out = frame_with(&ctx, vec![], 0.05, &mut |c| asked = d.show(c, &mut |t| copier_fn(&log, t)));
+    assert_eq!(asked, Some(ShareAction::Status("The image is online".into())));
+    assert!(text_rect(&out, "The image is online").is_some() && text_rect(&out, "Copied").is_some() && text_rect(&out, LINK).is_some(), "the result is drawn on that same frame");
+    assert!(repaint_delay(&out) <= Duration::from_secs(2), "and a frame is due for when Copied goes");
 }

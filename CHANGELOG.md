@@ -7,8 +7,10 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 - The window that says an image or a clip is online is roomier and shows the link on one row with "Copy link" joined to it on the right. A link too long for the row is cut short with "…"; the whole link shows when you point at it.
 - "Copy link" says "Copied", in green with a tick, for 2 seconds after a copy that worked, also after the copy that happens when publishing ends. A copy that failed leaves it at "Copy link" and says "Could not copy the link. Select it and copy it yourself." as before. The separate "Link copied" line is gone.
 - Under the link, "Open in browser" (was "Open") and "Done" share the row, equally wide. Enter and Escape still close the window.
+- The link can be reached with the keyboard: Tab goes to the link, then "Copy link", "Open in browser" and "Done". A click or double-click on the link selects all of it, and Ctrl+C then copies the whole link, also when it shows cut short.
+- When publishing ends, the window shows the link at once, without waiting for the mouse to move.
 - Every other stage of "Publish to" (the form, the upload, a refusal, cancelling) keeps its words and is drawn as wide as the online stage, so the window no longer changes size between them.
-- The screen after publishing a tour shows its link the same way, with "Copy" saying "Copied" for 2 seconds, and "Open in browser", "Try again" when offered, and "Done" side by side below it.
+- The screen after publishing a tour shows its link the same way, with "Copy" saying "Copied" for 2 seconds, Tab and Ctrl+C working on the link as above, and "Open in browser", "Try again" when offered, and "Done" side by side below it.
 
 ## 0.2.14 (2026-11-20)
 

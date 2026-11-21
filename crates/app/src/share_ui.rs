@@ -689,8 +689,12 @@ impl ShareDialog {
 
     /// Draw the window; Some when the editor has something to do. Escape and Enter are taken from the editor.
     pub fn show(&mut self, ctx: &egui::Context, copy: &mut dyn FnMut(&str) -> bool) -> Option<ShareAction> {
-        if let Some(action) = self.poll(copy) {
-            return Some(action);
+        // The frame that sees the job end draws its result at once (the link, a refusal): no
+        // frame without the window, and none that waits for the mouse to move. Only a closed
+        // window draws nothing.
+        let polled = self.poll(copy);
+        if let Some(ShareAction::Closed(_)) = polled {
+            return polled;
         }
         let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -760,6 +764,17 @@ impl ShareDialog {
                 });
             }
         });
+        // What the job said comes first; a press on a window the user has not seen yet is dropped.
+        let action = match polled {
+            Some(action) => Some(action),
+            None => {
+                if pressed.is_some() {
+                    // A press changes what the window shows ("Copied", a stage): the next frame now.
+                    ctx.request_repaint();
+                }
+                pressed.and_then(|b| self.press(b, copy))
+            }
+        };
         if self.job.is_some() || self.measure.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
@@ -768,7 +783,7 @@ impl ShareDialog {
             Some(left) => ctx.request_repaint_after(left),
             None => self.copied_at = None,
         }
-        pressed.and_then(|b| self.press(b, copy))
+        action
     }
 }
 
@@ -807,10 +822,12 @@ pub fn gap(ui: &mut egui::Ui, space: f32) {
 
 /// The link and its copy button in one bordered row, [`LINK_ROW_HEIGHT`] high across the
 /// whole width. The link is in a monospace face on the darker field text boxes have, on one
-/// line, cut short with "…" when it does not fit (the whole link shows on hover) and
-/// selectable. The button closes the row on the right: the accent with a copy icon and
-/// `copy_label`, or while `copied` the success green with a tick and [`COPIED_LABEL`]. It is
-/// as wide for both, so nothing moves. The button's response.
+/// line, cut short with "…" when it does not fit (the whole link shows on hover). The field
+/// takes keyboard focus before the button; a click or double-click on it selects it whole,
+/// and Ctrl+C while it has focus copies the whole link, never only the part that shows. The
+/// button closes the row on the right: the accent with a copy icon and `copy_label`, or while
+/// `copied` the success green with a tick and [`COPIED_LABEL`]. It is as wide for both, so
+/// nothing moves. The button's response.
 pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -> egui::Response {
     let visuals = ui.visuals().clone();
     let font = egui::FontId::proportional(BUTTON_TEXT);
@@ -821,13 +838,34 @@ pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -
     let button = egui::Rect::from_min_max(egui::pos2(row.right() - button_width, row.top()), row.max);
     let field = egui::Rect::from_min_max(row.min, egui::pos2(button.left(), row.bottom()));
 
-    ui.painter().rect_filled(field, CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, visuals.extreme_bg_color);
-    let builder = egui::UiBuilder::new().max_rect(field.shrink2(vec2(FIELD_PADDING_X, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center));
-    ui.scope_builder(builder, |ui| {
-        ui.add(egui::Label::new(RichText::new(link).monospace().size(LINK_TEXT).color(visuals.strong_text_color())).truncate().selectable(true));
-    });
+    let left_corners = CornerRadius { nw: r, sw: r, ne: 0, se: 0 };
+    ui.painter().rect_filled(field, left_corners, visuals.extreme_bg_color);
+    // Laid out here rather than as a label: a label's selection would copy only what shows.
+    let text_color = visuals.strong_text_color();
+    let mut job = egui::text::LayoutJob::single_section(link.to_string(), egui::TextFormat::simple(egui::FontId::monospace(LINK_TEXT), text_color));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(field.width() - 2.0 * FIELD_PADDING_X);
+    let shown = ui.fonts_mut(|f| f.layout_job(job));
+    let mut field_response = ui.interact(field, ui.make_persistent_id("link-row-field"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text);
+    if shown.elided {
+        field_response = field_response.on_hover_text(link);
+    }
+    if field_response.clicked() || field_response.double_clicked() {
+        field_response.request_focus();
+    }
+    let selected = field_response.has_focus();
+    if selected && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+        ui.ctx().copy_text(link.to_string());
+    }
+    let text_pos = egui::pos2(field.left() + FIELD_PADDING_X, field.center().y - shown.size().y / 2.0);
+    if selected {
+        // Selected whole: what Ctrl+C copies.
+        ui.painter().rect_filled(egui::Rect::from_min_size(text_pos, shown.size()).expand(2.0), 2.0, visuals.selection.bg_fill);
+        ui.painter().rect_stroke(field.shrink(2.0), left_corners, visuals.selection.stroke, StrokeKind::Inside);
+    }
+    ui.painter().galley(text_pos, shown, text_color);
+    field_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, link));
 
-    // After the link, so keyboard focus comes to the button first: a label never takes it.
+    // After the field: keyboard focus goes link, then this button, then the action row.
     let response = ui.interact(button, ui.make_persistent_id("link-row-copy"), Sense::click());
     let (base, fg, icon, label) = if copied { (SUCCESS, ON_SUCCESS, Icon::Check, COPIED_LABEL) } else { (PRIMARY, Color32::WHITE, Icon::Copy, copy_label) };
     let fill = if response.is_pointer_button_down_on() {
