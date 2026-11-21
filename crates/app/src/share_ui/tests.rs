@@ -67,6 +67,7 @@ fn the_image_window_says_what_the_mockup_says() {
             Line::Muted("To Cowfee Raid Tools at tours.example.com".into()),
             Line::Title,
             Line::Muted("1920 × 1080 · PNG · 1.4 MB".into()),
+            Line::Who { offered: vec![who::Choice::Anyone], chosen: who::Choice::Anyone },
             Line::Warning("Anyone who has the link can open the image. It stays online until you delete it in the dashboard.".into()),
         ]
     );
@@ -96,6 +97,7 @@ fn the_recording_window_says_what_the_mockup_says_with_and_without_ffmpeg() {
         [
             Line::Title,
             Line::Muted("12 s · 960 × 540 · MP4".into()),
+            Line::Who { offered: vec![who::Choice::Anyone], chosen: who::Choice::Anyone },
             Line::Warning("Anyone who has the link can open the clip. It stays online until you delete it in the dashboard.".into()),
         ]
     );
@@ -105,6 +107,7 @@ fn the_recording_window_says_what_the_mockup_says_with_and_without_ffmpeg() {
         [
             Line::Muted("12 s · 960 × 540 · GIF".into()),
             Line::Muted("Mythicshot did not find the video tool (ffmpeg) on this computer, so the clip is sent as a GIF. With it, the same clip is far smaller.".into()),
+            Line::Who { offered: vec![who::Choice::Anyone], chosen: who::Choice::Anyone },
             Line::Warning("Anyone who has the link can open the clip. It stays online until you delete it in the dashboard.".into()),
         ]
     );
@@ -178,7 +181,7 @@ fn the_bytes_sent_are_written_in_the_totals_unit_and_never_read_as_done_too_soon
 #[test]
 fn cancel_while_uploading_waits_for_the_clean_up_then_closes_with_a_sentence() {
     let mut d = image_form();
-    let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None }));
+    let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None, access: None }));
     let waiter = job.waiter();
     d.start(job);
     let (log, copy) = copier(true);
@@ -196,7 +199,7 @@ fn the_result_puts_the_link_on_the_clipboard_and_says_so_only_when_that_worked()
     let link = "https://img.example.com/i/abcdefghijklmnopqrst";
     for works in [true, false] {
         let mut d = image_form();
-        let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(link.into()) }));
+        let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(link.into()), access: None }));
         d.start(job);
         tx.send(()).unwrap();
         let (log, copy) = copier(works);
@@ -224,7 +227,7 @@ fn the_result_puts_the_link_on_the_clipboard_and_says_so_only_when_that_worked()
 #[test]
 fn a_link_mythicshot_cannot_open_says_where_to_find_the_item() {
     let mut d = clip_form(MediaType::Mp4);
-    let (job, tx) = held_job(Kind::Clip, Ok(Shared { id: "x".into(), link: None }));
+    let (job, tx) = held_job(Kind::Clip, Ok(Shared { id: "x".into(), link: None, access: None }));
     d.start(job);
     tx.send(()).unwrap();
     let (log, copy) = copier(true);
@@ -286,9 +289,9 @@ fn refusals_are_shown_with_their_heading_sentence_and_note_and_close() {
 fn publish_runs_the_starter_once_with_the_cleaned_title_and_the_server() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen2 = seen.clone();
-    let starter: Starter = Box::new(move |server, title| {
+    let starter: Starter = Box::new(move |server, title, _access| {
         seen2.lock().unwrap().push((server, title));
-        ShareJob::spawn(Kind::Image, |_| Ok(Shared { id: "x".into(), link: None }))
+        ShareJob::spawn(Kind::Image, |_| Ok(Shared { id: "x".into(), link: None, access: None }))
     });
     let mut d = ShareDialog::new(Kind::Image, SERVER.into(), "  Loot\twindow  ", String::new(), false, None, Some(starter));
     d.begin();
@@ -300,7 +303,7 @@ fn publish_runs_the_starter_once_with_the_cleaned_title_and_the_server() {
 #[test]
 fn closing_the_window_cancels_its_job() {
     let mut d = image_form();
-    let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None }));
+    let (job, _tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: None, access: None }));
     let waiter = job.waiter();
     d.start(job);
     drop(d);
@@ -342,10 +345,10 @@ fn a_whole_share_through_the_window_ends_with_the_link_copied() {
     let img = image::RgbaImage::from_pixel(64, 48, image::Rgba([200, 30, 30, 255]));
     let png = share::png_bytes(&img).unwrap();
     let base = s.base.clone();
-    let starter: Starter = Box::new(move |server, title| {
+    let starter: Starter = Box::new(move |server, title, access| {
         ShareJob::spawn(Kind::Image, move |r| {
             let item = Item { media: MediaType::Png, data: png, width: 64, height: 48, duration_ms: None, title, preview: share::preview_of(&img) };
-            share::share(&server, TOKEN, &item, |sent, total| r.uploading(sent, total))
+            share::share(&server, TOKEN, &item, &access, |sent, total| r.uploading(sent, total))
         })
     });
     let mut d = ShareDialog::new(Kind::Image, base, "Red", String::new(), false, None, Some(starter));
@@ -498,7 +501,7 @@ fn a_commit_that_lands_after_cancel_shows_the_link_but_leaves_the_clipboard_alon
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     d.start(ShareJob::spawn(Kind::Image, move |_| {
         let _ = rx.recv_timeout(Duration::from_secs(5));
-        Ok(Shared { id: "x".into(), link: Some(link.into()) })
+        Ok(Shared { id: "x".into(), link: Some(link.into()), access: None })
     }));
     let (log, copy) = copier(true);
     d.press(Button::Cancel, &mut |t| copy(&log, t));
@@ -575,7 +578,7 @@ fn online_offers_copy_link_then_open_in_browser_then_done_for_every_kind() {
 fn the_copy_after_publishing_shows_copied_for_two_seconds_then_copy_link_again() {
     for (kind, form) in every_kind() {
         let (mut d, now) = clocked(form);
-        let (job, tx) = held_job(kind, Ok(Shared { id: "x".into(), link: Some(LINK.into()) }));
+        let (job, tx) = held_job(kind, Ok(Shared { id: "x".into(), link: Some(LINK.into()), access: None }));
         d.start(job);
         tx.send(()).unwrap();
         let (log, copy) = copier(true);
@@ -616,7 +619,7 @@ fn a_copy_that_fails_keeps_copy_link_and_the_could_not_copy_line() {
     for (kind, form) in every_kind() {
         // The copy after publishing failed: no "Copied", and no sentence, as before.
         let (mut d, now) = clocked(form);
-        let (job, tx) = held_job(kind, Ok(Shared { id: "x".into(), link: Some(LINK.into()) }));
+        let (job, tx) = held_job(kind, Ok(Shared { id: "x".into(), link: Some(LINK.into()), access: None }));
         d.start(job);
         tx.send(()).unwrap();
         let (log, broken) = copier(false);
@@ -1010,7 +1013,7 @@ fn ctrl_c_on_the_focused_link_field_copies_the_whole_link_never_the_part_that_sh
 fn the_frame_that_sees_the_upload_end_draws_the_link_at_once() {
     let ctx = egui::Context::default();
     let (mut d, _now) = clocked(image_form());
-    let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(LINK.into()) }));
+    let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(LINK.into()), access: None }));
     let waiter = job.waiter();
     d.start(job);
     let out = draw(&ctx, &mut d);
@@ -1028,4 +1031,192 @@ fn the_frame_that_sees_the_upload_end_draws_the_link_at_once() {
     assert_eq!(asked, Some(ShareAction::Status("The image is online".into())));
     assert!(text_rect(&out, "The image is online").is_some() && text_rect(&out, "Copied").is_some() && text_rect(&out, LINK).is_some(), "the result is drawn on that same frame");
     assert!(repaint_delay(&out) <= Duration::from_secs(2), "and a frame is due for when Copied goes");
+}
+
+// ---- Who can view ----
+
+const ADDRESS: &str = "private.person@example.com";
+
+fn anyone_line(offered: Vec<who::Choice>) -> Line {
+    Line::Who { offered, chosen: who::Choice::Anyone }
+}
+
+#[test]
+fn who_can_view_sits_between_the_title_and_the_warning_and_starts_at_anyone() {
+    let mut d = image_form();
+    d.set_workspace("Cowfee Raid Tools");
+    d.set_site_version(Some("0.1.51"));
+    let v = d.view();
+    assert_eq!(
+        v.lines,
+        vec![
+            Line::Muted("To Cowfee Raid Tools at tours.example.com".into()),
+            Line::Title,
+            Line::Muted("1920 × 1080 · PNG · 1.4 MB".into()),
+            anyone_line(who::Choice::ALL.to_vec()),
+            Line::Warning("Anyone who has the link can open the image. It stays online until you delete it in the dashboard.".into()),
+        ]
+    );
+    assert!(v.texts().contains(&"Who can view".to_string()) && v.texts().contains(&"Anyone with the link".to_string()));
+    assert_eq!(v.disabled, None);
+}
+
+#[test]
+fn only_people_i_choose_asks_for_addresses_and_hides_the_public_warning() {
+    for (kind, mut d) in every_kind() {
+        d.set_site_version(Some("0.1.51"));
+        d.who.choose(who::Choice::People);
+        let v = d.view();
+        let tail: Vec<Line> = v.lines.iter().skip_while(|l| !matches!(l, Line::Who { .. })).cloned().collect();
+        assert_eq!(
+            tail,
+            vec![
+                Line::Who { offered: who::Choice::ALL.to_vec(), chosen: who::Choice::People },
+                Line::Addresses,
+                Line::Note("One per line. Each person gets a one-time link by email when they open it. There is no password.".into()),
+                Line::Muted("Add at least one email address.".into()),
+            ],
+            "{kind:?}"
+        );
+        assert!(!v.lines.iter().any(|l| matches!(l, Line::Warning(_))), "{kind:?}");
+        assert!(v.texts().contains(&"Email addresses".to_string()));
+        // Publish waits, with the reason, and a press does nothing.
+        assert_eq!(v.disabled, Some(Button::Publish));
+        assert_eq!(d.press(Button::Publish, &mut |_| false), None);
+        d.who.addresses = format!("{ADDRESS}\nnot an address");
+        assert_eq!(d.view().lines.last(), Some(&Line::Muted("Address 2 is not an email address.".into())));
+        assert_eq!(d.press(Button::Publish, &mut |_| false), None);
+        d.who.addresses = ADDRESS.into();
+        assert_eq!(d.view().disabled, None);
+        assert_eq!(d.press(Button::Publish, &mut |_| false), Some(ShareAction::Publish));
+    }
+}
+
+#[test]
+fn only_me_says_who_can_open_it_and_hides_the_public_warning() {
+    let mut d = clip_form(MediaType::Mp4);
+    d.set_site_version(Some("0.2.0"));
+    d.who.choose(who::Choice::OnlyMe);
+    let v = d.view();
+    assert_eq!(&v.lines[v.lines.len() - 2..], &[Line::Who { offered: who::Choice::ALL.to_vec(), chosen: who::Choice::OnlyMe }, Line::Muted("Only you can open it, signed in to the dashboard.".into())]);
+    assert!(!v.lines.iter().any(|l| matches!(l, Line::Warning(_))));
+    assert_eq!(v.disabled, None);
+}
+
+#[test]
+fn a_site_too_old_or_not_telling_offers_only_anyone_and_says_why() {
+    for version in [Some("0.1.50"), None] {
+        let mut d = image_form();
+        d.set_site_version(version);
+        d.who.choose(who::Choice::OnlyMe);
+        let v = d.view();
+        let at = v.lines.iter().position(|l| matches!(l, Line::Who { .. })).unwrap();
+        assert_eq!(&v.lines[at..], &[anyone_line(vec![who::Choice::Anyone]), Line::Muted("This site is too old to restrict who can view. Update it to choose.".into()), Line::Warning(warning(Kind::Image))], "{version:?}");
+    }
+    // Before the site has answered, only anyone is offered, and nothing is said.
+    let v = image_form().view();
+    let at = v.lines.iter().position(|l| matches!(l, Line::Who { .. })).unwrap();
+    assert_eq!(&v.lines[at..], &[anyone_line(vec![who::Choice::Anyone]), Line::Warning(warning(Kind::Image))]);
+}
+
+#[test]
+fn publish_hands_who_can_view_to_the_job_and_nothing_is_remembered() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let starter: Starter = Box::new(move |_, _, access| {
+        seen2.lock().unwrap().push(access);
+        ShareJob::spawn(Kind::Image, |_| Ok(Shared { id: "x".into(), link: None, access: None }))
+    });
+    let mut d = ShareDialog::new(Kind::Image, SERVER.into(), "t", String::new(), false, None, Some(starter));
+    d.set_site_version(Some("0.1.51"));
+    d.who.choose(who::Choice::People);
+    d.who.addresses = format!(" {ADDRESS} \n\nother@example.org");
+    d.begin();
+    let expected = Access::People(crate::publish::access::Viewers::new(vec![ADDRESS.into(), "other@example.org".into()]));
+    assert_eq!(seen.lock().unwrap().as_slice(), [expected]);
+    // A new window starts again at anyone with the link, with no addresses.
+    let fresh = image_form();
+    assert_eq!((fresh.who.chosen(), fresh.who.addresses.as_str()), (who::Choice::Anyone, ""));
+}
+
+#[test]
+fn online_says_who_can_open_it_under_the_link_and_a_public_item_is_as_before() {
+    let link = "https://img.example.com/i/a".to_string();
+    for (granted, line) in [
+        (Some(Granted::People(2)), Some("Only the 2 people you chose can open it. Change this in the dashboard.")),
+        (Some(Granted::People(1)), Some("Only the 1 person you chose can open it. Change this in the dashboard.")),
+        (Some(Granted::Me), Some("Only you can open it. Change this in the dashboard.")),
+        (None, None),
+    ] {
+        let mut d = image_form();
+        let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(link.clone()), access: granted }));
+        d.start(job);
+        tx.send(()).unwrap();
+        settle(&mut d, &mut |_| true);
+        let v = d.view();
+        assert_eq!(v.heading, "The image is online");
+        assert_eq!(v.lock.as_deref(), line);
+        assert_eq!(v.buttons, vec![Button::CopyLink, Button::Open, Button::Done]);
+        assert_eq!(v.lines, vec![Line::Muted(COPIED.into())], "the lock is under the link, not among the lines");
+    }
+}
+
+#[test]
+fn a_refusal_of_who_can_view_shows_its_sentence_and_says_nothing_was_shared() {
+    use crate::publish::access::Refused;
+    let mut d = image_form();
+    let (job, tx) = held_job(Kind::Image, Err(ShareError::Access(Refused::CannotRestrict)));
+    d.start(job);
+    tx.send(()).unwrap();
+    let action = settle(&mut d, &mut |_| true);
+    assert_eq!(action, Some(ShareAction::Status("The image was not uploaded".into())));
+    let v = d.view();
+    assert_eq!(v.lines, vec![Line::Text("This site cannot send mail, so it cannot restrict who can view. Nothing was shared.".into())]);
+    assert_eq!(v.buttons, vec![Button::Close]);
+}
+
+#[test]
+fn no_print_status_or_log_of_the_window_holds_an_address() {
+    let mut d = image_form();
+    d.set_site_version(Some("0.1.51"));
+    d.who.choose(who::Choice::People);
+    d.who.addresses = format!("{ADDRESS}\nsecond.person@example.org");
+    let mut seen = vec![format!("{:?}", d.view()), format!("{:?}", d.who), format!("{:?}", d.stage()), format!("{:?}", d.who.access()), d.view().texts().join("\n")];
+    // What the job's end says to the editor, a refusal included.
+    let (job, tx) = held_job(Kind::Image, Err(ShareError::Access(crate::publish::access::Refused::BadViewer(Some(2)))));
+    d.start(job);
+    tx.send(()).unwrap();
+    seen.push(format!("{:?}", settle(&mut d, &mut |_| true)));
+    seen.push(format!("{:?} {:?}", d.view(), d.stage()));
+    for text in seen {
+        assert!(!text.contains("private.person") && !text.contains("second.person") && !text.contains('@'), "{text}");
+    }
+}
+
+#[test]
+fn enter_in_the_address_field_is_a_new_line_not_publish() {
+    let ctx = egui::Context::default();
+    let mut d = image_form();
+    d.set_site_version(Some("0.1.51"));
+    d.who.choose(who::Choice::People);
+    d.who.addresses = ADDRESS.into();
+    let mut out = None;
+    ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
+    ctx.memory_mut(|m| m.request_focus(d.who.addresses_id()));
+    ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
+    assert!(d.who.typing(&ctx));
+    let enter = egui::RawInput { events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
+    ctx.run_ui(enter, |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
+    assert_eq!(out, None, "Enter while typing addresses does not publish");
+    assert_eq!(d.stage(), &Stage::Form);
+    assert!(d.who.addresses.contains('\n'), "Enter made a new line");
+}
+
+#[test]
+fn a_site_that_could_not_be_asked_offers_only_anyone_and_says_so() {
+    let mut d = image_form();
+    d.set_site(who::Site::Failed);
+    let v = d.view();
+    let at = v.lines.iter().position(|l| matches!(l, Line::Who { .. })).unwrap();
+    assert_eq!(&v.lines[at..], &[anyone_line(vec![who::Choice::Anyone]), Line::Muted("Could not ask the site whether it can restrict who can view.".into()), Line::Warning(warning(Kind::Image))]);
 }

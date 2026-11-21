@@ -2,6 +2,16 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.18 (2026-11-21)
+
+- "Publish image" and "Publish recording" ask who can view: "Anyone with the link" (as before, and always the first choice), "Only people I choose" (email addresses, one per line; each person gets a one-time link by email) or "Only me". The choice is made when something is shared, and is not remembered for the next time.
+- "Publish tour" asks the same when a tour is published for the first time. For a tour that is already published it says that who can view is changed in the dashboard.
+- Once online, a small lock line says who can open it, with the number of people chosen.
+- The choice is offered only by a site of version 0.1.51 or newer; an older site says it is too old to restrict who can view. A site that refuses or does not apply the choice gets nothing: the window says why in one sentence and nothing is shared or published.
+- When the site refuses who can view for a tour, or publishing is cancelled before the site took it, a tour that publish had just created is deleted again, so nothing is left on the site; the recording stays on the computer. A tour that was already a draft stays a draft, and the Tours page asks "Publish for anyone with the link?" before publishing it there. When the site took who can view before the publish stopped, the draft keeps it. No answer at all to the first publish call counts as a refusal. "Publish tour" says "Publish for anyone" on its button before publishing such a remembered draft for anyone with the link.
+- Publish waits until the addresses look right: at least one, at most 200 different ones, each with one "@", nothing but visible letters, digits and signs, and at most 254 characters. A list pasted with commas, semicolons or spaces between the addresses works too. The addresses are never written to a log, a status line or the settings, and the address field keeps nothing of them once the window closes.
+- With "Save this capture?" or "Export this recording?" open, Escape closes the question and the window stays open; tool keys and Ctrl+S no longer reach the editor behind it.
+
 ## 0.2.17 (2026-11-21)
 
 - The editor stays solid while "Publish to…", "Publish tour" or "Add to site" is open: before, it turned half see-through and the desktop behind the window showed through it. It still takes no clicks, keys or scrolling until the window closes.

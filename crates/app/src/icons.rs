@@ -59,6 +59,8 @@ pub enum Icon {
     Window,
     Screen,
     Record,
+    /// A small padlock: who can open something is restricted.
+    Lock,
 }
 
 const FG: Color32 = Color32::from_rgb(214, 218, 226);
@@ -336,6 +338,10 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.rect_stroke(rect(0.04, 0.1, 0.96, 0.7), 2.0, s, StrokeKind::Middle);
             p.add(line(&[(0.5, 0.7), (0.5, 0.9)]));
             p.add(line(&[(0.28, 0.9), (0.72, 0.9)]));
+        }
+        Icon::Lock => {
+            p.rect_filled(rect(0.18, 0.45, 0.82, 0.95), 1.5, c);
+            p.add(line(&[(0.32, 0.45), (0.32, 0.28), (0.4, 0.12), (0.6, 0.12), (0.68, 0.28), (0.68, 0.45)]));
         }
         Icon::Record => {
             p.circle_stroke(r.center(), r.width() * 0.44, s);

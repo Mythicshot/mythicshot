@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::access::{self, Access, Granted, Refused, Route};
 use super::{AbortGuard, Client, Method, Reply, Timeouts, check_server, is_id, is_invisible, not_understood, safe_link, size_rounded};
 
 /// The largest image or clip any site can be set to take: 38 parts of 2,000,000 bytes. A
@@ -125,6 +126,8 @@ pub struct Shared {
     /// The link, when the site gave one Mythicshot can use ([`item_link`]). None: the item is
     /// online all the same, and is found in the dashboard.
     pub link: Option<String>,
+    /// Who can open it, as the site said when it was created; None for anyone with the link.
+    pub access: Option<Granted>,
 }
 
 /// Which limit an item is over.
@@ -144,6 +147,8 @@ pub enum ShareError {
     /// The workspace has no room for it: what it needs, what is left, the allowance, in bytes.
     Full { needed: u64, left: u64, allowance: u64 },
     Cancelled,
+    /// Who can view was refused, or not applied: nothing was shared.
+    Access(Refused),
     /// Anything else, as a sentence of Mythicshot's.
     Failed(String),
 }
@@ -175,6 +180,7 @@ impl ShareError {
                 ),
                 note: Some(FULL_NOTE),
             }),
+            ShareError::Access(r) => Some(Refusal { heading: not_uploaded, text: crate::share_ui::who::refused_text(*r, noun, crate::share_ui::who::Ending::Shared), note: None }),
             ShareError::Failed(message) => Some(Refusal { heading: not_uploaded, text: message.clone(), note: None }),
         }
     }
@@ -315,24 +321,25 @@ fn fit(img: &image::RgbaImage, side: u32) -> image::RgbaImage {
     image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle)
 }
 
-/// Shares `item` on `server`, which answers with the link. `progress` gets the bytes sent so
+/// Shares `item` on `server` with who can view it set to `access`, which answers with the link. `progress` gets the bytes sent so
 /// far and the total before every request (and while waiting) and returns false to cancel,
 /// which ends in [`ShareError::Cancelled`] after the one clean-up DELETE. Blocks for as long as
 /// the upload takes: run it off the UI thread.
-pub fn share(server: &str, token: &str, item: &Item, mut progress: impl FnMut(u64, u64) -> bool) -> Result<Shared, ShareError> {
+pub fn share(server: &str, token: &str, item: &Item, access: &Access, mut progress: impl FnMut(u64, u64) -> bool) -> Result<Shared, ShareError> {
     let client = Client::new(server, token, Timeouts::default()).map_err(ShareError::Failed)?;
-    share_with(&client, item, &mut progress, &std::thread::sleep)
+    share_with(&client, item, access, &mut progress, &std::thread::sleep)
 }
 
 /// [`share`] on a client, with the pause used for `retry-after` given.
-fn share_with(client: &Client, item: &Item, progress: &mut dyn FnMut(u64, u64) -> bool, sleep: &dyn Fn(Duration)) -> Result<Shared, ShareError> {
-    Sharing { client, item, progress, sleep, sent: 0 }.run()
+fn share_with(client: &Client, item: &Item, access: &Access, progress: &mut dyn FnMut(u64, u64) -> bool, sleep: &dyn Fn(Duration)) -> Result<Shared, ShareError> {
+    Sharing { client, item, access, progress, sleep, sent: 0 }.run()
 }
 
 /// One share in progress.
 struct Sharing<'a> {
     client: &'a Client,
     item: &'a Item,
+    access: &'a Access,
     progress: &'a mut dyn FnMut(u64, u64) -> bool,
     sleep: &'a dyn Fn(Duration),
     sent: u64,
@@ -368,6 +375,12 @@ impl Sharing<'_> {
         let (id, answer) = self.create()?;
         // From here every exit but a commit the site answered, a panic included, sends exactly one DELETE.
         let guard = AbortGuard::new(self.client, format!("/api/v1/media/{id}"));
+        // A restriction the site did not say back was not applied: the item is deleted (the
+        // guard) before any part of it is sent.
+        if !access::applied(&answer, self.access) {
+            return Err(ShareError::Access(Refused::NotApplied));
+        }
+        let granted = if self.access.is_public() { None } else { access::granted(&answer) };
         let part_bytes = parts_of(&answer, total).ok_or_else(|| ShareError::Failed(not_understood("Could not start the upload")))?;
         for (n, part) in item.data.chunks(part_bytes).enumerate() {
             if !self.go_on() {
@@ -391,7 +404,7 @@ impl Sharing<'_> {
         // path on the configured server, which serves the item's page too.
         let usable = |key: &str| answer.get(key).and_then(Value::as_str).and_then(|l| item_link(&self.client.base, l));
         let link = usable("link").or_else(|| usable("path"));
-        Ok(Shared { id, link })
+        Ok(Shared { id, link, access: granted })
     }
 
     /// One request, sent again at most once after a transport failure when `resend` allows it,
@@ -451,8 +464,21 @@ impl Sharing<'_> {
         if !title.is_empty() {
             body["title"] = json!(title);
         }
-        let body = serde_json::to_vec(&body).map_err(|_| ShareError::Failed(not_understood(what)))?;
-        let reply = self.send(what, Method::Post, "/api/v1/media", Some(("application/json", &body)), false)?;
+        let mut body = match access::body_bytes(body, self.access, Route::Media) {
+            Ok(b) if !b.is_empty() => b,
+            Err(access::BodyError::TooLong) => return Err(ShareError::Access(Refused::ListTooLong)),
+            Ok(_) | Err(access::BodyError::Unreadable) => return Err(ShareError::Failed(not_understood(what))),
+        };
+        let reply = self.send(what, Method::Post, "/api/v1/media", Some(("application/json", &body)), false);
+        // The addresses are not kept once they are sent.
+        access::wipe_body(&mut body);
+        let reply = reply?;
+        // Nothing is created on any of these refusals.
+        if !self.access.is_public()
+            && let Some(r) = access::refused(reply.status, reply.json().as_ref())
+        {
+            return Err(ShareError::Access(r));
+        }
         if reply.status == 413 {
             match reply.error_code().as_deref() {
                 Some("media_too_large") => {

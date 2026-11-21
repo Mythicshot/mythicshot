@@ -357,6 +357,8 @@ pub enum Edit {
     ConfirmDelete { id: String },
     /// The question which saved chapter of this tour to edit is showing.
     ChoosingChapter { id: String },
+    /// The question whether to publish for anyone a tour whose restriction was not applied.
+    ConfirmPublish { id: String },
 }
 
 impl Edit {
@@ -364,7 +366,7 @@ impl Edit {
     fn tour_id(&self) -> Option<&str> {
         match self {
             Edit::None => None,
-            Edit::Renaming { id, .. } | Edit::ConfirmDelete { id } | Edit::ChoosingChapter { id } => Some(id),
+            Edit::Renaming { id, .. } | Edit::ConfirmDelete { id } | Edit::ChoosingChapter { id } | Edit::ConfirmPublish { id } => Some(id),
         }
     }
 }
@@ -694,7 +696,7 @@ impl Model {
                     self.notice = Some(Notice { text: LIST_CHANGED.to_string(), error: false });
                 }
             }
-            Edit::Renaming { id, .. } | Edit::ChoosingChapter { id } => {
+            Edit::Renaming { id, .. } | Edit::ChoosingChapter { id } | Edit::ConfirmPublish { id } => {
                 if !tours.iter().any(|t| &t.id == id) {
                     self.edit = Edit::None;
                     self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false });
@@ -921,6 +923,31 @@ impl Model {
         self.begin(id, Work::Publishing(None), Job::Publish)
     }
 
+    /// "Publish" on a draft as the row's button asks for it: a tour whose restricted publish
+    /// did not finish first asks whether to publish it for anyone ([`Edit::ConfirmPublish`]);
+    /// any other starts at once, as [`Model::start_publish`].
+    pub fn request_publish(&mut self, id: &str) -> Option<Started> {
+        if !publish_ui::restriction_unfinished(id) {
+            return self.start_publish(id);
+        }
+        if self.can_act(id) && self.tour(id).is_some_and(|t| !t.is_public()) {
+            self.errors.remove(id);
+            self.edit = Edit::ConfirmPublish { id: id.to_string() };
+        }
+        None
+    }
+
+    /// "Publish for anyone" in that question: only for the tour whose question is showing. The
+    /// question closes with the click, and the tour is no longer asked about.
+    pub fn confirm_publish(&mut self, id: &str) -> Option<Started> {
+        if self.edit != (Edit::ConfirmPublish { id: id.to_string() }) || !self.can_act(id) {
+            return None;
+        }
+        self.edit = Edit::None;
+        publish_ui::settle_restriction(id);
+        self.start_publish(id)
+    }
+
     /// "Publish changes" on a public tour whose live page is behind its draft: the job a draft's
     /// Publish runs, for the same link. It asks nothing, and starts only where the button shows
     /// and while nothing else runs on the tour.
@@ -1058,6 +1085,45 @@ impl Model {
     }
 }
 
+/// The buttons of the question before publishing for anyone, left to right, and whether each is
+/// the default (what Enter and Escape choose).
+pub fn confirm_publish_buttons() -> [(&'static str, bool); 2] {
+    [(crate::share_ui::who::CONFIRM_CANCEL, true), (crate::share_ui::who::CONFIRM_PUBLISH, false)]
+}
+
+/// Delete a tour a restricted publish created and could not publish as asked, the way the page
+/// deletes one: noted before the request goes (and only when the note could be written), the
+/// note removed once the site says nothing is left. True when the tour is gone. The saved
+/// recording on this computer is left alone.
+pub fn delete_created_tour(server: &str, token: &str, tour_id: &str, title: &str) -> bool {
+    let Some(unfinished) = SHARED_UNFINISHED.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+    let Ok(server) = publish::check_server(server) else { return false };
+    let noted_here = match unfinished.add(&server, tour_id, title) {
+        Noted::Now => true,
+        Noted::Before => false,
+        // No note, no delete: the page's own rule.
+        Noted::NotSaved => return false,
+    };
+    match publish::delete_tour(&server, token, tour_id, |_| {}) {
+        Ok(_) => {
+            unfinished.remove(&server, tour_id);
+            true
+        }
+        // The tour itself is gone; its note stays for "Finish deleting".
+        Err(f) if f.unfinished => true,
+        Err(f) => {
+            if f.not_started && noted_here {
+                unfinished.remove(&server, tour_id);
+            }
+            false
+        }
+    }
+}
+
+/// The app's list of deletes that did not finish, once it has started ([`Unfinished::start`]),
+/// for a delete sent from an editor.
+static SHARED_UNFINISHED: Mutex<Option<Unfinished>> = Mutex::new(None);
+
 // ---- Deletes that did not finish ----
 
 /// The deletes that were sent and are not known to be complete: the site may have removed
@@ -1152,6 +1218,10 @@ impl Unfinished {
         self.load(list);
         if let Some(save_now) = save_now {
             self.save_with(save_now);
+        }
+        // Not from tests: they start lists of their own, which no editor should write to.
+        if !cfg!(test) {
+            *SHARED_UNFINISHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.clone());
         }
     }
 
@@ -1736,6 +1806,8 @@ enum Click {
     /// Cancel on a row whose recording is being opened, by tour id.
     CancelOpen(String),
     DeleteTour(String),
+    /// "Publish for anyone" in the question for a tour whose restriction was not applied.
+    PublishForAnyone(String),
     FinishDelete(UnfinishedDelete),
     DismissNotice,
 }
@@ -1861,7 +1933,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                 RowButton::Rename => m.start_rename(&id),
                 RowButton::Delete => m.ask_delete(&id),
                 RowButton::Publish => {
-                    if let Some(job) = m.start_publish(&id) {
+                    if let Some(job) = m.request_publish(&id) {
                         state.spawn_job(job);
                     }
                 }
@@ -1886,6 +1958,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
             Click::ChooseChapter(chapter) => {
                 if let Some(key) = m.choose_chapter(&chapter) {
                     out.edit_project = Some(key);
+                }
+            }
+            Click::PublishForAnyone(id) => {
+                if let Some(job) = m.confirm_publish(&id) {
+                    state.spawn_job(job);
                 }
             }
             Click::DeleteTour(id) => {
@@ -1945,6 +2022,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
     let renaming = matches!(edit, Edit::Renaming { id, .. } if *id == t.id);
     let confirming = matches!(edit, Edit::ConfirmDelete { id } if *id == t.id);
     let choosing = matches!(edit, Edit::ChoosingChapter { id } if *id == t.id);
+    let asking_publish = matches!(edit, Edit::ConfirmPublish { id } if *id == t.id);
     let saved = m.saved(&t.id);
     egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1999,6 +2077,26 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                     }
                     if ui.add(egui::Button::new(RichText::new("Delete tour").color(Color32::WHITE)).fill(Color32::from_rgb(170, 48, 48))).clicked() {
                         clicks.push(Click::DeleteTour(t.id.clone()));
+                    }
+                });
+            });
+        } else if asking_publish {
+            // Cancel is the default: Enter and Escape both choose it.
+            egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_HEADING).strong()).wrap());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_TEXT).color(MUTED)).wrap());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let keys = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter));
+                    for (label, default) in confirm_publish_buttons() {
+                        let button = if default { egui::Button::new(RichText::new(label).strong()).fill(PRIMARY) } else { egui::Button::new(label) };
+                        let clicked = ui.add(button).clicked();
+                        if (clicked || (default && keys)) && default {
+                            clicks.push(Click::CancelEdit);
+                        } else if clicked {
+                            clicks.push(Click::PublishForAnyone(t.id.clone()));
+                        }
                     }
                 });
             });
@@ -5301,5 +5399,121 @@ pub(crate) mod tests {
         assert_eq!(m.error(C), Some(OPENING_ANOTHER));
         m.open_ended(&first.key);
         assert_eq!((m.error(C), m.error(A)), (None, Some(SAVED_DAMAGED)));
+    }
+
+    // ---- Publishing a tour whose restriction was not applied ----
+
+    fn restricted_draft(id: &str) -> Vec<RemoteTour> {
+        let mut tours = two();
+        tours[1].id = id.to_string();
+        tours
+    }
+
+    #[test]
+    fn a_tour_whose_restriction_was_not_applied_asks_before_it_is_published_for_anyone() {
+        let id = "tour_ffffffffffffffffffff0001";
+        crate::publish_ui::note_unfinished_restriction(id);
+        let mut m = loaded(restricted_draft(id));
+        assert_eq!(m.request_publish(id), None, "nothing is sent yet");
+        assert_eq!(m.edit(), &Edit::ConfirmPublish { id: id.into() });
+        // Cancel, the default, sends nothing and keeps the tour remembered.
+        m.cancel_edit();
+        assert_eq!(m.edit(), &Edit::None);
+        assert!(crate::publish_ui::restriction_unfinished(id));
+        assert_eq!(confirm_publish_buttons(), [("Cancel", true), ("Publish for anyone", false)]);
+        // Only the tour whose question shows can be published from it.
+        assert_eq!(m.request_publish(id), None);
+        assert_eq!(m.confirm_publish(B), None);
+        let job = m.confirm_publish(id).expect("publish for anyone");
+        assert_eq!((job.id.as_str(), &job.job), (id, &Job::Publish));
+        assert_eq!(m.edit(), &Edit::None);
+        assert!(!crate::publish_ui::restriction_unfinished(id), "the user chose anyone with the link");
+        assert_eq!(m.confirm_publish(id), None, "a second click finds nothing to confirm");
+    }
+
+    #[test]
+    fn a_tour_that_was_never_restricted_publishes_from_the_tours_page_as_before() {
+        let mut m = loaded(two());
+        let job = m.request_publish(B).expect("published at once");
+        assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Publish, listed: true });
+        assert_eq!(m.edit(), &Edit::None);
+    }
+
+    /// One frame of the page with a key pressed.
+    fn key_frame(ctx: &egui::Context, state: &mut ToursState, conn: &Conn, key: egui::Key) {
+        let mut page_out = PageOut::default();
+        let events = vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), events, ..Default::default() };
+        ctx.run_ui(input, |ui| super::ui(ui, state, conn, &mut page_out)).textures_delta.clear();
+    }
+
+    /// The rectangle of the one piece of text equal to `text` one frame draws.
+    fn text_rect(ctx: &egui::Context, state: &mut ToursState, conn: &Conn, text: &str) -> egui::Rect {
+        fn collect(shape: &egui::Shape, text: &str, into: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => into.push(egui::Rect::from_min_size(t.pos, t.galley.size())),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, text, into)),
+                _ => {}
+            }
+        }
+        let mut page_out = PageOut::default();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| super::ui(ui, state, conn, &mut page_out));
+        out.textures_delta.clear();
+        let mut found = Vec::new();
+        out.shapes.iter().for_each(|c| collect(&c.shape, text, &mut found));
+        assert_eq!(found.len(), 1, "{text}");
+        found[0]
+    }
+
+    #[test]
+    fn the_question_before_publishing_a_remembered_tour_for_anyone_is_drawn_and_cancel_is_the_default() {
+        const ID: &str = "tour_ffffffffffffffffffff0002";
+        let list = format!(r#"{{"tours":[{{"id":"{ID}","title":"Restricted draft","status":"draft","slug":"x1","url":null,"chapters":1,"steps":3,"updated_at":1763424000000,"published_at":null}}]}}"#);
+        let publish_line = format!("POST /api/v1/tours/{ID}/publish");
+        let s = stub(move |req, _| if req.line == "GET /api/v1/tours" { reply(200, &list) } else { reply(200, r#"{"slug":"x1","url":"/t/x1","steps":3,"access":"public","viewers":0}"#) });
+        crate::publish_ui::note_unfinished_restriction(ID);
+        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
+        let sent = || s.lines().iter().filter(|l| **l == publish_line).count();
+        let asking = |state: &ToursState| lock(&state.model).edit() == &Edit::ConfirmPublish { id: ID.into() };
+        let publish = places(&ctx, &mut state, &conn, "Publish")[0];
+        // Publish: the question, and nothing sent.
+        click(&ctx, &mut state, &conn, publish);
+        assert!(asking(&state));
+        let (text, _) = drawn(&ctx, &mut state, &conn);
+        for line in [crate::share_ui::who::CONFIRM_HEADING, "Cancel", "Publish for anyone"] {
+            assert!(has_line(&text, line), "{line:?} in:\n{text}");
+        }
+        assert!(text.replace('\n', " ").contains(crate::share_ui::who::CONFIRM_TEXT), "{text}");
+        assert!(!has_line(&text, "Publish"), "the row's own buttons give way to the question:\n{text}");
+        // The confirming button is never where the row's Publish was: a double click cannot reach it.
+        let confirm = text_rect(&ctx, &mut state, &conn, "Publish for anyone").expand(12.0);
+        assert!(!confirm.contains(publish), "{confirm:?} holds {publish:?}");
+        // Enter and Escape choose Cancel.
+        key_frame(&ctx, &mut state, &conn, egui::Key::Enter);
+        assert!(!asking(&state));
+        click(&ctx, &mut state, &conn, publish);
+        key_frame(&ctx, &mut state, &conn, egui::Key::Escape);
+        assert!(!asking(&state));
+        // A click on Cancel closes it.
+        click(&ctx, &mut state, &conn, publish);
+        let cancel = places(&ctx, &mut state, &conn, "Cancel")[0];
+        click(&ctx, &mut state, &conn, cancel);
+        assert!(!asking(&state));
+        // A second press where Publish was, while the question shows, publishes nothing.
+        click(&ctx, &mut state, &conn, publish);
+        click(&ctx, &mut state, &conn, publish);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sent(), 0, "nothing was published by any of that");
+        assert!(crate::publish_ui::restriction_unfinished(ID));
+        // Only "Publish for anyone" publishes.
+        if !asking(&state) {
+            click(&ctx, &mut state, &conn, publish);
+        }
+        let anyone = places(&ctx, &mut state, &conn, "Publish for anyone")[0];
+        click(&ctx, &mut state, &conn, anyone);
+        until(&ctx, &mut state, &conn, |_, _| sent() == 1);
+        assert!(!crate::publish_ui::restriction_unfinished(ID));
     }
 }
