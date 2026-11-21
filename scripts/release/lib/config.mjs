@@ -2,14 +2,17 @@
 //
 //   {
 //     "publisher": "CN=Example Ltd, O=Example Ltd, L=Town, C=GB",
+//     "issuerThumbprints": ["<SHA-1 thumbprint of the CA certificate that issues yours>"],
+//     "leafThumbprint": "<optional: SHA-1 thumbprint of your own certificate>",
+//     "requiredEkus": ["<optional: extra usage OIDs your certificate must carry>"],
 //     "timestampUrl": "http://timestamp.example.com",
 //     "method": "signtool",
 //     "signtool": { "args": ["/sha1", "<certificate thumbprint>"] }
 //   }
 //
 // Path: --config <file>, else the environment variable MYTHICSHOT_SIGNING_CONFIG, else
-// %USERPROFILE%\.mythicshot\release-signing.json. No value from the file is ever printed,
-// except "publisher" and "method", which are not secret.
+// %USERPROFILE%\.mythicshot\release-signing.json. Only facts that are not secret are ever
+// printed: publisher, method, the thumbprints and usages above, and signtool's path.
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -17,7 +20,8 @@ import { EXIT, Refusal, makeRedactor } from './errors.mjs';
 import { SIGNERS } from './signers.mjs';
 
 export const CONFIG_ENV = 'MYTHICSHOT_SIGNING_CONFIG';
-const FIELDS = ['publisher', 'timestampUrl', 'method', ...Object.keys(SIGNERS)];
+export const CODE_SIGNING_EKU = '1.3.6.1.5.5.7.3.3';
+const FIELDS = ['publisher', 'issuerThumbprints', 'leafThumbprint', 'requiredEkus', 'timestampUrl', 'method', ...Object.keys(SIGNERS)];
 
 export function defaultConfigPath(env = process.env) {
   if (env[CONFIG_ENV]) return resolve(env[CONFIG_ENV]);
@@ -43,13 +47,22 @@ function real(path) {
   }
 }
 
+/** A SHA-1 thumbprint as 40 upper-case hex characters (spaces and colons dropped), or null. */
+export function normaliseThumbprint(value) {
+  if (typeof value !== 'string') return null;
+  const t = value.replace(/[\s:]/g, '').toUpperCase();
+  return /^[0-9A-F]{40}$/.test(t) ? t : null;
+}
+
+const isOid = (value) => typeof value === 'string' && /^[0-2](\.(0|[1-9]\d*))+$/.test(value);
+
 /**
  * Reads and checks the configuration. Never throws for a bad file: returns
- * { path, config, problems, secrets, redact }. `problems` are plain sentences that quote no value.
+ * { path, config, problems, secrets, envNames, redact }. `problems` are plain sentences that quote no value.
  */
 export function inspectConfig({ path, env = process.env, repoRoot, findSigntool } = {}) {
   path = resolve(path ?? defaultConfigPath(env));
-  const result = { path, config: null, problems: [], secrets: [], redact: (t) => String(t ?? '') };
+  const result = { path, config: null, problems: [], secrets: [], envNames: [], redact: (t) => String(t ?? '') };
   if (!existsSync(path)) {
     result.problems.push(`No signing configuration at ${path}. Write one there (see docs/release.md), or give --config <file> or ${CONFIG_ENV}.`);
     return result;
@@ -73,8 +86,11 @@ export function inspectConfig({ path, env = process.env, repoRoot, findSigntool 
     return result;
   }
   const ctx = { env, findSigntool };
-  const signer = typeof data.method === 'string' ? SIGNERS[data.method] : undefined;
-  if (signer) result.secrets = signer.secrets(data[data.method], ctx);
+  const signer = typeof data.method === 'string' && Object.hasOwn(SIGNERS, data.method) ? SIGNERS[data.method] : undefined;
+  if (signer) {
+    result.secrets = signer.secrets(data[data.method], ctx);
+    result.envNames = signer.envNames(data[data.method]);
+  }
   if (typeof data.timestampUrl === 'string') result.secrets.push(data.timestampUrl);
   result.redact = makeRedactor(result.secrets);
 
@@ -83,6 +99,16 @@ export function inspectConfig({ path, env = process.env, repoRoot, findSigntool 
   }
   if (typeof data.publisher !== 'string' || data.publisher.trim() === '' || /[\r\n]/.test(data.publisher)) {
     result.problems.push('"publisher" must be the exact subject of the signing certificate, such as "CN=Example Ltd, O=Example Ltd, C=GB"; it is missing or empty.');
+  }
+  const issuers = Array.isArray(data.issuerThumbprints) ? data.issuerThumbprints.map(normaliseThumbprint) : null;
+  if (!issuers || issuers.length === 0 || issuers.some((t) => t === null)) {
+    result.problems.push('"issuerThumbprints" must be a list of one or more SHA-1 thumbprints (40 hex characters) of the CA certificates allowed to issue the signing certificate; it is missing, empty, or holds something else.');
+  }
+  if (data.leafThumbprint !== undefined && normaliseThumbprint(data.leafThumbprint) === null) {
+    result.problems.push('"leafThumbprint" is optional, but when given it must be the SHA-1 thumbprint (40 hex characters) of the signing certificate itself.');
+  }
+  if (data.requiredEkus !== undefined && (!Array.isArray(data.requiredEkus) || data.requiredEkus.length === 0 || !data.requiredEkus.every(isOid))) {
+    result.problems.push('"requiredEkus" is optional, but when given it must be a list of one or more usage OIDs such as "1.3.6.1.4.1.311.97.1.0".');
   }
   let url = null;
   try {
@@ -98,7 +124,15 @@ export function inspectConfig({ path, env = process.env, repoRoot, findSigntool 
   } else {
     result.problems.push(...signer.validate(data[data.method], ctx));
   }
-  if (result.problems.length === 0) result.config = { ...data, publisher: data.publisher.trim() };
+  if (result.problems.length === 0) {
+    result.config = {
+      ...data,
+      publisher: data.publisher.trim(),
+      issuerThumbprints: issuers,
+      leafThumbprint: data.leafThumbprint === undefined ? undefined : normaliseThumbprint(data.leafThumbprint),
+      requiredEkus: data.requiredEkus ?? [],
+    };
+  }
   return result;
 }
 
@@ -124,7 +158,17 @@ export function describeConfig(options) {
   const { config } = inspected;
   const ctx = { env: options?.env ?? process.env, findSigntool: options?.findSigntool };
   lines.push('Complete. Nothing was signed; this only reads the file.');
-  lines.push(`Expected publisher (signer subject): ${config.publisher}`);
+  lines.push('Each signed file must pass all of these checks:');
+  lines.push(`- Publisher: the signing certificate's subject must be exactly "${config.publisher}".`);
+  lines.push(`- Issuer: the CA certificate that issued the signing certificate must be one of ${config.issuerThumbprints.length} allowed (SHA-1 ${config.issuerThumbprints.join(', ')}). When the CA moves to a new issuing certificate, add its thumbprint here.`);
+  lines.push(config.leafThumbprint
+    ? `- Exact certificate: the signing certificate itself must be SHA-1 ${config.leafThumbprint}. A renewed certificate needs this changed.`
+    : '- Exact certificate: not pinned. Any certificate from an allowed issuer with the publisher subject is accepted.');
+  lines.push(`- Usage: the certificate must be meant for code signing (EKU ${CODE_SIGNING_EKU}); this is always required.`);
+  lines.push(config.requiredEkus.length
+    ? `- Extra usages: it must also carry ${config.requiredEkus.join(', ')} (for example a cloud signing service's identity usage).`
+    : '- Extra usages: none required.');
+  lines.push('- Trust, timestamp, digest: Windows must trust the chain on this machine, the file must be unchanged since signing, timestamped, and signed with SHA-256.');
   lines.push(`Timestamp server: set (${new URL(config.timestampUrl).protocol.replace(':', '')}, address not shown)`);
   lines.push(`Method: ${config.method}`);
   lines.push(...SIGNERS[config.method].describe(config[config.method], ctx));

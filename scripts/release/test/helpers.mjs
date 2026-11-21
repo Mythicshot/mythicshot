@@ -3,14 +3,17 @@
 import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { validFor, RECORDED } from './recorded.mjs';
+import { RECORDED, RECORDED_EXPECT, SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
 
 export const PUBLISHER = 'CN=Mythicshot Test Publisher, O=Mythicshot, C=GB';
+export const ISSUER = RECORDED_EXPECT.issuerThumbprints[0];
+export const COMMIT = '00f5a6f0000000000000000000000000000000aa';
 // Values that must never appear in any output.
 export const SECRET_THUMBPRINT = 'A1B2C3D4E5F60718293A4B5C6D7E8F9012345678';
 export const SECRET_PIN = 'pin-HUNTER2-very-secret';
 export const SECRET_ENV_VALUE = 'env-token-ZQX-31337';
 export const SECRET_TS_KEY = 'tskey-0f9e8d7c6b5a';
+export const SECRET_ENV_NAME = 'MYTHICSHOT_TEST_TOKEN';
 
 // Every temporary folder lives under one folder of the tests' own and is removed when the
 // test process ends (set MYTHICSHOT_KEEP_TEST_FILES=1 to keep them for a look).
@@ -35,14 +38,16 @@ export function writeConfig(overrides = {}, { raw } = {}) {
   writeFileSync(signtool, 'not a real signtool');
   const config = {
     publisher: PUBLISHER,
+    issuerThumbprints: [ISSUER],
     timestampUrl: `http://timestamp.invalid/rfc3161?key=${SECRET_TS_KEY}`,
     method: 'signtool',
-    signtool: { path: signtool, args: ['/sha1', SECRET_THUMBPRINT, '/p', SECRET_PIN, '/csp', { env: 'MYTHICSHOT_TEST_TOKEN' }] },
+    signtool: { path: signtool, args: ['/sha1', SECRET_THUMBPRINT, '/p', SECRET_PIN, '/csp', { env: SECRET_ENV_NAME }] },
     ...overrides,
   };
+  for (const [key, value] of Object.entries(config)) if (value === undefined) delete config[key];
   const path = join(dir, 'release-signing.json');
   writeFileSync(path, raw ?? JSON.stringify(config, null, 2));
-  return { path, dir, signtool, env: { MYTHICSHOT_TEST_TOKEN: SECRET_ENV_VALUE, USERPROFILE: dir } };
+  return { path, dir, signtool, env: { [SECRET_ENV_NAME]: SECRET_ENV_VALUE, USERPROFILE: dir } };
 }
 
 /** The bytes of a stand-in program whose version resource says `version` (a.b.c.d). */
@@ -74,18 +79,23 @@ const argAfter = (args, flag) => args[args.indexOf(flag) + 1];
 
 /**
  * A runner that plays every external program. Options change one behaviour each:
- *   exeVersion, msiVersion, dirty, extensions, signFails ('exe' | 'msi' | true), verify (file name -> recorded JSON),
- *   cargoFails, wixBuildFails, tamperInstaller
+ *   exeVersion, msiVersion, dirty, ignored, dirtyAfterBuild, headAfterBuild, extensions,
+ *   signFails ('exe' | 'msi' | true), verify (file name or 'exe'/'msi' -> recorded JSON),
+ *   digest (recorded signtool verify output for signed files), cargoFails, wixBuildFails,
+ *   tamperInstaller, commit
  */
 export function fakeWorld(options = {}) {
-  const world = { calls: [], signed: new Set(), exeForMsi: null };
+  const world = { calls: [], signed: new Set(), exeForMsi: null, built: false };
   world.runner = (command, args = [], opts = {}) => {
     world.calls.push({ command, args: [...args], tag: opts.tag, env: opts.env, cwd: opts.cwd });
     switch (opts.tag) {
-      case 'git-status':
-        return { code: 0, stdout: options.dirty ? ' M crates/app/src/main.rs\n' : '', stderr: '' };
+      case 'git-status': {
+        let out = options.ignored ?? '!! target/\n';
+        if (options.dirty || (world.built && options.dirtyAfterBuild)) out += options.dirtyAfterBuild ?? ' M crates/app/src/main.rs\n';
+        return { code: 0, stdout: out, stderr: '' };
+      }
       case 'git-head':
-        return { code: 0, stdout: '00f5a6f0000000000000000000000000000000aa\n', stderr: '' };
+        return { code: 0, stdout: `${world.built && options.headAfterBuild ? options.headAfterBuild : (options.commit ?? COMMIT)}\n`, stderr: '' };
       case 'wix-extensions':
         return { code: 0, stdout: options.extensions ?? 'WixToolset.UI.wixext 5.0.2\n', stderr: '' };
       case 'cargo-build': {
@@ -93,6 +103,7 @@ export function fakeWorld(options = {}) {
         const dir = join(argAfter(args, '--target-dir'), 'release');
         mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, 'mythicshot.exe'), fakeExe(options.exeVersion ?? '0.2.16.0'));
+        world.built = true;
         return { code: 0, stdout: '', stderr: '    Finished `release` profile' };
       }
       case 'sign': {
@@ -109,9 +120,14 @@ export function fakeWorld(options = {}) {
       case 'verify': {
         const file = opts.env.MYTHICSHOT_VERIFY_FILE;
         const name = file.split(/[\\/]/).pop();
-        const answer = options.verify?.[name] ?? options.verify?.[file.endsWith('.msi') ? 'msi' : 'exe'];
+        const answer = options.verify?.[name] ?? options.verify?.[/\.msi(\.part)?$/.test(file) ? 'msi' : 'exe'];
         if (answer) return { code: 0, stdout: `${answer}\r\n`, stderr: '' };
-        return { code: 0, stdout: world.signed.has(file) ? validFor(PUBLISHER) : RECORDED.notSigned, stderr: '' };
+        return { code: 0, stdout: world.isSigned(file) ? validFor(PUBLISHER) : RECORDED.notSigned, stderr: '' };
+      }
+      case 'verify-digest': {
+        const file = args[args.length - 1];
+        if (options.digest) return { code: 0, stdout: options.digest, stderr: '' };
+        return world.isSigned(file) ? { code: 0, stdout: SIGNTOOL_VERIFY.sha256, stderr: '' } : { code: 1, stdout: SIGNTOOL_VERIFY.untrusted, stderr: '' };
       }
       case 'wix-build': {
         if (options.wixBuildFails) return { code: 1, stdout: 'mythicshot.wxs(63) : error WIX0103: Cannot find the File file', stderr: '' };
@@ -135,6 +151,8 @@ export function fakeWorld(options = {}) {
         throw new Error(`The fake world has no answer for ${command} (${opts.tag})`);
     }
   };
+  // A signed file stays signed when it is copied (a .part copy, or a release folder made by hand).
+  world.isSigned = (file) => world.signed.has(file) || world.signed.has(file.replace(/\.part$/, '')) || [...world.signed].some((s) => s.split(/[\\/]/).pop() === file.split(/[\\/]/).pop().replace(/\.part$/, '')) || options.allSigned === true;
   world.tags = () => world.calls.map((c) => c.tag);
   return world;
 }

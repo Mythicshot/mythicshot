@@ -55,6 +55,16 @@ for (const [name, overrides, pattern] of [
   ['arguments that pick no certificate', { signtool: { args: ['/v'] } }, /picks no certificate/],
   ['an environment variable that is not set', { signtool: { args: ['/sha1', { env: 'MYTHICSHOT_NOT_SET_ANYWHERE' }] } }, /MYTHICSHOT_NOT_SET_ANYWHERE, which is not set/],
   ['a signtool path that does not exist', { signtool: { path: 'C:\\nowhere\\signtool.exe', args: ['/sha1', 'AB'] } }, /"signtool.path"/],
+  ['a digest flag written with a dash', { signtool: { args: ['/sha1', 'AB', '-fd', 'SHA1'] } }, /must not hold \/fd \(or -fd\)/],
+  ['/as, which appends a signature', { signtool: { args: ['/sha1', 'AB', '/as'] } }, /must not hold \/as/],
+  ['-as, which appends a signature', { signtool: { args: ['/sha1', 'AB', '-as'] } }, /must not hold \/as/],
+  ['a certificate picked with a dash only', { signtool: { args: ['-v'] } }, /picks no certificate/],
+  ['no issuer thumbprints', { issuerThumbprints: undefined }, /"issuerThumbprints"/],
+  ['an empty issuer list', { issuerThumbprints: [] }, /"issuerThumbprints"/],
+  ['an issuer that is not a thumbprint', { issuerThumbprints: ['CN=Some CA'] }, /"issuerThumbprints"/],
+  ['a leaf thumbprint that is not one', { leafThumbprint: 'abc' }, /"leafThumbprint"/],
+  ['required usages that are not OIDs', { requiredEkus: ['code signing'] }, /"requiredEkus"/],
+  ['an empty list of required usages', { requiredEkus: [] }, /"requiredEkus"/],
 ]) {
   test(`a configuration with ${name} is refused`, () => {
     const c = writeConfig(overrides);
@@ -63,6 +73,40 @@ for (const [name, overrides, pattern] of [
     assertNoSecrets(assert, problems.join(' '), 'the problems');
   });
 }
+
+test('values read from the environment get the same checks as written ones', () => {
+  const c = writeConfig({ signtool: { args: ['/sha1', 'AB', { env: 'MYTHICSHOT_TEST_FLAG' }] } });
+  for (const [value, pattern] of [['/seal', /must not hold \/seal/], ['-tseal', /must not hold \/tseal/], ['-as', /shorter than 4 characters/]]) {
+    const { problems } = inspectConfig({ path: c.path, env: { ...c.env, MYTHICSHOT_TEST_FLAG: value } });
+    assert.ok(problems.some((p) => pattern.test(p)), `${value}: expected ${pattern} in ${JSON.stringify(problems)}`);
+  }
+});
+
+test('a value read from the environment shorter than 4 characters is refused, unquoted', () => {
+  const c = writeConfig();
+  const { problems } = inspectConfig({ path: c.path, env: { ...c.env, MYTHICSHOT_TEST_TOKEN: 'k9z' } });
+  assert.ok(problems.some((p) => /reads MYTHICSHOT_TEST_TOKEN, whose value is shorter than 4 characters/.test(p)), JSON.stringify(problems));
+  assert.ok(!problems.join(' ').includes('k9z'));
+});
+
+test('thumbprints may be written with spaces, colons or small letters', () => {
+  const c = writeConfig({ issuerThumbprints: ['d3:0f:05:f6:37:e6:05:23:9c:00:70:d1:ea:98:60:d4:34:ac:2a:94'], leafThumbprint: '6ace 61ba e3f0 9f4d d269 7806 d73e 022c bfe7 0eb4' });
+  const { config, problems } = inspectConfig({ path: c.path, env: c.env });
+  assert.deepEqual(problems, []);
+  assert.deepEqual(config.issuerThumbprints, ['D30F05F637E605239C0070D1EA9860D434AC2A94']);
+  assert.equal(config.leafThumbprint, '6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4');
+});
+
+test('--check-config explains every certificate check in plain words', () => {
+  const c = writeConfig({ requiredEkus: ['1.3.6.1.4.1.311.97.1.0'] });
+  const text = describeConfig({ path: c.path, env: c.env }).lines.join('\n');
+  assert.match(text, /Issuer: the CA certificate that issued the signing certificate must be one of 1 allowed \(SHA-1 D30F05F637E605239C0070D1EA9860D434AC2A94\)/);
+  assert.match(text, /Exact certificate: not pinned/);
+  assert.match(text, /Usage: the certificate must be meant for code signing \(EKU 1\.3\.6\.1\.5\.5\.7\.3\.3\); this is always required/);
+  assert.match(text, /Extra usages: it must also carry 1\.3\.6\.1\.4\.1\.311\.97\.1\.0/);
+  assert.match(text, /signtool: .*signtool\.exe \(a program path, not a secret\)/);
+  assert.match(text, /given to signtool only, not to any other program/);
+});
 
 test('--check-config says "Complete" in plain words and shows no secret', () => {
   const c = writeConfig();

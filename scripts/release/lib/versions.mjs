@@ -2,6 +2,15 @@
 // version resource inside mythicshot.exe, and the ProductVersion of the installer.
 import { basename } from 'node:path';
 import { EXIT, Refusal, firstUsefulLine } from './errors.mjs';
+import { powershellArgs } from './runner.mjs';
+
+/** -1, 0 or 1 for two versions of three numbers. */
+export function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  return 0;
+}
 
 /** The version in the [workspace.package] section of Cargo.toml. */
 export function readWorkspaceVersion(cargoToml) {
@@ -59,10 +68,10 @@ export const MSI_VERSION_SCRIPT = [
 ].join('; ');
 
 /** The ProductVersion of an .msi, read without installing anything. */
-export function readMsiVersion(file, runner) {
-  const result = runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', MSI_VERSION_SCRIPT], {
+export function readMsiVersion(file, runner, env = process.env) {
+  const result = runner('powershell.exe', powershellArgs(MSI_VERSION_SCRIPT), {
     tag: 'msi-version',
-    env: { MYTHICSHOT_MSI_FILE: file },
+    env: { ...env, MYTHICSHOT_MSI_FILE: file },
   });
   const value = String(result.stdout ?? '').trim().split(/\r?\n/).pop()?.trim();
   if (result.code !== 0 || !value || value === 'none') {

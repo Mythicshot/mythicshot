@@ -2,21 +2,28 @@
 // RFC 3161 timestamp, unattended.
 //
 // EXTENSION POINT: to add a method (for example a cloud signing service with its own
-// command-line tool), add an entry to SIGNERS with the same three functions:
+// command-line tool), add an entry to SIGNERS with the same functions:
 //   validate(section, ctx) -> list of problems, plain sentences, never quoting a value
 //   describe(section, ctx) -> lines for --check-config, never quoting a value that could be secret
 //   secrets(section, ctx)  -> every value that must never be shown (resolved), for the redactor
+//   envNames(section)      -> the environment variables it reads, kept away from every other child
 //   sign(file, config, ctx) -> nothing; throws Refusal(EXIT.SIGN, ...) on failure
 // and document its config section in docs/release.md. The verifier does not change:
-// every method must produce a signature that Windows verifies.
+// every method must produce a signature that Windows verifies, and the digest check uses
+// signtool.exe from the Windows SDK whatever the method.
 import { existsSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { EXIT, Refusal, firstUsefulLine } from './errors.mjs';
 
-// signtool flags this command sets itself: the digest, the timestamp server and its digest.
-const OWNED_FLAGS = new Set(['/fd', '/tr', '/td', '/t', '/tseal']);
+// signtool flags this command sets itself (digest, timestamp) or forbids (/as appends a
+// signature instead of replacing it; /seal and /tseal change the signature's form).
+const OWNED_FLAGS = new Set(['/fd', '/tr', '/td', '/t', '/tseal', '/seal', '/as', '/itos', '/force']);
 // Flags that pick a certificate or a signing key: at least one must be given.
 const SELECTOR_FLAGS = new Set(['/sha1', '/f', '/n', '/i', '/a', '/dlib', '/csp', '/kc', '/r', '/u']);
+export const MIN_SECRET_LENGTH = 4;
+
+// signtool reads "-x" exactly like "/x".
+const flagOf = (value) => (typeof value === 'string' && /^[-/][A-Za-z0-9]+$/.test(value) ? `/${value.slice(1).toLowerCase()}` : null);
 
 /** The newest signtool.exe of the Windows 10/11 SDK for x64, or null. */
 export function findSigntool(env = process.env) {
@@ -37,6 +44,11 @@ export function findSigntool(env = process.env) {
   return null;
 }
 
+/** signtool.exe for signing and for the digest check: the configured one, else the newest SDK one. */
+export function signtoolPath(config, ctx) {
+  return config?.signtool?.path ?? (ctx.findSigntool ?? findSigntool)(ctx.env);
+}
+
 // An argument is a string, or { "env": "NAME" } to take it from an environment variable.
 function isArg(value) {
   return typeof value === 'string' || (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && typeof value.env === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value.env));
@@ -44,6 +56,19 @@ function isArg(value) {
 
 function resolveArgs(args, env) {
   return args.map((a) => (typeof a === 'string' ? a : env[a.env]));
+}
+
+/** Problems with a resolved argument list: forbidden flags, and no certificate picked. */
+function argumentProblems(resolved) {
+  const problems = [];
+  const flags = resolved.map(flagOf).filter(Boolean);
+  for (const flag of new Set(flags)) {
+    if (OWNED_FLAGS.has(flag)) problems.push(`"signtool.args" must not hold ${flag} (or -${flag.slice(1)}): the digest, the timestamp and the form of the signature are set by this command.`);
+  }
+  if (!flags.some((flag) => SELECTOR_FLAGS.has(flag))) {
+    problems.push(`"signtool.args" picks no certificate: give one of ${[...SELECTOR_FLAGS].join(', ')} (for example /sha1 with a thumbprint, or /dlib with a cloud signing library).`);
+  }
+  return problems;
 }
 
 const signtool = {
@@ -65,40 +90,51 @@ const signtool = {
       problems.push('"signtool.args" must be a list of the arguments that pick the certificate, such as ["/sha1", "<thumbprint>"]; it is missing or empty.');
       return problems;
     }
+    let complete = true;
     args.forEach((a, i) => {
-      if (!isArg(a)) problems.push(`"signtool.args" item ${i + 1} must be text, or {"env": "NAME"} to read it from an environment variable.`);
-      else if (typeof a !== 'string' && !ctx.env[a.env]) problems.push(`"signtool.args" item ${i + 1} reads the environment variable ${a.env}, which is not set.`);
+      if (!isArg(a)) {
+        problems.push(`"signtool.args" item ${i + 1} must be text, or {"env": "NAME"} to read it from an environment variable.`);
+        complete = false;
+      } else if (typeof a !== 'string') {
+        const value = ctx.env[a.env];
+        if (!value) {
+          problems.push(`"signtool.args" item ${i + 1} reads the environment variable ${a.env}, which is not set.`);
+          complete = false;
+        } else if (value.length < MIN_SECRET_LENGTH) {
+          problems.push(`"signtool.args" item ${i + 1} reads ${a.env}, whose value is shorter than ${MIN_SECRET_LENGTH} characters; such a value could not be hidden reliably in output, so it is refused.`);
+        }
+      }
     });
-    const literal = args.filter((a) => typeof a === 'string').map((a) => a.toLowerCase());
-    for (const flag of literal) {
-      if (OWNED_FLAGS.has(flag)) problems.push(`"signtool.args" must not hold ${flag}: the digest and the timestamp are set by this command (SHA-256, "timestampUrl").`);
-    }
-    if (!literal.some((flag) => SELECTOR_FLAGS.has(flag))) {
-      problems.push(`"signtool.args" picks no certificate: give one of ${[...SELECTOR_FLAGS].join(', ')} (for example /sha1 with a thumbprint, or /dlib with a cloud signing library).`);
-    }
+    // The same checks for values read from the environment as for those written in the file.
+    if (complete) problems.push(...argumentProblems(resolveArgs(args, ctx.env)));
     return problems;
   },
 
   describe(section, ctx) {
-    const path = section.path ?? (ctx.findSigntool ?? findSigntool)(ctx.env);
     const fromEnv = section.args.filter((a) => typeof a !== 'string').map((a) => a.env);
     return [
-      `signtool: ${path}`,
-      `signtool arguments: ${section.args.length} given (values not shown)${fromEnv.length ? `, of which ${fromEnv.length} read from the environment (${fromEnv.join(', ')}), all set` : ''}`,
+      `signtool: ${signtoolPath({ signtool: section }, ctx)} (a program path, not a secret)`,
+      `signtool arguments: ${section.args.length} given (values not shown)${fromEnv.length ? `, of which ${fromEnv.length} read from the environment (${fromEnv.join(', ')}), all set; those variables are given to signtool only, not to any other program` : ''}`,
       'Each file is signed with: signtool sign /fd SHA256 /tr <timestampUrl> /td SHA256 <your arguments> <file>',
     ];
   },
 
   secrets(section, ctx) {
     if (!section || !Array.isArray(section.args)) return [];
-    return resolveArgs(section.args.filter(isArg), ctx.env).filter((v) => typeof v === 'string' && !v.startsWith('/'));
+    return resolveArgs(section.args.filter(isArg), ctx.env).filter((v) => typeof v === 'string' && !flagOf(v));
+  },
+
+  envNames(section) {
+    if (!section || !Array.isArray(section.args)) return [];
+    return section.args.filter((a) => isArg(a) && typeof a !== 'string').map((a) => a.env);
   },
 
   sign(file, config, ctx) {
-    const section = config.signtool;
-    const exe = section.path ?? (ctx.findSigntool ?? findSigntool)(ctx.env);
-    const args = ['sign', '/fd', 'SHA256', '/tr', config.timestampUrl, '/td', 'SHA256', ...resolveArgs(section.args, ctx.env), file];
-    const result = ctx.runner(exe, args, { tag: 'sign' });
+    const resolved = resolveArgs(config.signtool.args, ctx.env);
+    const problems = argumentProblems(resolved);
+    if (problems.length || resolved.some((v) => typeof v !== 'string')) throw new Refusal(EXIT.CONFIG, `The signing arguments changed since they were checked: ${problems[0] ?? 'an environment variable is no longer set.'}`);
+    const args = ['sign', '/fd', 'SHA256', '/tr', config.timestampUrl, '/td', 'SHA256', ...resolved, file];
+    const result = ctx.runner(signtoolPath(config, ctx), args, { tag: 'sign', env: ctx.signEnv });
     if (result.code !== 0) {
       const why = firstUsefulLine(`${result.stderr}\n${result.stdout}`, ctx.redact, /error/i);
       throw new Refusal(EXIT.SIGN, `Signing ${basename(file)} failed (signtool exit ${result.code})${why ? `: ${why}` : '.'}`);

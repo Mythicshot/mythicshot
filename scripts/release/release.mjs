@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Cuts a signed Mythicshot release, or refuses. Node 24, standard library only.
 //
-//   node scripts/release/release.mjs [--config <file>] [--out <dir>] [--target-dir <dir>] [--wix <wix.exe>]
+//   node scripts/release/release.mjs [--config <file>] [--out <dir>] [--wix <wix.exe>]
 //   node scripts/release/release.mjs --check-config [--config <file>]
 //   node scripts/release/release.mjs --to-site <site checkout> [--from <release dir>] [--config <file>]
 //
@@ -17,7 +17,7 @@ import { releaseToSite } from './lib/site.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const VALUE_FLAGS = new Set(['--config', '--out', '--target-dir', '--wix', '--to-site', '--from']);
+const VALUE_FLAGS = new Set(['--config', '--out', '--wix', '--to-site', '--from']);
 const SWITCHES = new Set(['--check-config', '--help']);
 
 export function parseArgs(argv) {
@@ -39,7 +39,7 @@ export function parseArgs(argv) {
 }
 
 const HELP = `Cut a signed Mythicshot release (see docs/release.md).
-  node scripts/release/release.mjs [--config <file>] [--out <dir>] [--target-dir <dir>] [--wix <wix.exe>]
+  node scripts/release/release.mjs [--config <file>] [--out <dir>] [--wix <wix.exe>]
   node scripts/release/release.mjs --check-config [--config <file>]
   node scripts/release/release.mjs --to-site <site checkout> [--from <release dir>] [--config <file>]`;
 
@@ -59,12 +59,12 @@ export async function main(argv, { env = process.env, out = console.log, err = c
     if (opts['to-site']) {
       await releaseToSite(
         { site: opts['to-site'], from: opts.from ?? join(repoRoot, 'dist', 'release'), configPath: opts.config, env, repoRoot },
-        { runner, log: out },
+        { runner, log: out, findSigntool },
       );
       return EXIT.OK;
     }
     await cutRelease(
-      { repoRoot, out: opts.out, targetDir: opts['target-dir'], configPath: opts.config, env, wix: opts.wix },
+      { repoRoot, out: opts.out, configPath: opts.config, env, wix: opts.wix },
       { runner, log: out, findSigntool },
     );
     return EXIT.OK;

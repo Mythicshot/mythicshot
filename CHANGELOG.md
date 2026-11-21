@@ -8,6 +8,11 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 - It refuses, with one line saying why and nothing left behind, without a complete signing configuration, when signing fails, when a signature is not trusted, has no timestamp, does not match the file or is not from the expected publisher, and when Cargo.toml, the program and the installer disagree on the version.
 - `--to-site <site checkout>` copies the installer and `release.json` into the front page and runs its own checks, without publishing. `--check-config` says whether the signing configuration is complete without signing anything.
 - The signing certificate is chosen in a small file outside the repository; no value from it is ever shown. See docs/release.md.
+- A run first deletes its own earlier release, so a failed run leaves no release at all, never an older one. `build.json` records the commit the release was built from.
+- The signature check also requires the code signing usage, an issuing CA from the configured `issuerThumbprints`, optionally one exact certificate and extra usages, an embedded Authenticode signature and a SHA-256 digest. The file that ships is the file that was checked.
+- The program is built in a fresh folder with `--locked`, without build-changing environment variables, and only when no cargo configuration file could change it and the checkout is clean and unmoved before and after the build.
+- `--to-site` accepts only a release of the workspace version built from the current commit, never an older version than the site's, and the same version only with the same installer. It keeps the owner's "requires" and "installs" words, and puts the site back when anything refuses.
+- The GitHub workflow can no longer publish: it builds an unsigned installer by hand only, kept as a workflow artifact marked not for release.
 
 ## 0.2.14 (2026-11-20)
 
