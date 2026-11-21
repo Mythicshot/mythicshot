@@ -18,7 +18,7 @@ use mythicshot_recording::{FrameReader, Recording};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
-use crate::publish::{Published, Target, share};
+use crate::publish::{Published, Target, access::Access, share};
 use crate::publish_ui::{self, Before, EditTarget, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
@@ -182,6 +182,14 @@ impl ExportJob {
         match self {
             ExportJob::Publish(_, run, ..) => run.publishing(),
             _ => None,
+        }
+    }
+
+    /// For a publish: who can view the tour, as far as it went.
+    fn viewing(&self) -> publish_ui::Viewing {
+        match self {
+            ExportJob::Publish(_, run, ..) => run.viewing(),
+            _ => publish_ui::Viewing::default(),
         }
     }
 
@@ -389,6 +397,7 @@ fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, limit: Option<&Limit<'_>
 /// An error means nothing was uploaded, and then nothing is kept either; a recording that
 /// cannot be kept never makes it an error. A recording that was kept is measured against the
 /// limit of the settings, here on the job's thread.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn publish_job(
     state: &PublishState,
@@ -408,6 +417,7 @@ fn publish_job(
 
 /// [`publish_job`] with the save and the limit handed in, so a test can make the save fail,
 /// panic or wait, and can say what the saved recordings take.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn publish_job_with(
     state: &PublishState,
@@ -423,15 +433,58 @@ fn publish_job_with(
     save: &SaveFn<'_>,
     limit: &Limit<'_>,
 ) -> Result<PublishDone, String> {
+    publish_job_full(state, title, tour_title, server, token, target, publish_now, &Access::Public, keeping, worker, progress, save, limit)
+}
+
+/// [`publish_job`] for "Publish tour", with who can view the tour once it is published. What
+/// the site said about that is left in `worker` ([`Run::viewing`]) for the result screen; the
+/// addresses are not.
+#[allow(clippy::too_many_arguments)]
+fn publish_job_as(
+    state: &PublishState,
+    title: &str,
+    tour_title: &str,
+    server: &str,
+    token: impl FnOnce() -> Result<String, String>,
+    target: &Target,
+    publish_now: bool,
+    access: &Access,
+    keeping: &Keeping,
+    worker: &Arc<Run>,
+    progress: &dyn Fn(f32),
+) -> Result<PublishDone, String> {
+    let limit = Limit { warn_gb: publish_ui::warn_gb(), totals: &Store::totals };
+    publish_job_full(state, title, tour_title, server, token, target, publish_now, access, keeping, worker, progress, &store_save, &limit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_job_full(
+    state: &PublishState,
+    title: &str,
+    tour_title: &str,
+    server: &str,
+    token: impl FnOnce() -> Result<String, String>,
+    target: &Target,
+    publish_now: bool,
+    access: &Access,
+    keeping: &Keeping,
+    worker: &Arc<Run>,
+    progress: &dyn Fn(f32),
+    save: &SaveFn<'_>,
+    limit: &Limit<'_>,
+) -> Result<PublishDone, String> {
+    let restricted = publish_now && !access.is_public();
+    worker.set_viewing(publish_ui::Viewing { restricted, granted: None });
     with_bundle(state, title, worker, progress, |dir| {
         let token = token()?;
         let mut kept = Kept::Off;
-        let finished = crate::publish::upload_and_publish(
+        let (finished, granted) = crate::publish::upload_and_publish_as(
             server,
             &token,
             dir,
             target,
             publish_now,
+            access,
             |f| {
                 progress(PUBLISH_WRITE_SHARE + f * (1.0 - PUBLISH_WRITE_SHARE));
                 !worker.is_cancelled()
@@ -445,6 +498,7 @@ fn publish_job_with(
                 !worker.is_cancelled()
             },
         )?;
+        worker.set_viewing(publish_ui::Viewing { restricted, granted });
         Ok(PublishDone { finished, kept })
     })
 }
@@ -557,19 +611,19 @@ fn clip_duration_ms(frames: &[mythicshot_recording::export::OutFrame], end_ms: u
 /// create, before any part is sent), then share it with its first frame as the preview. The folder is removed
 /// whatever happens. The MP4 has no sound: Mythicshot records none, and the export asks ffmpeg
 /// for a video stream only.
-pub(crate) fn share_clip_job(clip: &ClipSpec, temp: &Path, server: &str, title: String, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
+pub(crate) fn share_clip_job(clip: &ClipSpec, temp: &Path, server: &str, title: String, access: &crate::publish::access::Access, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
     use share::ShareError;
     let dir = tempfile::Builder::new().prefix(crate::share_ui::TEMP_PREFIX).tempdir_in(temp).map_err(|_| ShareError::Failed("Could not make a temporary folder for the clip.".to_string()))?;
     let dir_path = dir.path().to_path_buf();
     r.keep_dir(Some(dir_path.clone()));
-    let result = prepare_and_share(clip, &dir_path, server, title, token, r);
+    let result = prepare_and_share(clip, &dir_path, server, title, access, token, r);
     r.keep_dir(None);
     drop(dir);
     crate::share_ui::remove_soon(&dir_path);
     result
 }
 
-fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
+fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, access: &crate::publish::access::Access, token: impl FnOnce() -> Result<String, String>, r: &crate::share_ui::Reporter) -> Result<share::Shared, share::ShareError> {
     use mythicshot_recording::export::{self, Job};
     use share::ShareError;
     let format = match clip.media {
@@ -601,7 +655,7 @@ fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, t
     });
     let token = token().map_err(ShareError::Failed)?;
     let item = share::Item { media: clip.media, data, width, height, duration_ms: Some(duration_ms), title, preview };
-    share::share(server, &token, &item, |sent, total| r.uploading(sent, total))
+    share::share(server, &token, &item, access, |sent, total| r.uploading(sent, total))
 }
 
 /// What "Update tour" replaces for an editor opened from the project `origin`.
@@ -1084,7 +1138,7 @@ impl Editor {
         match v.picker.as_mut().and_then(|p| p.show(ctx)) {
             None => {}
             Some(PickerOutcome::Cancel) => v.picker = None,
-            Some(PickerOutcome::Upload { title, target, mode, tour_title, before }) => {
+            Some(PickerOutcome::Upload { title, target, mode, tour_title, before, access }) => {
                 let has_steps = tour::plan_steps(&v.rec, &v.edit, &v.events).is_ok();
                 match publish_ui::publish_blocked(v.job.is_some(), has_steps, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref()) {
                     Some(blocked) => {
@@ -1094,7 +1148,7 @@ impl Editor {
                     }
                     None => {
                         v.picker_left = v.picker.take();
-                        self.start_publish(title, target, mode, tour_title, before);
+                        self.start_publish(title, target, mode, tour_title, before, access);
                     }
                 }
             }
@@ -1159,6 +1213,7 @@ impl Editor {
         }
         let Some(v) = self.video.as_mut() else { return };
         let finished = v.job.as_ref().and_then(|j| j.take_result());
+        let viewing = v.job.as_ref().map(|j| j.viewing()).unwrap_or_default();
         let progress = v.job.as_ref().map(|j| j.progress());
         let is_tour = v.job.as_ref().is_some_and(|j| j.is_tour());
         let is_site = v.job.as_ref().is_some_and(|j| j.is_site());
@@ -1230,7 +1285,7 @@ impl Editor {
                                 if let (true, Some(origin)) = (update, v.origin.as_mut()) {
                                     origin.tour_title = title.clone();
                                 }
-                                v.publish_result = Some(if update { ResultDialog::after_update(title, before, done) } else { ResultDialog::new(title, before, done) });
+                                v.publish_result = Some(if update { ResultDialog::after_update(title, before, done) } else { ResultDialog::new(title, before, done) }.with_viewing(viewing));
                             }
                         }
                     }
@@ -1457,8 +1512,8 @@ impl Editor {
         let (frames, end_ms) = video::plan(&v.rec, &v.edit);
         let duration_ms = clip_duration_ms(&frames, end_ms);
         let clip = ClipSpec { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone(), media, quality: v.quality, fps: v.fps };
-        let starter: crate::share_ui::Starter = Box::new(move |server, title| {
-            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, || publish_ui::token_for(&server), r))
+        let starter: crate::share_ui::Starter = Box::new(move |server, title, access| {
+            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, &access, || publish_ui::token_for(&server), r))
         });
         let server = publish_ui::server();
         let blocked = crate::share_ui::blocked_reason(&server);
@@ -1525,7 +1580,7 @@ impl Editor {
 
     /// Upload the tour, keep its recording on this computer when the setting says so, then
     /// publish the tour when `mode` says so: see [`publish_job`].
-    fn start_publish(&mut self, title: String, target: Target, mode: Mode, tour_title: String, before: Before) {
+    fn start_publish(&mut self, title: String, target: Target, mode: Mode, tour_title: String, before: Before, access: Access) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
@@ -1539,7 +1594,9 @@ impl Editor {
         let worker = run.clone();
         let kept_as = tour_title.clone();
         let job = EncodeJob::spawn(move |progress| {
-            let result = guarded(&worker, || publish_job(&state, &title, &kept_as, &server, || publish_ui::token_for(&server), &target, mode == Mode::PublishNow, &keeping, &worker, progress));
+            let result = guarded(&worker, || publish_job_as(&state, &title, &kept_as, &server, || publish_ui::token_for(&server), &target, mode == Mode::PublishNow, &access, &keeping, &worker, progress));
+            // The addresses go with the job.
+            drop(access);
             // The recording is let go of before the project it may have been opened from.
             drop(state);
             drop(open);

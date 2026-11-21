@@ -565,7 +565,8 @@ impl Editor {
         let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
         // While the "Publish tour", "Add to site" or "Publish to" window is open it gets the keys, and the editor behind it is inert.
         let modal = self.publish_picker_open() || self.site_dialog_open() || self.share.is_some();
-        if !modal {
+        // The close question takes the keys too (Escape dismisses it), but keeps clicks as they were.
+        if !modal && !self.confirm_close {
             self.video_keys(&ctx);
             self.shortcuts(&ctx);
         }
@@ -2493,5 +2494,36 @@ mod tests {
         dialog_checks::click(&mut ed, &ctx, pos2(RAIL / 2.0, 120.0));
         assert_eq!(ed.tool, tool);
         assert!(!ed.confirm_close && !ed.closed);
+    }
+
+    /// With the close question open the editor takes no keys: Escape dismisses the question (as a
+    /// click outside does) and the window stays, a tool key changes nothing, and Enter does
+    /// nothing, as before.
+    #[test]
+    fn the_close_question_takes_the_keys_and_escape_dismisses_it() {
+        let ctx = egui::Context::default();
+        let key = |k: Key, modifiers: Modifiers| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        ed.add_item(Shape::Rect(Bounds::new(mythicshot_editor::pt(5.0, 5.0), mythicshot_editor::pt(20.0, 20.0))));
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.confirm_close = true;
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        // A tool key: the tool stays.
+        let tool = ed.tool;
+        let other = Tool::ALL.into_iter().find(|t| *t != tool && !matches!(t, Tool::Spotlight | Tool::Card) && hotkeys::egui_shortcut(t.action().default_binding()).is_some()).expect("a tool with a key");
+        let (m, k) = hotkeys::egui_shortcut(other.action().default_binding()).unwrap();
+        dialog_checks::frame(&mut ed, &ctx, vec![key(k, m)]);
+        assert_eq!(ed.tool, tool, "{other:?}'s key reached the editor behind the question");
+        assert!(ed.confirm_close);
+        // Enter: nothing, as before.
+        dialog_checks::frame(&mut ed, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(ed.confirm_close && !ed.closed);
+        // Escape: the question goes, the window stays.
+        dialog_checks::frame(&mut ed, &ctx, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!ed.confirm_close && !ed.closed);
+        // And the keys work again.
+        dialog_checks::frame(&mut ed, &ctx, vec![key(k, m)]);
+        assert_eq!(ed.tool, other);
     }
 }

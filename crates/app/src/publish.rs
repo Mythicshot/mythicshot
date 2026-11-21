@@ -37,6 +37,7 @@
 //! Signing in (this computer gets its own token after a code is confirmed in the browser) is
 //! another, on a client that sends no credential: see [`connect`].
 
+pub mod access;
 pub mod connect;
 pub mod share;
 
@@ -204,6 +205,8 @@ pub struct Published {
 pub struct Live {
     pub steps: usize,
     pub url: Option<String>,
+    /// Who can view it, when the site says it is restricted; None for anyone with the link.
+    pub access: Option<access::Granted>,
 }
 
 /// Where an upload ended up.
@@ -246,10 +249,16 @@ pub fn after_publish(tour_id: &str, chapter_id: &str, steps: usize, result: Resu
 /// Whether a site of this version can replace a chapter ([`update_tour`]): 0.1.4 and anything
 /// newer. No version (an older site tells none) and text that is not `major.minor.patch` are a no.
 pub fn supports_update(version: Option<&str>) -> bool {
+    version_at_least(version, UPDATE_SINCE)
+}
+
+/// Whether `version` is `major.minor.patch` and at least `since`. No version (an older site
+/// tells none) and text that is not `major.minor.patch` are a no.
+pub(crate) fn version_at_least(version: Option<&str>, since: (u32, u32, u32)) -> bool {
     let Some(version) = version else { return false };
     let mut parts = version.split('.').map(|p| if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) { p.parse::<u32>().ok() } else { None });
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(Some(major)), Some(Some(minor)), Some(Some(patch)), None) => (major, minor, patch) >= UPDATE_SINCE,
+        (Some(Some(major)), Some(Some(minor)), Some(Some(patch)), None) => (major, minor, patch) >= since,
         _ => false,
     }
 }
@@ -419,23 +428,25 @@ pub fn publish_tour(server: &str, token: &str, tour_id: &str, progress: impl FnM
     Client::new(server, token, Timeouts::default())?.publish_tour(tour_id, PUBLISH_PAUSE, progress)
 }
 
-/// Uploads the bundle and, with `publish_now`, publishes the tour it went into. An
-/// error means nothing was uploaded; once the upload is in, the answer is `Ok` and says
-/// whether the tour is public. `uploaded` is called once, when the commit has answered and
-/// before the publish step: with what the site made of the upload, and never for an upload
+/// Uploads the bundle and, with `publish_now`, publishes the tour it went into, with who can
+/// view it set to `access` when it is published. An error means nothing was uploaded; once the
+/// upload is in, the answer is `Ok` and says whether the tour is public, and who can view it
+/// when the site says it is restricted. `uploaded` is called once, when the commit has answered
+/// and before the publish step: with what the site made of the upload, and never for an upload
 /// that failed or was cancelled.
 #[allow(clippy::too_many_arguments)]
-pub fn upload_and_publish(
+pub fn upload_and_publish_as(
     server: &str,
     token: &str,
     dir: &Path,
     target: &Target,
     publish_now: bool,
+    access: &access::Access,
     upload_progress: impl FnMut(f32) -> bool,
     uploaded: impl FnOnce(&Published),
     publish_progress: impl FnMut(Option<Images>) -> bool,
-) -> Result<Finished, String> {
-    Client::new(server, token, Timeouts::default())?.upload_and_publish(dir, target, publish_now, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
+) -> Result<(Finished, Option<access::Granted>), String> {
+    Client::new(server, token, Timeouts::default())?.upload_and_publish_as(dir, target, publish_now, access, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
 }
 
 /// Updates a tour over the same link: replaces the chapter `chapter_id` of `tour_id` with the
@@ -1058,6 +1069,7 @@ impl Client {
 }
 
 impl Client {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn upload_and_publish(
         &self,
@@ -1069,13 +1081,29 @@ impl Client {
         uploaded: impl FnOnce(&Published),
         publish_progress: impl FnMut(Option<Images>) -> bool,
     ) -> Result<Finished, String> {
+        self.upload_and_publish_as(dir, target, publish_now, &access::Access::Public, pause, upload_progress, uploaded, publish_progress).map(|(done, _)| done)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_and_publish_as(
+        &self,
+        dir: &Path,
+        target: &Target,
+        publish_now: bool,
+        access: &access::Access,
+        pause: Duration,
+        upload_progress: impl FnMut(f32) -> bool,
+        uploaded: impl FnOnce(&Published),
+        publish_progress: impl FnMut(Option<Images>) -> bool,
+    ) -> Result<(Finished, Option<access::Granted>), String> {
         let up = self.upload_bundle(dir, target, upload_progress)?;
         uploaded(&up);
         if !publish_now {
-            return Ok(Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft });
+            return Ok((Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft }, None));
         }
-        let result = self.publish_tour(&up.tour_id, pause, publish_progress);
-        Ok(after_publish(&up.tour_id, &up.chapter_id, up.steps, result))
+        let result = self.publish_tour_as(&up.tour_id, access, pause, publish_progress);
+        let granted = result.as_ref().ok().and_then(|live| live.access);
+        Ok((after_publish(&up.tour_id, &up.chapter_id, up.steps, result), granted))
     }
 
     /// Replace the chapter, hand the commit's answer to `uploaded`, then publish only when the
@@ -1112,8 +1140,19 @@ impl Client {
     /// answers in a row without progress: only a `done` count higher than any before is
     /// progress, so an answer without one counts as none. A call that fails is not sent
     /// again: publishing again later joins the same publish on the server, or starts a new one.
-    fn publish_tour(&self, tour_id: &str, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+    fn publish_tour(&self, tour_id: &str, pause: Duration, progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+        self.publish_tour_as(tour_id, &access::Access::Public, pause, progress)
+    }
+
+    /// [`Client::publish_tour`] with who can view set to `access` on the first call, the one
+    /// that starts the publish; later calls name only the publish. With a restriction, a
+    /// refusal of it ends the loop with its sentence, and so does a first answer that does not
+    /// say it back: a publish that answered 202 is then not driven on, and one the site
+    /// finished at once is taken off the web again.
+    fn publish_tour_as(&self, tour_id: &str, access: &access::Access, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+        use crate::share_ui::who;
         let what = "Could not publish the tour";
+        let refusal = |r: access::Refused| who::refused_text(r, "tour", who::Ending::Published);
         if !is_id(tour_id, "tour_") {
             return Err(not_understood(what));
         }
@@ -1125,10 +1164,21 @@ impl Client {
             if !progress(images) {
                 return Err(CANCELLED.into());
             }
-            let body = publish_id.as_ref().map(|id| json!({ "publish_id": id }).to_string().into_bytes());
-            let reply = self.send(Method::Post, &path, body.as_deref().map(|b| ("application/json", b))).map_err(|t| {
-                if call == 1 { format!("{what}: {}.", t.0) } else { format!("{what}: {} while the images were being copied.", t.0) }
-            })?;
+            // Who can view goes only on the call that starts the publish.
+            let restricting = publish_id.is_none() && !access.is_public();
+            let mut body = match &publish_id {
+                Some(id) => Some(json!({ "publish_id": id }).to_string().into_bytes()),
+                None if restricting => Some(access::body_bytes(json!({}), access, access::Route::Publish)),
+                None => None,
+            };
+            let reply = self.send(Method::Post, &path, body.as_deref().map(|b| ("application/json", b)));
+            if let (true, Some(b)) = (restricting, body.as_mut()) {
+                access::wipe_body(b);
+            }
+            let reply = reply.map_err(|t| if call == 1 { format!("{what}: {}.", t.0) } else { format!("{what}: {} while the images were being copied.", t.0) })?;
+            if restricting && let Some(r) = access::refused(reply.status, reply.json().as_ref()) {
+                return Err(refusal(r));
+            }
             if reply.status == 409 {
                 match reply.error_code().as_deref() {
                     Some("publish_busy") => return Err(format!("{what}: another publish of this tour is starting at this moment.")),
@@ -1141,6 +1191,16 @@ impl Client {
             }
             let reply = self.check(what, reply)?;
             let v = reply.json().ok_or_else(|| not_understood(what))?;
+            if restricting && !access::applied(&v, access) {
+                if reply.status == 202 {
+                    // Not driven on: the site clears a publish nobody drives, and nothing went public.
+                    return Err(refusal(access::Refused::NotApplied));
+                }
+                return Err(match self.unpublish_tour(tour_id, pause) {
+                    Ok(()) => refusal(access::Refused::NotApplied),
+                    Err(_) => who::TOUR_NOT_APPLIED_PUBLIC.to_string(),
+                });
+            }
             if reply.status == 202 {
                 let id = v.get("publish_id").and_then(Value::as_str).filter(|id| is_id(id, "pub_")).ok_or_else(|| not_understood(what))?;
                 publish_id = Some(id.to_string());
@@ -1168,7 +1228,7 @@ impl Client {
             }
             let steps = v.get("steps").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| not_understood(what))?;
             let url = public_url(&self.base, v.get("url").and_then(Value::as_str), v.get("slug").and_then(Value::as_str));
-            return Ok(Live { steps, url });
+            return Ok(Live { steps, url, access: access::granted(&v) });
         }
         Err(not_understood(what))
     }
@@ -1816,7 +1876,7 @@ pub(crate) mod tests {
             _ => reply(200, LIVE),
         });
         let (r, progress) = publish(&s);
-        assert_eq!(r.unwrap(), Live { steps: 5, url: Some(format!("{}/t/abc123", s.base)) });
+        assert_eq!(r.unwrap(), Live { steps: 5, url: Some(format!("{}/t/abc123", s.base)), access: None });
         assert_eq!(progress, [None, Some((12, 22)), Some((22, 22))]);
         let reqs = s.requests();
         assert_eq!(reqs.len(), 3);
@@ -2140,7 +2200,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_publish_result_says_whether_the_tour_is_public() {
-        let live = Live { steps: 7, url: Some("https://x.dev/t/a".into()) };
+        let live = Live { steps: 7, url: Some("https://x.dev/t/a".into()), access: None };
         assert_eq!(after_publish(TOUR, CH, 2, Ok(live)), Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 7, outcome: Outcome::Public { url: Some("https://x.dev/t/a".into()) } });
         assert_eq!(after_publish(TOUR, CH, 2, Err(CANCELLED.into())).outcome, Outcome::NotPublic { cancelled: true, error: String::new() });
         assert_eq!(after_publish(TOUR, CH, 2, Err("Could not publish the tour: x.".into())), Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::NotPublic { cancelled: false, error: "Could not publish the tour: x.".into() } });
@@ -3908,5 +3968,92 @@ pub(crate) mod tests {
         let text = toml::to_string(&crate::settings::Settings::default()).unwrap();
         assert!(text.contains("publish_server = \"\""), "{text}");
         assert!(!text.to_ascii_lowercase().contains("token"));
+    }
+
+    // ---- Who can view, on the call that starts a tour's publish ----
+
+    fn people(list: &[&str]) -> access::Access {
+        access::Access::People(access::Viewers::new(list.iter().map(|a| a.to_string()).collect()))
+    }
+
+    /// The platform of 0.1.51: the first call takes `access`, padded, and says it back; later
+    /// calls name the publish. `first` may answer the first call instead.
+    fn restricting_stub(first: impl Fn(&Value) -> Option<Answer> + Send + 'static) -> Stub {
+        stub(move |req, seen| {
+            if req.line == "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/unpublish" {
+                return reply(204, "");
+            }
+            if req.line != PUBLISH {
+                return platform(req, seen);
+            }
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            if seen == 0 {
+                if let Some(answer) = first(&body) {
+                    return answer;
+                }
+                let viewers = body.get("viewers").and_then(Value::as_array).map_or(0, Vec::len);
+                return reply(202, &json!({ "status": "in_progress", "publish_id": PUB, "done": 1, "total": 2, "access": body["access"], "viewers": viewers }).to_string());
+            }
+            if body != json!({ "publish_id": PUB }) {
+                return reply(400, r#"{"error":"bad_request"}"#);
+            }
+            reply(200, &json!({ "slug": "abc123", "url": "/t/abc123", "steps": 5, "access": "people", "viewers": 2 }).to_string())
+        })
+    }
+
+    fn publish_as(s: &Stub, access: &access::Access) -> Result<Live, String> {
+        client(s).publish_tour_as(TOUR, access, Duration::ZERO, |_| true)
+    }
+
+    #[test]
+    fn the_first_publish_call_carries_who_can_view_padded_and_later_calls_only_name_the_publish() {
+        let s = restricting_stub(|_| None);
+        let live = publish_as(&s, &people(&["a@example.com", "b@example.com"])).unwrap();
+        assert_eq!(live.access, Some(access::Granted::People(2)));
+        let reqs: Vec<Req> = s.requests().into_iter().filter(|r| r.line == PUBLISH).collect();
+        assert_eq!(reqs.len(), 2);
+        let first = &reqs[0].body;
+        assert!(first.len() >= access::Route::Publish.old_limit() + access::PAD_ABOVE && first.len() < access::Route::Publish.new_limit(), "{}", first.len());
+        let v: Value = serde_json::from_slice(first).unwrap();
+        assert_eq!((v["access"].as_str(), v["viewers"].clone()), (Some("people"), json!(["a@example.com", "b@example.com"])));
+        assert_eq!(serde_json::from_slice::<Value>(&reqs[1].body).unwrap(), json!({ "publish_id": PUB }));
+    }
+
+    #[test]
+    fn anyone_with_the_link_starts_a_publish_with_no_body_as_before() {
+        let s = restricting_stub(|_| None);
+        publish_as(&s, &access::Access::Public).unwrap();
+        assert!(s.requests().iter().find(|r| r.line == PUBLISH).unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn every_refusal_of_who_can_view_stops_the_publish_with_one_sentence_and_no_second_try() {
+        let cases = [
+            (409, r#"{"error":"already_published"}"#, "This tour was published before, so who can view can only be changed in the dashboard. Nothing was published."),
+            (409, r#"{"error":"access_already_set"}"#, "Who can view was already set for this tour in the dashboard. Nothing was published."),
+            (409, r#"{"error":"cannot_restrict"}"#, "This site cannot send mail, so it cannot restrict who can view. Nothing was published."),
+            (400, r#"{"error":"bad_viewer","detail":"viewers[1]"}"#, "Address 1 is not an email address. Nothing was published."),
+            (400, r#"{"error":"too_many_viewers"}"#, "At most 200 addresses. Nothing was published."),
+            (400, r#"{"error":"bad_request"}"#, "The site did not accept who can view. Nothing was published."),
+            // A site up to 0.1.50 refuses the padded body before it publishes anything.
+            (413, "Payload Too Large", "This site is too old to restrict who can view. Nothing was published."),
+        ];
+        for (status, body, sentence) in cases {
+            let s = restricting_stub(move |_| Some(reply(status, body)));
+            assert_eq!(publish_as(&s, &access::Access::Me), Err(sentence.to_string()), "{body}");
+            assert_eq!(s.lines(), vec![PUBLISH.to_string()], "one call, never again without the fields: {body}");
+        }
+    }
+
+    #[test]
+    fn a_first_answer_that_does_not_say_who_can_view_back_is_not_driven_on() {
+        // A 202 without it: no second call, and so nothing goes public.
+        let s = restricting_stub(|_| Some(in_progress(1, 2)));
+        assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_NOT_APPLIED.to_string()));
+        assert_eq!(s.lines(), vec![PUBLISH.to_string()]);
+        // A 200 at once: the tour is taken off the web again.
+        let s = restricting_stub(|_| Some(reply(200, LIVE)));
+        assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_NOT_APPLIED.to_string()));
+        assert_eq!(s.lines(), vec![PUBLISH.to_string(), "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/unpublish".to_string()]);
     }
 }

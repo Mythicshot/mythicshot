@@ -21,6 +21,7 @@ use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::publish::{
     self,
+    access::{Access, Granted},
     share::{self, Item, Kind, MediaType, Refusal, ShareError, Shared},
 };
 use crate::publish_ui::{self, Run};
@@ -322,8 +323,12 @@ pub enum Line {
     Title,
     /// In a coloured box: what goes public.
     Warning(String),
-    /// A small grey line under a refusal.
+    /// A small grey line under a refusal, and the help under the address field.
     Note(String),
+    /// "Who can view" over its dropdown: the choices offered, and the one chosen.
+    Who { offered: Vec<who::Choice>, chosen: who::Choice },
+    /// "Email addresses" over the field the addresses are typed in.
+    Addresses,
 }
 
 /// What the window shows now.
@@ -342,6 +347,9 @@ pub struct View {
     pub disabled: Option<Button>,
     /// Copy link says "Copied": the link was put on the clipboard a moment ago.
     pub copied: bool,
+    /// Online, with the small lock under the link: who can open what was shared, when it is not
+    /// anyone with the link.
+    pub lock: Option<String>,
 }
 
 impl View {
@@ -361,9 +369,12 @@ impl View {
             match line {
                 Line::Muted(t) | Line::Text(t) | Line::Warning(t) | Line::Note(t) => out.push(t.clone()),
                 Line::Title => out.push(TITLE_LABEL.to_string()),
+                Line::Who { chosen, .. } => out.extend([who::LABEL.to_string(), chosen.label().to_string()]),
+                Line::Addresses => out.push(who::ADDRESSES_LABEL.to_string()),
             }
         }
         out.extend(self.link.clone());
+        out.extend(self.lock.clone());
         out.extend(self.buttons.iter().map(|b| self.label(*b).to_string()));
         out
     }
@@ -382,8 +393,8 @@ pub enum ShareAction {
     Status(String),
 }
 
-/// Makes the job when Publish is pressed: given the server and the cleaned title.
-pub type Starter = Box<dyn FnOnce(String, String) -> ShareJob + Send>;
+/// Makes the job when Publish is pressed: given the server, the cleaned title and who can view.
+pub type Starter = Box<dyn FnOnce(String, String, Access) -> ShareJob + Send>;
 
 /// Asked every frame while the file is still being made off the UI thread: None until it is,
 /// then the details line with its size, or why it cannot be shared.
@@ -398,6 +409,12 @@ pub struct ShareDialog {
     /// Ask the site for the workspace's name when the form shows (not in tests).
     asks_site: bool,
     asked: bool,
+    /// What the site's version says about who can view, once it has answered.
+    site: Arc<Mutex<who::Site>>,
+    /// Who can view: never remembered, and the addresses are overwritten when the window goes.
+    pub who: who::Form,
+    /// Who can open the item, as the site said when it was created.
+    granted: Option<Granted>,
     pub title: String,
     details: String,
     gif_note: bool,
@@ -433,7 +450,26 @@ impl ShareDialog {
             Some(why) => Stage::Blocked(why),
             None => Stage::Form,
         };
-        ShareDialog { kind, server, workspace: Arc::new(Mutex::new(None)), asks_site: false, asked: false, title, details, gif_note, stage, starter, measure: None, job: None, copied_at: None, clock: Box::new(Instant::now), copy_failed: false }
+        ShareDialog {
+            kind,
+            server,
+            workspace: Arc::new(Mutex::new(None)),
+            asks_site: false,
+            asked: false,
+            site: Arc::new(Mutex::new(who::Site::Unknown)),
+            who: who::Form::default(),
+            granted: None,
+            title,
+            details,
+            gif_note,
+            stage,
+            starter,
+            measure: None,
+            job: None,
+            copied_at: None,
+            clock: Box::new(Instant::now),
+            copy_failed: false,
+        }
     }
 
     /// The window as the editors open it: it asks the site for the workspace's name, off the UI thread, once the form shows.
@@ -478,14 +514,27 @@ impl ShareDialog {
             return;
         }
         self.asked = true;
-        let (server, name) = (self.server.clone(), self.workspace.clone());
+        let (server, name, site) = (self.server.clone(), self.workspace.clone(), self.site.clone());
+        // One request tells both the workspace's name and the site's version.
         std::thread::spawn(move || {
-            if let Ok(ws) = publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token))
-                && let Ok(mut n) = name.lock()
-            {
-                *n = Some(ws.name);
+            if let Ok(ws) = publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token)) {
+                if let Ok(mut s) = site.lock() {
+                    *s = who::Site::of(ws.version.as_deref());
+                }
+                if let Ok(mut n) = name.lock() {
+                    *n = Some(ws.name);
+                }
             }
         });
+    }
+
+    /// The site's version, as `GET /api/v1/me` said it (None: it tells none).
+    #[cfg(test)]
+    pub fn set_site_version(&mut self, version: Option<&str>) {
+        if let Ok(mut s) = self.site.lock() {
+            *s = who::Site::of(version);
+        }
+        self.who.set_site(who::Site::of(version));
     }
 
     /// The workspace's name, as the site said it.
@@ -521,8 +570,10 @@ impl ShareDialog {
         if self.stage != Stage::Form || self.measure.is_some() {
             return;
         }
+        // Publish waits for addresses that can be sent.
+        let Ok(access) = self.who.access() else { return };
         let Some(starter) = self.starter.take() else { return };
-        let job = starter(self.server.clone(), share::clean_title(&self.title));
+        let job = starter(self.server.clone(), share::clean_title(&self.title), access);
         self.start(job);
     }
 
@@ -543,6 +594,11 @@ impl ShareDialog {
     /// Take in what the job did. When it shared the item, the link goes on the clipboard
     /// through `copy` (false when it could not be set). Some when the editor has something to do.
     pub fn poll(&mut self, copy: &mut dyn FnMut(&str) -> bool) -> Option<ShareAction> {
+        if let Ok(site) = self.site.lock()
+            && *site != who::Site::Unknown
+        {
+            self.who.set_site(*site);
+        }
         if let Some(measured) = self.measure.as_mut().and_then(|m| m()) {
             self.measure = None;
             match measured {
@@ -572,6 +628,7 @@ impl ShareDialog {
                 if copied {
                     self.copied_at = Some((self.clock)());
                 }
+                self.granted = shared.access;
                 self.stage = Stage::Online { link: shared.link, copied };
                 Some(ShareAction::Status(online_heading(self.kind)))
             }
@@ -594,7 +651,7 @@ impl ShareDialog {
                 self.stage = Stage::Cancelling;
                 None
             }
-            (Button::Publish, Stage::Form) if self.measure.is_none() => Some(ShareAction::Publish),
+            (Button::Publish, Stage::Form) if self.measure.is_none() && self.who.problem().is_none() => Some(ShareAction::Publish),
             (Button::Close, Stage::Refused(_) | Stage::Blocked(_)) | (Button::Done, Stage::Online { .. }) => Some(ShareAction::Closed(None)),
             (Button::Open, Stage::Online { link: Some(link), .. }) => Some(ShareAction::Open(link.clone())),
             (Button::CopyLink, Stage::Online { link: Some(link), .. }) => {
@@ -621,7 +678,7 @@ impl ShareDialog {
     /// What the window shows now.
     pub fn view(&self) -> View {
         let kind = self.kind;
-        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new(), disabled: None, copied: false };
+        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new(), disabled: None, copied: false, lock: None };
         match &self.stage {
             Stage::Form => {
                 let name = self.workspace.lock().ok().and_then(|n| n.clone());
@@ -631,9 +688,20 @@ impl ShareDialog {
                 if self.gif_note {
                     v.lines.push(Line::Muted(NO_FFMPEG.to_string()));
                 }
-                v.lines.push(Line::Warning(warning(kind)));
+                // Who can view, then what goes public: only for anyone with the link.
+                for part in self.who.parts() {
+                    v.lines.push(match part {
+                        who::Part::Choice { offered, chosen } => Line::Who { offered, chosen },
+                        who::Part::Addresses => Line::Addresses,
+                        who::Part::Help(t) => Line::Note(t.to_string()),
+                        who::Part::Muted(t) => Line::Muted(t),
+                    });
+                }
+                if self.who.chosen() == who::Choice::Anyone {
+                    v.lines.push(Line::Warning(warning(kind)));
+                }
                 v.buttons = vec![Button::Cancel, Button::Publish];
-                if self.measure.is_some() {
+                if self.measure.is_some() || self.who.problem().is_some() {
                     v.disabled = Some(Button::Publish);
                 }
             }
@@ -659,6 +727,7 @@ impl ShareDialog {
             }
             Stage::Online { link, copied } => {
                 v.heading = online_heading(kind);
+                v.lock = self.granted.map(who::online_line);
                 match link {
                     Some(link) => {
                         v.link = Some(link.clone());
@@ -696,8 +765,9 @@ impl ShareDialog {
         if let Some(ShareAction::Closed(_)) = polled {
             return polled;
         }
-        let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        // An open dropdown takes Escape itself, and Enter in the address field is a new line.
+        let escape = !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let enter = !who::typing_addresses(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
         let online = matches!(self.stage, Stage::Online { .. });
@@ -728,7 +798,14 @@ impl ShareDialog {
                         ui.label(RichText::new(TITLE_LABEL).strong());
                         ui.add(egui::TextEdit::singleline(&mut self.title).char_limit(share::TITLE_MAX).desired_width(f32::INFINITY));
                     }
+                    Line::Who { offered, chosen } => who::draw_part(ui, &who::Part::Choice { offered: offered.clone(), chosen: *chosen }, &mut self.who, MUTED),
+                    Line::Addresses => who::draw_part(ui, &who::Part::Addresses, &mut self.who, MUTED),
                 }
+            }
+            // Without a link the lock line follows the sentence; with one it goes under the link row.
+            if let (None, Some(lock)) = (&view.link, &view.lock) {
+                ui.add_space(6.0);
+                who::lock_line(ui, lock, MUTED);
             }
             if let Some(p) = view.progress {
                 ui.add_space(8.0);
@@ -739,6 +816,10 @@ impl ShareDialog {
                     gap(ui, BLOCK_GAP);
                     if link_row(ui, link, Button::CopyLink.label(), view.copied).clicked() {
                         pressed = Some(Button::CopyLink);
+                    }
+                    if let Some(lock) = &view.lock {
+                        ui.add_space(8.0);
+                        who::lock_line(ui, lock, MUTED);
                     }
                 }
                 gap(ui, BLOCK_GAP);
@@ -972,12 +1053,12 @@ impl Editor {
                 Err(_) => Err(ShareError::Failed(NOT_ENCODED.to_string())),
             })
         });
-        let starter: Starter = Box::new(move |server, title| {
+        let starter: Starter = Box::new(move |server, title, access| {
             ShareJob::spawn(Kind::Image, move |r| {
                 let png = encoded.lock().ok().and_then(|mut s| s.take()).and_then(Result::ok).ok_or_else(|| ShareError::Failed(NOT_ENCODED.to_string()))?;
                 let token = publish_ui::token_for(&server).map_err(ShareError::Failed)?;
                 let item = Item { media: MediaType::Png, data: png, width, height, duration_ms: None, title, preview: share::preview_of(&img) };
-                share::share(&server, &token, &item, |sent, total| r.uploading(sent, total))
+                share::share(&server, &token, &item, &access, |sent, total| r.uploading(sent, total))
             })
         });
         self.share = Some(ShareDialog::open(Kind::Image, server, self.title(), known, false, blocked, starter).measuring(measure));
@@ -1056,6 +1137,8 @@ pub fn sweep_stale(temp: &Path, age: Duration) {
         }
     }
 }
+
+pub mod who;
 
 #[cfg(test)]
 pub(crate) mod tests;

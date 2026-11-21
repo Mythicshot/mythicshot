@@ -79,6 +79,7 @@ fn run(s: &Stub, item: &Item, mut go: impl FnMut(u64, u64) -> bool) -> Run {
     let result = share_with(
         &client(s),
         item,
+        &Access::Public,
         &mut |sent, total| {
             reports.borrow_mut().push((sent, total));
             go(sent, total)
@@ -101,7 +102,7 @@ fn an_image_is_created_sent_previewed_and_committed_and_answers_the_link() {
     let s = platform_site();
     let item = image(1000);
     let r = run(&s, &item, |_, _| true);
-    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some("https://img.example.com/i/abcdefghijklmnopqrst".into()) }));
+    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some("https://img.example.com/i/abcdefghijklmnopqrst".into()), access: None }));
     assert_eq!(s.lines(), vec![CREATE.to_string(), part(0), PREVIEW.to_string(), COMMIT.to_string()]);
     assert_eq!(created_body(&s), json!({ "kind": "image", "content_type": "image/png", "bytes": 1000, "width": 1920, "height": 1080, "title": "Loot window, settings tab" }));
     let reqs = s.requests();
@@ -119,7 +120,7 @@ fn a_clip_goes_in_parts_of_the_length_the_site_names_in_order() {
     let s = site(4, "/r/abcdefghijklmnopqrst", |_, _| None);
     let item = clip(10);
     let r = run(&s, &item, |_, _| true);
-    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some(format!("{}/r/{LINK_ID}", s.base)) }));
+    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some(format!("{}/r/{LINK_ID}", s.base)), access: None }));
     assert_eq!(s.lines(), vec![CREATE.to_string(), part(0), part(1), part(2), COMMIT.to_string()]);
     // No title is no title key; a clip says how long it runs.
     assert_eq!(created_body(&s), json!({ "kind": "clip", "content_type": "video/mp4", "bytes": 10, "width": 960, "height": 540, "duration_ms": 12_000 }));
@@ -538,7 +539,7 @@ fn a_link_mythicshot_cannot_use_falls_back_to_the_path_on_the_configured_server(
     let long: &'static str = Box::leak(format!("https://img.example.com/i/{}", "a".repeat(400)).into_boxed_str());
     for bad in ["http://img.example.com/i/abcdefghijklmnopqrst", long, "javascript:alert(1)"] {
         let s = committing(Some(bad), "/i/abcdefghijklmnopqrst");
-        assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: Some(format!("{}/i/{LINK_ID}", s.base)) }), "{bad:?}");
+        assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: Some(format!("{}/i/{LINK_ID}", s.base)), access: None }), "{bad:?}");
     }
     // A usable link comes first, before the path.
     let s = committing(Some("https://img.example.com/i/abcdefghijklmnopqrst"), "/i/abcdefghijklmnopqrst");
@@ -548,7 +549,7 @@ fn a_link_mythicshot_cannot_use_falls_back_to_the_path_on_the_configured_server(
     assert_eq!(run(&s, &image(100), |_, _| true).result.unwrap().link, Some(format!("{}/i/{LINK_ID}", s.base)));
     // Neither usable: no link, and the item is still shared.
     let s = committing(Some("http://img.example.com/i/x"), "//evil.example/i/x");
-    assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: None }));
+    assert_eq!(run(&s, &image(100), |_, _| true).result, Ok(Shared { id: MED.into(), link: None, access: None }));
     assert_eq!(count(&s.lines(), DELETE), 0);
 }
 
@@ -557,7 +558,7 @@ fn a_link_mythicshot_cannot_use_still_leaves_the_item_shared_and_not_deleted() {
     for link in ["javascript:alert(1)", "http://img.example.com/i/abc", "https://u@img.example.com/i/abc", "https://img.example.com/i/\u{1b}[0m"] {
         let s = committing(Some(Box::leak(link.to_string().into_boxed_str())), "//evil.example/i/x");
         let r = run(&s, &image(100), |_, _| true);
-        assert_eq!(r.result, Ok(Shared { id: MED.into(), link: None }), "{link:?}");
+        assert_eq!(r.result, Ok(Shared { id: MED.into(), link: None, access: None }), "{link:?}");
         assert_eq!(count(&s.lines(), DELETE), 0);
     }
 }
@@ -569,7 +570,7 @@ fn the_token_goes_only_to_the_configured_server_never_to_the_links_host() {
     let link: &'static str = Box::leak(format!("{}/i/{LINK_ID}", media_host.base).into_boxed_str());
     let s = site(4, link, |_, _| None);
     let r = run(&s, &clip(10), |_, _| true);
-    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some(link.to_string()) }));
+    assert_eq!(r.result, Ok(Shared { id: MED.into(), link: Some(link.to_string()), access: None }));
     assert!(media_host.lines().is_empty(), "{:?}", media_host.lines());
     let reqs = s.requests();
     assert!(!reqs.is_empty() && reqs.iter().all(|r| r.auth.as_deref() == Some(&format!("Bearer {TOKEN}") as &str)));
@@ -609,4 +610,107 @@ fn the_image_is_sent_as_a_png_of_the_picture() {
     let bytes = png_bytes(&img).unwrap();
     assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert_eq!(image::load_from_memory(&bytes).unwrap().to_rgba8(), img);
+}
+
+// ---- Who can view ----
+
+fn run_as(s: &Stub, item: &Item, access: &Access) -> Result<Shared, ShareError> {
+    share_with(&client(s), item, access, &mut |_, _| true, &|_| {})
+}
+
+fn people(list: &[&str]) -> Access {
+    Access::People(access::Viewers::new(list.iter().map(|a| a.to_string()).collect()))
+}
+
+/// The platform of 0.1.51: the create says back what it applied, with the count of addresses.
+fn restricting_site() -> Stub {
+    site(2_000_000, "/i/abcdefghijklmnopqrst", |req, _| {
+        if req.line != CREATE {
+            return None;
+        }
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let viewers = body.get("viewers").and_then(Value::as_array).map_or(0, Vec::len);
+        let parts = body["bytes"].as_u64().unwrap().div_ceil(2_000_000);
+        let mut answer = json!({ "id": MED, "parts": parts, "part_bytes": 2_000_000 });
+        if let Some(a) = body.get("access") {
+            answer["access"] = a.clone();
+            answer["viewers"] = json!(viewers);
+        }
+        Some(reply(201, &answer.to_string()))
+    })
+}
+
+#[test]
+fn anyone_with_the_link_sends_the_create_byte_for_byte_as_before() {
+    let s = platform_site();
+    run_as(&s, &image(1000), &Access::Public).unwrap();
+    let body = s.requests().iter().find(|r| r.line == CREATE).unwrap().body.clone();
+    let before = serde_json::to_vec(&json!({ "kind": "image", "content_type": "image/png", "bytes": 1000, "width": 1920, "height": 1080, "title": "Loot window, settings tab" })).unwrap();
+    assert_eq!(body, before);
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.contains("access") && !text.contains("viewers") && !text.contains("pad"), "{text}");
+}
+
+#[test]
+fn only_people_i_choose_sends_the_addresses_padded_past_an_older_sites_limit() {
+    let s = restricting_site();
+    let shared = run_as(&s, &image(1000), &people(&["a@example.com", "b@example.com"])).unwrap();
+    assert_eq!(shared.access, Some(Granted::People(2)));
+    assert_eq!(s.lines(), vec![CREATE.to_string(), part(0), PREVIEW.to_string(), COMMIT.to_string()]);
+    let sent = s.requests()[0].body.clone();
+    assert!(sent.len() > Route::Media.old_limit() && sent.len() >= Route::Media.old_limit() + access::PAD_ABOVE, "{}", sent.len());
+    assert!(sent.len() < Route::Media.new_limit());
+    let v: Value = serde_json::from_slice(&sent).unwrap();
+    assert_eq!((v["access"].as_str(), v["viewers"].clone()), (Some("people"), json!(["a@example.com", "b@example.com"])));
+    // Only me sends no viewers.
+    let s = restricting_site();
+    assert_eq!(run_as(&s, &image(1000), &Access::Me).unwrap().access, Some(Granted::Me));
+    let v = created_body(&s);
+    assert_eq!(v["access"], "me");
+    assert!(v.get("viewers").is_none());
+}
+
+#[test]
+fn a_create_that_does_not_say_back_who_can_view_is_deleted_before_any_part() {
+    for answer in [json!({ "id": MED, "parts": 1, "part_bytes": 2_000_000 }), json!({ "id": MED, "parts": 1, "part_bytes": 2_000_000, "access": "public" }), json!({ "id": MED, "parts": 1, "part_bytes": 2_000_000, "access": "me" })] {
+        let a = answer.clone();
+        let s = site(2_000_000, "/i/x", move |req, _| (req.line == CREATE).then(|| reply(201, &a.to_string())));
+        let r = run_as(&s, &image(1000), &people(&["a@example.com"]));
+        assert_eq!(r, Err(ShareError::Access(Refused::NotApplied)), "{answer}");
+        assert_eq!(s.lines(), vec![CREATE.to_string(), DELETE.to_string()], "{answer}");
+        assert_eq!(ShareError::Access(Refused::NotApplied).refusal(Kind::Image).unwrap().text, "The site did not apply who can view, so nothing was shared.");
+    }
+}
+
+#[test]
+fn every_refusal_of_who_can_view_shares_nothing_and_is_never_tried_without_it() {
+    let cases = [
+        (400, r#"{"error":"bad_access"}"#, Refused::BadAccess),
+        (400, r#"{"error":"bad_viewer","detail":"viewers[2]"}"#, Refused::BadViewer(Some(2))),
+        (400, r#"{"error":"too_many_viewers"}"#, Refused::TooManyViewers),
+        (400, r#"{"error":"bad_request"}"#, Refused::BadRequest),
+        (409, r#"{"error":"cannot_restrict"}"#, Refused::CannotRestrict),
+        (409, r#"{"error":"too_large_to_restrict"}"#, Refused::TooLargeToRestrict),
+        // A site up to 0.1.50 refuses the padded body before it creates anything.
+        (413, r#"{"error":"payload_too_large"}"#, Refused::SiteTooOld),
+        (413, "Request Entity Too Large", Refused::SiteTooOld),
+    ];
+    for (status, body, want) in cases {
+        let s = site(2_000_000, "/i/x", move |req, _| (req.line == CREATE).then(|| reply(status, body)));
+        assert_eq!(run_as(&s, &image(1000), &people(&["a@example.com", "b@example.com"])), Err(ShareError::Access(want)), "{body}");
+        assert_eq!(s.lines(), vec![CREATE.to_string()], "one request, no delete, no second create: {body}");
+    }
+    let text = |r| ShareError::Access(r).refusal(Kind::Clip).unwrap();
+    assert_eq!(text(Refused::CannotRestrict).text, "This site cannot send mail, so it cannot restrict who can view. Nothing was shared.");
+    assert_eq!(text(Refused::TooLargeToRestrict).text, "This clip is too large to restrict on this site. Nothing was shared.");
+    assert_eq!(text(Refused::BadViewer(Some(2))).text, "Address 2 is not an email address. Nothing was shared.");
+    assert_eq!(text(Refused::TooManyViewers).text, "At most 200 addresses. Nothing was shared.");
+    assert_eq!(text(Refused::SiteTooOld).text, "This site is too old to restrict who can view. Nothing was shared.");
+    assert_eq!(text(Refused::CannotRestrict).heading, "The clip was not uploaded");
+}
+
+#[test]
+fn the_sites_own_413s_keep_their_meaning_with_a_restriction() {
+    let s = site(2_000_000, "/i/x", |req, _| (req.line == CREATE).then(|| reply(413, r#"{"error":"media_too_large","max_bytes":500,"max_side":8192}"#)));
+    assert!(matches!(run_as(&s, &image(1000), &Access::Me), Err(ShareError::TooLarge(TooLarge::Bytes { max: 500, .. }))));
 }

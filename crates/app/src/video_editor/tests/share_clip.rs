@@ -35,7 +35,7 @@ fn spec(root: &Path, media: share::MediaType) -> ClipSpec {
 /// Run the clip job as the window does, in a dialog that follows it, until it ends.
 fn shared(clip: ClipSpec, temp: &Path, server: &str, cancel_at_once: bool) -> (ShareDialog, Option<ShareAction>) {
     let (temp, server2) = (temp.to_path_buf(), server.to_string());
-    let job = ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &temp, &server2, "Sending a note to the raid".into(), || Ok(TOKEN.to_string()), r));
+    let job = ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &temp, &server2, "Sending a note to the raid".into(), &crate::publish::access::Access::Public, || Ok(TOKEN.to_string()), r));
     let mut d = ShareDialog::new(share::Kind::Clip, server.to_string(), "x", String::new(), false, None, None);
     d.start(job);
     let mut never = |_: &str| false;
