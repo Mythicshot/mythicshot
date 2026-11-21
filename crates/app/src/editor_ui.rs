@@ -571,7 +571,7 @@ impl Editor {
         }
         self.video_tick(&ctx);
         if modal {
-            ui.disable();
+            inert(ui);
         }
         self.toolbar(ui);
         self.status_bar(ui);
@@ -1626,7 +1626,7 @@ impl Editor {
         // with space between them, Save (or Export) as the main one.
         const BUTTON: egui::Vec2 = egui::vec2(132.0, 36.0);
         const GAP: f32 = 14.0;
-        let modal = egui::Modal::new(egui::Id::unique("confirm-close")).frame(egui::Frame::popup(&ctx.global_style()).inner_margin(24.0)).show(ctx, |ui| {
+        let modal = crate::share_ui::modal(egui::Id::unique("confirm-close")).frame(egui::Frame::popup(&ctx.global_style()).inner_margin(24.0)).show(ctx, |ui| {
             ui.set_width(3.0 * BUTTON.x + 2.0 * GAP + 24.0);
             let (title, text) = if is_video {
                 ("Export this recording?", "Closing without exporting deletes the recording.")
@@ -2001,6 +2001,152 @@ impl EditorWindow {
     }
 }
 
+/// Make `ui` and everything drawn in it take no clicks, drags, scrolls, hovers or keys, as
+/// [`egui::Ui::disable`] does, but without its fading: every window of the app can be see-through
+/// (for the recording frame), so a faded background would show the desktop behind the window.
+/// Transparent-capable windows must never paint their background with reduced opacity.
+fn inert(ui: &mut egui::Ui) {
+    let opacity = ui.opacity();
+    ui.disable();
+    ui.set_opacity(opacity);
+}
+
+/// Checks for a frame drawn with a dialog open over an editor: what the editor painted, whether
+/// anything dims the window, and clicks the way a mouse makes them. The video editor's tests use them too.
+#[cfg(test)]
+pub(crate) mod dialog_checks {
+    use super::*;
+
+    /// The window the tests draw into, as big as the editor opens.
+    pub(crate) const WINDOW: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 820.0));
+
+    pub(crate) fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput { screen_rect: Some(WINDOW), events, ..Default::default() }
+    }
+
+    /// What one frame painted: the shapes on the editor's own layer, and every shape of the frame;
+    /// and whether the editor's window was left taking input.
+    pub(crate) struct Painted {
+        pub(crate) editor: Vec<egui::Shape>,
+        pub(crate) all: Vec<egui::Shape>,
+        pub(crate) enabled: bool,
+    }
+
+    pub(crate) fn frame(ed: &mut Editor, ctx: &egui::Context, events: Vec<egui::Event>) -> Painted {
+        let (mut editor, mut enabled) = (Vec::new(), true);
+        let mut out = ctx.run_ui(input(events), |ui| {
+            ed.ui(ui);
+            enabled = ui.is_enabled();
+            let layer = ui.layer_id();
+            editor = ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().map(|c| c.shape.clone()).collect()).unwrap_or_default());
+        });
+        out.textures_delta.clear();
+        Painted { editor: flat(editor), all: flat(out.shapes.into_iter().map(|c| c.shape).collect()), enabled }
+    }
+
+    fn flat(shapes: Vec<egui::Shape>) -> Vec<egui::Shape> {
+        let mut out = Vec::new();
+        for s in shapes {
+            match s {
+                egui::Shape::Vec(v) => out.extend(flat(v)),
+                s => out.push(s),
+            }
+        }
+        out
+    }
+
+    /// The filled rectangles of at least 4000 square points: the panels' backgrounds and the canvas
+    /// (a rectangle with a fully transparent fill paints only its border, if any).
+    pub(crate) fn big_fills(shapes: &[egui::Shape]) -> Vec<(Rect, Color32)> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.rect.area() >= 4000.0 && r.fill.a() > 0 => Some((r.rect, r.fill)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The editor painted solid with a dialog open: the panels' backgrounds are exactly the ones
+    /// it paints without the dialog (`solid`), none of them see-through, and the toolbar, rail,
+    /// status bar and canvas backgrounds are all there.
+    pub(crate) fn assert_solid(with_dialog: &Painted, solid: &Painted) {
+        let fills = big_fills(&with_dialog.editor);
+        assert!(fills.iter().filter(|(_, c)| *c == BAR_BG).count() >= 3, "the toolbar, rail and status bar backgrounds: {fills:?}");
+        assert!(fills.iter().any(|(_, c)| *c == CANVAS_BG), "the canvas background: {fills:?}");
+        assert!(fills.iter().all(|(_, c)| c.a() == 255), "nothing of the editor's background is see-through: {fills:?}");
+        assert_eq!(fills, big_fills(&solid.editor), "the same backgrounds as with no dialog open");
+        // The picture itself is not faded either.
+        for s in &with_dialog.editor {
+            if let egui::Shape::Mesh(m) = s {
+                assert!(m.vertices.iter().all(|v| v.color.a() == 255), "a faded picture");
+            }
+        }
+    }
+
+    /// Nothing laid over the whole window shows: no dimming layer behind a dialog.
+    pub(crate) fn assert_not_dimmed(p: &Painted) {
+        for s in &p.all {
+            if let egui::Shape::Rect(r) = s {
+                assert!(!(r.rect.contains_rect(WINDOW) && r.fill.a() > 0 && r.fill.a() < 255), "a dimming layer over the window: {r:?}");
+            }
+        }
+    }
+
+    /// A left click at `at`: the press in one frame, the release in the next, and one frame more.
+    pub(crate) fn click(ed: &mut Editor, ctx: &egui::Context, at: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(ed, ctx, vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(ed, ctx, vec![button(false)]);
+        frame(ed, ctx, vec![]);
+    }
+
+    /// The window has no dimming over it, a click far outside the dialog lands on nothing, and the editor
+    /// behind is solid and inert while `open` (the dialog) is shown: a click on a tool, a hover over
+    /// it, a tool's key and a scroll over the canvas change nothing.
+    pub(crate) fn assert_inert_and_solid(make: impl Fn() -> Editor, open: impl Fn(&mut Editor), is_open: impl Fn(&Editor) -> bool) {
+        // Find a tool button on the rail: a point a click on which changes the tool with no dialog open.
+        let rail = (0..80).map(|i| pos2(RAIL / 2.0, 40.0 + i as f32 * 8.0)).find(|&at| {
+            let (mut ed, ctx) = (make(), egui::Context::default());
+            frame(&mut ed, &ctx, vec![]);
+            let before = ed.tool;
+            click(&mut ed, &ctx, at);
+            ed.tool != before
+        });
+        let rail = rail.expect("a tool button on the rail");
+
+        let ctx = egui::Context::default();
+        let mut ed = make();
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        frame(&mut ed, &ctx, vec![]);
+        let solid = frame(&mut ed, &ctx, vec![]);
+        assert!(!is_open(&ed), "the dialog is not open yet");
+        open(&mut ed);
+        frame(&mut ed, &ctx, vec![]);
+        let shown = frame(&mut ed, &ctx, vec![]);
+        assert!(is_open(&ed), "the dialog is open");
+        // The editor is disabled as before, so none of its widgets takes input, and only the fading is gone.
+        assert!(solid.enabled && !shown.enabled, "the editor is disabled while the dialog is open");
+        assert_solid(&shown, &solid);
+        assert_not_dimmed(&shown);
+
+        // Pointing at a tool highlights nothing: the editor paints exactly what it paints with no pointer.
+        let hovered = frame(&mut ed, &ctx, vec![egui::Event::PointerMoved(rail)]);
+        let away = frame(&mut ed, &ctx, vec![egui::Event::PointerGone]);
+        assert_eq!(format!("{:?}", hovered.editor), format!("{:?}", away.editor), "a hover highlight behind the dialog");
+
+        let (tool, zoom) = (ed.tool, ed.zoom);
+        click(&mut ed, &ctx, rail);
+        let keys: Vec<egui::Event> = [Key::A, Key::E, Key::T, Key::S, Key::R].into_iter().map(|key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }).collect();
+        frame(&mut ed, &ctx, keys);
+        let canvas = pos2(WINDOW.center().x, WINDOW.center().y);
+        frame(&mut ed, &ctx, vec![egui::Event::PointerMoved(canvas), egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 300.0), modifiers: Modifiers::CTRL | Modifiers::COMMAND, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel }]);
+        frame(&mut ed, &ctx, vec![]);
+        assert_eq!((ed.tool, ed.zoom), (tool, zoom), "the editor behind the dialog reacted");
+        assert!(is_open(&ed), "a click on the editor behind the dialog closed it");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2280,5 +2426,72 @@ mod tests {
         s.editor.styles.insert("text".into(), crate::settings::SavedStyle { font_size: 40.0, ..Default::default() });
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert_eq!(back.editor, s.editor);
+    }
+
+    // ---- The editor behind a dialog: solid, undimmed and inert ----
+
+    fn share_dialog() -> crate::share_ui::ShareDialog {
+        // Blocked from the start, so nothing is asked of any site.
+        crate::share_ui::ShareDialog::new(crate::publish::share::Kind::Image, String::new(), "t", String::new(), false, Some("No server is set.".into()), None)
+    }
+
+    /// The bug: with "Publish to…" open the editor was drawn half see-through, and the
+    /// desktop behind the window showed through it.
+    #[test]
+    fn the_editor_behind_publish_to_stays_solid_undimmed_and_inert() {
+        let make = || editor(EditorPrefs::default());
+        dialog_checks::assert_inert_and_solid(make, |ed| ed.share = Some(share_dialog()), |ed| ed.share.is_some());
+    }
+
+    /// Every dialog is made by the one helper that leaves the window undimmed.
+    #[test]
+    fn every_dialog_is_made_without_dimming() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    sources(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let made: Vec<_> = files.iter().filter(|p| std::fs::read_to_string(p).unwrap().contains(concat!("Modal", "::new("))).collect();
+        assert_eq!(made.len(), 1, "{made:?}");
+        assert!(made[0].ends_with("share_ui.rs"));
+    }
+
+    /// A click outside "Publish to…" closes nothing, as before the dimming went.
+    #[test]
+    fn a_click_outside_publish_to_does_not_close_it() {
+        let ctx = egui::Context::default();
+        let mut ed = editor(EditorPrefs::default());
+        ed.share = Some(share_dialog());
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::click(&mut ed, &ctx, pos2(10.0, 810.0));
+        assert!(ed.share.is_some());
+    }
+
+    /// The close question has no dimming either, the editor behind it stays solid, and a click
+    /// outside it still dismisses it without closing the window, as it did with the dimming.
+    #[test]
+    fn the_close_question_is_undimmed_and_a_click_outside_still_dismisses_it() {
+        let ctx = egui::Context::default();
+        let mut ed = editor(EditorPrefs::default());
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let solid = dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.confirm_close = true;
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let shown = dialog_checks::frame(&mut ed, &ctx, vec![]);
+        assert!(ed.confirm_close);
+        dialog_checks::assert_solid(&shown, &solid);
+        dialog_checks::assert_not_dimmed(&shown);
+        // A click on a tool behind the question reaches no tool: the backdrop still takes it, and dismisses the question.
+        let tool = ed.tool;
+        dialog_checks::click(&mut ed, &ctx, pos2(RAIL / 2.0, 120.0));
+        assert_eq!(ed.tool, tool);
+        assert!(!ed.confirm_close && !ed.closed);
     }
 }

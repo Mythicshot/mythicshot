@@ -2286,6 +2286,28 @@ mod tests {
         Editor::new_video(state.rec.clone(), state.events.clone(), state.items.clone(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
     }
 
+    /// "Add to site" is one of the dialogs that makes the editor inert: behind it the editor stays solid, undimmed and inert.
+    #[test]
+    fn the_editor_behind_add_to_site_stays_solid_undimmed_and_inert() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Each editor takes its recording's folder with it, so each gets a recording of its own.
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            let rec = recorded(&tmp.path().join(made.get().to_string()));
+            let s = Settings::default();
+            Editor::new_video(rec, Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+        };
+        crate::editor_ui::dialog_checks::assert_inert_and_solid(make, |ed| ed.open_site_dialog(), |ed| ed.site_dialog_open());
+        // A click outside it closes nothing.
+        let ctx = egui::Context::default();
+        let mut ed = make();
+        ed.open_site_dialog();
+        crate::editor_ui::dialog_checks::frame(&mut ed, &ctx, vec![]);
+        crate::editor_ui::dialog_checks::click(&mut ed, &ctx, egui::pos2(10.0, 810.0));
+        assert!(ed.site_dialog_open());
+    }
+
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {
         let s = Settings::default();
         Editor::open_project(store.load(key).unwrap(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()

@@ -2,6 +2,11 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.17 (2026-11-21)
+
+- The editor stays solid while "Publish to…", "Publish tour" or "Add to site" is open: before, it turned half see-through and the desktop behind the window showed through it. It still takes no clicks, keys or scrolling until the window closes.
+- No window is darkened behind a dialog any more. A click outside a dialog does what it did before.
+
 ## 0.2.16 (2026-11-21)
 
 - One command makes a release for the download page: `node scripts/release/release.mjs` builds Mythicshot, signs it, builds the installer from the signed program, signs the installer and checks both signatures before anything is written to `dist/release/`, next to the front page's `release.json` and a short summary.

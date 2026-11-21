@@ -701,7 +701,7 @@ impl ShareDialog {
         let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
         let online = matches!(self.stage, Stage::Online { .. });
-        egui::Modal::new(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
+        modal(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(WINDOW_WIDTH);
             ui.label(RichText::new(view.caption).color(MUTED).size(12.0));
             ui.add_space(4.0);
@@ -808,6 +808,13 @@ pub fn window_frame(ctx: &egui::Context) -> egui::Frame {
     let style = ctx.global_style();
     let corner = style.visuals.menu_corner_radius.nw.saturating_add(4);
     egui::Frame::popup(&style).inner_margin(WINDOW_PADDING).corner_radius(CornerRadius::same(corner))
+}
+
+/// Every dialog of the app: an [`egui::Modal`] whose backdrop still covers the whole window and
+/// takes every click outside the dialog, so nothing behind it reacts, but draws nothing: no window
+/// of the app is dimmed behind a dialog.
+pub fn modal(id: egui::Id) -> egui::Modal {
+    egui::Modal::new(id).backdrop_color(Color32::TRANSPARENT)
 }
 
 /// The window's heading.

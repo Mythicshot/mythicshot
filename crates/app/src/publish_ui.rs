@@ -981,7 +981,7 @@ impl ResultDialog {
         }
         let mut action = None;
         let copied = self.copied_left().is_some();
-        egui::Modal::new(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
+        share_ui::modal(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(share_ui::WINDOW_WIDTH);
             share_ui::heading_label(ui, result_heading(&self.done.outcome, self.update));
             ui.label(RichText::new(result_line(&self.title, &self.done, &self.before, self.update)).color(MUTED)).on_hover_text(&self.title);
@@ -1425,7 +1425,7 @@ impl Picker {
         let mut outcome = None;
         let (mut retry, mut pick) = (false, None);
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
-        egui::Modal::new(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
+        share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading("Publish tour");
             ui.add_space(4.0);
@@ -1607,7 +1607,7 @@ impl Picker {
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
-        egui::Modal::new(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
+        share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading("Publish tour");
             ui.add_space(4.0);
