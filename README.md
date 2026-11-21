@@ -138,6 +138,10 @@ Releases are built on GitHub: pushing a tag such as `v0.2.0` (matching the versi
 
 The wizard's banner images come from `installer/make_images.py`. The MSI is not code-signed yet, so Windows shows a SmartScreen warning the first time.
 
+### Signed release for the download page
+
+`node scripts/release/release.mjs` builds the program, signs it, builds the installer from the signed program, signs that, checks both signatures strictly and leaves `dist/release/` with the installer, `release.json` for the front page and a summary. It refuses, and leaves nothing behind, without a complete signing configuration or when any step or check fails. `--to-site <site checkout>` hands the release to the front page and runs its checks without publishing. How to cut a release, what the toolchain needs, the configuration file and every refusal: [docs/release.md](docs/release.md). Its tests: `node --test "scripts/release/test/*.test.mjs"`.
+
 ## Layout
 
 | Crate | Job |

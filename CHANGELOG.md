@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.16 (2026-11-21)
+
+- One command makes a release for the download page: `node scripts/release/release.mjs` builds Mythicshot, signs it, builds the installer from the signed program, signs the installer and checks both signatures before anything is written to `dist/release/`, next to the front page's `release.json` and a short summary.
+- It refuses, with one line saying why and nothing left behind, without a complete signing configuration, when signing fails, when a signature is not trusted, has no timestamp, does not match the file or is not from the expected publisher, and when Cargo.toml, the program and the installer disagree on the version.
+- `--to-site <site checkout>` copies the installer and `release.json` into the front page and runs its own checks, without publishing. `--check-config` says whether the signing configuration is complete without signing anything.
+- The signing certificate is chosen in a small file outside the repository; no value from it is ever shown. See docs/release.md.
+
 ## 0.2.14 (2026-11-20)
 
 - Sign in no longer asks the site again at once after an answer was lost: it waits one interval, as the site expects. When the code is gone after a lost answer, the window says "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again."
