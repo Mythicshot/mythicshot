@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, StrokeKind, vec2};
 
 use crate::editor_ui::Editor;
+use crate::icons::{self, Icon};
 use crate::publish::{
     self,
     share::{self, Item, Kind, MediaType, Refusal, ShareError, Shared},
@@ -28,6 +29,28 @@ const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
 const WARNING_BG: Color32 = Color32::from_rgb(74, 58, 22);
 const WARNING_TEXT: Color32 = Color32::from_rgb(245, 214, 150);
+/// "Copied": the green the app already uses for good news (a public tour, a working connection).
+const SUCCESS: Color32 = Color32::from_rgb(125, 211, 140);
+/// Text on [`SUCCESS`]: the app's card colour, the dark it draws on green with.
+const ON_SUCCESS: Color32 = Color32::from_rgb(27, 31, 39);
+
+// The window's measures, from the mockup the owner approved. The tour result screen uses them too.
+/// The width of what the window holds.
+pub const WINDOW_WIDTH: f32 = 520.0;
+/// Around what the window holds.
+pub const WINDOW_PADDING: f32 = 28.0;
+/// Between the text, the link row and the action row.
+pub const BLOCK_GAP: f32 = 20.0;
+/// The link row: the link and the Copy link button, one height.
+pub const LINK_ROW_HEIGHT: f32 = 46.0;
+/// Every button of the window but Copy link.
+pub const BUTTON_HEIGHT: f32 = 44.0;
+/// Between the buttons of the action row.
+pub const BUTTON_GAP: f32 = 12.0;
+pub const HEADING_SIZE: f32 = 20.0;
+/// What Copy link says for a moment after a copy that worked.
+pub const COPIED_LABEL: &str = "Copied";
+pub const OPEN_IN_BROWSER: &str = "Open in browser";
 
 /// The entry in the image editor's "Send to" menu and in the recording editor's Export menu.
 pub const MENU_ENTRY: &str = "Publish to…";
@@ -281,7 +304,7 @@ impl Button {
             Button::Cancel => "Cancel",
             Button::Publish => "Publish",
             Button::Close => "Close",
-            Button::Open => "Open",
+            Button::Open => OPEN_IN_BROWSER,
             Button::CopyLink => "Copy link",
             Button::Done => "Done",
         }
@@ -312,13 +335,24 @@ pub struct View {
     pub progress: Option<f32>,
     /// The link, in a read-only field.
     pub link: Option<String>,
-    /// From left to right; the last one is the main button.
+    /// From left to right; the last one is the main button. Online, in the order keyboard focus
+    /// takes them: Copy link (in the link row), then the action row.
     pub buttons: Vec<Button>,
     /// A button shown but not usable yet.
     pub disabled: Option<Button>,
+    /// Copy link says "Copied": the link was put on the clipboard a moment ago.
+    pub copied: bool,
 }
 
 impl View {
+    /// What `button` says now.
+    pub fn label(&self, button: Button) -> &'static str {
+        match button {
+            Button::CopyLink if self.copied => COPIED_LABEL,
+            other => other.label(),
+        }
+    }
+
     /// Every sentence of the window, for tests.
     #[cfg(test)]
     pub fn texts(&self) -> Vec<String> {
@@ -330,7 +364,7 @@ impl View {
             }
         }
         out.extend(self.link.clone());
-        out.extend(self.buttons.iter().map(|b| b.label().to_string()));
+        out.extend(self.buttons.iter().map(|b| self.label(*b).to_string()));
         out
     }
 }
@@ -372,7 +406,10 @@ pub struct ShareDialog {
     /// Set while the file is being made: Publish waits for it.
     measure: Option<Measure>,
     job: Option<ShareJob>,
+    /// When the link last went on the clipboard, by [`ShareDialog::clock`]: Copy link says "Copied" for a moment.
     copied_at: Option<Instant>,
+    /// The time "Copied" is measured by; the tests move their own.
+    clock: Box<dyn Fn() -> Instant + Send>,
     /// The last "Copy link" could not set the clipboard.
     copy_failed: bool,
 }
@@ -396,7 +433,7 @@ impl ShareDialog {
             Some(why) => Stage::Blocked(why),
             None => Stage::Form,
         };
-        ShareDialog { kind, server, workspace: Arc::new(Mutex::new(None)), asks_site: false, asked: false, title, details, gif_note, stage, starter, measure: None, job: None, copied_at: None, copy_failed: false }
+        ShareDialog { kind, server, workspace: Arc::new(Mutex::new(None)), asks_site: false, asked: false, title, details, gif_note, stage, starter, measure: None, job: None, copied_at: None, clock: Box::new(Instant::now), copy_failed: false }
     }
 
     /// The window as the editors open it: it asks the site for the workspace's name, off the UI thread, once the form shows.
@@ -412,6 +449,19 @@ impl ShareDialog {
     pub fn measuring(mut self, measure: Measure) -> ShareDialog {
         self.measure = Some(measure);
         self
+    }
+
+    /// The window on another clock than the real one.
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + 'static) -> ShareDialog {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// How long Copy link still says "Copied"; None when it does not.
+    fn copied_left(&self) -> Option<Duration> {
+        let since = (self.clock)().saturating_duration_since(self.copied_at?);
+        publish_ui::COPIED_FOR.checked_sub(since).filter(|left| !left.is_zero())
     }
 
     #[cfg(test)]
@@ -519,6 +569,9 @@ impl ShareDialog {
                 // clipboard is left as it was; the link is shown with its buttons.
                 let cancelled = self.stage == Stage::Cancelling;
                 let copied = !cancelled && shared.link.as_deref().is_some_and(&mut *copy);
+                if copied {
+                    self.copied_at = Some((self.clock)());
+                }
                 self.stage = Stage::Online { link: shared.link, copied };
                 Some(ShareAction::Status(online_heading(self.kind)))
             }
@@ -546,7 +599,7 @@ impl ShareDialog {
             (Button::Open, Stage::Online { link: Some(link), .. }) => Some(ShareAction::Open(link.clone())),
             (Button::CopyLink, Stage::Online { link: Some(link), .. }) => {
                 let copied = copy(link);
-                self.copied_at = copied.then(Instant::now);
+                self.copied_at = copied.then(|| (self.clock)());
                 self.copy_failed = !copied;
                 None
             }
@@ -568,7 +621,7 @@ impl ShareDialog {
     /// What the window shows now.
     pub fn view(&self) -> View {
         let kind = self.kind;
-        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new(), disabled: None };
+        let mut v = View { caption: caption(kind), heading: heading(kind).to_string(), lines: Vec::new(), progress: None, link: None, buttons: Vec::new(), disabled: None, copied: false };
         match &self.stage {
             Stage::Form => {
                 let name = self.workspace.lock().ok().and_then(|n| n.clone());
@@ -612,13 +665,11 @@ impl ShareDialog {
                         if *copied {
                             v.lines.push(Line::Muted(COPIED.to_string()));
                         }
-                        if let Some(note) = publish_ui::copied_note(self.copied_at.map(|t| t.elapsed())) {
-                            v.lines.push(Line::Muted(note.to_string()));
-                        }
                         if self.copy_failed {
                             v.lines.push(Line::Muted(COPY_FAILED.to_string()));
                         }
-                        v.buttons = vec![Button::Open, Button::CopyLink, Button::Done];
+                        v.copied = self.copied_left().is_some();
+                        v.buttons = vec![Button::CopyLink, Button::Open, Button::Done];
                     }
                     None => {
                         v.lines.push(Line::Text(no_link(kind)));
@@ -645,12 +696,12 @@ impl ShareDialog {
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
-        egui::Modal::new(egui::Id::unique("share-window")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
+        let online = matches!(self.stage, Stage::Online { .. });
+        egui::Modal::new(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(WINDOW_WIDTH);
             ui.label(RichText::new(view.caption).color(MUTED).size(12.0));
             ui.add_space(4.0);
-            ui.heading(&view.heading);
+            heading_label(ui, &view.heading);
             for line in &view.lines {
                 ui.add_space(6.0);
                 match line {
@@ -679,28 +730,152 @@ impl ShareDialog {
                 ui.add_space(8.0);
                 ui.add(egui::ProgressBar::new(p));
             }
-            if let Some(link) = &view.link {
-                ui.add_space(10.0);
-                // A `&str` buffer: the text can be selected and copied, never changed.
-                let mut shown = link.as_str();
-                ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
-            }
-            ui.add_space(16.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (i, button) in view.buttons.iter().enumerate().rev() {
-                    let main = i + 1 == view.buttons.len();
-                    let b = if main { egui::Button::new(RichText::new(button.label()).strong()).fill(PRIMARY) } else { egui::Button::new(button.label()) };
-                    if ui.add_enabled(view.disabled != Some(*button), b).clicked() {
+            if online {
+                if let Some(link) = &view.link {
+                    gap(ui, BLOCK_GAP);
+                    if link_row(ui, link, Button::CopyLink.label(), view.copied).clicked() {
+                        pressed = Some(Button::CopyLink);
+                    }
+                }
+                gap(ui, BLOCK_GAP);
+                // With a link the accent belongs to Copy link; without one Done stands alone and keeps it.
+                let actions: Vec<Button> = view.buttons.iter().copied().filter(|b| *b != Button::CopyLink).collect();
+                let row: Vec<ActionButton> = actions.iter().map(|b| ActionButton { label: view.label(*b), accent: view.link.is_none() }).collect();
+                for (button, response) in actions.iter().zip(action_row(ui, &row)) {
+                    if response.clicked() {
                         pressed = Some(*button);
                     }
                 }
-            });
+            } else if !view.buttons.is_empty() {
+                gap(ui, BLOCK_GAP);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, button) in view.buttons.iter().enumerate().rev() {
+                        let main = i + 1 == view.buttons.len();
+                        let text = RichText::new(view.label(*button)).size(BUTTON_TEXT);
+                        let b = if main { egui::Button::new(text.strong()).fill(PRIMARY) } else { egui::Button::new(text) };
+                        if ui.add_enabled(view.disabled != Some(*button), b.min_size(vec2(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))).clicked() {
+                            pressed = Some(*button);
+                        }
+                    }
+                });
+            }
         });
-        if self.job.is_some() || self.measure.is_some() || self.copied_at.is_some() {
+        if self.job.is_some() || self.measure.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        // A frame for when "Copied" goes back to "Copy link", and none after that.
+        match self.copied_left() {
+            Some(left) => ctx.request_repaint_after(left),
+            None => self.copied_at = None,
         }
         pressed.and_then(|b| self.press(b, copy))
     }
+}
+
+// ---- The look of the window, shared with the tour result screen ----
+
+/// The size of the buttons' text.
+const BUTTON_TEXT: f32 = 14.0;
+/// The narrowest a button of the stages without a link row is.
+const BUTTON_MIN_WIDTH: f32 = 96.0;
+/// The copy icon, and the space between it and its label.
+const ICON_SIZE: f32 = 16.0;
+const ICON_GAP: f32 = 8.0;
+/// Left and right of what a filled button holds.
+const BUTTON_PADDING_X: f32 = 18.0;
+/// Left and right of the link in its field.
+const FIELD_PADDING_X: f32 = 14.0;
+const LINK_TEXT: f32 = 13.0;
+
+/// The window's frame: the app's popup frame, as every window of the app has, with the
+/// mockup's padding and corners a little rounder than a popup's.
+pub fn window_frame(ctx: &egui::Context) -> egui::Frame {
+    let style = ctx.global_style();
+    let corner = style.visuals.menu_corner_radius.nw.saturating_add(4);
+    egui::Frame::popup(&style).inner_margin(WINDOW_PADDING).corner_radius(CornerRadius::same(corner))
+}
+
+/// The window's heading.
+pub fn heading_label(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).heading().size(HEADING_SIZE)).wrap());
+}
+
+/// `space` between two blocks, the item spacing egui adds of itself included.
+pub fn gap(ui: &mut egui::Ui, space: f32) {
+    ui.add_space((space - ui.spacing().item_spacing.y).max(0.0));
+}
+
+/// The link and its copy button in one bordered row, [`LINK_ROW_HEIGHT`] high across the
+/// whole width. The link is in a monospace face on the darker field text boxes have, on one
+/// line, cut short with "…" when it does not fit (the whole link shows on hover) and
+/// selectable. The button closes the row on the right: the accent with a copy icon and
+/// `copy_label`, or while `copied` the success green with a tick and [`COPIED_LABEL`]. It is
+/// as wide for both, so nothing moves. The button's response.
+pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -> egui::Response {
+    let visuals = ui.visuals().clone();
+    let font = egui::FontId::proportional(BUTTON_TEXT);
+    let text_width = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x;
+    let button_width = text_width(ui, copy_label).max(text_width(ui, COPIED_LABEL)) + ICON_SIZE + ICON_GAP + 2.0 * BUTTON_PADDING_X;
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LINK_ROW_HEIGHT), Sense::hover());
+    let r = visuals.widgets.inactive.corner_radius.nw.saturating_add(2);
+    let button = egui::Rect::from_min_max(egui::pos2(row.right() - button_width, row.top()), row.max);
+    let field = egui::Rect::from_min_max(row.min, egui::pos2(button.left(), row.bottom()));
+
+    ui.painter().rect_filled(field, CornerRadius { nw: r, sw: r, ne: 0, se: 0 }, visuals.extreme_bg_color);
+    let builder = egui::UiBuilder::new().max_rect(field.shrink2(vec2(FIELD_PADDING_X, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center));
+    ui.scope_builder(builder, |ui| {
+        ui.add(egui::Label::new(RichText::new(link).monospace().size(LINK_TEXT).color(visuals.strong_text_color())).truncate().selectable(true));
+    });
+
+    // After the link, so keyboard focus comes to the button first: a label never takes it.
+    let response = ui.interact(button, ui.make_persistent_id("link-row-copy"), Sense::click());
+    let (base, fg, icon, label) = if copied { (SUCCESS, ON_SUCCESS, Icon::Check, COPIED_LABEL) } else { (PRIMARY, Color32::WHITE, Icon::Copy, copy_label) };
+    let fill = if response.is_pointer_button_down_on() {
+        base.lerp_to_gamma(Color32::BLACK, 0.12)
+    } else if response.hovered() {
+        base.lerp_to_gamma(Color32::WHITE, 0.12)
+    } else {
+        base
+    };
+    let right = CornerRadius { nw: 0, sw: 0, ne: r, se: r };
+    ui.painter().rect_filled(button, right, fill);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+    let content = ICON_SIZE + ICON_GAP + galley.size().x;
+    let left = button.center().x - content / 2.0;
+    icons::paint(ui.painter(), egui::Rect::from_center_size(egui::pos2(left + ICON_SIZE / 2.0, button.center().y), egui::Vec2::splat(ICON_SIZE)), icon, fg);
+    ui.painter().galley(egui::pos2(left + ICON_SIZE + ICON_GAP, button.center().y - galley.size().y / 2.0), galley, fg);
+    ui.painter().rect_stroke(row, r, visuals.widgets.noninteractive.bg_stroke, StrokeKind::Inside);
+    if response.has_focus() {
+        ui.painter().rect_stroke(button.shrink(2.0), right, visuals.selection.stroke, StrokeKind::Inside);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    response
+}
+
+/// One button of [`action_row`].
+pub struct ActionButton<'a> {
+    pub label: &'a str,
+    /// Filled with the accent. The online window gives it to none of them: it belongs to Copy link.
+    pub accent: bool,
+}
+
+/// `buttons` side by side across the whole width, all as wide, [`BUTTON_GAP`] apart and
+/// [`BUTTON_HEIGHT`] high, left to right in the order keyboard focus takes them. Their responses.
+pub fn action_row(ui: &mut egui::Ui, buttons: &[ActionButton]) -> Vec<egui::Response> {
+    let width = ui.available_width();
+    let n = buttons.len().max(1) as f32;
+    let each = (width - BUTTON_GAP * (n - 1.0)) / n;
+    let (row, _) = ui.allocate_exact_size(vec2(width, BUTTON_HEIGHT), Sense::hover());
+    buttons
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let rect = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * (each + BUTTON_GAP), row.top()), vec2(each, BUTTON_HEIGHT));
+            let text = RichText::new(b.label).size(BUTTON_TEXT);
+            let button = if b.accent { egui::Button::new(text.strong()).fill(PRIMARY) } else { egui::Button::new(text) };
+            ui.put(rect, button.min_size(rect.size()))
+        })
+        .collect()
 }
 
 // ---- The editors ----
@@ -838,4 +1013,4 @@ pub fn sweep_stale(temp: &Path, age: Duration) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

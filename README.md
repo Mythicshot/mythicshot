@@ -81,7 +81,7 @@ In the "Publish tour" dialog, upload it as a new tour (the title starts as the r
 
 ## Publish to
 
-"Publish to…" shares one screenshot or one recording with a link: it is at the end of the image editor's "Send to" menu, and under "Share" in the recording editor's Export menu. The window says where it goes, takes an optional title (up to 120 characters), and shows the image's size before anything is sent. "Publish" uploads the image as you see it in the editor, as PNG; once it is online the link is on the clipboard, and "Open" opens it in the browser. It uses the same site address and token as "Publish tour", and without them the window says what to set up first.
+"Publish to…" shares one screenshot or one recording with a link: it is at the end of the image editor's "Send to" menu, and under "Share" in the recording editor's Export menu. The window says where it goes, takes an optional title (up to 120 characters), and shows the image's size before anything is sent. "Publish" uploads the image as you see it in the editor, as PNG; once it is online the link is on the clipboard, "Copy link" beside it copies it again and says "Copied" for a moment, and "Open in browser" opens it. It uses the same site address and token as "Publish tour", and without them the window says what to set up first.
 
 > [!WARNING]
 > Anyone who has the link can open the image or clip, and it stays online until you delete it in the site's dashboard.
