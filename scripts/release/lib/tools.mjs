@@ -2,15 +2,29 @@
 // current folder, the checkout or the site (where a planted git.exe or npm.cmd could sit), nor
 // from a relative PATH entry. Children also get NoDefaultCurrentDirectoryInExePath=1, so a
 // program they start by name is not looked up in their working folder either.
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { EXIT, Refusal } from './errors.mjs';
 
-const inside = (path, folder) => {
-  const p = resolve(path).toLowerCase();
-  const f = resolve(folder).toLowerCase();
-  return p === f || p.startsWith(f.endsWith(sep) ? f : f + sep);
-};
+/**
+ * Every way to write a folder or file, reduced to one: the real path from Windows (which resolves
+ * junctions, links and 8.3 short names), without a \\?\ prefix, trailing dots or spaces (Windows
+ * drops those), in lower case. A path that cannot be resolved is reduced the same way, textually.
+ */
+export function canonical(path) {
+  const strip = (p) => p.replace(/^\\\\\?\\(UNC\\)?/i, (m, unc) => (unc ? '\\\\' : '')).replace(/[\\/]+$/, '').replace(/[. ]+$/, '');
+  let real;
+  try {
+    real = realpathSync.native(strip(path));
+  } catch {
+    real = resolve(strip(path));
+  }
+  return strip(real).toLowerCase();
+}
+
+const within = (p, f) => p === f || p.startsWith(f.endsWith(sep) ? f : f + sep);
+/** Whether `path`, however written, is `folder` or below it, however written. */
+const inside = (path, folder) => within(canonical(path), canonical(folder)) || within(resolve(path).toLowerCase(), resolve(folder).toLowerCase());
 
 const isFile = (path) => {
   try {
@@ -28,7 +42,8 @@ export function findOnPath(name, { env, exclude = [], extensions = ['.exe', '.cm
     if (!dir || !isAbsolute(dir) || exclude.some((folder) => inside(dir, folder))) continue;
     for (const ext of extensions) {
       const candidate = join(dir, name + ext);
-      if (isFile(candidate)) return candidate;
+      // The tool itself is checked too: a link in an allowed folder must not lead into an excluded one.
+      if (isFile(candidate) && !exclude.some((folder) => inside(candidate, folder))) return candidate;
     }
   }
   return null;

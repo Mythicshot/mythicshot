@@ -1,22 +1,24 @@
-// --to-site killed at every step: after the kill, the next start (recoverSite, which every run
-// calls first) must leave the site either fully as it was or fully with the new release, never
-// mixed. A small stand-in site is used, with the site's steps played by fakes that behave like
-// the real package step (build into dist.building, then replace dist).
+// --to-site killed at every step, and recovery killed at every step: the site must always end
+// either fully as it was or fully with the new release, never mixed. A small stand-in site is
+// used, with the site's steps played by fakes that behave like the real package step (build into
+// dist.building, then replace dist). A "kill" is a thrown error that skips every clean-up; the
+// lock it leaves is then given a dead PID, as a real killed process would leave it.
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { EXIT, Refusal } from '../lib/errors.mjs';
 import { describeInstaller, installerName, makeBuildInfo, makeFragment } from '../lib/fragment.mjs';
-import { JOURNAL_DIR, JOURNAL_MARKER, recoverSite, releaseToSite } from '../lib/site.mjs';
+import { JOURNAL_DIR, JOURNAL_FORMAT, JOURNAL_MARKER, LOCK_FILE, realSite, recoverSite, releaseToSite } from '../lib/site.mjs';
 import { SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
-import { COMMIT, FAKE_TOOLS, fakeRepo, PUBLISHER, tempDir, writeConfig } from './helpers.mjs';
+import { COMMIT, deadPid, FAKE_TOOLS, fakeRepo, PUBLISHER, tempDir, writeConfig } from './helpers.mjs';
 
 const FILE = installerName('0.2.16');
 // One installer for every scenario of this file, so "fully new" is the same in each.
 const INSTALLER = randomBytes(2048);
 const OLD = { file: 'Mythicshot-0.2.15-x64.msi', version: '0.2.15', size: 9, sha256: 'a'.repeat(64), requires: 'Windows 10 or 11', installs: 'Per user.' };
+const kill = (name) => Object.assign(new Error(`killed after ${name}`), { simulatedKill: true });
 
 function standInSite({ upgrade }) {
   const site = join(tempDir('crash-site'), 'site');
@@ -83,50 +85,95 @@ function snapshot(site) {
   return { root, dist: tree(join(site, 'dist')), distBuilding: existsSync(join(site, 'dist.building')) };
 }
 
+/** What a killed process leaves: its lock, held by a PID that no longer runs. */
+function lockOfDeadRun(site) {
+  const path = join(site, LOCK_FILE);
+  if (!existsSync(path)) return;
+  const data = JSON.parse(readFileSync(path, 'utf8'));
+  writeFileSync(path, JSON.stringify({ ...data, pid: deadPid() }));
+}
+
 async function scenario(upgrade, afterStep) {
   const site = standInSite({ upgrade });
   const from = await releaseFolder();
   const config = writeConfig();
-  const run = () => releaseToSite({ from, site, configPath: config.path, env: config.env, repoRoot: fakeRepo() }, { runner, log: () => {}, tools: FAKE_TOOLS, afterStep });
+  const run = (hook = afterStep) => releaseToSite({ from, site, configPath: config.path, env: config.env, repoRoot: fakeRepo() }, { runner, log: () => {}, tools: FAKE_TOOLS, afterStep: hook });
   return { site, run };
+}
+
+const killAt = (k) => {
+  let count = 0;
+  return (name) => {
+    if (count++ === k) throw kill(name);
+  };
+};
+
+const which = (state, oldState, newState) => (JSON.stringify(state) === JSON.stringify(oldState) ? 'old' : JSON.stringify(state) === JSON.stringify(newState) ? 'new' : 'MIXED');
+
+const nothingLeft = (site, where) => {
+  assert.ok(!existsSync(join(site, JOURNAL_DIR)), `no journal (${where})`);
+  assert.ok(!existsSync(join(site, LOCK_FILE)), `no lock (${where})`);
+  assert.ok(!existsSync(join(site, 'preview')), `no preview folder this run made (${where})`);
+};
+
+async function reference(upgrade) {
+  const steps = [];
+  const clean = await scenario(upgrade, (name) => steps.push(name));
+  const oldState = snapshot(clean.site);
+  await clean.run();
+  const newState = snapshot(clean.site);
+  nothingLeft(clean.site, 'a clean run');
+  return { steps, oldState, newState };
 }
 
 for (const upgrade of [true, false]) {
   const label = upgrade ? 'an upgrade (old release, its installer, a stale same-name file, an old dist)' : 'a first release (release.json {})';
 
   test(`killed after every step of ${label}: the site ends fully old or fully new`, async () => {
-    // The steps, from one run that is not interrupted, and what "fully new" looks like.
-    const steps = [];
-    const clean = await scenario(upgrade, (name) => steps.push(name));
-    const oldState = snapshot(clean.site);
-    await clean.run();
-    const newState = snapshot(clean.site);
-    assert.ok(!existsSync(join(clean.site, JOURNAL_DIR)), 'no journal after a clean run');
-    assert.ok(!existsSync(join(clean.site, 'preview')), 'a preview folder this run made is gone again');
+    const { steps, oldState, newState } = await reference(upgrade);
     assert.notDeepEqual(oldState, newState);
     const expected = upgrade
-      ? ['journal-folder', 'journal-marker', 'journal-written', 'part-copied', 'release-saved', 'same-name-saved', 'previous-saved', 'release-written', 'release-renamed', 'installer-renamed', 'dist-saved', 'site-check', 'site-package', 'committed']
-      : ['journal-folder', 'journal-marker', 'journal-written', 'part-copied', 'release-saved', 'release-written', 'release-renamed', 'installer-renamed', 'site-check', 'site-package', 'committed'];
+      ? ['lock-taken', 'journal-folder', 'journal-marker', 'journal-written', 'part-copied', 'release-saved', 'same-name-saved', 'previous-saved', 'release-written', 'release-renamed', 'installer-renamed', 'dist-saved', 'site-check', 'site-package', 'committed']
+      : ['lock-taken', 'journal-folder', 'journal-marker', 'journal-written', 'part-copied', 'release-saved', 'release-written', 'release-renamed', 'installer-renamed', 'site-check', 'site-package', 'committed'];
     assert.deepEqual(steps, expected);
 
     for (let k = 0; k < steps.length; k++) {
-      let count = 0;
-      const killed = await scenario(upgrade, (name) => {
-        if (count++ === k) throw Object.assign(new Error(`killed after ${name}`), { simulatedKill: true });
-      });
-      assert.deepEqual(snapshot(killed.site), oldState);
+      const killed = await scenario(upgrade, killAt(k));
       await assert.rejects(killed.run(), (e) => e.simulatedKill === true);
-      // The next start finishes or undoes the interrupted run.
+      lockOfDeadRun(killed.site);
       const done = recoverSite(killed.site);
-      const after = snapshot(killed.site);
-      const which = JSON.stringify(after) === JSON.stringify(oldState) ? 'old' : JSON.stringify(after) === JSON.stringify(newState) ? 'new' : 'MIXED';
-      assert.notEqual(which, 'MIXED', `killed after ${steps[k]} (${done}): ${JSON.stringify(after)}`);
-      assert.equal(which, steps[k] === 'committed' ? 'new' : 'old', `killed after ${steps[k]}`);
-      assert.ok(!existsSync(join(killed.site, JOURNAL_DIR)), `the journal is gone after recovery (killed after ${steps[k]})`);
-      // And a run after that completes normally.
-      await killed.run();
+      const state = which(snapshot(killed.site), oldState, newState);
+      assert.equal(state, steps[k] === 'committed' ? 'new' : 'old', `killed after ${steps[k]} (${done}): ${JSON.stringify(snapshot(killed.site))}`);
+      nothingLeft(killed.site, `killed after ${steps[k]}`);
+      await killed.run(() => {});
       assert.deepEqual(snapshot(killed.site), newState, `a run after a kill after ${steps[k]} completes`);
     }
+  });
+
+  test(`recovery itself killed after every one of its steps, for every kill of ${label}: the site still ends fully old or fully new`, async () => {
+    const { steps, oldState, newState } = await reference(upgrade);
+    let checked = 0;
+    for (let k = 0; k < steps.length; k++) {
+      // The steps recovery takes after a kill at step k.
+      const probe = await scenario(upgrade, killAt(k));
+      await assert.rejects(probe.run(), (e) => e.simulatedKill);
+      lockOfDeadRun(probe.site);
+      const recoverySteps = [];
+      recoverSite(probe.site, () => {}, { afterStep: (name) => recoverySteps.push(name) });
+      for (let j = 0; j < recoverySteps.length; j++) {
+        const s = await scenario(upgrade, killAt(k));
+        await assert.rejects(s.run(), (e) => e.simulatedKill);
+        lockOfDeadRun(s.site);
+        assert.throws(() => recoverSite(s.site, () => {}, { afterStep: killAt(j) }), (e) => e.simulatedKill === true);
+        lockOfDeadRun(s.site);
+        recoverSite(s.site);
+        const state = which(snapshot(s.site), oldState, newState);
+        assert.equal(state, steps[k] === 'committed' ? 'new' : 'old', `run killed after ${steps[k]}, recovery killed after ${recoverySteps[j]}: ${JSON.stringify(snapshot(s.site))}`);
+        nothingLeft(s.site, `run killed after ${steps[k]}, recovery killed after ${recoverySteps[j]}`);
+        checked++;
+      }
+    }
+    assert.ok(checked > 20, `only ${checked} recovery kill points were checked`);
   });
 }
 
@@ -146,17 +193,86 @@ test('the new installer is fully checked before anything of the old release is m
 });
 
 test('a run that starts on an interrupted one puts the site back first, then goes on', async () => {
-  let count = 0;
   const s = await scenario(true, (name) => {
-    if (name === 'installer-renamed' && count++ === 0) throw Object.assign(new Error('killed'), { simulatedKill: true });
+    if (name === 'installer-renamed') throw kill(name);
   });
   await assert.rejects(s.run(), (e) => e.simulatedKill);
+  lockOfDeadRun(s.site);
   assert.ok(existsSync(join(s.site, JOURNAL_DIR, 'journal.json')));
   const logs = [];
   const config = writeConfig();
   await releaseToSite({ from: await releaseFolder(), site: s.site, configPath: config.path, env: config.env, repoRoot: fakeRepo() }, { runner, log: (l) => logs.push(l), tools: FAKE_TOOLS });
   assert.match(logs.join('\n'), /An earlier run was interrupted; the site was put back as it was before it/);
   assert.equal(JSON.parse(readFileSync(join(s.site, 'release.json'), 'utf8')).version, '0.2.16');
+  nothingLeft(s.site, 'after the second run');
+});
+
+// ---------------------------------------------------------------- one run at a time
+
+test('while another run holds the site (a live PID), a new run and recovery both refuse, and change nothing', async () => {
+  const s = await scenario(true, (name) => {
+    if (name === 'installer-renamed') throw kill(name);
+  });
+  await assert.rejects(s.run(), (e) => e.simulatedKill);
+  // The lock still names this (live) process: as if the first run were still going.
+  const before = snapshot(s.site);
+  const journal = readFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), 'utf8');
+  await assert.rejects(s.run(() => {}), (e) => e instanceof Refusal && e.code === EXIT.BUSY && /Another run on the site is still going \(PID \d+/.test(e.message));
+  assert.throws(() => recoverSite(s.site), (e) => e.code === EXIT.BUSY);
+  assert.deepEqual(snapshot(s.site), before);
+  assert.equal(readFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), 'utf8'), journal, 'the running journal is untouched');
+  // Once that process is gone, the lock is stale and the next run takes over.
+  lockOfDeadRun(s.site);
+  await s.run(() => {});
+  nothingLeft(s.site, 'after the takeover');
+});
+
+// ---------------------------------------------------------------- journals that are not trusted
+
+async function siteWithJournal(change) {
+  const s = await scenario(true, (name) => {
+    if (name === 'release-renamed') throw kill(name);
+  });
+  await assert.rejects(s.run(), (e) => e.simulatedKill);
+  lockOfDeadRun(s.site);
+  const file = join(s.site, JOURNAL_DIR, 'journal.json');
+  const journal = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(journal.format, JOURNAL_FORMAT);
+  assert.equal(journal.site, realSite(s.site));
+  writeFileSync(file, JSON.stringify(change(journal)));
+  return s;
+}
+
+for (const [name, change, pattern] of [
+  ['an older format', (j) => ({ ...j, format: 0 }), /its format is 0, not 1/],
+  ['another format', (j) => ({ ...j, format: '2' }), /its format is "2", not 1/],
+  ['no format', ({ format, ...j }) => j, /its format is undefined/],
+  ['an unknown state', (j) => ({ ...j, state: 'half-done' }), /its state "half-done" is unknown/],
+  ['a missing had-field', ({ hadDist, ...j }) => j, /"hadDist" is not true or false/],
+  ['a had-field that is not a boolean', (j) => ({ ...j, hadSameName: 'yes' }), /"hadSameName" is not true or false/],
+  ['another site folder', (j) => ({ ...j, site: 'c:\\some\\other\\site' }), /written for another site folder/],
+  ['no site folder', ({ site, ...j }) => j, /written for another site folder/],
+  ['a file name with a folder', (j) => ({ ...j, file: '..\\x.msi' }), /"file" is not an installer name/],
+]) {
+  test(`a journal with ${name} is refused, and nothing is rolled back from it`, async () => {
+    const s = await siteWithJournal(change);
+    const before = snapshot(s.site);
+    const journalBefore = readFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), 'utf8');
+    assert.throws(() => recoverSite(s.site), (e) => e instanceof Refusal && e.code === EXIT.SITE && pattern.test(e.message) && /nothing was changed/.test(e.message) && !/\n/.test(e.message));
+    await assert.rejects(s.run(() => {}), (e) => e.code === EXIT.SITE && pattern.test(e.message));
+    assert.deepEqual(snapshot(s.site), before, 'the site is left as it is');
+    assert.equal(readFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), 'utf8'), journalBefore, 'the journal is left for a person');
+    assert.ok(existsSync(join(s.site, JOURNAL_DIR, 'release.json')), 'the backups are left for a person');
+  });
+}
+
+test('an unreadable journal is refused in one line and left for a person', async () => {
+  const s = await scenario(false);
+  mkdirSync(join(s.site, JOURNAL_DIR), { recursive: true });
+  writeFileSync(join(s.site, JOURNAL_DIR, JOURNAL_MARKER), 'x');
+  writeFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), '{ broken');
+  await assert.rejects(s.run(), (e) => e.code === EXIT.SITE && /cannot be trusted \(it is not an object\); nothing was changed/.test(e.message) && !/\n/.test(e.message));
+  assert.ok(existsSync(join(s.site, JOURNAL_DIR, 'journal.json')));
 });
 
 test('a journal folder this command did not make is refused in one line', async () => {
@@ -167,13 +283,33 @@ test('a journal folder this command did not make is refused in one line', async 
   assert.ok(existsSync(join(s.site, JOURNAL_DIR, 'notes.txt')));
 });
 
-test('an unreadable journal is refused in one line and left for a person', async () => {
-  const s = await scenario(false);
-  mkdirSync(join(s.site, JOURNAL_DIR), { recursive: true });
-  writeFileSync(join(s.site, JOURNAL_DIR, JOURNAL_MARKER), 'x');
-  writeFileSync(join(s.site, JOURNAL_DIR, 'journal.json'), '{ broken');
-  await assert.rejects(s.run(), (e) => e.code === EXIT.SITE && /journal .* that cannot be read; restore the site from the backups there by hand/.test(e.message) && !/\n/.test(e.message));
-  assert.ok(existsSync(join(s.site, JOURNAL_DIR, 'journal.json')));
+// ---------------------------------------------------------------- backups that are not plain files
+
+// Hard links need no privilege on Windows (file symbolic links do); the same code refuses both.
+test('rollback never writes through a hard link at release.json, and refuses a backup with another name', async () => {
+  const s = await scenario(true, (name) => {
+    if (name === 'release-renamed') throw kill(name);
+  });
+  await assert.rejects(s.run(), (e) => e.simulatedKill);
+  lockOfDeadRun(s.site);
+  // Someone makes release.json another name of a file outside the site: rollback must replace it, not write into that file.
+  const outside = join(tempDir('outside'), 'victim.json');
+  writeFileSync(outside, 'not to be overwritten');
+  rmSync(join(s.site, 'release.json'));
+  linkSync(outside, join(s.site, 'release.json'));
+  recoverSite(s.site);
+  assert.equal(readFileSync(outside, 'utf8'), 'not to be overwritten');
+  assert.equal(JSON.parse(readFileSync(join(s.site, 'release.json'), 'utf8')).version, '0.2.15');
+
+  const t = await scenario(true, (name) => {
+    if (name === 'release-renamed') throw kill(name);
+  });
+  await assert.rejects(t.run(), (e) => e.simulatedKill);
+  lockOfDeadRun(t.site);
+  const backup = join(t.site, JOURNAL_DIR, 'release.json');
+  rmSync(backup);
+  linkSync(outside, backup);
+  assert.throws(() => recoverSite(t.site), (e) => e.code === EXIT.SITE && /is not a plain file/.test(e.message));
 });
 
 test('a preview folder that is a junction is never used for the journal', async () => {

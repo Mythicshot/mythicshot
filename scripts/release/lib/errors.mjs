@@ -11,6 +11,7 @@ export const EXIT = Object.freeze({
   VERSION: 7,
   SITE: 8,
   DIRTY: 9,
+  BUSY: 10,
 });
 
 /** A plain-words reason to stop. `code` is one of EXIT; the message is one line. */

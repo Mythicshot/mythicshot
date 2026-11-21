@@ -4,11 +4,12 @@
 // so a run that fails leaves no release at all, never an older one. Everything is written into
 // <out>.staging and moved to <out> only at the very end; on any failure staging is removed.
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { BUILD_ENV_STRIP, BUILD_ENV_STRIP_PREFIXES, checkCargoConfig, checkCleanCheckout, checkGitIndex, LS_FILES_ARGS, STATUS_ARGS } from './buildenv.mjs';
 import { requireConfig } from './config.mjs';
 import { EXIT, Refusal, firstUsefulLine } from './errors.mjs';
 import { describeInstaller, installerName, makeBuildInfo, makeFragment, sha256File } from './fragment.mjs';
+import { acquireLock } from './lock.mjs';
 import { childEnv, realRunner } from './runner.mjs';
 import { assertPlainFolder, removeTree } from './safefs.mjs';
 import { SIGNERS, signtoolPath } from './signers.mjs';
@@ -38,12 +39,28 @@ function removeOwn(path, what) {
   removeTree(path, what);
 }
 
+/** The lock that keeps two release runs off the same output folder: <out>.lock, beside it. */
+export const lockPathFor = (out) => `${out}.lock`;
+
 /**
  * Builds, signs, packages and verifies. Resolves to { out, version, commit, fragment, summary, file }.
+ * Only one run at a time may use an output folder: the lock <out>.lock holds its PID, and a second
+ * run refuses (EXIT.BUSY) while that PID is alive; a lock left by a run that is gone is taken over.
  * opts:  { repoRoot, out, configPath, env, wix }
  * deps:  { runner, log, findSigntool, now, tools }
  */
 export async function cutRelease(opts, deps = {}) {
+  const out = resolve(opts.out ?? join(resolve(opts.repoRoot), 'dist', 'release'));
+  mkdirSync(dirname(out), { recursive: true });
+  const lock = acquireLock(lockPathFor(out), { what: `the release folder ${out}` });
+  try {
+    return await cutReleaseLocked({ ...opts, out }, deps);
+  } finally {
+    lock.release();
+  }
+}
+
+async function cutReleaseLocked(opts, deps) {
   const env = opts.env ?? process.env;
   const runner = deps.runner ?? realRunner;
   const log = deps.log ?? ((line) => console.log(line));

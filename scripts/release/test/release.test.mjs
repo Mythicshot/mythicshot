@@ -5,10 +5,10 @@ import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { EXIT, Refusal } from '../lib/errors.mjs';
-import { cutRelease, MARKER } from '../lib/release.mjs';
+import { cutRelease, lockPathFor, MARKER } from '../lib/release.mjs';
 import { main } from '../release.mjs';
 import { RECORDED, SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
-import { assertNoSecrets, COMMIT, exists, FAKE_TOOLS, fakeRepo, fakeWorld, listTree, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, SECRET_THUMBPRINT, tempDir, treeText, writeConfig } from './helpers.mjs';
+import { assertNoSecrets, COMMIT, deadPid, exists, FAKE_TOOLS, fakeRepo, fakeWorld, listTree, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, SECRET_THUMBPRINT, tempDir, treeText, writeConfig } from './helpers.mjs';
 
 const BUILD_CHANGERS = { RUSTFLAGS: '-C debuginfo=2', CARGO_ENCODED_RUSTFLAGS: 'x', RUSTC_WRAPPER: 'evil.exe', CARGO_BUILD_RUSTC: 'evil.exe', CARGO_PROFILE_RELEASE_STRIP: 'false', CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: 'evil.exe', RUSTUP_TOOLCHAIN: 'nightly', RUSTUP_HOME: 'D:\\rustup', LINK: '/evil', _LINK_: '/evil', CL: '/evil', _CL_: '/evil', CC: 'evil.exe', CFLAGS: '-x', 'CC_x86_64-pc-windows-msvc': 'evil.exe', CXXFLAGS: '-x', AR: 'evil.exe', TARGET_CC: 'evil.exe', LIB: 'D:\\evil', INCLUDE: 'D:\\evil' };
 const GIT_CHANGERS = { GIT_DIR: 'D:\\other\\.git', GIT_WORK_TREE: 'D:\\other', GIT_INDEX_FILE: 'x' };
@@ -301,6 +301,33 @@ test('a refusal never names a tool path', async () => {
   let message = '';
   await cutRelease({ repoRoot: s2.repo, out: s2.out, configPath: s2.config.path, env: s2.env }, { runner: () => ({ code: 1, stdout: '', stderr: '' }), log: () => {}, tools: FAKE_TOOLS }).catch((e) => { message = e.message; });
   for (const path of Object.values(FAKE_TOOLS)) assert.ok(!message.includes(path), message);
+});
+
+test('a second release run on the same output folder refuses while the first one runs, and deletes nothing', async () => {
+  const s = setup();
+  await s.run();
+  // Another run (a live PID: this test process) holds the output folder.
+  writeFileSync(lockPathFor(s.out), JSON.stringify({ pid: process.pid, startedAt: '2026-11-21T02:00:00.000Z' }));
+  const second = fakeWorld();
+  await refuses(s.run(second), EXIT.BUSY, /Another run on the release folder .* is still going \(PID \d+, started 2026-11-21T02:00:00\.000Z\)/);
+  assert.deepEqual(second.calls, [], 'the second run ran nothing');
+  assert.ok(exists(join(s.out, 'release.json')), "the first run's release is untouched");
+  assert.ok(exists(lockPathFor(s.out)), 'the live lock stays');
+});
+
+test("a lock left by a release run that is gone is taken over, and the run completes and gives it back", async () => {
+  const s = setup();
+  mkdirSync(join(s.out, '..'), { recursive: true });
+  writeFileSync(lockPathFor(s.out), JSON.stringify({ pid: deadPid(), startedAt: '2026-11-21T02:00:00.000Z' }));
+  await s.run();
+  assert.ok(exists(join(s.out, 'release.json')));
+  assert.equal(exists(lockPathFor(s.out)), false);
+});
+
+test('a refused release run gives its lock back', async () => {
+  const s = setup({ cargoFails: true });
+  await refuses(s.run(), EXIT.BUILD, /release build failed/);
+  assert.equal(exists(lockPathFor(s.out)), false);
 });
 
 test('the command line: a missing configuration exits 3 with one "Refused:" line and leaves no output', async () => {

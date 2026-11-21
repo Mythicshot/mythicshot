@@ -40,6 +40,18 @@ test('inline tables that could hold a forbidden key are refused, in every spelli
   assert.deepEqual(forbiddenCargoKeys('net = { retry = 2 }\nalias = { b = "build" }\n'), []);
 });
 
+test("a multi-line string, which could hide keys from this check, is refused (''' and \"\"\")", () => {
+  const hiding = "note = '''\n[alias]\n'''\nrustflags = [\"-C\", \"link-arg=/evil\"]\n";
+  assert.ok(forbiddenCargoKeys(hiding).includes('a multi-line string'));
+  assert.ok(forbiddenCargoKeys('[alias]\nx = """\nlong\n"""\n').includes('a multi-line string'));
+  assert.deepEqual(forbiddenCargoKeys("[alias]\nb = 'build'\n"), []);
+});
+
+test('the build environment also loses what a Visual Studio Developer Prompt sets', () => {
+  const prompt = { PATH: 'p', VCINSTALLDIR: 'x', VSINSTALLDIR: 'x', VCToolsInstallDir: 'x', VCToolsVersion: 'x', VCToolsRedistDir: 'x', VCIDEInstallDir: 'x', WindowsSdkDir: 'x', WindowsSDKVersion: 'x', WindowsSdkBinPath: 'x', WindowsSdkVerBinPath: 'x', WindowsLibPath: 'x', UCRTVersion: 'x', UniversalCRTSdkDir: 'x', ExtensionSdkDir: 'x', DevEnvDir: 'x', VSCMD_ARG_TGT_ARCH: 'x', VSCMD_VER: 'x', __VSCMD_PREINIT_PATH: 'x', VS170COMNTOOLS: 'x', Platform: 'x64', PreferredToolArchitecture: 'x64', CommandPromptType: 'Native', FrameworkDir: 'x', FrameworkDir64: 'x', FrameworkVersion: 'x', FrameworkVersion64: 'x', Framework40Version: 'x', NETFXSDKDir: 'x', IFCPATH: 'x', EXTERNAL_INCLUDE: 'x', FSHARPINSTALLDIR: 'x', HTMLHelpDir: 'x', SystemRoot: 'C:\\Windows' };
+  assert.deepEqual(childEnv(prompt, { strip: BUILD_ENV_STRIP, stripPrefixes: BUILD_ENV_STRIP_PREFIXES }), { PATH: 'p', SystemRoot: 'C:\\Windows' });
+});
+
 test('include, which pulls in another configuration file, is refused', () => {
   assert.deepEqual(forbiddenCargoKeys('include = "../other.toml"\n'), ['include']);
   assert.deepEqual(forbiddenCargoKeys('include = { path = "x.toml" }\n'), ['include']);

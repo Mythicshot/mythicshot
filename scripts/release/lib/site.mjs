@@ -13,10 +13,11 @@
 // the site so moves are renames. The new installer is copied in as <name>.part and fully checked
 // BEFORE anything of the old release is moved. A run that is killed at any point leaves the site
 // either as it was or as it will be; the next run first finishes or undoes it from the journal.
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { requireConfig } from './config.mjs';
 import { EXIT, Refusal, firstUsefulLine } from './errors.mjs';
+import { acquireLock } from './lock.mjs';
 import { checkBuildInfo, checkFragment, installerName, OWNER_FIELDS, sha256File, siteRelease } from './fragment.mjs';
 import { childEnv, realRunner } from './runner.mjs';
 import { assertPlainFolder, removeTree } from './safefs.mjs';
@@ -58,87 +59,188 @@ export function readCurrentRelease(file) {
 
 // ---------------------------------------------------------------- the journal
 
+export const JOURNAL_FORMAT = 1;
+export const JOURNAL_STATES = ['started', 'committed', 'rolled-back'];
+const HAD_FIELDS = ['hadRelease', 'hadSameName', 'hadDist', 'hadDistBuilding', 'hadPreview'];
+export const LOCK_FILE = join('preview', '.mythicshot-release-journal.lock');
+
 const paths = (site) => {
   const dir = join(site, JOURNAL_DIR);
-  return { preview: join(site, 'preview'), dir, marker: join(dir, JOURNAL_MARKER), journal: join(dir, 'journal.json'), release: join(dir, 'release.json'), same: join(dir, 'same-name'), previous: join(dir, 'previous'), dist: join(dir, 'dist') };
+  return { preview: join(site, 'preview'), lock: join(site, LOCK_FILE), dir, marker: join(dir, JOURNAL_MARKER), journal: join(dir, 'journal.json'), release: join(dir, 'release.json'), same: join(dir, 'same-name'), previous: join(dir, 'previous'), dist: join(dir, 'dist') };
 };
 
-function writeJournal(p, journal) {
-  writeFileSync(`${p.journal}.tmp`, `${JSON.stringify(journal, null, 2)}\n`);
-  renameSync(`${p.journal}.tmp`, p.journal);
-}
-
-/** Removes the journal folder: backups first, the journal, then the marker, then the folder (and preview/ if this run made it). */
-function removeJournal(p, journal) {
-  if (existsSync(p.dist)) removeTree(p.dist, 'The saved dist folder');
-  for (const f of [p.release, p.same, p.previous, `${p.journal}.tmp`, p.journal, p.marker]) rmSync(f, { force: true });
-  if (existsSync(p.dir) && readdirSync(p.dir).length === 0) rmdirSync(p.dir);
-  if (journal && !journal.hadPreview && existsSync(p.preview) && readdirSync(p.preview).length === 0) rmdirSync(p.preview);
-}
-
-/** Puts the site back as the journal says it was. Safe to run again after being interrupted. */
-function rollback(site, p, journal) {
-  const target = join(site, journal.file);
-  rmSync(`${target}.part`, { force: true });
-  rmSync(join(site, 'release.json.tmp'), { force: true });
-  if (existsSync(p.same)) {
-    rmSync(target, { force: true });
-    renameSync(p.same, target);
-  } else if (!journal.hadSameName) {
-    rmSync(target, { force: true });
+/** The site's real path, the same however it is written (8.3 names, links, case). */
+export function realSite(site) {
+  try {
+    return realpathSync.native(site).replace(/^\\\\\?\\/, '').toLowerCase();
+  } catch {
+    return resolve(site).toLowerCase();
   }
-  if (journal.previousFile && existsSync(p.previous)) renameSync(p.previous, join(site, journal.previousFile));
-  if (existsSync(p.release)) copyFileSync(p.release, join(site, 'release.json'));
-  else if (!journal.hadRelease) rmSync(join(site, 'release.json'), { force: true });
+}
+
+/** Refuses a journal that is not exactly what this command writes, for this site. Nothing is rolled back from such a journal. */
+export function checkJournal(journal, site, where) {
+  const problem =
+    (!journal || typeof journal !== 'object' || Array.isArray(journal)) ? 'it is not an object'
+      : journal.format !== JOURNAL_FORMAT ? `its format is ${JSON.stringify(journal.format)}, not ${JOURNAL_FORMAT}`
+        : !JOURNAL_STATES.includes(journal.state) ? `its state ${JSON.stringify(journal.state)} is unknown`
+          : HAD_FIELDS.find((f) => typeof journal[f] !== 'boolean') ? `"${HAD_FIELDS.find((f) => typeof journal[f] !== 'boolean')}" is not true or false`
+            : !(typeof journal.file === 'string' && INSTALLER_NAME.test(journal.file)) ? '"file" is not an installer name'
+              : !(journal.previousFile === null || (typeof journal.previousFile === 'string' && INSTALLER_NAME.test(journal.previousFile))) ? '"previousFile" is not an installer name or null'
+                : typeof journal.site !== 'string' || journal.site !== realSite(site) ? 'it was written for another site folder'
+                  : null;
+  if (problem) {
+    throw new Refusal(EXIT.SITE, `An earlier run left a journal in ${where} that cannot be trusted (${problem}); nothing was changed. Restore the site from the backups there by hand, then remove the folder.`);
+  }
+  return journal;
+}
+
+function writeJournal(p, journal, step) {
+  writeFileSync(`${p.journal}.tmp`, `${JSON.stringify(journal, null, 2)}\n`);
+  step('journal-tmp-written');
+  renameSync(`${p.journal}.tmp`, p.journal);
+  step('journal-renamed');
+}
+
+/** A backup must be a plain file with no other name (not a link, not a hard link). */
+function plainBackup(path) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Refusal(EXIT.SITE, `The backup ${path} is not a plain file (a link or a file with another name); it is not used. Restore the site by hand.`);
+  }
+}
+
+/** Removes the journal folder: backups first, the journal, then the marker, then the folder. */
+function removeJournal(p, step) {
   if (existsSync(p.dist)) {
-    if (existsSync(join(site, 'dist'))) removeTree(join(site, 'dist'), "The site's dist folder");
+    removeTree(p.dist, 'The saved dist folder');
+    step('saved-dist-removed');
+  }
+  for (const f of [p.release, p.same, p.previous, `${p.journal}.tmp`, p.journal, p.marker]) {
+    if (!existsSync(f)) continue;
+    rmSync(f, { force: true });
+    step(`removed-${f.split(/[\\/]/).pop()}`);
+  }
+  if (existsSync(p.dir) && readdirSync(p.dir).length === 0) {
+    rmdirSync(p.dir);
+    step('journal-folder-removed');
+  }
+}
+
+/** Puts the site back as the journal says it was. Safe to run again after being interrupted at any step. */
+function rollback(site, p, journal, step) {
+  const target = join(site, journal.file);
+  const siteRelease = join(site, 'release.json');
+  for (const leftover of [`${target}.part`, join(site, 'release.json.tmp')]) {
+    if (existsSync(leftover)) {
+      rmSync(leftover, { force: true });
+      step(`removed-${leftover.split(/[\\/]/).pop()}`);
+    }
+  }
+  if (existsSync(p.same)) {
+    plainBackup(p.same);
+    rmSync(target, { force: true });
+    step('new-installer-removed');
+    renameSync(p.same, target);
+    step('same-name-restored');
+  } else if (!journal.hadSameName && existsSync(target)) {
+    rmSync(target, { force: true });
+    step('new-installer-removed');
+  }
+  if (journal.previousFile && existsSync(p.previous)) {
+    plainBackup(p.previous);
+    renameSync(p.previous, join(site, journal.previousFile));
+    step('previous-restored');
+  }
+  if (existsSync(p.release)) {
+    plainBackup(p.release);
+    // The destination is removed first, so a link at its place is replaced, never written through.
+    rmSync(siteRelease, { force: true });
+    step('release-removed');
+    copyFileSync(p.release, siteRelease, constants.COPYFILE_EXCL);
+    step('release-restored');
+  } else if (!journal.hadRelease && existsSync(siteRelease)) {
+    rmSync(siteRelease, { force: true });
+    step('release-removed');
+  }
+  if (existsSync(p.dist)) {
+    assertPlainFolder(p.dist, 'The saved dist folder');
+    if (existsSync(join(site, 'dist'))) {
+      removeTree(join(site, 'dist'), "The site's dist folder");
+      step('new-dist-removed');
+    }
     renameSync(p.dist, join(site, 'dist'));
+    step('dist-restored');
   } else if (!journal.hadDist && existsSync(join(site, 'dist'))) {
     removeTree(join(site, 'dist'), "The site's dist folder");
+    step('new-dist-removed');
   }
-  if (!journal.hadDistBuilding && existsSync(join(site, 'dist.building'))) removeTree(join(site, 'dist.building'), "The site's dist.building folder");
-  writeJournal(p, { ...journal, state: 'rolled-back' });
-  removeJournal(p, journal);
+  if (!journal.hadDistBuilding && existsSync(join(site, 'dist.building'))) {
+    removeTree(join(site, 'dist.building'), "The site's dist.building folder");
+    step('dist-building-removed');
+  }
+  writeJournal(p, { ...journal, state: 'rolled-back' }, step);
+  removeJournal(p, step);
+}
+
+/** Removes preview/ when the run that made it is done with it and it is empty. */
+function tidyPreview(p, hadPreview) {
+  if (hadPreview === false && existsSync(p.preview) && readdirSync(p.preview).length === 0) rmdirSync(p.preview);
 }
 
 /**
  * Finishes or undoes an interrupted earlier run from its journal, or refuses in one line.
+ * Takes the site's lock first (refusing while another run holds it) unless `lockHeld`.
  * Returns what it did: null, 'cleaned', 'finished' or 'rolled-back'.
  */
-export function recoverSite(site, log = () => {}) {
-  const p = paths(resolve(site));
-  if (!existsSync(p.dir)) return null;
+export function recoverSite(site, log = () => {}, { afterStep = () => {}, lockHeld = false } = {}) {
+  site = resolve(site);
+  const p = paths(site);
+  if (!existsSync(p.dir) && !existsSync(p.lock)) return null;
   assertPlainFolder(p.preview, "The site's preview folder");
-  assertPlainFolder(p.dir, 'The release journal folder');
-  if (!existsSync(p.marker)) {
-    if (readdirSync(p.dir).length === 0) {
-      rmdirSync(p.dir);
+  const lock = lockHeld ? null : acquireLock(p.lock, { what: 'the site', extra: { hadPreview: true }, inherit: ['hadPreview'] });
+  let hadPreview = typeof lock?.data.hadPreview === 'boolean' ? lock.data.hadPreview : true;
+  let killed = false;
+  try {
+    if (!existsSync(p.dir)) return lock?.tookOver ? 'cleaned' : null;
+    assertPlainFolder(p.dir, 'The release journal folder');
+    if (!existsSync(p.marker)) {
+      if (readdirSync(p.dir).length === 0) {
+        rmdirSync(p.dir);
+        return 'cleaned';
+      }
+      throw new Refusal(EXIT.SITE, `${p.dir} exists but was not made by this command; look at it and remove it by hand.`);
+    }
+    if (!existsSync(p.journal)) {
+      // Started but stopped before writing the journal: nothing in the site was changed yet.
+      removeJournal(p, afterStep);
       return 'cleaned';
     }
-    throw new Refusal(EXIT.SITE, `${p.dir} exists but was not made by this command; look at it and remove it by hand.`);
+    let journal;
+    try {
+      journal = JSON.parse(readFileSync(p.journal, 'utf8'));
+    } catch {
+      journal = null;
+    }
+    checkJournal(journal, site, p.dir);
+    hadPreview = journal.hadPreview;
+    if (journal.state === 'committed' || journal.state === 'rolled-back') {
+      removeJournal(p, afterStep);
+      log('An earlier run had finished; its leftover journal was removed.');
+      return 'finished';
+    }
+    rollback(site, p, journal, afterStep);
+    log(`An earlier run was interrupted; the site was put back as it was before it (${journal.file} not added).`);
+    return 'rolled-back';
+  } catch (error) {
+    killed = Boolean(error?.simulatedKill);
+    throw error;
+  } finally {
+    if (lock && !killed) {
+      lock.release();
+      tidyPreview(p, hadPreview);
+    }
   }
-  if (!existsSync(p.journal)) {
-    // Started but stopped before writing the journal: nothing in the site was changed yet.
-    removeJournal(p, null);
-    return 'cleaned';
-  }
-  let journal;
-  try {
-    journal = JSON.parse(readFileSync(p.journal, 'utf8'));
-  } catch {
-    journal = null;
-  }
-  if (!journal || typeof journal.file !== 'string' || !INSTALLER_NAME.test(journal.file) || (journal.previousFile && !INSTALLER_NAME.test(journal.previousFile))) {
-    throw new Refusal(EXIT.SITE, `An earlier run left a journal in ${p.dir} that cannot be read; restore the site from the backups there by hand, then remove the folder.`);
-  }
-  if (journal.state === 'committed' || journal.state === 'rolled-back') {
-    removeJournal(p, journal);
-    log('An earlier run had finished; its leftover journal was removed.');
-    return 'finished';
-  }
-  rollback(resolve(site), p, journal);
-  log(`An earlier run was interrupted; the site was put back as it was before it (${journal.file} not added).`);
-  return 'rolled-back';
 }
 
 // ---------------------------------------------------------------- the command
@@ -195,117 +297,146 @@ export async function releaseToSite(opts, deps = {}) {
   if (!pkg || pkg.name !== 'mythicshot-site' || !pkg.scripts?.check || !pkg.scripts?.package || !existsSync(join(site, 'scripts', 'package.mjs'))) {
     throw new Refusal(EXIT.SITE, `${site} is not the front page checkout (no package.json named mythicshot-site with "check" and "package").`);
   }
-  recoverSite(site, log);
-
-  const runSiteSteps = () => {
-    for (const step of ['check', 'package']) {
-      log(`Running the site's own npm run ${step}...`);
-      const result = runner(tools.npm, ['run', step], { cwd: site, shell: true, tag: `site-${step}`, env: baseEnv });
-      afterStep(`site-${step}`);
-      if (result.code !== 0) {
-        throw new Refusal(EXIT.SITE, `The site's npm run ${step} refused the release (exit ${result.code}): ${firstUsefulLine(`${result.stderr}\n${result.stdout}`, redact, /problem|refus|must|not |error/i)}`);
-      }
-    }
-  };
-
-  const siteReleaseFile = join(site, 'release.json');
-  const target = join(site, release.file);
-  const current = readCurrentRelease(siteReleaseFile);
-  if (current) {
-    const order = compareVersions(release.version, current.version);
-    if (order < 0) throw new Refusal(EXIT.SITE, `The site already offers version ${current.version}, newer than this release (${release.version}). An older release is never put on the site.`);
-    if (order === 0) {
-      if (current.sha256 !== release.sha256 || current.file !== release.file || current.size !== release.size) {
-        throw new Refusal(EXIT.SITE, `The site already offers version ${release.version} with a different installer. A version is never replaced by another build of it.`);
-      }
-      if (existsSync(target) && (await sha256File(target)) === release.sha256) {
-        // No file changes, but the installer the site offers must pass every check, and dist/ is rebuilt.
-        check(target);
-        const offered = msiVersion(target);
-        if (offered !== release.version && offered !== `${release.version}.0`) {
-          throw new Refusal(EXIT.VERSION, `${release.file} in the site says version ${offered}, but release.json says ${release.version}.`);
-        }
-        if ((await sha256File(target)) !== release.sha256) throw new Refusal(EXIT.SITE, `${release.file} in the site changed while it was checked.`);
-        runSiteSteps();
-        log(`The site already offers exactly this release (${release.file}, ${release.version}); no file was changed, and its check and package steps passed. Nothing was published.`);
-        return { site, file: release.file, version: release.version, unchanged: true };
-      }
-    }
-  }
-  // The installer the site's current release.json names is the previous release: it is replaced.
-  const previousFile = current && current.file !== release.file && existsSync(join(site, current.file)) ? current.file : null;
-  const others = readdirSync(site).filter((name) => /\.(exe|msi|part|tmp)$/i.test(name) && name !== release.file && name !== previousFile);
-  if (others.length) {
-    throw new Refusal(EXIT.SITE, `The site already holds another installer or leftover (${others.join(', ')}) that its release.json does not name; the site's check refuses large files other than the one in release.json. Remove it first.`);
-  }
-
-  // Changing the site: journal first, then the new installer checked as .part, then the swap.
   const p = paths(site);
   assertPlainFolder(p.preview, "The site's preview folder");
-  const journal = {
-    state: 'started',
-    file: release.file,
-    previousFile,
-    hadRelease: existsSync(siteReleaseFile),
-    hadSameName: existsSync(target),
-    hadDist: existsSync(join(site, 'dist')),
-    hadDistBuilding: existsSync(join(site, 'dist.building')),
-    hadPreview: existsSync(p.preview),
-  };
-  const part = `${target}.part`;
-  mkdirSync(p.dir, { recursive: true });
-  afterStep('journal-folder');
-  writeFileSync(p.marker, 'Made by scripts/release/release.mjs --to-site. While it is here, a run was interrupted: the next run puts the site back.\n');
-  afterStep('journal-marker');
+  const previewExisted = existsSync(p.preview);
+  mkdirSync(p.preview, { recursive: true });
+  let lock;
   try {
-    writeJournal(p, journal);
-    afterStep('journal-written');
-    copyFileSync(source, part);
-    afterStep('part-copied');
-    if ((await sha256File(part)) !== release.sha256) throw new Refusal(EXIT.SITE, `The copy of ${release.file} in the site does not match release.json.`);
-    check(part);
-    const productVersion = msiVersion(part);
-    if (productVersion !== release.version && productVersion !== `${release.version}.0`) {
-      throw new Refusal(EXIT.VERSION, `${release.file} says version ${productVersion}, but release.json says ${release.version}.`);
-    }
-    if ((await sha256File(part)) !== release.sha256) throw new Refusal(EXIT.SITE, `The copy of ${release.file} changed while it was checked.`);
-
-    if (journal.hadRelease) {
-      copyFileSync(siteReleaseFile, p.release);
-      afterStep('release-saved');
-    }
-    if (journal.hadSameName) {
-      renameSync(target, p.same);
-      afterStep('same-name-saved');
-    }
-    if (previousFile) {
-      renameSync(join(site, previousFile), p.previous);
-      afterStep('previous-saved');
-    }
-    writeFileSync(`${siteReleaseFile}.tmp`, siteRelease(release, current));
-    afterStep('release-written');
-    renameSync(`${siteReleaseFile}.tmp`, siteReleaseFile);
-    afterStep('release-renamed');
-    renameSync(part, target);
-    afterStep('installer-renamed');
-    log(`Copied ${release.file} and release.json into ${site}.`);
-    if (journal.hadDist) {
-      // The last good package is kept aside until the new one is complete.
-      assertPlainFolder(join(site, 'dist'), "The site's dist folder");
-      renameSync(join(site, 'dist'), p.dist);
-      afterStep('dist-saved');
-    }
-    runSiteSteps();
-    writeJournal(p, { ...journal, state: 'committed' });
-    afterStep('committed');
+    lock = acquireLock(p.lock, { what: 'the site', extra: { hadPreview: previewExisted }, inherit: ['hadPreview'] });
   } catch (error) {
-    if (error?.simulatedKill) throw error;
-    rollback(site, p, journal);
-    if (error instanceof Refusal) throw new Refusal(error.code, `${error.message} The site's earlier installer, release.json and dist/ are back.`);
+    tidyPreview(p, previewExisted);
     throw error;
   }
-  removeJournal(p, journal);
-  if (previousFile) log(`The previous installer ${previousFile} was removed from the site; release.json no longer names it.`);
-  log(`The site accepts Mythicshot ${release.version}: its check passed and dist/ holds download/${release.file}. Nothing was published; publishing is a separate step.`);
-  return { site, file: release.file, version: release.version, unchanged: false };
+  // A stale lock's run made preview/ or not; that run's answer is inherited and counts.
+  const hadPreview = typeof lock.data.hadPreview === 'boolean' ? lock.data.hadPreview : previewExisted;
+  afterStep('lock-taken');
+  let killed = false;
+  try {
+    return await changeSite();
+  } catch (error) {
+    killed = Boolean(error?.simulatedKill);
+    throw error;
+  } finally {
+    if (!killed) {
+      lock.release();
+      tidyPreview(p, hadPreview);
+    }
+  }
+
+  async function changeSite() {
+    recoverSite(site, log, { lockHeld: true });
+
+    const runSiteSteps = () => {
+      for (const step of ['check', 'package']) {
+        log(`Running the site's own npm run ${step}...`);
+        const result = runner(tools.npm, ['run', step], { cwd: site, shell: true, tag: `site-${step}`, env: baseEnv });
+        afterStep(`site-${step}`);
+        if (result.code !== 0) {
+          throw new Refusal(EXIT.SITE, `The site's npm run ${step} refused the release (exit ${result.code}): ${firstUsefulLine(`${result.stderr}\n${result.stdout}`, redact, /problem|refus|must|not |error/i)}`);
+        }
+      }
+    };
+
+    const siteReleaseFile = join(site, 'release.json');
+    const target = join(site, release.file);
+    const current = readCurrentRelease(siteReleaseFile);
+    if (current) {
+      const order = compareVersions(release.version, current.version);
+      if (order < 0) throw new Refusal(EXIT.SITE, `The site already offers version ${current.version}, newer than this release (${release.version}). An older release is never put on the site.`);
+      if (order === 0) {
+        if (current.sha256 !== release.sha256 || current.file !== release.file || current.size !== release.size) {
+          throw new Refusal(EXIT.SITE, `The site already offers version ${release.version} with a different installer. A version is never replaced by another build of it.`);
+        }
+        if (existsSync(target) && (await sha256File(target)) === release.sha256) {
+          // No file changes, but the installer the site offers must pass every check, and dist/ is rebuilt.
+          check(target);
+          const offered = msiVersion(target);
+          if (offered !== release.version && offered !== `${release.version}.0`) {
+            throw new Refusal(EXIT.VERSION, `${release.file} in the site says version ${offered}, but release.json says ${release.version}.`);
+          }
+          if ((await sha256File(target)) !== release.sha256) throw new Refusal(EXIT.SITE, `${release.file} in the site changed while it was checked.`);
+          runSiteSteps();
+          log(`The site already offers exactly this release (${release.file}, ${release.version}); no file was changed, and its check and package steps passed. Nothing was published.`);
+          return { site, file: release.file, version: release.version, unchanged: true };
+        }
+      }
+    }
+    // The installer the site's current release.json names is the previous release: it is replaced.
+    const previousFile = current && current.file !== release.file && existsSync(join(site, current.file)) ? current.file : null;
+    const others = readdirSync(site).filter((name) => /\.(exe|msi|part|tmp)$/i.test(name) && name !== release.file && name !== previousFile);
+    if (others.length) {
+      throw new Refusal(EXIT.SITE, `The site already holds another installer or leftover (${others.join(', ')}) that its release.json does not name; the site's check refuses large files other than the one in release.json. Remove it first.`);
+    }
+
+    // Changing the site: journal first, then the new installer checked as .part, then the swap.
+    const journal = {
+      format: JOURNAL_FORMAT,
+      site: realSite(site),
+      state: 'started',
+      file: release.file,
+      previousFile,
+      hadRelease: existsSync(siteReleaseFile),
+      hadSameName: existsSync(target),
+      hadDist: existsSync(join(site, 'dist')),
+      hadDistBuilding: existsSync(join(site, 'dist.building')),
+      hadPreview,
+    };
+    const part = `${target}.part`;
+    mkdirSync(p.dir, { recursive: true });
+    afterStep('journal-folder');
+    writeFileSync(p.marker, 'Made by scripts/release/release.mjs --to-site. While it is here, a run was interrupted: the next run puts the site back.\n');
+    afterStep('journal-marker');
+    try {
+      writeJournal(p, journal, () => {});
+      afterStep('journal-written');
+      copyFileSync(source, part);
+      afterStep('part-copied');
+      if ((await sha256File(part)) !== release.sha256) throw new Refusal(EXIT.SITE, `The copy of ${release.file} in the site does not match release.json.`);
+      check(part);
+      const productVersion = msiVersion(part);
+      if (productVersion !== release.version && productVersion !== `${release.version}.0`) {
+        throw new Refusal(EXIT.VERSION, `${release.file} says version ${productVersion}, but release.json says ${release.version}.`);
+      }
+      if ((await sha256File(part)) !== release.sha256) throw new Refusal(EXIT.SITE, `The copy of ${release.file} changed while it was checked.`);
+
+      if (journal.hadRelease) {
+        copyFileSync(siteReleaseFile, p.release);
+        afterStep('release-saved');
+      }
+      if (journal.hadSameName) {
+        renameSync(target, p.same);
+        afterStep('same-name-saved');
+      }
+      if (previousFile) {
+        renameSync(join(site, previousFile), p.previous);
+        afterStep('previous-saved');
+      }
+      writeFileSync(`${siteReleaseFile}.tmp`, siteRelease(release, current));
+      afterStep('release-written');
+      renameSync(`${siteReleaseFile}.tmp`, siteReleaseFile);
+      afterStep('release-renamed');
+      renameSync(part, target);
+      afterStep('installer-renamed');
+      log(`Copied ${release.file} and release.json into ${site}.`);
+      if (journal.hadDist) {
+        // The last good package is kept aside until the new one is complete.
+        assertPlainFolder(join(site, 'dist'), "The site's dist folder");
+        renameSync(join(site, 'dist'), p.dist);
+        afterStep('dist-saved');
+      }
+      runSiteSteps();
+      writeJournal(p, { ...journal, state: 'committed' }, () => {});
+      afterStep('committed');
+    } catch (error) {
+      if (error?.simulatedKill) throw error;
+      rollback(site, p, journal, () => {});
+      if (error instanceof Refusal) throw new Refusal(error.code, `${error.message} The site's earlier installer, release.json and dist/ are back.`);
+      throw error;
+    }
+    removeJournal(p, () => {});
+    if (previousFile) log(`The previous installer ${previousFile} was removed from the site; release.json no longer names it.`);
+    log(`The site accepts Mythicshot ${release.version}: its check passed and dist/ holds download/${release.file}. Nothing was published; publishing is a separate step.`);
+    return { site, file: release.file, version: release.version, unchanged: false };
+  }
 }

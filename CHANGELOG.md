@@ -16,6 +16,10 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 - `--to-site` survives being killed: it writes a journal under the site's `preview/` folder, checks the new installer before moving anything old, keeps the old files and `dist/` aside, and the next run puts an interrupted site back. A site `release.json` that is neither `{}` nor a valid release is refused, and the same version is accepted only with the same file, size and checksum; then the site's check and package steps still run.
 - The build also loses the Visual Studio and C compiler variables (`LINK`, `CL`, `CC`, `CFLAGS`, `LIB`, `INCLUDE` and more) and `RUSTUP_HOME`; inline tables and `include` in cargo configuration are refused; git runs without `GIT_*` variables, and files git is told to ignore changes in are refused.
 - Tools are run by absolute path only, never from the checkout, the site or the current folder; the signature check also refuses a certificate chain with any problem other than a since-expired certificate; and a short secret after `/p`, `/kc` or `/csp` is refused.
+- Only one run at a time: a release run locks its output folder and `--to-site` locks the site; a second run refuses (exit 10) while the first one's process is alive, and a lock left by a killed run is taken over.
+- `--to-site` trusts a journal only when it is exactly its own (format 1, known state, every field, this site's path), and otherwise leaves everything for a person. Putting the site back never writes through a link, and is itself safe to interrupt.
+- A cargo configuration with a multi-line string is refused; a release run from a Visual Studio Developer Prompt builds exactly like one from a plain shell; tools are compared by their real paths; npm's shell is always System32's cmd.exe.
+- docs/release.md says plainly that revocation is not checked by this command.
 
 ## 0.2.14 (2026-11-20)
 

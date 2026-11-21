@@ -23,6 +23,9 @@ export const BUILD_ENV_STRIP = [
   'RUSTFLAGS', 'RUSTDOCFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTC_BOOTSTRAP', 'RUSTC_LINKER',
   'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'CARGO_TARGET_DIR', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN', 'RUSTUP_HOME',
   'LINK', '_LINK_', 'CL', '_CL_', 'LIB', 'LIBPATH', 'INCLUDE', 'RC', 'NASM', 'LDFLAGS', 'CPPFLAGS',
+  // What a Visual Studio Developer Prompt sets, so a release run from one behaves like one from a plain shell
+  // (rustc then finds Visual Studio itself instead of trusting these).
+  'Platform', 'PreferredToolArchitecture', 'CommandPromptType', 'NETFXSDKDir', 'IFCPATH', 'EXTERNAL_INCLUDE', 'FSHARPINSTALLDIR', 'HTMLHelpDir',
 ];
 // ...and by prefix (which also covers the cc crate's per-target spellings, such as CC_x86_64-pc-windows-msvc,
 // CFLAGS_x86_64_pc_windows_msvc, TARGET_CC and HOST_CFLAGS).
@@ -30,6 +33,10 @@ export const BUILD_ENV_STRIP_PREFIXES = [
   'CARGO_BUILD_', 'CARGO_TARGET_', 'CARGO_PROFILE_', 'CARGO_UNSTABLE_', 'CARGO_REGISTRIES_', 'CARGO_SOURCE_',
   'CC', 'CFLAGS', 'CXX', 'CXXFLAGS', 'AR', 'RANLIB', 'TARGET_', 'HOST_', 'CRATE_CC_', 'RC_', 'NASM_',
   'BINDGEN_', 'LIBCLANG_', 'CLANG_', 'CMAKE', 'VCPKG',
+  // Developer Prompt: VCINSTALLDIR, VSINSTALLDIR, VCToolsInstallDir, VCToolsVersion, VCIDEInstallDir, VS170COMNTOOLS,
+  // VSCMD_*, __VSCMD_*, WindowsSdkDir, WindowsSDKVersion, WindowsSdkBinPath, WindowsLibPath, UCRTVersion,
+  // UniversalCRTSdkDir, ExtensionSdkDir, DevEnvDir, FrameworkDir*, FrameworkVersion*, Framework40Version.
+  'VC', 'VS', '__VSCMD', 'WindowsSdk', 'WindowsSDK', 'WindowsLib', 'UCRT', 'UniversalCRT', 'ExtensionSdk', 'DevEnv', 'Framework',
 ];
 
 // Keys of a cargo configuration file that can change what is built or with which tools.
@@ -54,6 +61,9 @@ const dotted = (text) => text.split('.').map(unquote).join('.');
 /** The keys of a cargo configuration file (as section.key) that may change the build. */
 export function forbiddenCargoKeys(toml) {
   const found = [];
+  // A multi-line string can hide lines that look like headers or keys from this line-by-line reading,
+  // and can make real keys after it look like string content. Such a file is refused whole.
+  if (/'''|"""/.test(String(toml))) found.push('a multi-line string');
   let section = '';
   for (const raw of String(toml).split(/\r?\n/)) {
     const line = raw.replace(/^\s+/, '');

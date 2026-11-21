@@ -7,6 +7,12 @@
 // gets this process's environment. `tag` names the step ("cargo-build", "sign", "verify", ...)
 // so a fake can answer by step. `shell` is used only for fixed command lines such as "npm run check".
 import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+
+/** The only shell ever used: %SystemRoot%\System32\cmd.exe (never ComSpec). */
+export function systemShell(env = process.env) {
+  return join(env.SystemRoot ?? env.SYSTEMROOT ?? process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe');
+}
 
 export function realRunner(command, args = [], options = {}) {
   const spawnOptions = {
@@ -16,9 +22,18 @@ export function realRunner(command, args = [], options = {}) {
     windowsHide: true,
     maxBuffer: 64 * 1024 * 1024,
   };
-  const result = options.shell
-    ? spawnSync([/\s/.test(command) ? `"${command}"` : command, ...args].join(' '), { ...spawnOptions, shell: true })
-    : spawnSync(command, args, spawnOptions);
+  let result;
+  if (options.shell) {
+    // Only for fixed command lines (npm run check). cmd would read " as quoting and % as a variable,
+    // so a command line holding either is never run; the command is always quoted, and the shell is
+    // always cmd.exe from System32, never whatever ComSpec names.
+    if ([command, ...args].some((part) => /["%]/.test(String(part)))) {
+      return { code: -1, stdout: '', stderr: `${command} was not run through the shell: it holds " or %.` };
+    }
+    result = spawnSync([`"${command}"`, ...args].join(' '), { ...spawnOptions, shell: systemShell(spawnOptions.env) });
+  } else {
+    result = spawnSync(command, args, spawnOptions);
+  }
   if (result.error) return { code: -1, stdout: '', stderr: `${command} could not be started (${result.error.code ?? result.error.message})` };
   return { code: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }

@@ -1,6 +1,7 @@
 // Shared test helpers: temporary folders, a signing configuration, a fake checkout and a
 // fake runner that answers every external step from recorded outputs.
 import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RECORDED, RECORDED_EXPECT, SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
@@ -196,3 +197,8 @@ export const exists = (p) => {
     return false;
   }
 };
+
+/** The PID of a process that has already ended (a stand-in for a killed run). */
+export function deadPid() {
+  return spawnSync(process.execPath, ['-e', '0']).pid;
+}
