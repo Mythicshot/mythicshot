@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.15 (2026-11-21)
+
+- The window that says an image or a clip is online is roomier and shows the link on one row with "Copy link" joined to it on the right. A link too long for the row is cut short with "…"; the whole link shows when you point at it.
+- "Copy link" says "Copied", in green with a tick, for 2 seconds after a copy that worked, also after the copy that happens when publishing ends. A copy that failed leaves it at "Copy link" and says "Could not copy the link. Select it and copy it yourself." as before. The separate "Link copied" line is gone.
+- Under the link, "Open in browser" (was "Open") and "Done" share the row, equally wide. Enter and Escape still close the window.
+- Every other stage of "Publish to" (the form, the upload, a refusal, cancelling) keeps its words and is drawn as wide as the online stage, so the window no longer changes size between them.
+- The screen after publishing a tour shows its link the same way, with "Copy" saying "Copied" for 2 seconds, and "Open in browser", "Try again" when offered, and "Done" side by side below it.
+
 ## 0.2.14 (2026-11-20)
 
 - Sign in no longer asks the site again at once after an answer was lost: it waits one interval, as the site expects. When the code is gone after a lost answer, the window says "The site's answer was lost on the way. If this computer shows on the Connections page of your dashboard, disconnect it there, then sign in again."
