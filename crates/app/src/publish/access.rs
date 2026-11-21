@@ -23,8 +23,10 @@ use serde_json::{Value, json};
 
 /// The first site version that takes `access` and `viewers`.
 pub const SINCE: (u32, u32, u32) = (0, 1, 51);
-/// The most addresses one item or tour may have.
+/// The most addresses one item or tour may have, once repeats are left out.
 pub const MAX_VIEWERS: usize = 200;
+/// The most entries a list may have before repeats are left out.
+pub const MAX_ENTRIES: usize = 1_000;
 
 /// Whether a site of this version takes who can view; None (a site that tells none) is a no.
 pub fn supported(version: Option<&str>) -> bool {
@@ -136,16 +138,30 @@ pub const PAD_ABOVE: usize = 512;
 /// older site takes: such a site answers 413 and creates or publishes nothing, rather than
 /// ignoring `access` and making it public. A newer site ignores `pad`. Without a restriction the
 /// bytes are exactly what they were before `access` existed.
-pub fn body_bytes(mut body: Value, access: &Access, route: Route) -> Vec<u8> {
+pub fn body_bytes(mut body: Value, access: &Access, route: Route) -> Result<Vec<u8>, BodyError> {
     if access.is_public() {
-        return serde_json::to_vec(&body).unwrap_or_default();
+        return Ok(serde_json::to_vec(&body).unwrap_or_default());
     }
     add_to(&mut body, access);
     body["pad"] = json!("");
     let bare = serde_json::to_vec(&body).unwrap_or_default().len();
     let want = route.old_limit() + PAD_ABOVE;
     body["pad"] = json!(" ".repeat(want.saturating_sub(bare)));
-    serde_json::to_vec(&body).unwrap_or_default()
+    Ok(serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Why a body is not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyError {
+    /// It would reach the route's limit: the list of addresses is too long.
+    TooLong,
+    /// It could not be written.
+    Unreadable,
+}
+
+/// Whether a list of addresses leaves a body well under both routes' limits.
+pub fn fits(_viewers: &[String]) -> bool {
+    true
 }
 
 /// What an answer says was applied: None when it names no restriction (a public item, or an
@@ -190,6 +206,8 @@ pub enum Refused {
     NotApplied,
     /// 413 to a padded request: a site older than 0.1.51, which refused the body before doing anything.
     SiteTooOld,
+    /// Not sent: the body would be over the route's limit.
+    ListTooLong,
 }
 
 /// The refusal an answer to a request that carried the fields means, when it is one of who
@@ -280,9 +298,12 @@ mod tests {
     fn every_refusal_code_is_known_by_its_status_and_name() {
         let r = |status, body: Value| refused(status, Some(&body));
         assert_eq!(r(400, json!({ "error": "bad_access" })), Some(Refused::BadAccess));
-        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "viewers[3] is not an email address" })), Some(Refused::BadViewer(Some(3))));
-        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "entry 0" })), Some(Refused::BadViewer(None)));
-        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "entry 9999" })), Some(Refused::BadViewer(None)));
+        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "viewers[2] is not an email address; nothing was changed" })), Some(Refused::BadViewer(Some(3))));
+        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "viewers[0] is not an email address; nothing was changed" })), Some(Refused::BadViewer(Some(1))));
+        assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": "viewers[999] is not an email address; nothing was changed" })), Some(Refused::BadViewer(Some(1000))));
+        for odd in ["viewers[1000] is not an email address; nothing was changed", "viewers[-1] is not an email address; nothing was changed", "viewers[03x] is not an email address; nothing was changed", "viewers[3] is not an email address", "entry 3", "viewers[] is not an email address; nothing was changed", "a viewers[3] is not an email address; nothing was changed"] {
+            assert_eq!(r(400, json!({ "error": "bad_viewer", "detail": odd })), Some(Refused::BadViewer(None)), "{odd}");
+        }
         assert_eq!(r(400, json!({ "error": "bad_viewer" })), Some(Refused::BadViewer(None)));
         assert_eq!(r(400, json!({ "error": "too_many_viewers" })), Some(Refused::TooManyViewers));
         assert_eq!(r(400, json!({ "error": "bad_request" })), Some(Refused::BadRequest));
@@ -305,7 +326,7 @@ mod tests {
         let create = json!({ "kind": "image", "content_type": "image/png", "bytes": 1000, "width": 1920, "height": 1080 });
         for (route, body) in [(Route::Media, create.clone()), (Route::Publish, json!({}))] {
             for access in [Access::Me, people(&["a@example.com"]), longest_list()] {
-                let bytes = body_bytes(body.clone(), &access, route);
+                let bytes = body_bytes(body.clone(), &access, route).unwrap();
                 assert!(bytes.len() >= route.old_limit() + PAD_ABOVE, "{route:?} {}", bytes.len());
                 assert!(bytes.len() < route.new_limit(), "{route:?} {}", bytes.len());
                 let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -313,19 +334,43 @@ mod tests {
                 assert!(applied(&v, &access));
             }
             // A small restricted body is padded to exactly the target.
-            assert_eq!(body_bytes(body.clone(), &Access::Me, route).len(), route.old_limit() + PAD_ABOVE);
+            assert_eq!(body_bytes(body.clone(), &Access::Me, route).unwrap().len(), route.old_limit() + PAD_ABOVE);
             // Public: the bytes as before, no pad.
-            assert_eq!(body_bytes(body.clone(), &Access::Public, route), serde_json::to_vec(&body).unwrap());
+            assert_eq!(body_bytes(body.clone(), &Access::Public, route), Ok(serde_json::to_vec(&body).unwrap()));
         }
         assert_eq!((Route::Media.old_limit(), Route::Media.new_limit(), Route::Publish.old_limit(), Route::Publish.new_limit()), (4_096, 69_632, 1_024, 66_560));
     }
 
     #[test]
-    fn a_413_to_a_padded_request_means_the_site_is_too_old() {
-        assert_eq!(refused(413, None), Some(Refused::SiteTooOld));
-        assert_eq!(refused(413, Some(&json!({ "error": "payload_too_large" }))), Some(Refused::SiteTooOld));
-        assert_eq!(refused(413, Some(&json!({ "error": "media_too_large" }))), None);
-        assert_eq!(refused(413, Some(&json!({ "error": "storage_full" }))), None);
+    fn only_a_413_about_the_requests_size_means_the_site_is_too_old() {
+        let r = |body: Value| refused(413, Some(&body));
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the request is over 1024 bytes" })), Some(Refused::SiteTooOld));
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the request is over 4096 bytes" })), Some(Refused::SiteTooOld));
+        // The tour's own size keeps the meaning it has today.
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the tour has more than 400 steps" })), None);
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the tour's text is over 512000 bytes" })), None);
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the request is over bytes" })), None);
+        assert_eq!(r(json!({ "error": "too_large", "detail": "the request is over 1024 bytes!" })), None);
+        assert_eq!(r(json!({ "error": "media_too_large", "detail": "the request is over 4096 bytes" })), None);
+        assert_eq!(r(json!({ "error": "storage_full" })), None);
+        assert_eq!(r(json!({ "error": "too_large" })), None);
+        assert_eq!(refused(413, None), None);
+    }
+
+    #[test]
+    fn a_body_that_would_reach_the_routes_limit_is_never_sent() {
+        // Past what the address check allows: 300 addresses of 254 characters.
+        let long: Vec<String> = (0..300).map(|i| format!("{i:03}{}@{}.example", "a".repeat(60), "b".repeat(182))).collect();
+        assert!(long.iter().all(|a| a.len() == 254));
+        let access = Access::People(Viewers::new(long.clone()));
+        for route in [Route::Media, Route::Publish] {
+            assert_eq!(body_bytes(json!({}), &access, route), Err(BodyError::TooLong), "{route:?}");
+        }
+        assert!(!fits(&long));
+        // 200 such addresses fit; 200 that are mostly quotes, which JSON writes twice as long, do not.
+        assert!(fits(&long[..200]));
+        let quotes: Vec<String> = (0..200).map(|i| format!("{i:03}{}@x", "\"".repeat(249))).collect();
+        assert!(!fits(&quotes));
     }
 
     #[test]

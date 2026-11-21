@@ -433,7 +433,7 @@ fn publish_job_with(
     save: &SaveFn<'_>,
     limit: &Limit<'_>,
 ) -> Result<PublishDone, String> {
-    publish_job_full(state, title, tour_title, server, token, target, publish_now, &Access::Public, keeping, worker, progress, save, limit)
+    publish_job_full(state, title, tour_title, server, token, target, publish_now, &Access::Public, keeping, worker, progress, save, limit, &|_, _| false)
 }
 
 /// [`publish_job`] for "Publish tour", with who can view the tour once it is published. What
@@ -454,7 +454,18 @@ fn publish_job_as(
     progress: &dyn Fn(f32),
 ) -> Result<PublishDone, String> {
     let limit = Limit { warn_gb: publish_ui::warn_gb(), totals: &Store::totals };
-    publish_job_full(state, title, tour_title, server, token, target, publish_now, access, keeping, worker, progress, &store_save, &limit)
+    let delete = |token: &str, tour_id: &str| crate::tours_ui::delete_created_tour(server, token, tour_id, tour_title);
+    publish_job_full(state, title, tour_title, server, token, target, publish_now, access, keeping, worker, progress, &store_save, &limit, &delete)
+}
+
+/// What a restricted publish that did not finish leaves on the site, and what is done about it:
+/// a tour this publish created (`Target::New`) whose first publish call the site did not
+/// accept is deleted again through `delete` (true when nothing is left); a tour the site took
+/// the restriction for keeps it; any other is remembered so that the Tours page asks before
+/// publishing it for anyone. None when there is nothing to say: not restricted, or published.
+pub(crate) fn settle_restricted(restricted: bool, target: &Target, finished: &crate::publish::Finished, first: crate::publish::PublishedAs, delete: &dyn Fn(&str) -> bool) -> Option<publish_ui::Left> {
+    let _ = (restricted, target, finished, first, delete);
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -472,13 +483,14 @@ fn publish_job_full(
     progress: &dyn Fn(f32),
     save: &SaveFn<'_>,
     limit: &Limit<'_>,
+    delete: &dyn Fn(&str, &str) -> bool,
 ) -> Result<PublishDone, String> {
     let restricted = publish_now && !access.is_public();
-    worker.set_viewing(publish_ui::Viewing { restricted, granted: None });
+    worker.set_viewing(publish_ui::Viewing { restricted, granted: None, left: None });
     with_bundle(state, title, worker, progress, |dir| {
         let token = token()?;
         let mut kept = Kept::Off;
-        let (finished, granted) = crate::publish::upload_and_publish_as(
+        let (finished, first) = crate::publish::upload_and_publish_as(
             server,
             &token,
             dir,
@@ -498,7 +510,8 @@ fn publish_job_full(
                 !worker.is_cancelled()
             },
         )?;
-        worker.set_viewing(publish_ui::Viewing { restricted, granted });
+        let left = settle_restricted(restricted, target, &finished, first, &|tour_id| delete(&token, tour_id));
+        worker.set_viewing(publish_ui::Viewing { restricted, granted: first.granted, left });
         Ok(PublishDone { finished, kept })
     })
 }
@@ -3660,4 +3673,119 @@ mod tests {
     /// One real pass of a real recording through the folder of saved recordings, with the real
     /// ffmpeg; ignored unless asked for.
     mod e2e_recording;
+
+    // ---- A restricted publish that did not finish ----
+
+    fn ended(tour: &str, outcome: Outcome) -> Finished {
+        Finished { tour_id: tour.into(), chapter_id: CH.into(), steps: 2, outcome }
+    }
+
+    fn not_public(error: &str) -> Outcome {
+        Outcome::NotPublic { cancelled: false, error: error.into() }
+    }
+
+    const REFUSED: &str = "This site cannot send mail, so it cannot restrict who can view. Nothing was published.";
+
+    #[test]
+    fn a_tour_this_publish_created_is_deleted_again_when_the_site_did_not_take_the_restriction() {
+        use crate::publish::PublishedAs;
+        use crate::publish_ui::{Left, restriction_unfinished};
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let works = |id: &str| {
+            deleted.borrow_mut().push(id.to_string());
+            true
+        };
+        let fails = |id: &str| {
+            deleted.borrow_mut().push(id.to_string());
+            false
+        };
+        let refused = PublishedAs::default();
+        // Refused (any code), or not taken at the first answer: deleted, and nothing is remembered.
+        let t = "tour_abababababababababab0001";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, not_public(REFUSED)), refused, &works), Some(Left::Deleted));
+        assert_eq!(deleted.take(), vec![t.to_string()]);
+        assert!(!restriction_unfinished(t));
+        // Cancelled after the upload and before the site took the first call: the same.
+        let t = "tour_abababababababababab0002";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, Outcome::NotPublic { cancelled: true, error: String::new() }), refused, &works), Some(Left::Deleted));
+        assert_eq!(deleted.take(), vec![t.to_string()]);
+        // The delete does not go through: the draft stays, remembered for the Tours page.
+        let t = "tour_abababababababababab0003";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, not_public(REFUSED)), refused, &fails), Some(Left::StillThere));
+        assert!(restriction_unfinished(t));
+        deleted.take();
+        // A tour that was there before is never deleted: it is remembered.
+        let t = "tour_abababababababababab0004";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::Chapter(t.into()), &ended(t, not_public(REFUSED)), refused, &works), Some(Left::Draft));
+        assert!(restriction_unfinished(t) && deleted.take().is_empty());
+        // The site took the restriction, then the publish stopped: it stays restricted, nothing to ask.
+        let t = "tour_abababababababababab0005";
+        crate::publish_ui::note_unfinished_restriction(t);
+        let accepted = PublishedAs { accepted: true, granted: Some(crate::publish::access::Granted::Me) };
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, Outcome::NotPublic { cancelled: true, error: String::new() }), accepted, &works), Some(Left::Restricted));
+        assert!(!restriction_unfinished(t) && deleted.take().is_empty());
+        // Published for anyone and not taken down: said, never deleted, remembered.
+        let t = "tour_abababababababababab0006";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, not_public(crate::share_ui::who::TOUR_NOT_APPLIED_PUBLIC)), refused, &works), Some(Left::Online));
+        assert!(deleted.take().is_empty());
+        // Published as asked: nothing to say, nothing remembered.
+        let t = "tour_abababababababababab0007";
+        crate::publish_ui::note_unfinished_restriction(t);
+        assert_eq!(settle_restricted(true, &Target::New, &ended(t, Outcome::Public { url: None }), accepted, &works), None);
+        assert!(!restriction_unfinished(t));
+        // Not restricted: as before.
+        assert_eq!(settle_restricted(false, &Target::New, &ended(t, not_public("Could not publish the tour: no.")), refused, &works), None);
+        assert!(deleted.take().is_empty());
+    }
+
+    /// A site that takes the upload of tour `tour` and answers its first publish call with `first`.
+    fn refusing_site(tour: &'static str, first: Answer) -> Stub {
+        let first = std::sync::Mutex::new(Some(first));
+        stub(move |req, seen| {
+            let l = req.line.as_str();
+            if l == format!("POST /api/v1/tours/{tour}/publish") {
+                return first.lock().unwrap().take().unwrap_or_else(|| reply(500, r#"{"error":"internal"}"#));
+            }
+            if l == format!("DELETE /api/v1/tours/{tour}") {
+                return reply(200, r#"{"deleted":true}"#);
+            }
+            if l.ends_with("/commit") {
+                return reply(201, &format!(r#"{{"tour_id":"{tour}","chapter_id":"{CH}","steps":2}}"#));
+            }
+            platform(req, seen)
+        })
+    }
+
+    #[test]
+    fn a_refused_restricted_publish_of_a_new_tour_leaves_nothing_on_the_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let limit = Limit { warn_gb: 0, totals: &Store::totals };
+        for (n, first) in [(1, r#"{"error":"cannot_restrict"}"#), (2, r#"{"error":"bad_viewer","detail":"viewers[0] is not an email address; nothing was changed"}"#), (3, r#"{"error":"access_already_set"}"#), (4, r#"{"error":"bad_request"}"#)] {
+            let tour: &'static str = Box::leak(format!("tour_cdcdcdcdcdcdcdcdcdcd000{n}").into_boxed_str());
+            let status = if first.contains("access_already_set") || first.contains("cannot_restrict") { 409 } else { 400 };
+            let s = refusing_site(tour, reply(status, first));
+            let run = Arc::new(Run::default());
+            let base = s.base.clone();
+            let delete = move |token: &str, id: &str| crate::publish::delete_tour(&base, token, id, |_| {}).is_ok();
+            let done = publish_job_full(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Access::Me, &Keeping::Off, &run, &|_| {}, &store_save, &limit, &delete).unwrap();
+            assert!(matches!(done.finished.outcome, Outcome::NotPublic { cancelled: false, .. }), "{first}");
+            assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::Deleted), "{first}");
+            assert!(s.lines().contains(&format!("DELETE /api/v1/tours/{tour}")), "{first}: {:?}", s.lines());
+            assert!(!crate::publish_ui::restriction_unfinished(tour));
+        }
+        // The delete is refused: the draft is still there, and the Tours page will ask.
+        let tour = "tour_cdcdcdcdcdcdcdcdcdcd0009";
+        let s = refusing_site(tour, reply(409, r#"{"error":"cannot_restrict"}"#));
+        let run = Arc::new(Run::default());
+        let done = publish_job_full(&state, TITLE, TOUR_TITLE, &s.base, || Ok(TOKEN.to_string()), &Target::New, true, &Access::Me, &Keeping::Off, &run, &|_| {}, &store_save, &limit, &|_, _| false).unwrap();
+        assert!(matches!(done.finished.outcome, Outcome::NotPublic { .. }));
+        assert_eq!(run.viewing().left, Some(crate::publish_ui::Left::StillThere));
+        assert!(crate::publish_ui::restriction_unfinished(tour));
+    }
 }

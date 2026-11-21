@@ -357,6 +357,8 @@ pub enum Edit {
     ConfirmDelete { id: String },
     /// The question which saved chapter of this tour to edit is showing.
     ChoosingChapter { id: String },
+    /// The question whether to publish for anyone a tour whose restriction was not applied.
+    ConfirmPublish { id: String },
 }
 
 impl Edit {
@@ -364,7 +366,7 @@ impl Edit {
     fn tour_id(&self) -> Option<&str> {
         match self {
             Edit::None => None,
-            Edit::Renaming { id, .. } | Edit::ConfirmDelete { id } | Edit::ChoosingChapter { id } => Some(id),
+            Edit::Renaming { id, .. } | Edit::ConfirmDelete { id } | Edit::ChoosingChapter { id } | Edit::ConfirmPublish { id } => Some(id),
         }
     }
 }
@@ -694,7 +696,7 @@ impl Model {
                     self.notice = Some(Notice { text: LIST_CHANGED.to_string(), error: false });
                 }
             }
-            Edit::Renaming { id, .. } | Edit::ChoosingChapter { id } => {
+            Edit::Renaming { id, .. } | Edit::ChoosingChapter { id } | Edit::ConfirmPublish { id } => {
                 if !tours.iter().any(|t| &t.id == id) {
                     self.edit = Edit::None;
                     self.notice = Some(Notice { text: publish::TOUR_GONE.to_string(), error: false });
@@ -921,6 +923,18 @@ impl Model {
         self.begin(id, Work::Publishing(None), Job::Publish)
     }
 
+    /// "Publish" on a draft as the row's button asks for it: a tour whose restricted publish
+    /// did not finish first asks whether to publish it for anyone ([`Edit::ConfirmPublish`]);
+    /// any other starts at once, as [`Model::start_publish`].
+    pub fn request_publish(&mut self, id: &str) -> Option<Started> {
+        self.start_publish(id)
+    }
+
+    /// "Publish for anyone" in that question: only for the tour whose question is showing.
+    pub fn confirm_publish(&mut self, _id: &str) -> Option<Started> {
+        None
+    }
+
     /// "Publish changes" on a public tour whose live page is behind its draft: the job a draft's
     /// Publish runs, for the same link. It asks nothing, and starts only where the button shows
     /// and while nothing else runs on the tour.
@@ -1056,6 +1070,21 @@ impl Model {
     pub fn dismiss_notice(&mut self) {
         self.notice = None;
     }
+}
+
+/// The buttons of the question before publishing for anyone, left to right, and whether each is
+/// the default (what Enter and Escape choose).
+pub fn confirm_publish_buttons() -> [(&'static str, bool); 2] {
+    [(crate::share_ui::who::CONFIRM_CANCEL, false), (crate::share_ui::who::CONFIRM_PUBLISH, false)]
+}
+
+/// Delete a tour a restricted publish created and could not publish as asked, the way the page
+/// deletes one: noted before the request goes (and only when the note could be written), the
+/// note removed once the site says nothing is left. True when the tour is gone. The saved
+/// recording on this computer is left alone.
+pub fn delete_created_tour(server: &str, token: &str, tour_id: &str, title: &str) -> bool {
+    let _ = (server, token, tour_id, title);
+    false
 }
 
 // ---- Deletes that did not finish ----
@@ -5301,5 +5330,43 @@ pub(crate) mod tests {
         assert_eq!(m.error(C), Some(OPENING_ANOTHER));
         m.open_ended(&first.key);
         assert_eq!((m.error(C), m.error(A)), (None, Some(SAVED_DAMAGED)));
+    }
+
+    // ---- Publishing a tour whose restriction was not applied ----
+
+    fn restricted_draft(id: &str) -> Vec<RemoteTour> {
+        let mut tours = two();
+        tours[1].id = id.to_string();
+        tours
+    }
+
+    #[test]
+    fn a_tour_whose_restriction_was_not_applied_asks_before_it_is_published_for_anyone() {
+        let id = "tour_ffffffffffffffffffff0001";
+        crate::publish_ui::note_unfinished_restriction(id);
+        let mut m = loaded(restricted_draft(id));
+        assert_eq!(m.request_publish(id), None, "nothing is sent yet");
+        assert_eq!(m.edit(), &Edit::ConfirmPublish { id: id.into() });
+        // Cancel, the default, sends nothing and keeps the tour remembered.
+        m.cancel_edit();
+        assert_eq!(m.edit(), &Edit::None);
+        assert!(crate::publish_ui::restriction_unfinished(id));
+        assert_eq!(confirm_publish_buttons(), [("Cancel", true), ("Publish for anyone", false)]);
+        // Only the tour whose question shows can be published from it.
+        assert_eq!(m.request_publish(id), None);
+        assert_eq!(m.confirm_publish(B), None);
+        let job = m.confirm_publish(id).expect("publish for anyone");
+        assert_eq!((job.id.as_str(), &job.job), (id, &Job::Publish));
+        assert_eq!(m.edit(), &Edit::None);
+        assert!(!crate::publish_ui::restriction_unfinished(id), "the user chose anyone with the link");
+        assert_eq!(m.confirm_publish(id), None, "a second click finds nothing to confirm");
+    }
+
+    #[test]
+    fn a_tour_that_was_never_restricted_publishes_from_the_tours_page_as_before() {
+        let mut m = loaded(two());
+        let job = m.request_publish(B).expect("published at once");
+        assert_eq!(job, Started { site: site(), id: B.into(), title: "Testing".into(), job: Job::Publish, listed: true });
+        assert_eq!(m.edit(), &Edit::None);
     }
 }

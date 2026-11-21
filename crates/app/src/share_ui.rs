@@ -517,15 +517,27 @@ impl ShareDialog {
         let (server, name, site) = (self.server.clone(), self.workspace.clone(), self.site.clone());
         // One request tells both the workspace's name and the site's version.
         std::thread::spawn(move || {
-            if let Ok(ws) = publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token)) {
-                if let Ok(mut s) = site.lock() {
-                    *s = who::Site::of(ws.version.as_deref());
+            match publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token)) {
+                Ok(ws) => {
+                    if let Ok(mut s) = site.lock() {
+                        *s = who::Site::of(ws.version.as_deref());
+                    }
+                    if let Ok(mut n) = name.lock() {
+                        *n = Some(ws.name);
+                    }
                 }
-                if let Ok(mut n) = name.lock() {
-                    *n = Some(ws.name);
-                }
+                Err(_) => {}
             }
         });
+    }
+
+    /// What the site said about itself, or that it could not be asked.
+    #[cfg(test)]
+    pub fn set_site(&mut self, site: who::Site) {
+        if let Ok(mut s) = self.site.lock() {
+            *s = site;
+        }
+        self.who.set_site(site);
     }
 
     /// The site's version, as `GET /api/v1/me` said it (None: it tells none).
@@ -767,7 +779,7 @@ impl ShareDialog {
         }
         // An open dropdown takes Escape itself, and Enter in the address field is a new line.
         let escape = !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        let enter = !who::typing_addresses(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let enter = !self.who.typing(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
         let online = matches!(self.stage, Stage::Online { .. });

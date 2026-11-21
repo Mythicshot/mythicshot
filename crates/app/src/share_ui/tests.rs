@@ -1202,9 +1202,9 @@ fn enter_in_the_address_field_is_a_new_line_not_publish() {
     d.who.addresses = ADDRESS.into();
     let mut out = None;
     ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
-    ctx.memory_mut(|m| m.request_focus(who::addresses_id()));
+    ctx.memory_mut(|m| m.request_focus(d.who.addresses_id()));
     ctx.run_ui(egui::RawInput::default(), |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
-    assert!(who::typing_addresses(&ctx));
+    assert!(d.who.typing(&ctx));
     let enter = egui::RawInput { events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
     ctx.run_ui(enter, |ui| out = d.show(ui.ctx(), &mut |_| false)).textures_delta.clear();
     assert_eq!(out, None, "Enter while typing addresses does not publish");

@@ -201,6 +201,14 @@ pub struct Published {
 }
 
 /// A tour that went public: its step count and its link, when the server gave a usable one.
+/// What a restricted publish's first answer said: whether the site accepted the call that
+/// carried who can view (and so holds it for the tour), and what it said it applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PublishedAs {
+    pub accepted: bool,
+    pub granted: Option<access::Granted>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Live {
     pub steps: usize,
@@ -445,7 +453,7 @@ pub fn upload_and_publish_as(
     upload_progress: impl FnMut(f32) -> bool,
     uploaded: impl FnOnce(&Published),
     publish_progress: impl FnMut(Option<Images>) -> bool,
-) -> Result<(Finished, Option<access::Granted>), String> {
+) -> Result<(Finished, PublishedAs), String> {
     Client::new(server, token, Timeouts::default())?.upload_and_publish_as(dir, target, publish_now, access, PUBLISH_PAUSE, upload_progress, uploaded, publish_progress)
 }
 
@@ -1095,15 +1103,17 @@ impl Client {
         upload_progress: impl FnMut(f32) -> bool,
         uploaded: impl FnOnce(&Published),
         publish_progress: impl FnMut(Option<Images>) -> bool,
-    ) -> Result<(Finished, Option<access::Granted>), String> {
+    ) -> Result<(Finished, PublishedAs), String> {
         let up = self.upload_bundle(dir, target, upload_progress)?;
         uploaded(&up);
         if !publish_now {
-            return Ok((Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft }, None));
+            return Ok((Finished { tour_id: up.tour_id, chapter_id: up.chapter_id, steps: up.steps, outcome: Outcome::Draft }, PublishedAs::default()));
         }
-        let result = self.publish_tour_as(&up.tour_id, access, pause, publish_progress);
-        let granted = result.as_ref().ok().and_then(|live| live.access);
-        Ok((after_publish(&up.tour_id, &up.chapter_id, up.steps, result), granted))
+        let mut first = PublishedAs::default();
+        let result = self.publish_tour_as(&up.tour_id, access, pause, publish_progress, &mut |granted| first = PublishedAs { accepted: true, granted });
+        // The final answer says who can view; the first one's word stands when it does not.
+        let granted = result.as_ref().ok().and_then(|live| live.access).or(first.granted);
+        Ok((after_publish(&up.tour_id, &up.chapter_id, up.steps, result), PublishedAs { granted, ..first }))
     }
 
     /// Replace the chapter, hand the commit's answer to `uploaded`, then publish only when the
@@ -1141,7 +1151,7 @@ impl Client {
     /// progress, so an answer without one counts as none. A call that fails is not sent
     /// again: publishing again later joins the same publish on the server, or starts a new one.
     fn publish_tour(&self, tour_id: &str, pause: Duration, progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
-        self.publish_tour_as(tour_id, &access::Access::Public, pause, progress)
+        self.publish_tour_as(tour_id, &access::Access::Public, pause, progress, &mut |_| {})
     }
 
     /// [`Client::publish_tour`] with who can view set to `access` on the first call, the one
@@ -1149,7 +1159,9 @@ impl Client {
     /// refusal of it ends the loop with its sentence, and so does a first answer that does not
     /// say it back: a publish that answered 202 is then not driven on, and one the site
     /// finished at once is taken off the web again.
-    fn publish_tour_as(&self, tour_id: &str, access: &access::Access, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool) -> Result<Live, String> {
+    /// `first` hears of a first answer that applied what was asked, with what it applied.
+    fn publish_tour_as(&self, tour_id: &str, access: &access::Access, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool, first: &mut dyn FnMut(Option<access::Granted>)) -> Result<Live, String> {
+        let _ = &first;
         use crate::share_ui::who;
         let what = "Could not publish the tour";
         let refusal = |r: access::Refused| who::refused_text(r, "tour", who::Ending::Published);
@@ -1168,7 +1180,11 @@ impl Client {
             let restricting = publish_id.is_none() && !access.is_public();
             let mut body = match &publish_id {
                 Some(id) => Some(json!({ "publish_id": id }).to_string().into_bytes()),
-                None if restricting => Some(access::body_bytes(json!({}), access, access::Route::Publish)),
+                None if restricting => match access::body_bytes(json!({}), access, access::Route::Publish) {
+                    Ok(b) if !b.is_empty() => Some(b),
+                    Err(access::BodyError::TooLong) => return Err(refusal(access::Refused::ListTooLong)),
+                    Ok(_) | Err(access::BodyError::Unreadable) => return Err(not_understood(what)),
+                },
                 None => None,
             };
             let reply = self.send(Method::Post, &path, body.as_deref().map(|b| ("application/json", b)));
@@ -4002,7 +4018,7 @@ pub(crate) mod tests {
     }
 
     fn publish_as(s: &Stub, access: &access::Access) -> Result<Live, String> {
-        client(s).publish_tour_as(TOUR, access, Duration::ZERO, |_| true)
+        client(s).publish_tour_as(TOUR, access, Duration::ZERO, |_| true, &mut |_| {})
     }
 
     #[test]
@@ -4032,11 +4048,11 @@ pub(crate) mod tests {
             (409, r#"{"error":"already_published"}"#, "This tour was published before, so who can view can only be changed in the dashboard. Nothing was published."),
             (409, r#"{"error":"access_already_set"}"#, "Who can view was already set for this tour in the dashboard. Nothing was published."),
             (409, r#"{"error":"cannot_restrict"}"#, "This site cannot send mail, so it cannot restrict who can view. Nothing was published."),
-            (400, r#"{"error":"bad_viewer","detail":"viewers[1]"}"#, "Address 1 is not an email address. Nothing was published."),
+            (400, r#"{"error":"bad_viewer","detail":"viewers[0] is not an email address; nothing was changed"}"#, "Address 1 is not an email address. Nothing was published."),
             (400, r#"{"error":"too_many_viewers"}"#, "At most 200 addresses. Nothing was published."),
             (400, r#"{"error":"bad_request"}"#, "The site did not accept who can view. Nothing was published."),
             // A site up to 0.1.50 refuses the padded body before it publishes anything.
-            (413, "Payload Too Large", "This site is too old to restrict who can view. Nothing was published."),
+            (413, r#"{"error":"too_large","detail":"the request is over 1024 bytes"}"#, "This site is too old to restrict who can view. Nothing was published."),
         ];
         for (status, body, sentence) in cases {
             let s = restricting_stub(move |_| Some(reply(status, body)));
@@ -4051,9 +4067,47 @@ pub(crate) mod tests {
         let s = restricting_stub(|_| Some(in_progress(1, 2)));
         assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_NOT_APPLIED.to_string()));
         assert_eq!(s.lines(), vec![PUBLISH.to_string()]);
-        // A 200 at once: the tour is taken off the web again.
-        let s = restricting_stub(|_| Some(reply(200, LIVE)));
+        // Every answer names who can view: one that names another setting was not applied.
+        let s = restricting_stub(|_| Some(reply(202, &json!({ "status": "in_progress", "publish_id": PUB, "done": 1, "total": 2, "access": "public", "viewers": 0 }).to_string())));
         assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_NOT_APPLIED.to_string()));
+        assert_eq!(s.lines(), vec![PUBLISH.to_string()]);
+        // A 200 at once: the tour is taken off the web again, and that is what is said.
+        let s = restricting_stub(|_| Some(reply(200, LIVE)));
+        assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_UNPUBLISHED_AGAIN.to_string()));
         assert_eq!(s.lines(), vec![PUBLISH.to_string(), "POST /api/v1/tours/tour_aaaaaaaaaaaaaaaaaaaaaaaa/unpublish".to_string()]);
+        // When that fails, it says the tour is public, and nothing else.
+        let s = stub(|req, _| if req.line == PUBLISH { reply(200, LIVE) } else { reply(500, r#"{"error":"internal"}"#) });
+        assert_eq!(publish_as(&s, &access::Access::Me), Err(crate::share_ui::who::TOUR_NOT_APPLIED_PUBLIC.to_string()));
+    }
+
+    #[test]
+    fn a_413_about_the_tour_itself_keeps_its_meaning_with_a_restriction() {
+        let s = restricting_stub(|_| Some(reply(413, r#"{"error":"too_large","detail":"the tour has more than 400 steps"}"#)));
+        assert_eq!(publish_as(&s, &access::Access::Me), Err("Could not publish the tour: the tour has more than 400 steps (HTTP 413).".to_string()));
+    }
+
+    #[test]
+    fn the_first_answer_that_applied_who_can_view_is_heard_and_kept() {
+        // Accepted at the first answer: told, with what was applied, even when the last answer does not repeat it.
+        let s = stub(|req, seen| {
+            if req.line != PUBLISH {
+                return platform(req, seen);
+            }
+            if seen == 0 { reply(202, &json!({ "status": "in_progress", "publish_id": PUB, "done": 1, "total": 2, "access": "me", "viewers": 0 }).to_string()) } else { reply(200, LIVE) }
+        });
+        let mut heard = Vec::new();
+        let live = client(&s).publish_tour_as(TOUR, &access::Access::Me, Duration::ZERO, |_| true, &mut |g| heard.push(g)).unwrap();
+        assert_eq!(heard, vec![Some(access::Granted::Me)]);
+        assert_eq!(live.access, None);
+        // A refusal is never an acceptance.
+        let s = restricting_stub(|_| Some(reply(409, r#"{"error":"cannot_restrict"}"#)));
+        let mut heard = Vec::new();
+        assert!(client(&s).publish_tour_as(TOUR, &access::Access::Me, Duration::ZERO, |_| true, &mut |g| heard.push(g)).is_err());
+        assert!(heard.is_empty());
+        // Nor is a cancel before the first call.
+        let s = restricting_stub(|_| None);
+        let mut heard = Vec::new();
+        assert_eq!(client(&s).publish_tour_as(TOUR, &access::Access::Me, Duration::ZERO, |_| false, &mut |g| heard.push(g)), Err(CANCELLED.to_string()));
+        assert!(heard.is_empty());
     }
 }

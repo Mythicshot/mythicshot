@@ -464,10 +464,11 @@ impl Sharing<'_> {
         if !title.is_empty() {
             body["title"] = json!(title);
         }
-        let mut body = access::body_bytes(body, self.access, Route::Media);
-        if body.is_empty() {
-            return Err(ShareError::Failed(not_understood(what)));
-        }
+        let mut body = match access::body_bytes(body, self.access, Route::Media) {
+            Ok(b) if !b.is_empty() => b,
+            Err(access::BodyError::TooLong) => return Err(ShareError::Access(Refused::ListTooLong)),
+            Ok(_) | Err(access::BodyError::Unreadable) => return Err(ShareError::Failed(not_understood(what))),
+        };
         let reply = self.send(what, Method::Post, "/api/v1/media", Some(("application/json", &body)), false);
         // The addresses are not kept once they are sent.
         access::wipe_body(&mut body);

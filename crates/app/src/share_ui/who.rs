@@ -41,6 +41,30 @@ pub const TOUR_NOT_APPLIED: &str = "The site did not apply who can view, so the 
 /// The same, when the site finished the publish at once and taking it down again failed. The
 /// wording is proposed and waits for the owner's approval.
 pub const TOUR_NOT_APPLIED_PUBLIC: &str = "The site did not apply who can view, and the tour is public now. Unpublish it on the Tours page.";
+/// "Publish tour", for a tour that was published once and is not now. The wording is approved.
+pub const PUBLISHED_BEFORE: &str = "This tour was published before, so who can view is changed in the dashboard.";
+/// Why Publish waits: the addresses would not fit in a request. The wording is approved.
+pub const LIST_TOO_LONG: &str = "The list of addresses is too long.";
+/// Under the single choice when the site could not be asked. The wording is approved.
+pub const COULD_NOT_ASK: &str = "Could not ask the site whether it can restrict who can view.";
+/// A 200 without the restriction, taken off the web again. The wording is approved.
+pub const TOUR_UNPUBLISHED_AGAIN: &str = "The site did not apply who can view. The tour was online for a moment and has been unpublished.";
+/// After a refused restricted publish of a tour this publish created, deleted again. Approved.
+pub const NOTHING_LEFT: &str = "Nothing was left on the site.";
+/// The same, when the delete did not go through. Approved.
+pub const STILL_THERE: &str = "The draft is still on the site. Delete it on the Tours page, or publish it there only if anyone with the link may see it.";
+/// After a refused restricted publish of a tour that was there before. Approved.
+pub const DRAFT_PUBLIC_IF_PUBLISHED: &str = "The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link.";
+/// After a restricted publish the site accepted and that did not finish. Proposed, awaits approval.
+pub const STAYS_AS_CHOSEN: &str = "The draft is uploaded. Who can view stays as you chose.";
+/// The result screen's heading when the tour was deleted again. Proposed, awaits approval.
+pub const NOT_PUBLISHED_HEADING: &str = "The tour was not published";
+/// The Tours page's question before a plain Publish of a tour whose restriction was not applied. Approved.
+pub const CONFIRM_HEADING: &str = "Publish for anyone with the link?";
+pub const CONFIRM_TEXT: &str = "You chose to restrict who can view this tour, and that was not applied. Publishing here makes it visible to anyone with the link.";
+pub const CONFIRM_CANCEL: &str = "Cancel";
+pub const CONFIRM_PUBLISH: &str = "Publish for anyone";
+
 /// The result screen's last words for a restricted tour. The wording is proposed and waits for the owner's approval.
 pub const ONLY_PEOPLE_WORDS: &str = "only the people you chose";
 pub const ONLY_ME_WORDS: &str = "only you";
@@ -113,6 +137,7 @@ pub fn refused_text(r: Refused, noun: &str, ending: Ending) -> String {
         Refused::AlreadyPublished => format!("This {noun} was published before, so who can view can only be changed in the dashboard. {nothing}"),
         Refused::AccessAlreadySet => format!("Who can view was already set for this {noun} in the dashboard. {nothing}"),
         Refused::SiteTooOld => format!("This site is too old to restrict who can view. {nothing}"),
+        Refused::ListTooLong => format!("{LIST_TOO_LONG} {nothing}"),
         Refused::NotApplied => match ending {
             Ending::Shared => NOT_APPLIED.to_string(),
             Ending::Published => TOUR_NOT_APPLIED.to_string(),
@@ -125,6 +150,8 @@ pub fn refused_text(r: Refused, noun: &str, ending: Ending) -> String {
 pub enum Problem {
     NoAddress,
     TooMany,
+    /// The addresses would not fit in a request.
+    TooLong,
     /// The address at this position (from 1, blank lines not counted) does not look like one.
     Bad(usize),
 }
@@ -134,6 +161,7 @@ impl Problem {
         match self {
             Problem::NoAddress => NO_ADDRESS.to_string(),
             Problem::TooMany => TOO_MANY.to_string(),
+            Problem::TooLong => LIST_TOO_LONG.to_string(),
             Problem::Bad(n) => bad_address(n),
         }
     }
@@ -185,6 +213,8 @@ pub enum Site {
     Takes,
     /// Older, or it tells no version.
     TooOld,
+    /// It could not be asked.
+    Failed,
 }
 
 impl Site {
@@ -195,12 +225,21 @@ impl Site {
 }
 
 /// The choice in a window: what is chosen and the addresses typed.
-#[derive(Default)]
 pub struct Form {
     choice: Choice,
     /// What is typed in the field, one address per line.
     pub addresses: String,
     site: Site,
+    /// The address field's id: this window's own.
+    id: egui::Id,
+    /// The context the field was drawn in, to remove what it stored when the window goes.
+    ctx: Option<egui::Context>,
+}
+
+impl Default for Form {
+    fn default() -> Form {
+        Form { choice: Choice::default(), addresses: String::new(), site: Site::default(), id: egui::Id::unique("who-can-view-addresses"), ctx: None }
+    }
 }
 
 impl fmt::Debug for Form {
@@ -217,6 +256,16 @@ impl Drop for Form {
 }
 
 impl Form {
+    /// The address field's id.
+    pub fn addresses_id(&self) -> egui::Id {
+        self.id
+    }
+
+    /// Whether the address field has the keyboard: Enter is then a new line, not the main button.
+    pub fn typing(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.has_focus(self.id))
+    }
+
     pub fn set_site(&mut self, site: Site) {
         self.site = site;
     }
@@ -225,7 +274,7 @@ impl Form {
     pub fn offered(&self) -> Vec<Choice> {
         match self.site {
             Site::Takes => Choice::ALL.to_vec(),
-            Site::Unknown | Site::TooOld => vec![Choice::Anyone],
+            Site::Unknown | Site::TooOld | Site::Failed => vec![Choice::Anyone],
         }
     }
 
@@ -277,16 +326,6 @@ impl Form {
 
 // ---- Drawing ----
 
-/// The address field's id, so a window can tell that Enter is typed into it.
-pub fn addresses_id() -> egui::Id {
-    egui::Id::unique("who-can-view-addresses")
-}
-
-/// Whether the address field has the keyboard: Enter is then a new line, not the main button.
-pub fn typing_addresses(ctx: &egui::Context) -> bool {
-    ctx.memory(|m| m.has_focus(addresses_id()))
-}
-
 /// Draw one piece of the choice, as the app draws a labelled setting: the label over a
 /// dropdown like the Preferences ones, the label over a three-row field.
 pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32) {
@@ -305,7 +344,8 @@ pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32
         }
         Part::Addresses => {
             ui.label(RichText::new(ADDRESSES_LABEL).strong());
-            ui.add(egui::TextEdit::multiline(&mut form.addresses).id(addresses_id()).desired_rows(3).desired_width(f32::INFINITY));
+            let id = form.id;
+            ui.add(egui::TextEdit::multiline(&mut form.addresses).id(id).desired_rows(3).desired_width(f32::INFINITY));
         }
         Part::Help(t) => {
             ui.add(egui::Label::new(RichText::new(*t).color(muted).size(12.0)).wrap());
@@ -379,7 +419,7 @@ mod tests {
         assert_eq!(check(""), Err(Problem::NoAddress));
         assert_eq!(check("  \n\n \t"), Err(Problem::NoAddress));
         assert_eq!(check(" a@example.com \n\nb@example.org\n"), Ok(vec!["a@example.com".to_string(), "b@example.org".to_string()]));
-        for bad in ["no-at.example.com", "@example.com", "name@", "a@b@c", "a b@example.com", "a@exa mple.com"] {
+        for bad in ["no-at.example.com", "@example.com", "name@", "a@b@c"] {
             assert_eq!(check(&format!("ok@example.com\n\n{bad}")), Err(Problem::Bad(2)), "{bad}");
         }
         let many = |n: usize| (0..n).map(|i| format!("p{i}@example.com")).collect::<Vec<_>>().join("\n");
@@ -388,6 +428,80 @@ mod tests {
         assert_eq!(Problem::NoAddress.text(), NO_ADDRESS);
         assert_eq!(Problem::TooMany.text(), TOO_MANY);
         assert_eq!(Problem::Bad(2).text(), "Address 2 is not an email address.");
+    }
+
+    #[test]
+    fn a_pasted_list_splits_on_commas_semicolons_and_spaces_and_counts_after_repeats() {
+        assert_eq!(check("a@example.com, b@example.com;c@example.com d@example.com\te@example.com"), Ok(["a", "b", "c", "d", "e"].map(|n| format!("{n}@example.com")).to_vec()));
+        // "Name <address>" is two entries, and the name is not an address.
+        assert_eq!(check("Pat Doe <pat@example.com>"), Err(Problem::Bad(1)));
+        assert_eq!(check("ok@example.com, <pat@example.com> Pat"), Err(Problem::Bad(3)));
+        // Repeats, whatever their case, count once against the 200; they are still sent as typed.
+        let mut list: Vec<String> = (0..200).map(|i| format!("p{i}@example.com")).collect();
+        list.push("P0@Example.com".into());
+        assert_eq!(check(&list.join("\n")).map(|l| l.len()), Ok(201));
+        list.push("new@example.com".into());
+        assert_eq!(check(&list.join("\n")), Err(Problem::TooMany));
+        // More than 1,000 entries are too many, repeats or not.
+        assert_eq!(check(&vec!["same@example.com"; 1001].join(",")), Err(Problem::TooMany));
+        assert_eq!(check(&vec!["same@example.com"; 1000].join(",")).map(|l| l.len()), Ok(1000));
+    }
+
+    #[test]
+    fn only_visible_ascii_addresses_up_to_254_characters_are_sent() {
+        for bad in ["josé@example.com", "a\u{200B}b@example.com", "\u{FEFF}a@example.com", "a@exämple.com", "a\u{7F}@example.com"] {
+            assert_eq!(check(&format!("ok@example.com\n{bad}")), Err(Problem::Bad(2)), "{bad:?}");
+        }
+        let at = |n: usize| format!("{}@example.com", "a".repeat(n - 12));
+        assert_eq!(at(254).len(), 254);
+        assert!(check(&at(254)).is_ok());
+        assert_eq!(check(&at(255)), Err(Problem::Bad(1)));
+        // Addresses JSON writes twice as long can still not fit in one request: said before anything is sent.
+        let quotes: Vec<String> = (0..200).map(|i| format!("{i:03}{}@x", "\"".repeat(249))).collect();
+        assert_eq!(check(&quotes.join("\n")), Err(Problem::TooLong));
+        assert_eq!(Problem::TooLong.text(), "The list of addresses is too long.");
+    }
+
+    #[test]
+    fn the_second_list_of_sentences_is_pinned() {
+        assert_eq!(PUBLISHED_BEFORE, "This tour was published before, so who can view is changed in the dashboard.");
+        assert_eq!(COULD_NOT_ASK, "Could not ask the site whether it can restrict who can view.");
+        assert_eq!(TOUR_UNPUBLISHED_AGAIN, "The site did not apply who can view. The tour was online for a moment and has been unpublished.");
+        assert_eq!(NOTHING_LEFT, "Nothing was left on the site.");
+        assert_eq!(STILL_THERE, "The draft is still on the site. Delete it on the Tours page, or publish it there only if anyone with the link may see it.");
+        assert_eq!(DRAFT_PUBLIC_IF_PUBLISHED, "The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link.");
+        assert_eq!(STAYS_AS_CHOSEN, "The draft is uploaded. Who can view stays as you chose.");
+        assert_eq!(NOT_PUBLISHED_HEADING, "The tour was not published");
+        assert_eq!((CONFIRM_HEADING, CONFIRM_CANCEL, CONFIRM_PUBLISH), ("Publish for anyone with the link?", "Cancel", "Publish for anyone"));
+        assert_eq!(CONFIRM_TEXT, "You chose to restrict who can view this tour, and that was not applied. Publishing here makes it visible to anyone with the link.");
+        assert_eq!(refused_text(Refused::ListTooLong, "image", Ending::Shared), "The list of addresses is too long. Nothing was shared.");
+        assert_eq!(refused_text(Refused::ListTooLong, "tour", Ending::Published), "The list of addresses is too long. Nothing was published.");
+    }
+
+    #[test]
+    fn a_site_that_could_not_be_asked_says_so_under_the_single_choice() {
+        let mut f = Form::default();
+        f.set_site(Site::Failed);
+        assert_eq!(f.parts(), vec![Part::Choice { offered: vec![Choice::Anyone], chosen: Choice::Anyone }, Part::Muted(COULD_NOT_ASK.into())]);
+    }
+
+    #[test]
+    fn the_address_fields_stored_state_goes_with_its_window() {
+        let ctx = egui::Context::default();
+        let mut f = Form::default();
+        f.set_site(Site::Takes);
+        f.choose(Choice::People);
+        f.addresses = "private.person@example.com".into();
+        let id = f.addresses_id();
+        let stored = |ctx: &egui::Context, id| ctx.data_mut(|d| d.get_persisted::<egui::text_edit::TextEditState>(id)).is_some();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| draw_part(ui, &Part::Addresses, &mut f, Color32::GRAY));
+        assert!(stored(&ctx, id), "the field keeps its state (and undo history) while the window is open");
+        drop(f);
+        assert!(!stored(&ctx, id), "the state, undo history and all, goes when the window goes");
+        // The next window's field is its own, and empty.
+        let next = Form::default();
+        assert_ne!(next.addresses_id(), id);
+        assert!(next.addresses.is_empty() && !stored(&ctx, next.addresses_id()));
     }
 
     #[test]

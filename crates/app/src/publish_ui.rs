@@ -358,6 +358,41 @@ pub struct Viewing {
     /// "Try again": that would publish without the restriction.
     pub restricted: bool,
     pub granted: Option<Granted>,
+    /// A restricted publish that did not finish: what is left on the site.
+    pub left: Option<Left>,
+}
+
+/// What a restricted publish that did not finish left on the site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// The tour it created was deleted again: nothing is left.
+    Deleted,
+    /// It created the tour, and deleting it did not go through: a draft anyone could be shown.
+    StillThere,
+    /// A draft that was there before: publishing it plainly makes it public.
+    Draft,
+    /// The site took who can view before the publish stopped: the draft keeps it.
+    Restricted,
+    /// The site published it for anyone, and taking it down again failed.
+    Online,
+}
+
+// ---- Tours whose restriction was not applied ----
+
+/// The tours whose restricted publish did not finish in this session, so that the Tours page
+/// asks before publishing one for anyone. In memory only; never the addresses.
+static UNFINISHED_RESTRICTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A restricted publish of `tour_id` has its draft on the site and has not finished.
+pub fn note_unfinished_restriction(_tour_id: &str) {}
+
+/// That publish finished, the tour is gone, or the user chose to publish it for anyone.
+pub fn settle_restriction(_tour_id: &str) {}
+
+/// Whether a plain publish of `tour_id` must be asked about first.
+pub fn restriction_unfinished(_tour_id: &str) -> bool {
+    let _ = &UNFINISHED_RESTRICTIONS;
+    false
 }
 
 static RUNS: Mutex<Vec<Arc<Run>>> = Mutex::new(Vec::new());
@@ -980,6 +1015,16 @@ impl ResultDialog {
         }
     }
 
+    /// The screen's heading.
+    fn heading(&self) -> &'static str {
+        result_heading(&self.done.outcome, self.update)
+    }
+
+    /// What else the screen says, and whether it is an error.
+    fn note(&self) -> Option<(String, bool)> {
+        result_note(&self.done.outcome, &self.before, self.update)
+    }
+
     /// The small lock line under the link, for a restricted tour.
     fn lock(&self) -> Option<String> {
         self.granted().map(who::online_line)
@@ -1504,7 +1549,7 @@ impl Picker {
     fn edit_outcome(&self, shown: &Shown) -> Option<PickerOutcome> {
         let edit = self.edit.as_ref()?;
         match edit_choice(shown, edit.picked_new)? {
-            EditChoice::NewTour => (!self.title.trim().is_empty() && self.who_ready(self.who_shown(shown))).then(|| self.upload()),
+            EditChoice::NewTour => (!self.title.trim().is_empty() && self.who_ready(self.who_shown(shown))).then(|| self.try_upload()).flatten(),
             EditChoice::Update => {
                 // What the tour is, as the list this offer came from said: its title too, which
                 // the result screen shows and the saved recording takes over.
@@ -1521,7 +1566,7 @@ impl Picker {
             return Some(PickerOutcome::Cancel);
         }
         self.sync_site();
-        let enter = !who::typing_addresses(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let enter = !self.who.typing(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let shown = self.shown();
         let tour_title = self.tour_title();
         let logo_line = self.logo_line(&shown);
@@ -1718,12 +1763,18 @@ impl Picker {
         shown != WhoShown::Choice || self.who.problem().is_none()
     }
 
-    /// Who can view as the upload sends it: only when the choice is shown.
-    fn access(&self, shown: WhoShown) -> Access {
+    /// Who can view as the upload sends it: only when the choice is shown. None while the
+    /// addresses cannot be sent: nothing starts then.
+    fn access(&self, shown: WhoShown) -> Option<Access> {
         match shown {
-            WhoShown::Choice => self.who.access().unwrap_or_default(),
-            WhoShown::Nothing | WhoShown::Dashboard => Access::Public,
+            WhoShown::Choice => Some(self.who.access().unwrap_or_default()),
+            WhoShown::Nothing | WhoShown::Dashboard => Some(Access::Public),
         }
+    }
+
+    /// The line about the dashboard: for a tour published now, or published before.
+    fn dashboard_line(&self) -> &'static str {
+        who::CHANGE_IN_DASHBOARD
     }
 
     /// Draw who can view: the choice, or the line about the dashboard.
@@ -1762,8 +1813,19 @@ impl Picker {
         }
     }
 
+    /// What the main button does in a test, where it can be used.
+    #[cfg(test)]
     fn upload(&self) -> PickerOutcome {
-        let access = self.access(self.who_shown(&self.shown()));
+        self.try_upload().expect("the upload can start")
+    }
+
+    /// What the main button does: None while who can view cannot be sent.
+    fn try_upload(&self) -> Option<PickerOutcome> {
+        let access = self.access(self.who_shown(&self.shown()))?;
+        Some(self.upload_as(access))
+    }
+
+    fn upload_as(&self, access: Access) -> PickerOutcome {
         match &self.choice {
             Choice::New => {
                 let title = self.title.trim().to_string();
@@ -1791,7 +1853,7 @@ impl Picker {
             return Some(PickerOutcome::Cancel);
         }
         self.sync_site();
-        let enter = !who::typing_addresses(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let enter = !self.who.typing(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -1879,7 +1941,7 @@ impl Picker {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let upload = egui::Button::new(RichText::new(self.mode.button()).strong()).fill(PRIMARY);
                 if ui.add_enabled(can_upload, upload).clicked() {
-                    outcome = Some(self.upload());
+                    outcome = self.try_upload();
                 }
                 if ui.button("Cancel").clicked() {
                     outcome = Some(PickerOutcome::Cancel);
@@ -1887,7 +1949,7 @@ impl Picker {
             });
         });
         if outcome.is_none() && enter && self.can_upload() {
-            outcome = Some(self.upload());
+            outcome = self.try_upload();
         }
         if retry {
             self.choice = Choice::New;
@@ -3388,12 +3450,12 @@ pub(crate) mod tests {
         let ctx = egui::Context::default();
         let mut out = None;
         ctx.run_ui(egui::RawInput::default(), |ui| out = p.show(ui.ctx())).textures_delta.clear();
-        ctx.memory_mut(|m| m.request_focus(who::addresses_id()));
+        ctx.memory_mut(|m| m.request_focus(p.who.addresses_id()));
         ctx.run_ui(egui::RawInput::default(), |ui| out = p.show(ui.ctx())).textures_delta.clear();
         ctx.run_ui(key_press(egui::Key::Enter), |ui| out = p.show(ui.ctx())).textures_delta.clear();
         assert!(out.is_none(), "Enter is a new line in the field");
         // Elsewhere Enter still publishes.
-        ctx.memory_mut(|m| m.surrender_focus(who::addresses_id()));
+        ctx.memory_mut(|m| m.surrender_focus(p.who.addresses_id()));
         ctx.run_ui(key_press(egui::Key::Enter), |ui| out = p.show(ui.ctx())).textures_delta.clear();
         assert!(matches!(out, Some(PickerOutcome::Upload { access: Access::People(_), .. })));
     }
@@ -3405,19 +3467,95 @@ pub(crate) mod tests {
     #[test]
     fn the_result_of_a_restricted_publish_says_who_can_view_and_offers_no_try_again() {
         let public = Outcome::Public { url: Some("https://tours.example.com/t/abc".into()) };
-        let r = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(public.clone())).with_viewing(Viewing { restricted: true, granted: Some(Granted::People(2)) });
+        let r = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(public.clone())).with_viewing(Viewing { restricted: true, granted: Some(Granted::People(2)), left: None });
         assert_eq!(r.line(), "Demo · 3 steps · only the people you chose");
         assert_eq!(r.lock().as_deref(), Some("Only the 2 people you chose can open it. Change this in the dashboard."));
-        let me = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(public.clone())).with_viewing(Viewing { restricted: true, granted: Some(Granted::Me) });
+        let me = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(public.clone())).with_viewing(Viewing { restricted: true, granted: Some(Granted::Me), left: None });
         assert_eq!(me.line(), "Demo · 3 steps · only you");
         // A public tour is as before.
         let plain = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(public));
         assert_eq!((plain.line().as_str(), plain.lock()), ("Demo · 3 steps · public", None));
         // A restricted publish that failed is not tried again: that would publish it for anyone.
         let failed = Outcome::NotPublic { cancelled: false, error: "This site cannot send mail, so it cannot restrict who can view. Nothing was published.".into() };
-        let r = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(failed.clone())).with_viewing(Viewing { restricted: true, granted: None });
+        let r = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(failed.clone())).with_viewing(Viewing { restricted: true, granted: None, left: Some(Left::Draft) });
         assert!(!r.can_retry());
         assert_eq!(r.lock(), None);
         assert!(ResultDialog::new("Demo".into(), Before::new_tour(), published_done(failed)).can_retry());
+    }
+
+    // ---- After a restricted publish did not finish ----
+
+    #[test]
+    fn tours_whose_restriction_was_not_applied_are_remembered_in_memory_until_settled() {
+        let id = "tour_cccccccccccccccccccccc01";
+        assert!(!restriction_unfinished(id));
+        note_unfinished_restriction(id);
+        note_unfinished_restriction(id);
+        assert!(restriction_unfinished(id));
+        assert!(!restriction_unfinished("tour_cccccccccccccccccccccc02"));
+        settle_restriction(id);
+        assert!(!restriction_unfinished(id));
+    }
+
+    #[test]
+    fn a_picker_whose_addresses_cannot_be_sent_starts_nothing() {
+        let mut p = restricted_picker();
+        p.who.choose(who::Choice::People);
+        assert!(p.try_upload().is_none(), "no address");
+        p.who.addresses = "a@example.com".into();
+        assert!(matches!(p.try_upload(), Some(PickerOutcome::Upload { access: Access::People(_), .. })));
+    }
+
+    #[test]
+    fn a_tour_published_before_and_unpublished_says_so_about_the_dashboard() {
+        let mut p = restricted_picker();
+        let mut once = tour("Was public", 1, 3, "draft");
+        once.id = "tour_dddddddddddddddddddddddd".into();
+        once.published_at = Some(1_700_000_000_000);
+        let mut now = tour("Public", 1, 3, "published");
+        now.id = "tour_eeeeeeeeeeeeeeeeeeeeeeee".into();
+        *p.list.lock().unwrap() = ListState::Loaded(vec![once, now]);
+        p.choice = Choice::Tour("tour_dddddddddddddddddddddddd".into());
+        assert_eq!(p.who_shown(&Shown::OnlyNew(None)), WhoShown::Dashboard);
+        assert_eq!(p.dashboard_line(), who::PUBLISHED_BEFORE);
+        p.choice = Choice::Tour("tour_eeeeeeeeeeeeeeeeeeeeeeee".into());
+        assert_eq!(p.dashboard_line(), who::CHANGE_IN_DASHBOARD);
+    }
+
+    fn after(outcome: Outcome, left: Left) -> ResultDialog {
+        ResultDialog::new("Demo".into(), Before::new_tour(), published_done(outcome)).with_viewing(Viewing { restricted: true, granted: None, left: Some(left) })
+    }
+
+    fn refused() -> Outcome {
+        Outcome::NotPublic { cancelled: false, error: "This site cannot send mail, so it cannot restrict who can view. Nothing was published.".into() }
+    }
+
+    #[test]
+    fn the_result_of_a_restricted_publish_that_did_not_finish_says_what_is_left_on_the_site() {
+        let cannot = "This site cannot send mail, so it cannot restrict who can view. Nothing was published.";
+        let r = after(refused(), Left::Deleted);
+        assert_eq!(r.heading(), "The tour was not published");
+        assert_eq!(r.note(), Some((format!("{cannot} Nothing was left on the site."), true)));
+        let r = after(refused(), Left::StillThere);
+        assert_eq!(r.heading(), "Draft uploaded");
+        assert_eq!(r.note(), Some((format!("{cannot} The draft is still on the site. Delete it on the Tours page, or publish it there only if anyone with the link may see it."), true)));
+        let r = after(refused(), Left::Draft);
+        assert_eq!(r.note(), Some((format!("{cannot} The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link."), true)));
+        let cancelled = Outcome::NotPublic { cancelled: true, error: String::new() };
+        assert_eq!(after(cancelled.clone(), Left::Deleted).note(), Some(("Publishing was cancelled. Nothing was left on the site.".into(), false)));
+        assert_eq!(after(cancelled.clone(), Left::Restricted).note(), Some(("Publishing was cancelled. The draft is uploaded. Who can view stays as you chose.".into(), false)));
+        assert_eq!(after(cancelled, Left::Draft).note(), Some(("Publishing was cancelled. The draft is uploaded. Publishing it from the Tours page makes it visible to anyone with the link.".into(), false)));
+        // The site published it and taking it down failed: that sentence alone, never "not public".
+        let public = Outcome::NotPublic { cancelled: false, error: who::TOUR_NOT_APPLIED_PUBLIC.into() };
+        let r = after(public, Left::Online);
+        assert_eq!(r.note(), Some((who::TOUR_NOT_APPLIED_PUBLIC.to_string(), true)));
+        assert!(!r.note().unwrap().0.contains("not public"));
+        // Taken down again: said as it happened.
+        let again = Outcome::NotPublic { cancelled: false, error: who::TOUR_UNPUBLISHED_AGAIN.into() };
+        assert_eq!(after(again.clone(), Left::Deleted).note(), Some((format!("{} Nothing was left on the site.", who::TOUR_UNPUBLISHED_AGAIN), true)));
+        assert_eq!(after(again, Left::Draft).note(), Some((format!("{} {}", who::TOUR_UNPUBLISHED_AGAIN, who::DRAFT_PUBLIC_IF_PUBLISHED), true)));
+        // A publish that was never restricted says what it said before.
+        let plain = ResultDialog::new("Demo".into(), Before::new_tour(), published_done(refused()));
+        assert_eq!(plain.note(), Some((format!("{cannot} The draft is uploaded, but it is not public."), true)));
     }
 }

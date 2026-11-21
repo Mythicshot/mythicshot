@@ -686,14 +686,13 @@ fn a_create_that_does_not_say_back_who_can_view_is_deleted_before_any_part() {
 fn every_refusal_of_who_can_view_shares_nothing_and_is_never_tried_without_it() {
     let cases = [
         (400, r#"{"error":"bad_access"}"#, Refused::BadAccess),
-        (400, r#"{"error":"bad_viewer","detail":"viewers[2]"}"#, Refused::BadViewer(Some(2))),
+        (400, r#"{"error":"bad_viewer","detail":"viewers[1] is not an email address; nothing was changed"}"#, Refused::BadViewer(Some(2))),
         (400, r#"{"error":"too_many_viewers"}"#, Refused::TooManyViewers),
         (400, r#"{"error":"bad_request"}"#, Refused::BadRequest),
         (409, r#"{"error":"cannot_restrict"}"#, Refused::CannotRestrict),
         (409, r#"{"error":"too_large_to_restrict"}"#, Refused::TooLargeToRestrict),
         // A site up to 0.1.50 refuses the padded body before it creates anything.
-        (413, r#"{"error":"payload_too_large"}"#, Refused::SiteTooOld),
-        (413, "Request Entity Too Large", Refused::SiteTooOld),
+        (413, r#"{"error":"too_large","detail":"the request is over 4096 bytes"}"#, Refused::SiteTooOld),
     ];
     for (status, body, want) in cases {
         let s = site(2_000_000, "/i/x", move |req, _| (req.line == CREATE).then(|| reply(status, body)));
@@ -707,6 +706,16 @@ fn every_refusal_of_who_can_view_shares_nothing_and_is_never_tried_without_it() 
     assert_eq!(text(Refused::TooManyViewers).text, "At most 200 addresses. Nothing was shared.");
     assert_eq!(text(Refused::SiteTooOld).text, "This site is too old to restrict who can view. Nothing was shared.");
     assert_eq!(text(Refused::CannotRestrict).heading, "The clip was not uploaded");
+}
+
+#[test]
+fn a_413_that_is_not_about_the_requests_size_is_no_refusal_of_who_can_view() {
+    for body in [r#"{"error":"too_large","detail":"something else"}"#, "Request Entity Too Large"] {
+        let s = site(2_000_000, "/i/x", move |req, _| (req.line == CREATE).then(|| reply(413, body)));
+        let r = run_as(&s, &image(1000), &Access::Me);
+        assert!(matches!(r, Err(ShareError::Failed(_))), "{body}: {r:?}");
+        assert_eq!(s.lines(), vec![CREATE.to_string()]);
+    }
 }
 
 #[test]
