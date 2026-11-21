@@ -32,6 +32,8 @@ pub enum Icon {
     Save,
     SaveAs,
     Copy,
+    /// A tick: something worked ("Copied").
+    Check,
     Send,
     Folder,
     Effects,
@@ -232,6 +234,9 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::Copy => {
             p.rect_stroke(rect(0.3, 0.3, 0.95, 0.95), 1.5, s, StrokeKind::Middle);
             p.add(line(&[(0.15, 0.7), (0.05, 0.7), (0.05, 0.05), (0.7, 0.05), (0.7, 0.15)]));
+        }
+        Icon::Check => {
+            p.add(line(&[(0.08, 0.52), (0.38, 0.82), (0.92, 0.2)]));
         }
         Icon::Send => {
             p.add(Shape::convex_polygon(vec![at(0.0, 0.45), at(1.0, 0.05), at(0.62, 0.95), at(0.45, 0.6)], Color32::TRANSPARENT, s));
