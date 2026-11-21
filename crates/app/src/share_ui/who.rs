@@ -291,6 +291,7 @@ static FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 
 impl Form {
     /// The address field's id.
+    #[cfg(test)]
     pub fn addresses_id(&self) -> egui::Id {
         self.id
     }
