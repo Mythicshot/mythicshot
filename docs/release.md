@@ -138,7 +138,7 @@ Not closable with the standard tools, so left to the owner of the signing machin
 - Node 24 and Windows PowerShell 5.1, both used with their standard parts only.
 - A code signing certificate, chaining to a root trusted on the signing machine, its issuing CA's thumbprint, and its timestamp server. Without them the command refuses every time.
 
-The full build runs every time, in a fresh folder (about three and a half minutes on the development PC).
+The full build runs every time, in a fresh folder (two and a half to three and a half minutes on the development PC).
 
 ## The GitHub workflow
 
