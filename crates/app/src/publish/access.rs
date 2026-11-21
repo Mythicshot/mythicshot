@@ -120,8 +120,7 @@ impl Route {
     }
 
     /// The largest body a site of 0.1.51 or newer takes when `access` is in it: what a padded
-    /// body must stay under (pinned by the tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// body must stay under.
     pub fn new_limit(self) -> usize {
         match self {
             Route::Media => 69_632,
@@ -138,16 +137,25 @@ pub const PAD_ABOVE: usize = 512;
 /// older site takes: such a site answers 413 and creates or publishes nothing, rather than
 /// ignoring `access` and making it public. A newer site ignores `pad`. Without a restriction the
 /// bytes are exactly what they were before `access` existed.
+///
+/// Nothing is answered that would not do: a body that could not be written, and one that would
+/// reach the route's new limit (the site would refuse it with a 413 that reads like an older
+/// site's), are errors, and nothing is sent.
 pub fn body_bytes(mut body: Value, access: &Access, route: Route) -> Result<Vec<u8>, BodyError> {
+    let write = |body: &Value| serde_json::to_vec(body).ok().filter(|b| !b.is_empty()).ok_or(BodyError::Unreadable);
     if access.is_public() {
-        return Ok(serde_json::to_vec(&body).unwrap_or_default());
+        return write(&body);
     }
     add_to(&mut body, access);
     body["pad"] = json!("");
-    let bare = serde_json::to_vec(&body).unwrap_or_default().len();
+    let bare = write(&body)?.len();
     let want = route.old_limit() + PAD_ABOVE;
     body["pad"] = json!(" ".repeat(want.saturating_sub(bare)));
-    Ok(serde_json::to_vec(&body).unwrap_or_default())
+    let bytes = write(&body)?;
+    if bytes.len() >= route.new_limit() {
+        return Err(BodyError::TooLong);
+    }
+    Ok(bytes)
 }
 
 /// Why a body is not sent.
@@ -159,9 +167,13 @@ pub enum BodyError {
     Unreadable,
 }
 
-/// Whether a list of addresses leaves a body well under both routes' limits.
-pub fn fits(_viewers: &[String]) -> bool {
-    true
+/// Room kept in a body for everything but the addresses (an item's title, the pad's quotes).
+const ROOM_FOR_THE_REST: usize = 2_048;
+
+/// Whether a list of addresses, as JSON writes it, leaves a body well under both routes' limits.
+pub fn fits(viewers: &[String]) -> bool {
+    let smallest = Route::Media.new_limit().min(Route::Publish.new_limit());
+    serde_json::to_vec(viewers).is_ok_and(|v| v.len() + ROOM_FOR_THE_REST < smallest)
 }
 
 /// What an answer says was applied: None when it names no restriction (a public item, or an
@@ -213,16 +225,18 @@ pub enum Refused {
 /// The refusal an answer to a request that carried the fields means, when it is one of who
 /// can view's; None for any other answer, which the caller handles as before.
 pub fn refused(status: u16, answer: Option<&Value>) -> Option<Refused> {
-    let code = answer.and_then(|a| a.get("error")).and_then(Value::as_str);
-    // A body over an older site's limit. A newer site's own 413s (an item over its size limit,
-    // a workspace without room) keep their meaning.
-    if status == 413 && !matches!(code, Some("media_too_large" | "storage_full")) {
-        return Some(Refused::SiteTooOld);
+    let answer = answer?;
+    let code = answer.get("error").and_then(Value::as_str)?;
+    let detail = answer.get("detail").and_then(Value::as_str);
+    // A body over the limit, which a site up to 0.1.50 says of a padded body. Every other 413
+    // (a tour too large, an item over its size limit, a workspace without room) keeps the
+    // meaning the client gives it without a restriction.
+    if status == 413 {
+        return (code == "too_large" && detail.is_some_and(over_the_limit)).then_some(Refused::SiteTooOld);
     }
-    let (answer, code) = (answer?, code?);
     Some(match (status, code) {
         (400, "bad_access") => Refused::BadAccess,
-        (400, "bad_viewer") => Refused::BadViewer(answer.get("detail").and_then(Value::as_str).and_then(position)),
+        (400, "bad_viewer") => Refused::BadViewer(detail.and_then(position)),
         (400, "too_many_viewers") => Refused::TooManyViewers,
         (400, "bad_request") => Refused::BadRequest,
         (409, "cannot_restrict") => Refused::CannotRestrict,
@@ -233,11 +247,21 @@ pub fn refused(status: u16, answer: Option<&Value>) -> Option<Refused> {
     })
 }
 
-/// The position a `bad_viewer` detail names: its first number, when it is one of the positions
-/// a list can have (1 to [`MAX_VIEWERS`]). Nothing else of the detail is ever used.
+/// Whether a 413's detail is exactly "the request is over <digits> bytes".
+fn over_the_limit(detail: &str) -> bool {
+    detail.strip_prefix("the request is over ").and_then(|d| d.strip_suffix(" bytes")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The position (from 1) a `bad_viewer` detail names. The site writes exactly
+/// "viewers[<i>] is not an email address; nothing was changed", `<i>` from 0 in the list as
+/// sent; only a plain number from 0 to 999 in exactly that text is read, and nothing else of
+/// the detail is ever used, shown or logged.
 fn position(detail: &str) -> Option<u32> {
-    let digits: String = detail.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
-    digits.parse::<u32>().ok().filter(|n| (1..=MAX_VIEWERS as u32).contains(n))
+    let i = detail.strip_prefix("viewers[")?.strip_suffix("] is not an email address; nothing was changed")?;
+    if i.is_empty() || i.len() > 3 || !i.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    i.parse::<u32>().ok().filter(|n| *n < MAX_ENTRIES as u32).map(|n| n + 1)
 }
 
 /// Overwrite a request body that held addresses, once it is sent.

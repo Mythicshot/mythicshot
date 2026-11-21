@@ -526,7 +526,12 @@ impl ShareDialog {
                         *n = Some(ws.name);
                     }
                 }
-                Err(_) => {}
+                // Only "Anyone with the link" is offered then, with the line that says why.
+                Err(_) => {
+                    if let Ok(mut s) = site.lock() {
+                        *s = who::Site::Failed;
+                    }
+                }
             }
         });
     }

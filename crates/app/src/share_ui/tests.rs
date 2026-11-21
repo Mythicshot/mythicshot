@@ -1211,3 +1211,12 @@ fn enter_in_the_address_field_is_a_new_line_not_publish() {
     assert_eq!(d.stage(), &Stage::Form);
     assert!(d.who.addresses.contains('\n'), "Enter made a new line");
 }
+
+#[test]
+fn a_site_that_could_not_be_asked_offers_only_anyone_and_says_so() {
+    let mut d = image_form();
+    d.set_site(who::Site::Failed);
+    let v = d.view();
+    let at = v.lines.iter().position(|l| matches!(l, Line::Who { .. })).unwrap();
+    assert_eq!(&v.lines[at..], &[anyone_line(vec![who::Choice::Anyone]), Line::Muted("Could not ask the site whether it can restrict who can view.".into()), Line::Warning(warning(Kind::Image))]);
+}

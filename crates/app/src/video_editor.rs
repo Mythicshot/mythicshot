@@ -464,8 +464,37 @@ fn publish_job_as(
 /// the restriction for keeps it; any other is remembered so that the Tours page asks before
 /// publishing it for anyone. None when there is nothing to say: not restricted, or published.
 pub(crate) fn settle_restricted(restricted: bool, target: &Target, finished: &crate::publish::Finished, first: crate::publish::PublishedAs, delete: &dyn Fn(&str) -> bool) -> Option<publish_ui::Left> {
-    let _ = (restricted, target, finished, first, delete);
-    None
+    use crate::publish::Outcome;
+    use publish_ui::Left;
+    if !restricted {
+        return None;
+    }
+    let id = finished.tour_id.as_str();
+    let Outcome::NotPublic { error, .. } = &finished.outcome else {
+        // Published as asked (or nothing was published): nothing to ask about.
+        publish_ui::settle_restriction(id);
+        return None;
+    };
+    // Public now, and taking it down failed: said as it is; the Tours page offers Unpublish.
+    if error == crate::share_ui::who::TOUR_NOT_APPLIED_PUBLIC {
+        return Some(Left::Online);
+    }
+    // The site took the call that carried who can view: the draft keeps it, whoever publishes it.
+    if first.accepted {
+        publish_ui::settle_restriction(id);
+        return Some(Left::Restricted);
+    }
+    // A draft with nothing restricted on it. One this publish made is taken away again.
+    if matches!(target, Target::New) {
+        if delete(id) {
+            publish_ui::settle_restriction(id);
+            return Some(Left::Deleted);
+        }
+        publish_ui::note_unfinished_restriction(id);
+        return Some(Left::StillThere);
+    }
+    publish_ui::note_unfinished_restriction(id);
+    Some(Left::Draft)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,7 +533,14 @@ fn publish_job_full(
             // The commit has answered: the project is saved now, before the publish step, so
             // that it matches the site's draft whatever becomes of the publish. A cancel stops
             // a copy of the frames, so it never holds the publish step up.
-            |up| kept = keep_recording(keeping, save, Some(limit), &|| !worker.is_cancelled(), server, up, state, title, tour_title),
+            |up| {
+                // From here until it is settled, a plain publish of this draft would make it
+                // public: remembered at once, so even an editor closed half-way leaves it known.
+                if restricted {
+                    publish_ui::note_unfinished_restriction(&up.tour_id);
+                }
+                kept = keep_recording(keeping, save, Some(limit), &|| !worker.is_cancelled(), server, up, state, title, tour_title)
+            },
             |images| {
                 worker.set_publishing(images);
                 !worker.is_cancelled()
@@ -1290,7 +1326,11 @@ impl Editor {
                         }
                         Exported::Published(done, title, before, update) => {
                             // Never the link itself in the log: the result screen shows it.
-                            let msg = publish_ui::result_status(&done.finished, &before, update);
+                            let msg = if viewing.left == Some(publish_ui::Left::Deleted) {
+                                format!("{}. {}", crate::share_ui::who::NOT_PUBLISHED_HEADING, crate::share_ui::who::NOTHING_LEFT)
+                            } else {
+                                publish_ui::result_status(&done.finished, &before, update)
+                            };
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {

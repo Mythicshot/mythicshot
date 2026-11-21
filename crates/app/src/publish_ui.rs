@@ -383,16 +383,26 @@ pub enum Left {
 /// asks before publishing one for anyone. In memory only; never the addresses.
 static UNFINISHED_RESTRICTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+fn unfinished_restrictions() -> std::sync::MutexGuard<'static, Vec<String>> {
+    UNFINISHED_RESTRICTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A restricted publish of `tour_id` has its draft on the site and has not finished.
-pub fn note_unfinished_restriction(_tour_id: &str) {}
+pub fn note_unfinished_restriction(tour_id: &str) {
+    let mut list = unfinished_restrictions();
+    if !list.iter().any(|t| t == tour_id) {
+        list.push(tour_id.to_string());
+    }
+}
 
 /// That publish finished, the tour is gone, or the user chose to publish it for anyone.
-pub fn settle_restriction(_tour_id: &str) {}
+pub fn settle_restriction(tour_id: &str) {
+    unfinished_restrictions().retain(|t| t != tour_id);
+}
 
 /// Whether a plain publish of `tour_id` must be asked about first.
-pub fn restriction_unfinished(_tour_id: &str) -> bool {
-    let _ = &UNFINISHED_RESTRICTIONS;
-    false
+pub fn restriction_unfinished(tour_id: &str) -> bool {
+    unfinished_restrictions().iter().any(|t| t == tour_id)
 }
 
 static RUNS: Mutex<Vec<Arc<Run>>> = Mutex::new(Vec::new());
@@ -1003,8 +1013,12 @@ impl ResultDialog {
         self.viewing.granted.filter(|_| matches!(self.done.outcome, Outcome::Public { .. }))
     }
 
-    /// "Customer onboarding · 14 steps · public", or "… · only you" for a restricted tour.
+    /// "Customer onboarding · 14 steps · public", or "… · only you" for a restricted tour; only
+    /// the title for a tour that was deleted again.
     fn line(&self) -> String {
+        if self.viewing.left == Some(Left::Deleted) {
+            return short_title(&self.title, ROW_TITLE_MAX);
+        }
         let line = result_line(&self.title, &self.done, &self.before, self.update);
         match self.granted() {
             Some(g) => match line.strip_suffix("public") {
@@ -1017,11 +1031,30 @@ impl ResultDialog {
 
     /// The screen's heading.
     fn heading(&self) -> &'static str {
+        if self.viewing.left == Some(Left::Deleted) {
+            return who::NOT_PUBLISHED_HEADING;
+        }
         result_heading(&self.done.outcome, self.update)
     }
 
-    /// What else the screen says, and whether it is an error.
+    /// What else the screen says, and whether it is an error. A restricted publish that did not
+    /// finish says what is left on the site, never "not public" after a sentence about who can view.
     fn note(&self) -> Option<(String, bool)> {
+        if let (true, Some(left), Outcome::NotPublic { cancelled, error }) = (self.viewing.restricted, self.viewing.left, &self.done.outcome) {
+            let base = if *cancelled { "Publishing was cancelled.".to_string() } else { error.clone() };
+            let tail = match left {
+                Left::Deleted => Some(who::NOTHING_LEFT),
+                Left::StillThere => Some(who::STILL_THERE),
+                Left::Draft => Some(who::DRAFT_PUBLIC_IF_PUBLISHED),
+                Left::Restricted => Some(who::STAYS_AS_CHOSEN),
+                Left::Online => None,
+            };
+            let text = match tail {
+                Some(tail) => format!("{base} {tail}"),
+                None => base,
+            };
+            return Some((text, !cancelled));
+        }
         result_note(&self.done.outcome, &self.before, self.update)
     }
 
@@ -1089,9 +1122,9 @@ impl ResultDialog {
         let copied = self.copied_left().is_some();
         share_ui::modal(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(share_ui::WINDOW_WIDTH);
-            share_ui::heading_label(ui, result_heading(&self.done.outcome, self.update));
+            share_ui::heading_label(ui, self.heading());
             ui.label(RichText::new(self.line()).color(MUTED)).on_hover_text(&self.title);
-            if let Some((note, is_error)) = result_note(&self.done.outcome, &self.before, self.update) {
+            if let Some((note, is_error)) = self.note() {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(note).color(if is_error { ERROR } else { MUTED })).wrap());
             }
@@ -1696,22 +1729,20 @@ impl Picker {
         }
         let (list, server, site) = (self.list.clone(), self.server.clone(), self.site.clone());
         std::thread::spawn(move || {
-            let result = token_for(&server).and_then(|token| {
-                // The site's version says whether who can view can be chosen. A site that could
-                // not be asked offers only "Anyone with the link".
-                if let Ok(ws) = publish::workspace(&server, &token)
-                    && let Ok(mut s) = site.lock()
-                {
-                    *s = who::Site::of(ws.version.as_deref());
-                }
-                publish::list_tours(&server, &token)
-            });
-            let state = match result {
+            let token = token_for(&server);
+            let state = match token.as_ref().map_err(String::clone).and_then(|token| publish::list_tours(&server, token)) {
                 Ok(tours) => ListState::Loaded(tours),
                 Err(e) => ListState::Failed(e),
             };
             if let Ok(mut l) = list.lock() {
                 *l = state;
+            }
+            // Then the site's version, which says whether who can view can be chosen: asked
+            // after the list, so a slow answer never holds the list up. A site that could not be
+            // asked offers only "Anyone with the link", and says so.
+            let told = token.and_then(|token| publish::workspace(&server, &token)).map(|ws| who::Site::of(ws.version.as_deref())).unwrap_or(who::Site::Failed);
+            if let Ok(mut s) = site.lock() {
+                *s = told;
             }
         });
     }
@@ -1729,6 +1760,7 @@ impl Picker {
         let site = match &self.edit {
             Some(edit) => match edit.version.lock().ok().and_then(|v| v.clone()) {
                 Some(version) => who::Site::of(version.as_deref()),
+                None if matches!(self.list.lock().as_deref(), Ok(ListState::Failed(_))) => who::Site::Failed,
                 None => who::Site::Unknown,
             },
             None => self.site.lock().map(|s| *s).unwrap_or_default(),
@@ -1767,14 +1799,17 @@ impl Picker {
     /// addresses cannot be sent: nothing starts then.
     fn access(&self, shown: WhoShown) -> Option<Access> {
         match shown {
-            WhoShown::Choice => Some(self.who.access().unwrap_or_default()),
+            WhoShown::Choice => self.who.access().ok(),
             WhoShown::Nothing | WhoShown::Dashboard => Some(Access::Public),
         }
     }
 
     /// The line about the dashboard: for a tour published now, or published before.
     fn dashboard_line(&self) -> &'static str {
-        who::CHANGE_IN_DASHBOARD
+        match self.chosen_tour() {
+            Some(t) if !t.is_public() && t.published_at.is_some() => who::PUBLISHED_BEFORE,
+            _ => who::CHANGE_IN_DASHBOARD,
+        }
     }
 
     /// Draw who can view: the choice, or the line about the dashboard.
@@ -1783,7 +1818,7 @@ impl Picker {
             WhoShown::Nothing => {}
             WhoShown::Dashboard => {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(who::CHANGE_IN_DASHBOARD).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(self.dashboard_line()).color(MUTED)).wrap());
             }
             WhoShown::Choice => {
                 ui.add_space(8.0);

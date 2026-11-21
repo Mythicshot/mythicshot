@@ -167,27 +167,46 @@ impl Problem {
     }
 }
 
-/// Whether `s` looks like an address: exactly one "@", with text on both sides, and no space.
-/// The site is the judge; this only keeps the common mistakes from reaching it.
+/// The longest address the site takes.
+const MAX_ADDRESS: usize = 254;
+
+/// Whether `s` looks like an address: visible ASCII only (no space, nothing invisible), at most
+/// 254 characters, and exactly one "@" with text on both sides. The site is the judge; this
+/// only keeps the mistakes it would refuse from reaching it after a tour is uploaded.
 fn looks_like_address(s: &str) -> bool {
+    if s.len() > MAX_ADDRESS || !s.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
     let mut parts = s.split('@');
     let (Some(name), Some(host), None) = (parts.next(), parts.next(), parts.next()) else { return false };
-    !name.is_empty() && !host.is_empty() && !s.chars().any(char::is_whitespace)
+    !name.is_empty() && !host.is_empty()
 }
 
-/// The addresses in `text`, one per line, trimmed, blank lines left out; or why they cannot be sent.
+/// The addresses in `text`, or why they cannot be sent. They may be one per line or pasted
+/// with commas, semicolons or spaces between them; blank entries are left out. They are sent
+/// in this order and as typed (the site trims, lowercases and leaves out repeats), so "Address
+/// N" means the same entry to the site and here; repeats, whatever their case, count once
+/// against the 200.
 pub fn check(text: &str) -> Result<Vec<String>, Problem> {
-    let list: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let list: Vec<&str> = text.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|e| !e.is_empty()).collect();
     if list.is_empty() {
         return Err(Problem::NoAddress);
     }
-    if list.len() > access::MAX_VIEWERS {
+    if list.len() > access::MAX_ENTRIES {
         return Err(Problem::TooMany);
     }
     if let Some(i) = list.iter().position(|a| !looks_like_address(a)) {
         return Err(Problem::Bad(i + 1));
     }
-    Ok(list.into_iter().map(str::to_string).collect())
+    let distinct: std::collections::HashSet<String> = list.iter().map(|a| a.to_ascii_lowercase()).collect();
+    if distinct.len() > access::MAX_VIEWERS {
+        return Err(Problem::TooMany);
+    }
+    let list: Vec<String> = list.into_iter().map(str::to_string).collect();
+    if !access::fits(&list) {
+        return Err(Problem::TooLong);
+    }
+    Ok(list)
 }
 
 /// One piece of the choice as a window shows it, in order.
@@ -238,7 +257,9 @@ pub struct Form {
 
 impl Default for Form {
     fn default() -> Form {
-        Form { choice: Choice::default(), addresses: String::new(), site: Site::default(), id: egui::Id::unique("who-can-view-addresses"), ctx: None }
+        // Each window's field its own: two editors can be open at once.
+        let n = FIELDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Form { choice: Choice::default(), addresses: String::new(), site: Site::default(), id: egui::Id::unique(("who-can-view-addresses", n)), ctx: None }
     }
 }
 
@@ -250,10 +271,23 @@ impl fmt::Debug for Form {
 }
 
 impl Drop for Form {
+    /// The addresses are overwritten, and what the field stored (its undo history holds what
+    /// was typed) is removed, so no later window can bring them back.
     fn drop(&mut self) {
         crate::publish_ui::wipe(&mut self.addresses);
+        if let Some(ctx) = self.ctx.take() {
+            forget_field(&ctx, self.id);
+        }
     }
 }
+
+/// Remove what the address field `id` stored in `ctx`: its cursor and its undo history.
+fn forget_field(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+}
+
+/// A number for each window's address field.
+static FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Form {
     /// The address field's id.
@@ -308,8 +342,10 @@ impl Form {
     pub fn parts(&self) -> Vec<Part> {
         let chosen = self.chosen();
         let mut out = vec![Part::Choice { offered: self.offered(), chosen }];
-        if self.site == Site::TooOld {
-            out.push(Part::Muted(TOO_OLD.to_string()));
+        match self.site {
+            Site::TooOld => out.push(Part::Muted(TOO_OLD.to_string())),
+            Site::Failed => out.push(Part::Muted(COULD_NOT_ASK.to_string())),
+            Site::Unknown | Site::Takes => {}
         }
         match chosen {
             Choice::Anyone => {}
@@ -345,6 +381,11 @@ pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32
         Part::Addresses => {
             ui.label(RichText::new(ADDRESSES_LABEL).strong());
             let id = form.id;
+            // The first time the field shows, nothing stored under its id is taken over.
+            if form.ctx.is_none() {
+                forget_field(ui.ctx(), id);
+                form.ctx = Some(ui.ctx().clone());
+            }
             ui.add(egui::TextEdit::multiline(&mut form.addresses).id(id).desired_rows(3).desired_width(f32::INFINITY));
         }
         Part::Help(t) => {
@@ -494,7 +535,7 @@ mod tests {
         f.addresses = "private.person@example.com".into();
         let id = f.addresses_id();
         let stored = |ctx: &egui::Context, id| ctx.data_mut(|d| d.get_persisted::<egui::text_edit::TextEditState>(id)).is_some();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| draw_part(ui, &Part::Addresses, &mut f, Color32::GRAY));
+        ctx.run_ui(egui::RawInput::default(), |ui| draw_part(ui, &Part::Addresses, &mut f, Color32::GRAY)).textures_delta.clear();
         assert!(stored(&ctx, id), "the field keeps its state (and undo history) while the window is open");
         drop(f);
         assert!(!stored(&ctx, id), "the state, undo history and all, goes when the window goes");

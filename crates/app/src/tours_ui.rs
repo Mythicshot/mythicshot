@@ -927,12 +927,25 @@ impl Model {
     /// did not finish first asks whether to publish it for anyone ([`Edit::ConfirmPublish`]);
     /// any other starts at once, as [`Model::start_publish`].
     pub fn request_publish(&mut self, id: &str) -> Option<Started> {
-        self.start_publish(id)
+        if !publish_ui::restriction_unfinished(id) {
+            return self.start_publish(id);
+        }
+        if self.can_act(id) && self.tour(id).is_some_and(|t| !t.is_public()) {
+            self.errors.remove(id);
+            self.edit = Edit::ConfirmPublish { id: id.to_string() };
+        }
+        None
     }
 
-    /// "Publish for anyone" in that question: only for the tour whose question is showing.
-    pub fn confirm_publish(&mut self, _id: &str) -> Option<Started> {
-        None
+    /// "Publish for anyone" in that question: only for the tour whose question is showing. The
+    /// question closes with the click, and the tour is no longer asked about.
+    pub fn confirm_publish(&mut self, id: &str) -> Option<Started> {
+        if self.edit != (Edit::ConfirmPublish { id: id.to_string() }) || !self.can_act(id) {
+            return None;
+        }
+        self.edit = Edit::None;
+        publish_ui::settle_restriction(id);
+        self.start_publish(id)
     }
 
     /// "Publish changes" on a public tour whose live page is behind its draft: the job a draft's
@@ -1075,7 +1088,7 @@ impl Model {
 /// The buttons of the question before publishing for anyone, left to right, and whether each is
 /// the default (what Enter and Escape choose).
 pub fn confirm_publish_buttons() -> [(&'static str, bool); 2] {
-    [(crate::share_ui::who::CONFIRM_CANCEL, false), (crate::share_ui::who::CONFIRM_PUBLISH, false)]
+    [(crate::share_ui::who::CONFIRM_CANCEL, true), (crate::share_ui::who::CONFIRM_PUBLISH, false)]
 }
 
 /// Delete a tour a restricted publish created and could not publish as asked, the way the page
@@ -1083,9 +1096,33 @@ pub fn confirm_publish_buttons() -> [(&'static str, bool); 2] {
 /// note removed once the site says nothing is left. True when the tour is gone. The saved
 /// recording on this computer is left alone.
 pub fn delete_created_tour(server: &str, token: &str, tour_id: &str, title: &str) -> bool {
-    let _ = (server, token, tour_id, title);
-    false
+    let Some(unfinished) = SHARED_UNFINISHED.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+    let Ok(server) = publish::check_server(server) else { return false };
+    let noted_here = match unfinished.add(&server, tour_id, title) {
+        Noted::Now => true,
+        Noted::Before => false,
+        // No note, no delete: the page's own rule.
+        Noted::NotSaved => return false,
+    };
+    match publish::delete_tour(&server, token, tour_id, |_| {}) {
+        Ok(_) => {
+            unfinished.remove(&server, tour_id);
+            true
+        }
+        // The tour itself is gone; its note stays for "Finish deleting".
+        Err(f) if f.unfinished => true,
+        Err(f) => {
+            if f.not_started && noted_here {
+                unfinished.remove(&server, tour_id);
+            }
+            false
+        }
+    }
 }
+
+/// The app's list of deletes that did not finish, once it has started ([`Unfinished::start`]),
+/// for a delete sent from an editor.
+static SHARED_UNFINISHED: Mutex<Option<Unfinished>> = Mutex::new(None);
 
 // ---- Deletes that did not finish ----
 
@@ -1181,6 +1218,10 @@ impl Unfinished {
         self.load(list);
         if let Some(save_now) = save_now {
             self.save_with(save_now);
+        }
+        // Not from tests: they start lists of their own, which no editor should write to.
+        if !cfg!(test) {
+            *SHARED_UNFINISHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.clone());
         }
     }
 
@@ -1765,6 +1806,8 @@ enum Click {
     /// Cancel on a row whose recording is being opened, by tour id.
     CancelOpen(String),
     DeleteTour(String),
+    /// "Publish for anyone" in the question for a tour whose restriction was not applied.
+    PublishForAnyone(String),
     FinishDelete(UnfinishedDelete),
     DismissNotice,
 }
@@ -1890,7 +1933,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                 RowButton::Rename => m.start_rename(&id),
                 RowButton::Delete => m.ask_delete(&id),
                 RowButton::Publish => {
-                    if let Some(job) = m.start_publish(&id) {
+                    if let Some(job) = m.request_publish(&id) {
                         state.spawn_job(job);
                     }
                 }
@@ -1915,6 +1958,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
             Click::ChooseChapter(chapter) => {
                 if let Some(key) = m.choose_chapter(&chapter) {
                     out.edit_project = Some(key);
+                }
+            }
+            Click::PublishForAnyone(id) => {
+                if let Some(job) = m.confirm_publish(&id) {
+                    state.spawn_job(job);
                 }
             }
             Click::DeleteTour(id) => {
@@ -1974,6 +2022,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
     let renaming = matches!(edit, Edit::Renaming { id, .. } if *id == t.id);
     let confirming = matches!(edit, Edit::ConfirmDelete { id } if *id == t.id);
     let choosing = matches!(edit, Edit::ChoosingChapter { id } if *id == t.id);
+    let asking_publish = matches!(edit, Edit::ConfirmPublish { id } if *id == t.id);
     let saved = m.saved(&t.id);
     egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -2028,6 +2077,26 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                     }
                     if ui.add(egui::Button::new(RichText::new("Delete tour").color(Color32::WHITE)).fill(Color32::from_rgb(170, 48, 48))).clicked() {
                         clicks.push(Click::DeleteTour(t.id.clone()));
+                    }
+                });
+            });
+        } else if asking_publish {
+            // Cancel is the default: Enter and Escape both choose it.
+            egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_HEADING).strong()).wrap());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_TEXT).color(MUTED)).wrap());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let keys = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter));
+                    for (label, default) in confirm_publish_buttons() {
+                        let button = if default { egui::Button::new(RichText::new(label).strong()).fill(PRIMARY) } else { egui::Button::new(label) };
+                        let clicked = ui.add(button).clicked();
+                        if (clicked || (default && keys)) && default {
+                            clicks.push(Click::CancelEdit);
+                        } else if clicked {
+                            clicks.push(Click::PublishForAnyone(t.id.clone()));
+                        }
                     }
                 });
             });

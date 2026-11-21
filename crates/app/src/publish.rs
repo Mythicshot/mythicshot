@@ -1161,7 +1161,6 @@ impl Client {
     /// finished at once is taken off the web again.
     /// `first` hears of a first answer that applied what was asked, with what it applied.
     fn publish_tour_as(&self, tour_id: &str, access: &access::Access, pause: Duration, mut progress: impl FnMut(Option<Images>) -> bool, first: &mut dyn FnMut(Option<access::Granted>)) -> Result<Live, String> {
-        let _ = &first;
         use crate::share_ui::who;
         let what = "Could not publish the tour";
         let refusal = |r: access::Refused| who::refused_text(r, "tour", who::Ending::Published);
@@ -1213,9 +1212,13 @@ impl Client {
                     return Err(refusal(access::Refused::NotApplied));
                 }
                 return Err(match self.unpublish_tour(tour_id, pause) {
-                    Ok(()) => refusal(access::Refused::NotApplied),
+                    Ok(()) => who::TOUR_UNPUBLISHED_AGAIN.to_string(),
                     Err(_) => who::TOUR_NOT_APPLIED_PUBLIC.to_string(),
                 });
+            }
+            // The site took the call that started the publish, with what was asked.
+            if call == 1 {
+                first(access::granted(&v));
             }
             if reply.status == 202 {
                 let id = v.get("publish_id").and_then(Value::as_str).filter(|id| is_id(id, "pub_")).ok_or_else(|| not_understood(what))?;
