@@ -12,14 +12,17 @@ import { EXIT, Refusal } from '../lib/errors.mjs';
 import { describeInstaller, installerName, makeBuildInfo, makeFragment, siteRelease } from '../lib/fragment.mjs';
 import { realRunner } from '../lib/runner.mjs';
 import { releaseToSite } from '../lib/site.mjs';
+import { findOnPath } from '../lib/tools.mjs';
 import { main } from '../release.mjs';
 import { RECORDED, SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
-import { assertNoSecrets, COMMIT, exists, fakeRepo, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, tempDir, writeConfig } from './helpers.mjs';
+import { assertNoSecrets, COMMIT, exists, FAKE_TOOLS, fakeRepo, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, tempDir, writeConfig } from './helpers.mjs';
 
 const SITE = process.env.MYTHICSHOT_SITE ?? 'C:\\dev\\mythicshot-site';
 const skip = !existsSync(join(SITE, 'scripts', 'package.mjs')) && `no front page checkout at ${SITE}`;
 const LEFT_OUT = new Set(['.git', 'node_modules', 'dist', 'dist.building', 'preview', '.tmp']);
 const ENV = { ...process.env, [SECRET_ENV_NAME]: SECRET_ENV_VALUE };
+// The site's own steps run through the real npm, found the way the release command finds it.
+const TOOLS = { ...FAKE_TOOLS, npm: findOnPath('npm', { env: process.env, extensions: ['.cmd', '.exe'] }) };
 
 /** A fresh copy of the site in a temporary folder, without its history, builds or installers. */
 function copySite(release = '{}\n') {
@@ -66,7 +69,7 @@ const world = ({ verify = validFor(PUBLISHER), head = COMMIT, msiVersion = '0.2.
 };
 
 async function toSite({ copy, release, w = world(), repo = fakeRepo(), config = writeConfig(), logs = [] }) {
-  return releaseToSite({ from: release.dir, site: copy, configPath: config.path, env: ENV, repoRoot: repo }, { runner: w.runner, log: (l) => logs.push(l) });
+  return releaseToSite({ from: release.dir, site: copy, configPath: config.path, env: ENV, repoRoot: repo }, { runner: w.runner, log: (l) => logs.push(l), tools: TOOLS });
 }
 
 const refusedWith = (code, pattern) => (e) => {
@@ -137,7 +140,7 @@ test('--to-site refuses a release older than the site\'s', { skip }, async () =>
   assert.ok(!w.tags().includes('site-check'));
 });
 
-test('--to-site with the same version and the same installer changes nothing and succeeds', { skip }, async () => {
+test('--to-site with the same version and the same installer changes no file, and still runs the site steps', { skip, timeout: 120000 }, async () => {
   const release = await fakeRelease();
   const copy = copySite(release.fragment);
   writeFileSync(join(copy, release.file), readFileSync(join(release.dir, release.file)));
@@ -145,10 +148,10 @@ test('--to-site with the same version and the same installer changes nothing and
   const logs = [];
   const result = await toSite({ copy, release, w, logs });
   assert.equal(result.unchanged, true);
-  assert.ok(!w.tags().includes('site-check'));
-  assert.equal(exists(join(copy, 'dist')), false);
-  assert.match(logs.join('\n'), /already offers exactly this release/);
-  assert.deepEqual(w.tags(), ['git-head', 'verify', 'verify-digest', 'msi-version'], 'the offered installer is still checked');
+  assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), release.fragment);
+  assert.ok(exists(join(copy, 'dist', 'download', release.file)), 'dist/ was rebuilt');
+  assert.match(logs.join('\n'), /already offers exactly this release.*check and package steps passed/);
+  assert.deepEqual(w.tags(), ['git-head', 'verify', 'verify-digest', 'msi-version', 'site-check', 'site-package'], 'the offered installer is still checked, and dist/ rebuilt');
   assert.equal(w.calls[1].env.MYTHICSHOT_VERIFY_FILE, join(copy, release.file));
 });
 
@@ -159,6 +162,23 @@ test('--to-site with the same version refuses when the installer the site offers
   await assert.rejects(toSite({ copy, release, w: world({ verify: RECORDED.notSigned }) }), refusedWith(EXIT.VERIFY, /is not signed/));
   assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), release.fragment);
 });
+
+for (const [name, change] of [['another file name', { file: 'Mythicshot-0.2.16-x64-b.msi' }], ['another size', { size: 1 }]]) {
+  test(`--to-site refuses the same version with ${name}, even with the same checksum`, { skip }, async () => {
+    const release = await fakeRelease();
+    const copy = copySite(`${JSON.stringify({ ...JSON.parse(release.fragment), ...change }, null, 2)}\n`);
+    await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /already offers version 0\.2\.16 with a different installer/));
+  });
+}
+
+for (const [name, content] of [['no version', { file: 'Mythicshot-0.2.15-x64.msi', size: 1, sha256: 'a'.repeat(64) }], ['a version that is not three numbers', { file: 'Mythicshot-0.2.15-x64.msi', version: '0.2', size: 1, sha256: 'a'.repeat(64) }], ['no file', { version: '0.2.15', size: 1, sha256: 'a'.repeat(64) }], ['an unknown field', { file: 'Mythicshot-0.2.15-x64.msi', version: '0.2.15', size: 1, sha256: 'a'.repeat(64), note: 'x' }]]) {
+  test(`--to-site refuses a site release.json with ${name}`, { skip }, async () => {
+    const copy = copySite(`${JSON.stringify(content)}\n`);
+    const release = await fakeRelease();
+    await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /neither empty \(\{\}\) nor a valid release/));
+    assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), `${JSON.stringify(content)}\n`);
+  });
+}
 
 test('--to-site refuses the same version with a different installer', { skip }, async () => {
   const release = await fakeRelease();
@@ -187,7 +207,7 @@ test('--to-site refuses an installer under another name than its version\'s', { 
 test('--to-site refuses an installer whose ProductVersion differs, and puts the site back', { skip }, async () => {
   const copy = copySite();
   const release = await fakeRelease();
-  await assert.rejects(toSite({ copy, release, w: world({ msiVersion: '0.2.14' }) }), refusedWith(EXIT.VERSION, /says version 0\.2\.14, but release\.json says 0\.2\.16.*are back/));
+  await assert.rejects(toSite({ copy, release, w: world({ msiVersion: '0.2.14' }) }), refusedWith(EXIT.VERSION, /says version 0\.2\.14, but release\.json says 0\.2\.16.*release\.json and dist\/ are back/));
   assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), '{}\n');
   assert.equal(exists(join(copy, release.file)), false);
   assert.equal(exists(join(copy, `${release.file}.part`)), false);
@@ -215,7 +235,7 @@ test('--to-site refuses an installer its release.json does not name', { skip }, 
   const copy = copySite();
   writeFileSync(join(copy, 'Mythicshot-0.2.15-x64.msi'), 'old');
   const release = await fakeRelease();
-  await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /another installer \(Mythicshot-0\.2\.15-x64\.msi\) that its release\.json does not name/));
+  await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /another installer or leftover \(Mythicshot-0\.2\.15-x64\.msi\) that its release\.json does not name/));
   assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), '{}\n');
 });
 
@@ -227,7 +247,7 @@ test('when the site\'s check refuses: release.json, an installer of the same nam
   writeFileSync(join(copy, release.file), 'a stale file of the same name');
   // A broken site: a hard-wrapped paragraph in a text file, which the site's check refuses.
   writeFileSync(join(copy, 'NOTES.md'), 'This paragraph\ncarries on.\n');
-  await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /The site's npm run check refused the release.*earlier installer and release\.json are back/));
+  await assert.rejects(toSite({ copy, release }), refusedWith(EXIT.SITE, /The site's npm run check refused the release.*earlier installer, release\.json and dist\/ are back/));
   assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), `${JSON.stringify(old, null, 2)}\n`);
   assert.equal(readFileSync(join(copy, release.file), 'utf8'), 'a stale file of the same name');
   assert.equal(readFileSync(join(copy, old.file), 'utf8'), 'old installer');
@@ -242,13 +262,14 @@ test('a failed package step: a dist/ this run created is removed', { skip, timeo
   assert.equal(exists(join(copy, 'dist')), false);
 });
 
-test('a failed package step: a dist/ that was there before is left, and the refusal says so', { skip, timeout: 120000 }, async () => {
+test('a failed package step: a dist/ that was there before is put back as it was', { skip, timeout: 120000 }, async () => {
   const copy = copySite();
   mkdirSync(join(copy, 'dist'));
   writeFileSync(join(copy, 'dist', 'index.html'), 'the last good package');
   const release = await fakeRelease();
-  const w = world({ site: { 'site-package': () => ({ code: 1, stdout: '', stderr: 'The packaged files do not pass the checks: x' }) } });
-  await assert.rejects(toSite({ copy, release, w }), refusedWith(EXIT.SITE, /dist\/ was there before this run and is left as the site's package step left it/));
+  const w = world({ site: { 'site-package': (opts) => { mkdirSync(join(opts.cwd, 'dist'), { recursive: true }); writeFileSync(join(opts.cwd, 'dist', 'half.html'), 'x'); return { code: 1, stdout: '', stderr: 'The packaged files do not pass the checks: x' }; } } });
+  await assert.rejects(toSite({ copy, release, w }), refusedWith(EXIT.SITE, /npm run package refused.*dist\/ are back/));
+  assert.equal(exists(join(copy, 'dist', 'half.html')), false);
   assert.equal(readFileSync(join(copy, 'dist', 'index.html'), 'utf8'), 'the last good package');
 });
 
@@ -261,7 +282,7 @@ test('the command line: --to-site without a configuration exits 3 and touches no
   const copy = copySite();
   const release = await fakeRelease();
   const lines = [];
-  const code = await main(['--to-site', copy, '--from', release.dir, '--config', join(tempDir(), 'none.json')], { env: {}, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: world().runner, repoRoot: fakeRepo() });
+  const code = await main(['--to-site', copy, '--from', release.dir, '--config', join(tempDir(), 'none.json')], { env: {}, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: world().runner, repoRoot: fakeRepo(), tools: TOOLS });
   assert.equal(code, EXIT.CONFIG);
   assert.match(lines.join('\n'), /^Refused: No release without a complete signing configuration/);
   assert.equal(readFileSync(join(copy, 'release.json'), 'utf8'), '{}\n');

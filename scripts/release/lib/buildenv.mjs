@@ -14,11 +14,23 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { EXIT, Refusal } from './errors.mjs';
 
+// Removed from the build's environment, by exact name (compared without case):
+//   rustc and cargo: flags, wrappers, the compiler itself, the toolchain and its home
+//   MSVC: LINK and _LINK_ (extra linker options), CL and _CL_ (extra compiler options), and the
+//     LIB, LIBPATH and INCLUDE search paths (rustc and the cc crate find Visual Studio themselves)
+//   the cc crate and C build scripts: CC, CXX, AR, RANLIB, their flags, NASM, RC
 export const BUILD_ENV_STRIP = [
-  'RUSTFLAGS', 'RUSTDOCFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTC_BOOTSTRAP',
-  'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'CARGO_TARGET_DIR', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN',
+  'RUSTFLAGS', 'RUSTDOCFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTC_BOOTSTRAP', 'RUSTC_LINKER',
+  'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'CARGO_TARGET_DIR', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN', 'RUSTUP_HOME',
+  'LINK', '_LINK_', 'CL', '_CL_', 'LIB', 'LIBPATH', 'INCLUDE', 'RC', 'NASM', 'LDFLAGS', 'CPPFLAGS',
 ];
-export const BUILD_ENV_STRIP_PREFIXES = ['CARGO_BUILD_', 'CARGO_TARGET_', 'CARGO_PROFILE_', 'CARGO_UNSTABLE_', 'CARGO_REGISTRIES_', 'CARGO_SOURCE_'];
+// ...and by prefix (which also covers the cc crate's per-target spellings, such as CC_x86_64-pc-windows-msvc,
+// CFLAGS_x86_64_pc_windows_msvc, TARGET_CC and HOST_CFLAGS).
+export const BUILD_ENV_STRIP_PREFIXES = [
+  'CARGO_BUILD_', 'CARGO_TARGET_', 'CARGO_PROFILE_', 'CARGO_UNSTABLE_', 'CARGO_REGISTRIES_', 'CARGO_SOURCE_',
+  'CC', 'CFLAGS', 'CXX', 'CXXFLAGS', 'AR', 'RANLIB', 'TARGET_', 'HOST_', 'CRATE_CC_', 'RC_', 'NASM_',
+  'BINDGEN_', 'LIBCLANG_', 'CLANG_', 'CMAKE', 'VCPKG',
+];
 
 // Keys of a cargo configuration file that can change what is built or with which tools.
 const FORBIDDEN_KEYS = [
@@ -30,7 +42,11 @@ const FORBIDDEN_KEYS = [
   /^env(\.|$)/,
   /^unstable(\.|$)/,
   /^paths$/,
+  /^include(\.|$)/,
 ];
+// The same, as key paths: an inline table ({ ... }) at a key that any of these starts with is refused whole.
+const FORBIDDEN_PATHS = ['build.rustflags', 'build.rustdocflags', 'build.rustc', 'build.rustdoc', 'build.rustc-wrapper', 'build.rustc-workspace-wrapper', 'build.target', 'build.target-dir', 'target', 'profile', 'patch', 'source', 'env', 'unstable', 'paths', 'include'];
+const coversForbidden = (key) => FORBIDDEN_PATHS.some((p) => p === key || p.startsWith(`${key}.`));
 
 const unquote = (part) => part.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
 const dotted = (text) => text.split('.').map(unquote).join('.');
@@ -48,10 +64,12 @@ export function forbiddenCargoKeys(toml) {
       if (FORBIDDEN_KEYS.some((re) => re.test(section))) found.push(section);
       continue;
     }
-    const key = /^((?:"[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)(?:\s*\.\s*(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+))*)\s*=/.exec(line);
+    const key = /^((?:"[^"]*"|'[^']*'|[A-Za-z0-9_.-]+)(?:\s*\.\s*(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+))*)\s*=\s*(.?)/.exec(line);
     if (!key) continue;
     const full = (section ? `${section}.` : '') + dotted(key[1].replace(/\s*\.\s*/g, '.'));
     if (FORBIDDEN_KEYS.some((re) => re.test(full))) found.push(full);
+    // An inline table hides its keys on the same line: refuse it whenever it could hold a forbidden one.
+    else if (key[2] === '{' && coversForbidden(full)) found.push(`${full} (inline table)`);
   }
   return [...new Set(found)];
 }
@@ -104,4 +122,17 @@ export function checkCleanCheckout(statusText, when) {
   }
 }
 
-export const STATUS_ARGS = ['status', '--porcelain', '--untracked-files=all', '--ignored=matching'];
+/**
+ * Refuses when `git ls-files -v` shows a file git has been told not to look at (skip-worktree,
+ * tag S, or assume-unchanged, a small letter): a change to it would not show in git status.
+ */
+export function checkGitIndex(lsFilesText) {
+  const hidden = String(lsFilesText).split(/\r?\n/).filter(Boolean).filter((l) => /^(S|[a-z]) /.test(l));
+  if (hidden.length) {
+    throw new Refusal(EXIT.DIRTY, `git is told not to look at ${hidden.length} file${hidden.length > 1 ? 's' : ''} (skip-worktree or assume-unchanged; first: ${hidden[0].slice(2)}), so a change there would not show. Clear it with git update-index --no-skip-worktree --no-assume-unchanged.`);
+  }
+}
+
+export const LS_FILES_ARGS = ['ls-files', '-v'];
+
+export const STATUS_ARGS =['status', '--porcelain', '--untracked-files=all', '--ignored=matching'];

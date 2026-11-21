@@ -1,15 +1,15 @@
 // Outputs of the verifier's PowerShell step (VERIFY_SCRIPT), recorded on Windows 11 with
-// Windows PowerShell 5.1 on 2026-11-21. Paths in messages are shortened to <file>.
+// Windows PowerShell 5.1 on 2026-11-21, with the chain status (for the valid file it says NotTimeValid: its certificate has since expired, which the timestamp covers). Paths in messages are shortened to <file>.
 //   notSigned:    the unsigned release build of mythicshot.exe
 //   untrusted:    a copy of a small exe signed with a throw-away leaf certificate (issued by a
 //                 throw-away CA that is in no store), held only in a temporary PFX file
 //   valid:        a copy of signtool.exe from the Windows SDK (signed and timestamped by Microsoft)
 //   hashMismatch: the same copy with one byte changed after signing
 export const RECORDED = {
-  notSigned: '{"status":"NotSigned","message":"The file <file> is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170","subject":null,"timestamper":null,"type":"None","thumbprint":null,"ekus":[],"chain":[]}',
-  untrusted: '{"status":"UnknownError","message":"A certificate chain could not be built to a trusted root authority","subject":"CN=Mythicshot Throwaway Leaf","timestamper":null,"type":"Authenticode","thumbprint":"EA0E86ABFE0DA71771AA88ED7BBB35B82F621130","ekus":["1.3.6.1.5.5.7.3.3","1.3.6.1.4.1.311.97.1.0"],"chain":["EA0E86ABFE0DA71771AA88ED7BBB35B82F621130"]}',
-  valid: '{"status":"Valid","message":"Signature verified.","subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamper":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:3303-05E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","type":"Authenticode","thumbprint":"6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","ekus":["1.3.6.1.4.1.311.61.6.1","1.3.6.1.5.5.7.3.3"],"chain":["6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","D30F05F637E605239C0070D1EA9860D434AC2A94","3B1EFD3A66EA28B16697394703A72CA340A05BD5"]}',
-  hashMismatch: '{"status":"HashMismatch","message":"The contents of file <file> might have been changed by an unauthorized user or process, because the hash of the file does not match the hash stored in the digital signature. The script cannot run on the specified system. For more information, run Get-Help about_Signing.","subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamper":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:3303-05E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","type":"Authenticode","thumbprint":"6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","ekus":["1.3.6.1.4.1.311.61.6.1","1.3.6.1.5.5.7.3.3"],"chain":["6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","D30F05F637E605239C0070D1EA9860D434AC2A94","3B1EFD3A66EA28B16697394703A72CA340A05BD5"]}',
+  notSigned: '{"status":"NotSigned","message":"The file <file> is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170","subject":null,"timestamper":null,"type":"None","thumbprint":null,"ekus":[],"chain":[],"chainStatus":[]}',
+  untrusted: '{"status":"UnknownError","message":"A certificate chain could not be built to a trusted root authority","subject":"CN=Mythicshot Throwaway Leaf","timestamper":null,"type":"Authenticode","thumbprint":"EA96C84E40C988CDD2A2DC14DD170EF25484AF53","ekus":["1.3.6.1.5.5.7.3.3","1.3.6.1.4.1.311.97.1.0"],"chain":["EA96C84E40C988CDD2A2DC14DD170EF25484AF53"],"chainStatus":["PartialChain"]}',
+  valid: '{"status":"Valid","message":"Signature verified.","subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamper":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:3303-05E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","type":"Authenticode","thumbprint":"6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","ekus":["1.3.6.1.4.1.311.61.6.1","1.3.6.1.5.5.7.3.3"],"chain":["6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","D30F05F637E605239C0070D1EA9860D434AC2A94","3B1EFD3A66EA28B16697394703A72CA340A05BD5"],"chainStatus":["NotTimeValid"]}',
+  hashMismatch: '{"status":"HashMismatch","message":"The contents of file <file> might have been changed by an unauthorized user or process, because the hash of the file does not match the hash stored in the digital signature. The script cannot run on the specified system. For more information, run Get-Help about_Signing.","subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamper":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:3303-05E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","type":"Authenticode","thumbprint":"6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","ekus":["1.3.6.1.4.1.311.61.6.1","1.3.6.1.5.5.7.3.3"],"chain":["6ACE61BAE3F09F4DD2697806D73E022CBFE70EB4","D30F05F637E605239C0070D1EA9860D434AC2A94","3B1EFD3A66EA28B16697394703A72CA340A05BD5"],"chainStatus":["NotTimeValid"]}',
 };
 
 // What the recorded valid answer must be checked against to pass.
@@ -30,7 +30,7 @@ export const SIGNTOOL_VERIFY = {
 SIGNTOOL_VERIFY.sha1 = SIGNTOOL_VERIFY.sha256.replace('(sha256)', '(sha1)');
 
 /** The recorded valid answer, changed for one test: another subject, no timestamp, other usages or chain. */
-export function validFor(subject, { timestamp = true, ekus, chain, thumbprint, type } = {}) {
+export function validFor(subject, { timestamp = true, ekus, chain, thumbprint, type, chainStatus } = {}) {
   const data = JSON.parse(RECORDED.valid);
   data.subject = subject;
   if (!timestamp) data.timestamper = null;
@@ -41,5 +41,6 @@ export function validFor(subject, { timestamp = true, ekus, chain, thumbprint, t
   }
   if (chain) data.chain = chain;
   if (type !== undefined) data.type = type;
+  if (chainStatus !== undefined) data.chainStatus = chainStatus;
   return JSON.stringify(data);
 }

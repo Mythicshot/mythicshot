@@ -8,6 +8,14 @@ import { RECORDED, RECORDED_EXPECT, SIGNTOOL_VERIFY, validFor } from './recorded
 export const PUBLISHER = 'CN=Mythicshot Test Publisher, O=Mythicshot, C=GB';
 export const ISSUER = RECORDED_EXPECT.issuerThumbprints[0];
 export const COMMIT = '00f5a6f0000000000000000000000000000000aa';
+// Tools as the release command would resolve them; the fake runner answers by step, not by path.
+export const FAKE_TOOLS = {
+  powershell: String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+  git: String.raw`C:\Program Files\Git\cmd\git.exe`,
+  cargo: String.raw`C:\Users\x\.cargo\bin\cargo.exe`,
+  wix: String.raw`C:\Users\x\.dotnet\tools\wix.exe`,
+  npm: String.raw`C:\Program Files\nodejs\npm.cmd`,
+};
 // Values that must never appear in any output.
 export const SECRET_THUMBPRINT = 'A1B2C3D4E5F60718293A4B5C6D7E8F9012345678';
 export const SECRET_PIN = 'pin-HUNTER2-very-secret';
@@ -94,6 +102,8 @@ export function fakeWorld(options = {}) {
         if (options.dirty || (world.built && options.dirtyAfterBuild)) out += options.dirtyAfterBuild ?? ' M crates/app/src/main.rs\n';
         return { code: 0, stdout: out, stderr: '' };
       }
+      case 'git-ls-files':
+        return { code: 0, stdout: options.lsFiles ?? 'H Cargo.toml\nH crates/app/src/main.rs\n', stderr: '' };
       case 'git-head':
         return { code: 0, stdout: `${world.built && options.headAfterBuild ? options.headAfterBuild : (options.commit ?? COMMIT)}\n`, stderr: '' };
       case 'wix-extensions':

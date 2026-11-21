@@ -21,6 +21,8 @@ const OWNED_FLAGS = new Set(['/fd', '/tr', '/td', '/t', '/tseal', '/seal', '/as'
 // Flags that pick a certificate or a signing key: at least one must be given.
 const SELECTOR_FLAGS = new Set(['/sha1', '/f', '/n', '/i', '/a', '/dlib', '/csp', '/kc', '/r', '/u']);
 export const MIN_SECRET_LENGTH = 4;
+// Flags whose value is treated as a secret and must be MIN_SECRET_LENGTH or longer.
+export const SECRET_VALUE_FLAGS = new Set(['/p', '/kc', '/csp']);
 
 // signtool reads "-x" exactly like "/x".
 const flagOf = (value) => (typeof value === 'string' && /^[-/][A-Za-z0-9]+$/.test(value) ? `/${value.slice(1).toLowerCase()}` : null);
@@ -68,6 +70,14 @@ function argumentProblems(resolved) {
   if (!flags.some((flag) => SELECTOR_FLAGS.has(flag))) {
     problems.push(`"signtool.args" picks no certificate: give one of ${[...SELECTOR_FLAGS].join(', ')} (for example /sha1 with a thumbprint, or /dlib with a cloud signing library).`);
   }
+  // A value after a flag that carries a password, a key container or a provider name is a secret,
+  // and a secret shorter than MIN_SECRET_LENGTH could not be hidden reliably in output.
+  resolved.forEach((value, i) => {
+    const flag = flagOf(resolved[i - 1]);
+    if (i > 0 && SECRET_VALUE_FLAGS.has(flag) && typeof value === 'string' && !flagOf(value) && value.length < MIN_SECRET_LENGTH) {
+      problems.push(`"signtool.args" item ${i + 1}, the value after ${flag}, is shorter than ${MIN_SECRET_LENGTH} characters; such a secret could not be hidden reliably in output, so it is refused.`);
+    }
+  });
   return problems;
 }
 

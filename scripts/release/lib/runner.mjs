@@ -17,7 +17,7 @@ export function realRunner(command, args = [], options = {}) {
     maxBuffer: 64 * 1024 * 1024,
   };
   const result = options.shell
-    ? spawnSync([command, ...args].join(' '), { ...spawnOptions, shell: true })
+    ? spawnSync([/\s/.test(command) ? `"${command}"` : command, ...args].join(' '), { ...spawnOptions, shell: true })
     : spawnSync(command, args, spawnOptions);
   if (result.error) return { code: -1, stdout: '', stderr: `${command} could not be started (${result.error.code ?? result.error.message})` };
   return { code: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };

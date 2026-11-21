@@ -35,7 +35,7 @@ node scripts/release/release.mjs --check-config
 
 1. Delete this command's own earlier output folder and staging folder (only folders that carry its marker file `.mythicshot-release`, and never through a link or junction). From here on, a refusal means no release exists.
 2. Read the signing configuration. Without a complete one nothing is built.
-3. Read the version from `[workspace.package]` in `Cargo.toml`. Refuse cargo configuration files that could change the build (see below). Refuse a checkout that is not clean: no change, no untracked file, and no ignored file outside `target/`, `dist/` and `out/`.
+3. Find the tools (see "Tools" below). Read the version from `[workspace.package]` in `Cargo.toml`. Refuse cargo configuration files that could change the build (see below). Refuse a checkout that is not clean: no change, no untracked file, no ignored file outside `target/`, `dist/` and `out/`, and no file git has been told not to look at (skip-worktree or assume-unchanged in `git ls-files -v`).
 4. Check that WiX has its UI extension (`WixToolset.UI.wixext` 5.0.2). The command never downloads an extension.
 5. `cargo build --release --offline --locked -p mythicshot --target-dir <staging>\target`: a fresh target folder every time, so no earlier build output can be reused, with `Cargo.lock` exactly as committed. Then check again that the checkout is clean and at the same commit.
 6. Check that the program's version resource is the workspace version, sign it, hash it, check its signature, and check that the hash did not change meanwhile.
@@ -52,12 +52,17 @@ Before it touches the site it checks:
 - `release.json` and `build.json` in the release folder agree, and the installer there has the recorded size and SHA-256;
 - the release's version is the workspace version in `Cargo.toml`, and it was built from the commit the checkout is at now (`git rev-parse HEAD`);
 - the installer's name is `Mythicshot-<version>-x64.msi`;
-- the site's current `release.json`: a newer version is never replaced by an older one, and the same version is accepted only with the same installer. In that case nothing changes and the command succeeds;
-- no installer lies in the site that its `release.json` does not name.
+- the site's current `release.json` is either empty (`{}`, no release yet) or a complete, valid release; anything else (no version, a malformed field, an unknown field) is refused, so an age check can never be skipped;
+- a newer version is never replaced by an older one, and the same version is accepted only with the same file name, size and SHA-256. Then no file changes, but the installer the site offers is still checked strictly and the site's `npm run check` and `npm run package` still run, so `dist/` is never stale;
+- no installer or leftover (`.part`, `.tmp`) lies in the site that its `release.json` does not name.
 
-Then it copies the installer into the site as `<name>.part`, hashes exactly that copy, checks its signature and its ProductVersion, writes `release.json` (carrying the owner's `requires` and `installs` over unchanged from the previous one), renames the copy, and runs the site's `npm run check` and `npm run package`. The installer the previous `release.json` named is removed when this succeeds.
+Then it copies the installer into the site as `<name>.part`, hashes exactly that copy, checks its signature and its ProductVersion, and only then moves anything of the old release: it keeps the old `release.json`, an earlier file of the same name, the previous installer and the old `dist/` aside, writes the new `release.json` (carrying the owner's `requires` and `installs` over unchanged), renames the copy, and runs the site's `npm run check` and `npm run package`.
 
-If anything refuses, the site's earlier `release.json`, an earlier file of the same name and the previous installer are put back from a temporary backup, and a `dist/` folder that this run created is removed. A `dist/` that was there before is left as the site's package step left it (that step only replaces it when it succeeds), and the refusal says so.
+### The journal, and a run that is killed
+
+Every change to the site is written down first in a journal, and the old files are kept beside it until the new release is complete. It lives at a fixed path inside the site checkout, `preview\.mythicshot-release-journal\`, carrying the marker file `.mythicshot-site-journal`. That place was chosen because the site's own check and package step skip `preview/` (`SKIPPED_FOLDERS` in `scripts/check.mjs`), its publish script skips it too, git ignores it (`.gitignore`), nothing else writes there, and it is on the same drive as the site, so keeping a file aside is a rename, not a copy. A `preview/` that this run created is removed again; a `preview/` that is a link or junction is refused.
+
+If anything refuses, the journal puts the site back: old `release.json`, the earlier file of the same name, the previous installer and the old `dist/` return, and a `dist/` this run created is removed. If the process is killed instead, the next run (of either command form that touches the site) first reads the journal: an unfinished run is undone, a finished one only has its journal removed, and then the run goes on. The site is therefore always either fully as it was or fully the new release, never mixed; a test kills a run after every single step and checks exactly that. A journal folder without the marker, or a journal that cannot be read, is refused in one line and left for a person.
 
 ## What it refuses
 
@@ -71,10 +76,12 @@ Every refusal is one line starting with `Refused:`, and the exit code says which
 | 3 | The signing configuration is missing, inside a repository, not JSON, or incomplete |
 | 4 | A cargo configuration file could change the build; the build, the installer build, `wix msi validate` or the extension check fails; or the installer does not hold the signed program |
 | 5 | Signing the program or the installer fails |
-| 6 | A signature check fails: not signed; not trusted on this machine; no timestamp; file changed after signing (hash mismatch); signature type not exactly `Authenticode`; signed by anyone but the configured publisher; certificate without the code signing usage or a required extra usage; issued by a CA not in `issuerThumbprints`; not the pinned certificate; digest other than SHA-256; or a file that changed while it was checked |
+| 6 | A signature check fails: not signed; not trusted on this machine; no timestamp; file changed after signing (hash mismatch); signature type not exactly `Authenticode`; signed by anyone but the configured publisher; certificate without the code signing usage or a required extra usage; issued by a CA not in `issuerThumbprints`; not the pinned certificate; a chain status other than `NotTimeValid` (an expired certificate, which the timestamp covers); digest other than SHA-256; or a file that changed while it was checked |
 | 7 | `Cargo.toml`, the program's version resource and the installer's ProductVersion do not agree, or (`--to-site`) the release is not the workspace version |
-| 8 | `--to-site`: the release folder was changed since it was made, was built from another commit, has the wrong file name, is older than the site's release or the same version with another installer; the folder is not the site; the site holds an installer its `release.json` does not name; or the site's own check or package step refuses |
-| 9 | The checkout has uncommitted changes, untracked files or stray ignored files, before or after the build, or moved to another commit during it |
+| 8 | `--to-site`: the release folder was changed since it was made, was built from another commit, has the wrong file name, is older than the site's release or the same version with another installer; the folder is not the site; the site's `release.json` is neither `{}` nor a valid release; the site holds an installer or leftover its `release.json` does not name; a journal folder is not this command's or cannot be read; or the site's own check or package step refuses |
+| 9 | The checkout has uncommitted changes, untracked files, stray ignored files or files git is told not to look at, before or after the build, or moved to another commit during it |
+
+A missing tool (PowerShell, git, cargo, WiX, npm) is exit 4, named but without a path.
 
 ## The signing configuration
 
@@ -114,7 +121,9 @@ Each file is signed with `signtool sign /fd SHA256 /tr <timestampUrl> /td SHA256
 | A cloud signing service with a signtool library | `["/dlib", "<path to the service's dlib>", "/dmdf", "<path to its metadata.json>"]` |
 
 > [!warning] Secrets stay out of output
-> The only configuration values ever printed are `publisher`, `issuerThumbprints`, `leafThumbprint`, `requiredEkus`, `method` and signtool's path (none is secret). Every other value is replaced by `[hidden]` in tool output, and the timestamp address is never shown.
+> The only configuration values ever printed are `publisher`, `issuerThumbprints`, `leafThumbprint`, `requiredEkus`, `method` and signtool's path (none is secret). The timestamp address is never shown, and every other value of 4 or more characters is replaced by `[hidden]` in tool output.
+
+The limit, exactly: a value shorter than 4 characters cannot be hidden reliably, so the command refuses one wherever it is treated as a secret, that is a value read with `{"env": "NAME"}` and a written value after `/p`, `/kc` or `/csp` (or `-p`, `-kc`, `-csp`). Other written values shorter than 4 characters, such as the store name in `/s My`, are not hidden, because they are not secrets; do not put a secret anywhere else in `args`.
 
 Values read with `{"env": "NAME"}` are removed from the environment of every program the command starts except signtool. signtool still receives such a value on its command line, where other programs of the same user could read it while it runs; a cloud signing service that needs no PIN or password is preferable to a PIN passed this way.
 
@@ -124,11 +133,19 @@ Other methods: `scripts/release/lib/signers.mjs` holds the list of methods and s
 
 Closed by the command:
 
-- The build's environment loses `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTC`, `RUSTDOC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_BOOTSTRAP`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_ENCODED_RUSTDOCFLAGS`, `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL`, `RUSTUP_TOOLCHAIN` and every `CARGO_BUILD_*`, `CARGO_TARGET_*`, `CARGO_PROFILE_*`, `CARGO_UNSTABLE_*`, `CARGO_REGISTRIES_*` and `CARGO_SOURCE_*` variable.
-- Cargo configuration files (`.cargo\config` and `.cargo\config.toml` in the checkout, in every folder above it, and in `CARGO_HOME`, which is `%USERPROFILE%\.cargo` when not set) are read, and the release is refused when one sets `build.rustflags`, `build.rustdocflags`, `build.rustc`, `build.rustdoc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper`, `build.target`, `build.target-dir`, anything under `[target]`, `[profile]`, `[patch]`, `[source]`, `[env]` or `[unstable]`, or `paths`.
-- A fresh target folder, `--locked`, and a clean checkout at the same commit before and after the build.
+- The build's environment loses these variables (names compared without case):
+  - rustc and cargo: `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTC`, `RUSTDOC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_BOOTSTRAP`, `RUSTC_LINKER`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_ENCODED_RUSTDOCFLAGS`, `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL`, `RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`, and every `CARGO_BUILD_*`, `CARGO_TARGET_*`, `CARGO_PROFILE_*`, `CARGO_UNSTABLE_*`, `CARGO_REGISTRIES_*` and `CARGO_SOURCE_*`;
+  - the Visual Studio compiler and linker: `LINK` and `_LINK_` (extra linker options), `CL` and `_CL_` (extra compiler options), and the search paths `LIB`, `LIBPATH` and `INCLUDE` (rustc and the cc crate find Visual Studio and the Windows SDK by themselves);
+  - the cc crate and other build scripts: every variable starting with `CC`, `CFLAGS`, `CXX`, `CXXFLAGS`, `AR`, `RANLIB`, `TARGET_`, `HOST_`, `CRATE_CC_`, `RC_`, `NASM_`, `BINDGEN_`, `LIBCLANG_`, `CLANG_`, `CMAKE` or `VCPKG`, which covers the per-target spellings such as `CC_x86_64-pc-windows-msvc`, and `RC`, `NASM`, `LDFLAGS` and `CPPFLAGS`.
+  A machine whose Rust lives under a non-default `RUSTUP_HOME` therefore cannot build releases; that is deliberate.
+- Cargo configuration files (`.cargo\config` and `.cargo\config.toml` in the checkout, in every folder above it, and in `CARGO_HOME`, which is `%USERPROFILE%\.cargo` when not set) are read, and the release is refused when one sets `build.rustflags`, `build.rustdocflags`, `build.rustc`, `build.rustdoc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper`, `build.target`, `build.target-dir`, anything under `[target]`, `[profile]`, `[patch]`, `[source]`, `[env]` or `[unstable]`, `paths`, or `include` (another file pulled in). The check reads section headers, dotted keys (`build.rustflags = ...`) and inline tables: an inline table at a key that could hold any of these (`build = { ... }`, `target = { ... }`) is refused whole, even when it holds only harmless keys.
+- A fresh target folder, `--locked`, and a clean checkout at the same commit before and after the build; git runs without any `GIT_*` variable, so `GIT_DIR` or `GIT_INDEX_FILE` cannot point the checks at another checkout.
 
 Not closable with the standard tools, so left to the owner of the signing machine: the compiler and linker installed on it (rustup's default toolchain, the Visual Studio linker and resource compiler), and the crate sources already downloaded into `CARGO_HOME`, which cargo trusts once they are unpacked.
+
+## Tools
+
+Each tool is found once, at the start, as an absolute path, and run by that path: Windows PowerShell 5.1 at `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`; git, cargo and npm in the absolute entries of `PATH` (cargo also in `CARGO_HOME\bin`); WiX from `--wix`, `MYTHICSHOT_WIX` or `%USERPROFILE%\.dotnet\tools\wix.exe` (an absolute path only), else `PATH`; signtool as described above. A relative `PATH` entry, the current folder, the checkout and the site (and everything below them) are never searched, so a `git.exe` or `npm.cmd` planted there is never run. Every program the command starts gets `NoDefaultCurrentDirectoryInExePath=1`, so it does not look up programs in its own working folder either. Tool paths are printed only by `--check-config`.
 
 ## What the toolchain needs
 
@@ -142,7 +159,19 @@ The full build runs every time, in a fresh folder (two and a half to three and a
 
 ## The GitHub workflow
 
-`.github/workflows/release.yml` cannot publish. It runs only by hand from the Actions tab, builds an unsigned MSI for testing, and keeps it for seven days as a workflow artifact named `mythicshot-<version>-unsigned-not-for-release`. A test (`scripts/release/test/workflow.test.mjs`) fails if it gains a tag or push trigger or a release-publishing step.
+`.github/workflows/release.yml` cannot publish. It runs only by hand from the Actions tab, builds an unsigned MSI for testing, and keeps it for seven days as a workflow artifact named `mythicshot-<version>-unsigned-not-for-release`. A test (`scripts/release/test/workflow.test.mjs`) reads every file under `.github/workflows/` and fails unless each has `permissions: contents: read` at the top and no write permission, and none has a publishing step (a release action, `gh release`, the releases API, Pages, `cargo publish` or `npm publish`); it also fails if the release workflow gains a tag or push trigger.
+
+## First real signed run: check by hand
+
+Some facts can only be seen with the real certificate. On the first run with it, look at each of these, and stop if one is not as described:
+
+- [ ] `signtool verify /pa /v` on the signed `mythicshot.exe` and on the MSI prints a line `Hash of file (sha256): ...`. The digest check reads exactly that line (the pattern `Hash of file \(([A-Za-z0-9-]+)\)`); if this signtool version words it differently, every release is refused with "did not report the digest".
+- [ ] The issuing CA found for the signer (`chain[1]`, shown as "issued by CA" in the log and in `SUMMARY.txt`) equals the thumbprint the CA publishes for its issuing certificate, and that is the value in `issuerThumbprints`.
+- [ ] Windows reports the MSI's signature type as `Authenticode` (`(Get-AuthenticodeSignature <msi>).SignatureType`), as for the exe.
+- [ ] The timestamp signer named in `SUMMARY.txt` ("Timestamped by") is the timestamp authority of the configured `timestampUrl`.
+- [ ] `wix msi decompile -x` still puts the program at `File\MythicshotExe` (the `File` table's Id of `mythicshot.exe` in `installer\mythicshot.wxs`); if that changes, every release is refused with "does not hold the signed mythicshot.exe".
+- [ ] The whole run, with its fresh build (two and a half to three and a half minutes on the development PC, more on a slower machine), fits in the time limit of the job that runs it unattended.
+- [ ] The chain the verifier builds offline reports nothing but `NotTimeValid` at most (an intermediate missing from the signature would show as `PartialChain` and refuse).
 
 ## Tests
 
@@ -155,6 +184,7 @@ They need no certificate, compiler or WiX: every external program answers from o
 - The front page tests copy `C:\dev\mythicshot-site` (or `MYTHICSHOT_SITE`) into a temporary folder and run the site's own `npm run check` and `npm run package` on the copy; without a site checkout they skip.
 - One test makes a throw-away CA and code signing certificate held only in temporary files (with the openssl of Git for Windows, keys never stored, no certificate store touched, no timestamp server called), signs a temporary copy of a small program, and checks that the real PowerShell step reads its thumbprint, usages and chain, and that the real verifier and signtool refuse it as untrusted.
 - The safe-delete tests make real junctions in temporary folders.
+- The crash tests (`site-crash.test.mjs`) use a small stand-in site, kill `--to-site` after every step, and check that the next start leaves the site fully old or fully new.
 - The version test reads the real `target/release/mythicshot.exe` when one is there.
 
 Temporary files go under `%TEMP%\mythicshot-release-tests` and are removed when the tests end (`MYTHICSHOT_KEEP_TEST_FILES=1` keeps them).

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { BUILD_ENV_STRIP, BUILD_ENV_STRIP_PREFIXES, cargoConfigFiles, checkCleanCheckout, forbiddenCargoKeys } from '../lib/buildenv.mjs';
+import { BUILD_ENV_STRIP, BUILD_ENV_STRIP_PREFIXES, cargoConfigFiles, checkCleanCheckout, checkGitIndex, forbiddenCargoKeys } from '../lib/buildenv.mjs';
 import { EXIT, Refusal } from '../lib/errors.mjs';
 import { childEnv } from '../lib/runner.mjs';
 import { removeTree } from '../lib/safefs.mjs';
@@ -27,6 +27,35 @@ test('the build environment loses every variable that changes how cargo or rustc
   const env = { PATH: 'p', RUSTFLAGS: 'x', rustflags: 'y', RUSTC_WRAPPER: 'x', CARGO_BUILD_TARGET_DIR: 'x', CARGO_PROFILE_RELEASE_LTO: 'off', CARGO_TARGET_DIR: 'x', CARGO_ENCODED_RUSTFLAGS: 'x', RUSTUP_TOOLCHAIN: 'x', CARGO_HOME: 'C:\\cargo' };
   const out = childEnv(env, { strip: BUILD_ENV_STRIP, stripPrefixes: BUILD_ENV_STRIP_PREFIXES });
   assert.deepEqual(out, { PATH: 'p', CARGO_HOME: 'C:\\cargo' });
+});
+
+test('inline tables that could hold a forbidden key are refused, in every spelling', () => {
+  assert.deepEqual(forbiddenCargoKeys('build = { rustflags = ["-C", "link-arg=/evil"] }\n'), ['build (inline table)']);
+  assert.deepEqual(forbiddenCargoKeys('target = { x86_64-pc-windows-msvc = { linker = "evil.exe" } }\n'), ['target (inline table)']);
+  assert.deepEqual(forbiddenCargoKeys('target.x86_64-pc-windows-msvc = { linker = "evil.exe" }\n'), ['target.x86_64-pc-windows-msvc']);
+  assert.deepEqual(forbiddenCargoKeys('"build" = {rustc-wrapper="x"}\n'), ['build (inline table)']);
+  assert.deepEqual(forbiddenCargoKeys('profile = { release = { strip = false } }\n'), ['profile']);
+  assert.deepEqual(forbiddenCargoKeys('[build]\nrustflags = { }\n'), ['build.rustflags']);
+  // A table that cannot hold one of them is fine.
+  assert.deepEqual(forbiddenCargoKeys('net = { retry = 2 }\nalias = { b = "build" }\n'), []);
+});
+
+test('include, which pulls in another configuration file, is refused', () => {
+  assert.deepEqual(forbiddenCargoKeys('include = "../other.toml"\n'), ['include']);
+  assert.deepEqual(forbiddenCargoKeys('include = { path = "x.toml" }\n'), ['include']);
+  assert.deepEqual(forbiddenCargoKeys('[[include]]\npath = "x.toml"\n'), ['include', 'include.path']);
+});
+
+test('the build environment loses what the MSVC tools and the cc crate read', () => {
+  const env = { PATH: 'p', SystemRoot: 'C:\\Windows', USERPROFILE: 'C:\\u', LINK: 'x', _LINK_: 'x', cl: 'x', _CL_: 'x', CC: 'x', 'CC_x86_64-pc-windows-msvc': 'x', CFLAGS: 'x', CFLAGS_x86_64_pc_windows_msvc: 'x', CXX: 'x', CXXFLAGS: 'x', AR: 'x', ARFLAGS: 'x', RANLIB: 'x', TARGET_CC: 'x', HOST_CFLAGS: 'x', CRATE_CC_NO_DEFAULTS: '1', RUSTUP_HOME: 'x', LIB: 'x', LIBPATH: 'x', INCLUDE: 'x', RC: 'x', RC_x86_64: 'x', BINDGEN_EXTRA_CLANG_ARGS: 'x', LIBCLANG_PATH: 'x', CMAKE_GENERATOR: 'x', VCPKG_ROOT: 'x' };
+  assert.deepEqual(childEnv(env, { strip: BUILD_ENV_STRIP, stripPrefixes: BUILD_ENV_STRIP_PREFIXES }), { PATH: 'p', SystemRoot: 'C:\\Windows', USERPROFILE: 'C:\\u' });
+});
+
+test('files git is told not to look at are refused', () => {
+  assert.doesNotThrow(() => checkGitIndex('H Cargo.toml\nH src/main.rs\n'));
+  for (const listing of ['S src/main.rs\n', 'h Cargo.toml\n', 's src/x.rs\n']) {
+    assert.throws(() => checkGitIndex(listing), (e) => e instanceof Refusal && e.code === EXIT.DIRTY && /skip-worktree or assume-unchanged/.test(e.message));
+  }
 });
 
 test('cargo reads configuration from the checkout, every folder above it and CARGO_HOME', () => {

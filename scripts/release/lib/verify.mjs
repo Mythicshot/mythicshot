@@ -21,7 +21,7 @@ export const VERIFY_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
   '$p = $env:MYTHICSHOT_VERIFY_FILE',
   '$s = Get-AuthenticodeSignature -LiteralPath $p',
-  '$o = [ordered]@{ status = [string]$s.Status; message = [string]$s.StatusMessage; subject = $null; timestamper = $null; type = [string]$s.SignatureType; thumbprint = $null; ekus = @(); chain = @() }',
+  '$o = [ordered]@{ status = [string]$s.Status; message = [string]$s.StatusMessage; subject = $null; timestamper = $null; type = [string]$s.SignatureType; thumbprint = $null; ekus = @(); chain = @(); chainStatus = @() }',
   'if ($s.TimeStamperCertificate) { $o.timestamper = $s.TimeStamperCertificate.Subject }',
   '$c = $s.SignerCertificate',
   'if ($c) {',
@@ -34,6 +34,7 @@ export const VERIFY_SCRIPT = [
   ' $ch.ChainPolicy.ExtraStore.AddRange($extra)',
   ' [void]$ch.Build($c)',
   ' $o.chain = @($ch.ChainElements | ForEach-Object { $_.Certificate.Thumbprint })',
+ ' $o.chainStatus = @($ch.ChainStatus | ForEach-Object { [string]$_.Status })',
   '}',
   'New-Object PSObject -Property $o | ConvertTo-Json -Compress',
 ].join('\n');
@@ -43,9 +44,9 @@ const list = (value) => (Array.isArray(value) ? value : value == null ? [] : [va
 const upper = (t) => String(t ?? '').toUpperCase();
 
 /** Runs Windows' check and returns what it says about `file`, or throws Refusal(EXIT.VERIFY). */
-export function readSignature(file, { runner, env, redact = (t) => String(t ?? '') }) {
+export function readSignature(file, { runner, env, powershell = 'powershell.exe', redact = (t) => String(t ?? '') }) {
   const name = basename(file);
-  const result = runner('powershell.exe', powershellArgs(VERIFY_SCRIPT), {
+  const result = runner(powershell, powershellArgs(VERIFY_SCRIPT), {
     tag: 'verify',
     env: { ...(env ?? process.env), MYTHICSHOT_VERIFY_FILE: file },
   });
@@ -83,9 +84,9 @@ export function checkDigest(file, { runner, signtool, env, redact = (t) => Strin
  * Verifies `file`. Returns { subject, timestamper, thumbprint, issuer } or throws Refusal(EXIT.VERIFY, ...).
  * `expect` holds publisher, issuerThumbprints, leafThumbprint, requiredEkus (from the configuration).
  */
-export function verifySignature(file, { expect, runner, signtool, env, redact = (t) => String(t ?? '') }) {
+export function verifySignature(file, { expect, runner, signtool, powershell, env, redact = (t) => String(t ?? '') }) {
   const name = basename(file);
-  const info = readSignature(file, { runner, env, redact });
+  const info = readSignature(file, { runner, env, powershell, redact });
   const message = redact(info.message ?? '').trim();
   switch (info.status) {
     case 'Valid':
@@ -129,6 +130,10 @@ export function verifySignature(file, { expect, runner, signtool, env, redact = 
   if (!(expect.issuerThumbprints ?? []).map(upper).includes(issuer)) {
     throw new Refusal(EXIT.VERIFY, `${name} is signed with a certificate issued by CA ${issuer}, which is not in "issuerThumbprints".`);
   }
+  // The chain as built offline may only say that a certificate has since expired (the timestamp covers that).
+  if (!Array.isArray(info.chainStatus)) throw new Refusal(EXIT.VERIFY, `${name}: the state of the signing certificate's chain was not reported.`);
+  const chainProblems = info.chainStatus.map(String).filter((st) => st !== 'NoError' && st !== 'NotTimeValid');
+  if (chainProblems.length) throw new Refusal(EXIT.VERIFY, `${name}: the signing certificate's chain reports ${chainProblems.join(', ')}.`);
   checkDigest(file, { runner, signtool, env, redact });
   return { subject: normalise(info.subject), timestamper: normalise(info.timestamper), thumbprint, issuer };
 }

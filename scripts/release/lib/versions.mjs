@@ -68,8 +68,8 @@ export const MSI_VERSION_SCRIPT = [
 ].join('; ');
 
 /** The ProductVersion of an .msi, read without installing anything. */
-export function readMsiVersion(file, runner, env = process.env) {
-  const result = runner('powershell.exe', powershellArgs(MSI_VERSION_SCRIPT), {
+export function readMsiVersion(file, runner, env = process.env, powershell = 'powershell.exe') {
+  const result = runner(powershell, powershellArgs(MSI_VERSION_SCRIPT), {
     tag: 'msi-version',
     env: { ...env, MYTHICSHOT_MSI_FILE: file },
   });

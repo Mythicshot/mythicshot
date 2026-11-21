@@ -8,9 +8,10 @@ import { EXIT, Refusal } from '../lib/errors.mjs';
 import { cutRelease, MARKER } from '../lib/release.mjs';
 import { main } from '../release.mjs';
 import { RECORDED, SIGNTOOL_VERIFY, validFor } from './recorded.mjs';
-import { assertNoSecrets, COMMIT, exists, fakeRepo, fakeWorld, listTree, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, SECRET_THUMBPRINT, tempDir, treeText, writeConfig } from './helpers.mjs';
+import { assertNoSecrets, COMMIT, exists, FAKE_TOOLS, fakeRepo, fakeWorld, listTree, PUBLISHER, SECRET_ENV_NAME, SECRET_ENV_VALUE, SECRET_THUMBPRINT, tempDir, treeText, writeConfig } from './helpers.mjs';
 
-const BUILD_CHANGERS = { RUSTFLAGS: '-C debuginfo=2', CARGO_ENCODED_RUSTFLAGS: 'x', RUSTC_WRAPPER: 'evil.exe', CARGO_BUILD_RUSTC: 'evil.exe', CARGO_PROFILE_RELEASE_STRIP: 'false', CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: 'evil.exe', RUSTUP_TOOLCHAIN: 'nightly' };
+const BUILD_CHANGERS = { RUSTFLAGS: '-C debuginfo=2', CARGO_ENCODED_RUSTFLAGS: 'x', RUSTC_WRAPPER: 'evil.exe', CARGO_BUILD_RUSTC: 'evil.exe', CARGO_PROFILE_RELEASE_STRIP: 'false', CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: 'evil.exe', RUSTUP_TOOLCHAIN: 'nightly', RUSTUP_HOME: 'D:\\rustup', LINK: '/evil', _LINK_: '/evil', CL: '/evil', _CL_: '/evil', CC: 'evil.exe', CFLAGS: '-x', 'CC_x86_64-pc-windows-msvc': 'evil.exe', CXXFLAGS: '-x', AR: 'evil.exe', TARGET_CC: 'evil.exe', LIB: 'D:\\evil', INCLUDE: 'D:\\evil' };
+const GIT_CHANGERS = { GIT_DIR: 'D:\\other\\.git', GIT_WORK_TREE: 'D:\\other', GIT_INDEX_FILE: 'x' };
 
 function setup(worldOptions = {}, configOverrides = {}, extraEnv = {}) {
   const repo = fakeRepo();
@@ -19,7 +20,7 @@ function setup(worldOptions = {}, configOverrides = {}, extraEnv = {}) {
   const out = join(tempDir('out'), 'release');
   const logs = [];
   const env = { ...config.env, PATH: 'C:\\Windows', ...extraEnv };
-  const run = (w = world) => cutRelease({ repoRoot: repo, out, configPath: config.path, env, wix: 'wix.exe' }, { runner: w.runner, log: (l) => logs.push(l) });
+  const run = (w = world) => cutRelease({ repoRoot: repo, out, configPath: config.path, env, wix: 'wix.exe' }, { runner: w.runner, log: (l) => logs.push(l), tools: FAKE_TOOLS });
   return { repo, config, world, out, logs, env, run };
 }
 
@@ -39,15 +40,15 @@ const noOutput = (s) => {
 };
 
 test('a release: signed program inside a signed installer, release.json, build.json and a summary, nothing else', async () => {
-  const s = setup({}, {}, BUILD_CHANGERS);
+  const s = setup({}, {}, { ...BUILD_CHANGERS, ...GIT_CHANGERS });
   const result = await s.run();
   assert.deepEqual(listTree(s.out), [MARKER, 'Mythicshot-0.2.16-x64.msi', 'SUMMARY.txt', 'build.json', 'release.json']);
   assert.equal(exists(`${s.out}.staging`), false);
   assert.deepEqual(s.world.tags(), [
-    'git-status', 'git-head', 'wix-extensions',
-    'cargo-build', 'git-status', 'git-head',
+    'git-status', 'git-ls-files', 'git-head', 'wix-extensions',
+    'cargo-build', 'git-status', 'git-ls-files', 'git-head',
     'sign', 'verify', 'verify-digest',
-    'wix-build', 'wix-validate', 'wix-extract', 'git-status', 'git-head',
+    'wix-build', 'wix-validate', 'wix-extract', 'git-status', 'git-ls-files', 'git-head',
     'sign', 'verify', 'verify-digest', 'msi-version',
   ]);
   const cargo = s.world.calls.find((c) => c.tag === 'cargo-build');
@@ -55,6 +56,16 @@ test('a release: signed program inside a signed installer, release.json, build.j
   assert.equal(cargo.args.at(-1), join(`${s.out}.staging`, 'target'), 'a fresh target folder inside staging');
   for (const name of Object.keys(BUILD_CHANGERS)) assert.ok(!(name in cargo.env), `${name} reaches the build`);
   assert.equal(cargo.env.PATH, 'C:\\Windows');
+  // Absolute tools, no GIT_* for git, and no tool looked up in a child's working folder.
+  assert.equal(cargo.command, FAKE_TOOLS.cargo);
+  for (const call of s.world.calls) {
+    assert.equal(call.env?.NoDefaultCurrentDirectoryInExePath, '1', `${call.tag} may run a tool from its working folder`);
+    assert.ok(/^[A-Z]:\\/i.test(call.command), `${call.tag} ran ${call.command} by name`);
+  }
+  for (const call of s.world.calls.filter((c) => c.tag.startsWith('git-'))) {
+    assert.equal(call.command, FAKE_TOOLS.git);
+    for (const name of Object.keys(GIT_CHANGERS)) assert.ok(!(name in call.env), `git received ${name}`);
+  }
   const [signExe, signMsi] = s.world.calls.filter((c) => c.tag === 'sign');
   assert.equal(s.world.exeForMsi, signExe.args.at(-1), 'the installer is built from the program that was signed');
   assert.deepEqual(signExe.args.slice(0, 7), ['sign', '/fd', 'SHA256', '/tr', JSON.parse(readFileSync(s.config.path, 'utf8')).timestampUrl, '/td', 'SHA256']);
@@ -83,7 +94,7 @@ test('without a signing configuration: refused before anything is built, and an 
   assert.ok(exists(join(s.out, 'release.json')));
   const runs = fakeWorld();
   await refuses(
-    cutRelease({ repoRoot: s.repo, out: s.out, configPath: join(tempDir(), 'none.json'), env: s.env }, { runner: runs.runner, log: () => {} }),
+    cutRelease({ repoRoot: s.repo, out: s.out, configPath: join(tempDir(), 'none.json'), env: s.env }, { runner: runs.runner, log: () => {}, tools: FAKE_TOOLS }),
     EXIT.CONFIG, /No release without a complete signing configuration\. No signing configuration at/,
   );
   assert.deepEqual(runs.calls, [], 'nothing was run');
@@ -267,15 +278,36 @@ test('an output folder reached through a junction on the way is refused', async 
   writeFileSync(join(realParent, 'release', MARKER), 'ours');
   writeFileSync(join(realParent, 'release', 'keep.txt'), 'keep');
   const out = join(linkParent, 'release');
-  await refuses(cutRelease({ repoRoot: s.repo, out, configPath: s.config.path, env: s.env }, { runner: s.world.runner, log: () => {} }), EXIT.USAGE, /really is .*a link or junction on the way/);
+  await refuses(cutRelease({ repoRoot: s.repo, out, configPath: s.config.path, env: s.env }, { runner: s.world.runner, log: () => {}, tools: FAKE_TOOLS }), EXIT.USAGE, /really is .*a link or junction on the way/);
   assert.ok(exists(join(realParent, 'release', 'keep.txt')));
+});
+
+for (const [name, lsFiles, pattern] of [
+  ['a skip-worktree file', 'H Cargo.toml\nS crates/app/src/main.rs\n', /git is told not to look at 1 file \(skip-worktree or assume-unchanged; first: crates\/app\/src\/main\.rs\)/],
+  ['an assume-unchanged file', 'h Cargo.toml\nH README.md\n', /first: Cargo\.toml/],
+]) {
+  test(`${name} in the index: refused before building`, async () => {
+    const s = setup({ lsFiles });
+    await refuses(s.run(), EXIT.DIRTY, pattern);
+    assert.ok(!s.world.tags().includes('cargo-build'));
+    noOutput(s);
+  });
+}
+
+test('a refusal never names a tool path', async () => {
+  const s = setup({ extensions: '' });
+  await refuses(s.run(), EXIT.BUILD, /WixToolset\.UI\.wixext/).catch(() => {});
+  const s2 = setup();
+  let message = '';
+  await cutRelease({ repoRoot: s2.repo, out: s2.out, configPath: s2.config.path, env: s2.env }, { runner: () => ({ code: 1, stdout: '', stderr: '' }), log: () => {}, tools: FAKE_TOOLS }).catch((e) => { message = e.message; });
+  for (const path of Object.values(FAKE_TOOLS)) assert.ok(!message.includes(path), message);
 });
 
 test('the command line: a missing configuration exits 3 with one "Refused:" line and leaves no output', async () => {
   const repo = fakeRepo();
   const out = join(tempDir('out'), 'release');
   const lines = [];
-  const code = await main(['--config', join(tempDir(), 'none.json'), '--out', out], { env: {}, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: fakeWorld().runner, repoRoot: repo });
+  const code = await main(['--config', join(tempDir(), 'none.json'), '--out', out], { env: {}, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: fakeWorld().runner, repoRoot: repo, tools: FAKE_TOOLS });
   assert.equal(code, EXIT.CONFIG);
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^Refused: No release without a complete signing configuration\./);
@@ -287,10 +319,10 @@ test('the command line: --check-config exits 0 or 3 and never signs', async () =
   const c = writeConfig();
   const world = fakeWorld();
   const lines = [];
-  assert.equal(await main(['--check-config', '--config', c.path], { env: c.env, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: world.runner }), EXIT.OK);
+  assert.equal(await main(['--check-config', '--config', c.path], { env: c.env, out: (l) => lines.push(l), err: (l) => lines.push(l), runner: world.runner, tools: FAKE_TOOLS }), EXIT.OK);
   assert.match(lines.join('\n'), /Complete/);
   assertNoSecrets(assert, lines.join('\n'), '--check-config');
-  assert.equal(await main(['--check-config', '--config', join(tempDir(), 'none.json')], { env: {}, out: () => {}, err: () => {}, runner: world.runner }), EXIT.CONFIG);
+  assert.equal(await main(['--check-config', '--config', join(tempDir(), 'none.json')], { env: {}, out: () => {}, err: () => {}, runner: world.runner, tools: FAKE_TOOLS }), EXIT.CONFIG);
   assert.deepEqual(world.calls, []);
 });
 
@@ -307,7 +339,7 @@ test('the command line: an unexpected error shows no message text', async () => 
   const runner = () => {
     throw new Error(`boom ${SECRET_THUMBPRINT}`);
   };
-  const code = await main(['--config', c.path, '--out', join(tempDir('out'), 'r')], { env: c.env, out: () => {}, err: (l) => lines.push(l), runner, repoRoot: fakeRepo() });
+  const code = await main(['--config', c.path, '--out', join(tempDir('out'), 'r')], { env: c.env, out: () => {}, err: (l) => lines.push(l), runner, repoRoot: fakeRepo(), tools: FAKE_TOOLS });
   assert.equal(code, EXIT.UNEXPECTED);
   assertNoSecrets(assert, lines.join('\n'), 'the unexpected error');
 });

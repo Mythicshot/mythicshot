@@ -94,6 +94,28 @@ test('an unreadable answer or a failing PowerShell is refused', () => {
   refused(answering('', { code: 1 }), /could not be checked \(PowerShell exit 1\)/);
 });
 
+test('a chain that only says its certificate has since expired passes (the recorded valid file says exactly that)', () => {
+  assert.deepEqual(JSON.parse(RECORDED.valid).chainStatus, ['NotTimeValid']);
+  assert.doesNotThrow(() => run(answering(validFor(P, { chainStatus: [] }))));
+  assert.doesNotThrow(() => run(answering(validFor(P, { chainStatus: ['NoError'] }))));
+});
+
+for (const status of [['Revoked'], ['NotSignatureValid'], ['UntrustedRoot'], ['PartialChain'], ['NotTimeValid', 'InvalidBasicConstraints'], ['NotValidForUsage']]) {
+  test(`a chain reporting ${status.join(' and ')} is refused`, () => refused(answering(validFor(P, { chainStatus: status })), new RegExp(`chain reports ${status.filter((s) => s !== 'NotTimeValid').join(', ')}`)));
+}
+
+test('a chain status that was not reported is refused', () => {
+  const data = JSON.parse(RECORDED.valid);
+  delete data.chainStatus;
+  refused(answering(JSON.stringify(data)), /state of the signing certificate's chain was not reported/);
+});
+
+test('PowerShell is run by the path it is given', () => {
+  const runner = answering(RECORDED.valid);
+  verifySignature('x.msi', { expect: RECORDED_EXPECT, runner, signtool: SIGNTOOL, powershell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' });
+  assert.equal(runner.calls[0].command, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+});
+
 test('echoed output is redacted', () => {
   const runner = answering('', { code: 1, stderr: 'Get-AuthenticodeSignature : error near secret-value-1234' });
   assert.throws(

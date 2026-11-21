@@ -14,6 +14,7 @@ import { describeConfig } from './lib/config.mjs';
 import { EXIT, Refusal } from './lib/errors.mjs';
 import { cutRelease } from './lib/release.mjs';
 import { releaseToSite } from './lib/site.mjs';
+import { describeTools, resolveTools } from './lib/tools.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -44,7 +45,7 @@ const HELP = `Cut a signed Mythicshot release (see docs/release.md).
   node scripts/release/release.mjs --to-site <site checkout> [--from <release dir>] [--config <file>]`;
 
 /** Runs the command; resolves to the exit code. Output goes through `out` and `err` (one line each). */
-export async function main(argv, { env = process.env, out = console.log, err = console.error, runner, findSigntool, repoRoot = REPO_ROOT } = {}) {
+export async function main(argv, { env = process.env, out = console.log, err = console.error, runner, findSigntool, tools, repoRoot = REPO_ROOT } = {}) {
   try {
     const opts = parseArgs(argv);
     if (opts.help) {
@@ -54,18 +55,21 @@ export async function main(argv, { env = process.env, out = console.log, err = c
     if (opts['check-config']) {
       const report = describeConfig({ path: opts.config, env, repoRoot, findSigntool });
       for (const line of report.lines) out(line);
+      // The only place tool paths are printed.
+      out('Tools (absolute paths; never from the checkout, the site or the current folder):');
+      for (const line of describeTools(tools ?? resolveTools({ env, exclude: [repoRoot, process.cwd()], wix: opts.wix }))) out(`- ${line}`);
       return report.ok ? EXIT.OK : EXIT.CONFIG;
     }
     if (opts['to-site']) {
       await releaseToSite(
         { site: opts['to-site'], from: opts.from ?? join(repoRoot, 'dist', 'release'), configPath: opts.config, env, repoRoot },
-        { runner, log: out, findSigntool },
+        { runner, log: out, findSigntool, tools },
       );
       return EXIT.OK;
     }
     await cutRelease(
       { repoRoot, out: opts.out, configPath: opts.config, env, wix: opts.wix },
-      { runner, log: out, findSigntool },
+      { runner, log: out, findSigntool, tools },
     );
     return EXIT.OK;
   } catch (error) {

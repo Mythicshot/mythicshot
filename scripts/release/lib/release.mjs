@@ -5,25 +5,20 @@
 // <out>.staging and moved to <out> only at the very end; on any failure staging is removed.
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { BUILD_ENV_STRIP, BUILD_ENV_STRIP_PREFIXES, checkCargoConfig, checkCleanCheckout, STATUS_ARGS } from './buildenv.mjs';
+import { BUILD_ENV_STRIP, BUILD_ENV_STRIP_PREFIXES, checkCargoConfig, checkCleanCheckout, checkGitIndex, LS_FILES_ARGS, STATUS_ARGS } from './buildenv.mjs';
 import { requireConfig } from './config.mjs';
 import { EXIT, Refusal, firstUsefulLine } from './errors.mjs';
 import { describeInstaller, installerName, makeBuildInfo, makeFragment, sha256File } from './fragment.mjs';
 import { childEnv, realRunner } from './runner.mjs';
 import { assertPlainFolder, removeTree } from './safefs.mjs';
 import { SIGNERS, signtoolPath } from './signers.mjs';
+import { CHILD_ENV_ADD, resolveTools } from './tools.mjs';
 import { verifySignature } from './verify.mjs';
 import { checkVersions, readExeVersion, readMsiVersion, readWorkspaceVersion } from './versions.mjs';
 
 export const MARKER = '.mythicshot-release';
 export const WIX_UI_EXTENSION = 'WixToolset.UI.wixext';
 export const WIX_VERSION = '5.0.2';
-
-export function defaultWix(env = process.env) {
-  if (env.MYTHICSHOT_WIX) return env.MYTHICSHOT_WIX;
-  const tool = join(env.USERPROFILE ?? '', '.dotnet', 'tools', 'wix.exe');
-  return existsSync(tool) ? tool : 'wix';
-}
 
 function must(result, code, what, redact) {
   if (result.code !== 0) {
@@ -46,7 +41,7 @@ function removeOwn(path, what) {
 /**
  * Builds, signs, packages and verifies. Resolves to { out, version, commit, fragment, summary, file }.
  * opts:  { repoRoot, out, configPath, env, wix }
- * deps:  { runner, log, findSigntool, now }
+ * deps:  { runner, log, findSigntool, now, tools }
  */
 export async function cutRelease(opts, deps = {}) {
   const env = opts.env ?? process.env;
@@ -56,7 +51,6 @@ export async function cutRelease(opts, deps = {}) {
   const repoRoot = resolve(opts.repoRoot);
   const out = resolve(opts.out ?? join(repoRoot, 'dist', 'release'));
   const staging = `${out}.staging`;
-  const wix = opts.wix ?? defaultWix(env);
 
   // 0. No earlier release survives a run: whatever happens next, the old one is gone.
   removeOwn(out, 'The output folder');
@@ -65,19 +59,25 @@ export async function cutRelease(opts, deps = {}) {
   // 1. Signing configuration: without it nothing is built.
   const { config, redact, envNames } = requireConfig({ path: opts.configPath, env, repoRoot, findSigntool: deps.findSigntool });
   const signer = SIGNERS[config.method];
-  // Values read from the environment for signing go to the signing tool only.
-  const baseEnv = childEnv(env, { strip: envNames });
+  // Tools: absolute paths, never from the checkout or the current folder; none is printed here.
+  const tools = deps.tools ?? resolveTools({ env, exclude: [repoRoot, process.cwd()], wix: opts.wix, need: ['powershell', 'git', 'cargo', 'wix'] });
+  // Values read from the environment for signing go to the signing tool only; git gets no GIT_* variable.
+  const baseEnv = childEnv(env, { strip: envNames, add: CHILD_ENV_ADD });
+  const gitEnv = childEnv(baseEnv, { stripPrefixes: ['GIT_'] });
   const buildEnv = childEnv(baseEnv, { strip: BUILD_ENV_STRIP, stripPrefixes: BUILD_ENV_STRIP_PREFIXES });
   const signtool = signtoolPath(config, { env, findSigntool: deps.findSigntool });
-  const signCtx = { runner, env, signEnv: env, redact, findSigntool: deps.findSigntool };
-  const check = (file) => verifySignature(file, { expect: config, runner, signtool, env: baseEnv, redact });
+  const signCtx = { runner, env, signEnv: childEnv(env, { add: CHILD_ENV_ADD }), redact, findSigntool: deps.findSigntool };
+  const check = (file) => verifySignature(file, { expect: config, runner, signtool, powershell: tools.powershell, env: baseEnv, redact });
 
   // 2. Version, checkout and build settings.
   const version = readWorkspaceVersion(readFileSync(join(repoRoot, 'Cargo.toml'), 'utf8'));
   checkCargoConfig(repoRoot, env);
-  const git = (args, tag, what) => must(runner('git', args, { cwd: repoRoot, tag, env: baseEnv }), EXIT.BUILD, what, redact).stdout;
+  const git = (args, tag, what) => must(runner(tools.git, args, { cwd: repoRoot, tag, env: gitEnv }), EXIT.BUILD, what, redact).stdout;
   const commitNow = () => git(['rev-parse', 'HEAD'], 'git-head', 'Reading the commit (git rev-parse)').trim();
-  const cleanCheck = (when) => checkCleanCheckout(git(STATUS_ARGS, 'git-status', 'Reading the checkout (git status)'), when);
+  const cleanCheck = (when) => {
+    checkCleanCheckout(git(STATUS_ARGS, 'git-status', 'Reading the checkout (git status)'), when);
+    checkGitIndex(git(LS_FILES_ARGS, 'git-ls-files', 'Reading the index (git ls-files)'));
+  };
   cleanCheck('before the build');
   const commit = commitNow();
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Refusal(EXIT.BUILD, 'git did not report a commit id.');
@@ -87,8 +87,8 @@ export async function cutRelease(opts, deps = {}) {
   };
 
   // 3. The WiX UI extension must already be on this machine; this command never downloads one.
-  const extensions = runner(wix, ['extension', 'list', '-g'], { tag: 'wix-extensions', env: baseEnv });
-  if (extensions.code !== 0) throw new Refusal(EXIT.BUILD, `The WiX toolset could not be started (${wix}). Install WiX ${WIX_VERSION} as a .NET global tool.`);
+  const extensions = runner(tools.wix, ['extension', 'list', '-g'], { tag: 'wix-extensions', env: baseEnv });
+  if (extensions.code !== 0) throw new Refusal(EXIT.BUILD, `The WiX toolset could not be started. Install WiX ${WIX_VERSION} as a .NET global tool.`);
   if (!new RegExp(`^${WIX_UI_EXTENSION.replace(/\./g, '\\.')}\\s+${WIX_VERSION.replace(/\./g, '\\.')}\\b`, 'm').test(extensions.stdout)) {
     throw new Refusal(EXIT.BUILD, `The WiX extension ${WIX_UI_EXTENSION} ${WIX_VERSION} is not installed, and this command does not download it. Run: wix extension add -g ${WIX_UI_EXTENSION}/${WIX_VERSION}`);
   }
@@ -101,7 +101,7 @@ export async function cutRelease(opts, deps = {}) {
   try {
     // 4. The program, in a fresh target folder, with Cargo.lock as committed.
     log(`Building Mythicshot ${version} from commit ${commit} (cargo build --release --offline --locked, fresh target folder)...`);
-    must(runner('cargo', ['build', '--release', '--offline', '--locked', '-p', 'mythicshot', '--target-dir', target], { cwd: repoRoot, tag: 'cargo-build', env: buildEnv }), EXIT.BUILD, 'The release build', redact);
+    must(runner(tools.cargo, ['build', '--release', '--offline', '--locked', '-p', 'mythicshot', '--target-dir', target], { cwd: repoRoot, tag: 'cargo-build', env: buildEnv }), EXIT.BUILD, 'The release build', redact);
     sameCommit('after the build');
     const built = join(target, 'release', 'mythicshot.exe');
     if (!existsSync(built)) throw new Refusal(EXIT.BUILD, `The release build finished but ${built} is not there.`);
@@ -122,13 +122,13 @@ export async function cutRelease(opts, deps = {}) {
     const msi = join(work, msiName);
     log(`Building the installer ${msiName} (wix build)...`);
     must(
-      runner(wix, ['build', 'mythicshot.wxs', 'ui.wxs', '-ext', WIX_UI_EXTENSION, '-arch', 'x64', '-d', `Version=${version}`, '-d', `Exe=${exe}`, '-o', msi], { cwd: join(repoRoot, 'installer'), tag: 'wix-build', env: baseEnv }),
+      runner(tools.wix, ['build', 'mythicshot.wxs', 'ui.wxs', '-ext', WIX_UI_EXTENSION, '-arch', 'x64', '-d', `Version=${version}`, '-d', `Exe=${exe}`, '-o', msi], { cwd: join(repoRoot, 'installer'), tag: 'wix-build', env: baseEnv }),
       EXIT.BUILD, 'The installer build (wix build)', redact,
     );
     if (!existsSync(msi)) throw new Refusal(EXIT.BUILD, `wix build finished but ${msiName} is not there.`);
-    must(runner(wix, ['msi', 'validate', msi], { tag: 'wix-validate', env: baseEnv }), EXIT.BUILD, 'Validating the installer (wix msi validate)', redact);
+    must(runner(tools.wix, ['msi', 'validate', msi], { tag: 'wix-validate', env: baseEnv }), EXIT.BUILD, 'Validating the installer (wix msi validate)', redact);
     const extracted = join(work, 'extract');
-    must(runner(wix, ['msi', 'decompile', '-x', extracted, '-o', join(extracted, 'installer.wxs'), msi], { tag: 'wix-extract', env: baseEnv }), EXIT.BUILD, 'Reading the program back out of the installer (wix msi decompile)', redact);
+    must(runner(tools.wix, ['msi', 'decompile', '-x', extracted, '-o', join(extracted, 'installer.wxs'), msi], { tag: 'wix-extract', env: baseEnv }), EXIT.BUILD, 'Reading the program back out of the installer (wix msi decompile)', redact);
     const inside = join(extracted, 'File', 'MythicshotExe');
     if (!existsSync(inside) || (await sha256File(inside)) !== exeHash) {
       throw new Refusal(EXIT.BUILD, 'The installer does not hold the signed mythicshot.exe.');
@@ -142,7 +142,7 @@ export async function cutRelease(opts, deps = {}) {
     copyFileSync(msi, part);
     const msiHash = await sha256File(part);
     const msiSignature = check(part);
-    checkVersions({ workspace: version, exe: readExeVersion(readFileSync(inside)), msi: readMsiVersion(part, runner, baseEnv) });
+    checkVersions({ workspace: version, exe: readExeVersion(readFileSync(inside)), msi: readMsiVersion(part, runner, baseEnv, tools.powershell) });
     if ((await sha256File(part)) !== msiHash) throw new Refusal(EXIT.VERIFY, `${msiName} changed while its signature was checked.`);
     const final = join(staging, msiName);
     renameSync(part, final);

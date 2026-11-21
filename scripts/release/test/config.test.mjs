@@ -82,6 +82,20 @@ test('values read from the environment get the same checks as written ones', () 
   }
 });
 
+for (const [flag, value] of [['/p', 'abc'], ['-p', 'x1'], ['/kc', 'k'], ['/csp', 'cs']]) {
+  test(`a written secret shorter than 4 characters after ${flag} is refused, unquoted`, () => {
+    const c = writeConfig({ signtool: { args: ['/sha1', 'A1B2C3D4E5', flag, value] } });
+    const { problems } = inspectConfig({ path: c.path, env: c.env });
+    assert.ok(problems.some((p) => new RegExp(`item 4, the value after ${flag.replace('-', '/')}, is shorter than 4 characters`).test(p)), JSON.stringify(problems));
+    assert.ok(!problems.join(' ').includes(` ${value} `));
+  });
+}
+
+test('short values after other flags are allowed (they are not secrets, such as the store name My)', () => {
+  const c = writeConfig({ signtool: { args: ['/s', 'My', '/sha1', 'A1B2C3D4E5'] } });
+  assert.deepEqual(inspectConfig({ path: c.path, env: c.env }).problems, []);
+});
+
 test('a value read from the environment shorter than 4 characters is refused, unquoted', () => {
   const c = writeConfig();
   const { problems } = inspectConfig({ path: c.path, env: { ...c.env, MYTHICSHOT_TEST_TOKEN: 'k9z' } });
