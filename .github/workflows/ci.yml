@@ -5,6 +5,10 @@ on:
   push:
   pull_request:
 
+# Read-only: CI builds and tests, and never publishes anything.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: ${{ matrix.os }}
