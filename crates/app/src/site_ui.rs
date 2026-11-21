@@ -178,7 +178,7 @@ impl SiteDialog {
         let mut outcome = None;
         let mut choose = false;
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
-        egui::Modal::new(egui::Id::unique("add-to-site-dialog")).frame(frame).show(ctx, |ui| {
+        crate::share_ui::modal(egui::Id::unique("add-to-site-dialog")).frame(frame).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.heading("Add to site");
             ui.add(egui::Label::new(RichText::new(INTRO).color(MUTED)).wrap());
