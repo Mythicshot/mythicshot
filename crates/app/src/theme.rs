@@ -337,6 +337,12 @@ pub fn popup_frame() -> egui::Frame {
     egui::Frame::new().fill(RAISED).stroke(Stroke::new(1.0, BORDER_STRONG)).corner_radius(RADIUS_LG)
 }
 
+/// Paint the whole window in ground before its panels: where two panels meet, egui softens both
+/// edges, and without this the seam between them lets a little of the desktop through.
+pub fn window_background(ui: &egui::Ui) {
+    ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, GROUND);
+}
+
 /// A small window of its own (the destination picker, a toast): the whole window painted opaque
 /// in ground, and on it a surface-raised card with a 1px border-strong edge and radius-lg that
 /// fills it, so the rounded corners show ground and never the desktop. `margin` is the space
@@ -681,6 +687,11 @@ mod tests {
         let mut files = Vec::new();
         walk(&root, &mut files);
         files.sort();
+        // Modules built only for tests (`#[cfg(test)] mod name;` in main.rs).
+        let main = std::fs::read_to_string(root.join("main.rs")).unwrap();
+        let lines: Vec<&str> = main.lines().collect();
+        let test_only: Vec<String> = lines.windows(2).filter(|w| w[0].trim() == "#[cfg(test)]").filter_map(|w| w[1].trim().strip_prefix("mod ")?.strip_suffix(';').map(|m| format!("{m}.rs"))).collect();
+        files.retain(|p| !test_only.iter().any(|t| p.strip_prefix(&root).is_ok_and(|r| r.to_string_lossy() == *t)));
         files
             .into_iter()
             .map(|p| {

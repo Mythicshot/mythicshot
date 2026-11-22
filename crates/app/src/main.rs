@@ -31,6 +31,8 @@ mod sign_in_ui;
 mod share_ui;
 mod site;
 mod site_ui;
+#[cfg(test)]
+mod snapshot;
 mod theme;
 mod tray;
 mod tour;

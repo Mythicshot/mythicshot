@@ -236,5 +236,8 @@ mod tests {
             // The card on it: surface-raised with its border and corners.
             assert!(checks::fills(&out).iter().any(|(_, c, r)| *c == theme::RAISED && *r == theme::RADIUS_LG), "the toast's card");
         }
+        // Filled in pixel by pixel: not one pixel lets the desktop through, not even at the card's rounded corners.
+        assert_eq!(crate::snapshot::uncovered(&theme::test_context(), PICKER_SIZE.into(), 1.25, 2, |ui| picker.ui(ui)), 0, "the destination picker");
+        assert_eq!(crate::snapshot::uncovered(&theme::test_context(), TOAST_SIZE.into(), 1.25, 2, |ui| toast.ui(ui)), 0, "the toast");
     }
 }

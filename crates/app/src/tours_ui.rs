@@ -2179,7 +2179,7 @@ pub(crate) mod tests {
         Site { server: "https://tours.example.com".into(), epoch: 1 }
     }
 
-    fn conn(token: TokenStatus) -> Conn {
+    pub(crate) fn conn(token: TokenStatus) -> Conn {
         Conn { server: "https://tours.example.com".into(), token, epoch: 1, bound: Some("https://tours.example.com".into()) }
     }
 
@@ -4746,7 +4746,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn page_with(saved: Vec<ProjectInfo>) -> ToursState {
+    pub(crate) fn page_with(saved: Vec<ProjectInfo>) -> ToursState {
         let state = page();
         *lock(&state.model) = loaded_with(three(), saved);
         state

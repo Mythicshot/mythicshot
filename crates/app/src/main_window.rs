@@ -358,6 +358,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
 
 /// The window's contents: the menu on the left, the selected page beside it.
 pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
+    theme::window_background(ui);
     let mut out = PageOut::default();
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
     egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, &mut out));
@@ -805,6 +806,42 @@ mod tests {
             assert!(fills.iter().any(|(r, c, _)| *c == theme::SURFACE && r.height() >= window.height() - 1.0), "{page:?}: the menu on surface");
             assert!(fills.iter().any(|(r, c, _)| *c == theme::GROUND && r.height() >= window.height() - 1.0), "{page:?}: the page on ground");
         }
+        // Filled in pixel by pixel at 125% scaling: not one pixel lets the desktop through, not
+        // even at the seam where the menu meets the page.
+        for page in Page::ALL {
+            s.nav.request(page);
+            let uncovered = crate::snapshot::uncovered(&crate::theme::test_context(), window.size(), 1.25, 3, |ui| window_ui(ui, &mut s));
+            assert_eq!(uncovered, 0, "{page:?}: pixels the desktop shows through");
+        }
+    }
+
+    /// Pictures of the window's pages for the owner, drawn without a window (see `snapshot`).
+    /// The Tours page shows three tours from a model filled by hand; nothing is asked of any site.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn snapshot_the_main_window_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let mut shots: Vec<(&str, Page, Option<settings_ui::Tab>)> = vec![("main-home", Page::Home, None), ("main-workspace", Page::Workspace, None)];
+        shots.extend([("settings-general", settings_ui::Tab::General), ("settings-output", settings_ui::Tab::Output), ("settings-hotkeys", settings_ui::Tab::Hotkeys)].map(|(n, t)| (n, Page::Preferences, Some(t))));
+        for (name, page, tab) in shots {
+            let mut s = shared(tmp.path());
+            s.nav.request(page);
+            if let Some(tab) = tab {
+                s.prefs.state.tab = tab;
+            }
+            let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| window_ui(ui, &mut s));
+            assert_eq!(crate::snapshot::save(&image, name), 0, "{name}: nothing behind the window shows");
+        }
+        // The Tours page with its rows, beside the menu as the window draws it.
+        let mut tours = crate::tours_ui::tests::page_with(Vec::new());
+        let conn = crate::tours_ui::tests::conn(TokenStatus::Saved);
+        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| {
+            let mut out = PageOut::default();
+            egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, Page::Tours, &mut out));
+            egui::CentralPanel::default().show(ui, |ui| tours_ui::ui(ui, &mut tours, &conn, &mut out));
+        });
+        assert_eq!(crate::snapshot::save(&image, "main-tours"), 0, "the Tours page: nothing behind the window shows");
     }
 
     /// Every piece of text one frame of the window draws.

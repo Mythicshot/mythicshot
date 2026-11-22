@@ -544,6 +544,7 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        theme::window_background(ui);
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.asks_before_closing() {
@@ -2462,6 +2463,41 @@ mod tests {
         let out = run(&mut ed);
         crate::theme::checks::assert_window_opaque(&out, dialog_checks::WINDOW, "the editor with a dialog open");
         crate::theme::checks::assert_dialog_opaque(&out, "the share dialog over the editor");
+        // Filled in pixel by pixel at 125% scaling: not one pixel lets the desktop through.
+        let mut ed = editor(EditorPrefs::default());
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor");
+        ed.share = Some(share_dialog());
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor with a dialog");
+    }
+
+    /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and
+    /// with "Publish to…" open on its form. The picture in it is made here: bands and blocks, like
+    /// a screenshot of some app. Nothing is asked of any site.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn snapshot_the_editor_and_the_share_dialog() {
+        let shot = RgbaImage::from_fn(960, 600, |x, y| {
+            let band = if y < 48 { [40, 44, 52] } else if x < 200 { [235, 237, 240] } else { [250, 250, 251] };
+            let block = (260..900).contains(&x) && ((90..170).contains(&y) || (200..330).contains(&y) || (360..560).contains(&y)) && (x / 4 + y / 4) % 1 == 0;
+            let c = if block { [212, 222, 240] } else { band };
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let s = Settings::default();
+        let make = || Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = make();
+        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+        assert_eq!(crate::snapshot::save(&image, "editor"), 0, "the editor: nothing behind the window shows");
+        // The dialog's form drawn over the editor in the same frame. Through the editor it would
+        // first look for a saved token on this computer; here it is shown as it is once one is found.
+        let mut ed = make();
+        let details = crate::share_ui::image_details(960, 600, crate::publish::share::MediaType::Png, 412_000);
+        let mut share = crate::share_ui::ShareDialog::new(crate::publish::share::Kind::Image, "https://tours.example.com".into(), "Loot window", details, false, None, None);
+        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| {
+            ed.ui(ui);
+            share.show(ui.ctx(), &mut |_| false);
+        });
+        assert_eq!(crate::snapshot::save(&image, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
     }
 
     /// Every dialog is made by the one helper that leaves the window undimmed.
