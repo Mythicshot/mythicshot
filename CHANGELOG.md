@@ -2,6 +2,11 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.25 (2026-11-22)
+
+- The countdown before a recording is a large number in the recording bar, where the timer then runs. It is no longer drawn over the recorded area.
+- The red recording frame is shown only around a region or a window. A recording of a whole screen has none.
+
 ## 0.2.24 (2026-11-22)
 
 - A tour step's pulse can be moved: in Tour settings, under This step, "Pulse" offers "Where I clicked" or "A spot I pick". With a spot picked, drag the pulse on the picture, or click where it should go; "Put it back where I clicked" returns it to the recorded click, which is never lost. Each drag is one undo step.
