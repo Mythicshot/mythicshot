@@ -214,6 +214,12 @@ pub fn set_cloaked(hwnd: WindowId, cloaked: bool) -> bool {
 /// created hidden, to be placed before it is shown.
 #[cfg(windows)]
 pub fn find_own_hidden_window(title: &str) -> Option<WindowId> {
+    find_own(title, true)
+}
+
+/// This process's first top-level window with this exact title, hidden ones only if asked.
+#[cfg(windows)]
+fn find_own(title: &str, hidden_only: bool) -> Option<WindowId> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, IsWindowVisible};
@@ -225,7 +231,7 @@ pub fn find_own_hidden_window(title: &str) -> Option<WindowId> {
         let h = unsafe { FindWindowExW(None, after, PCWSTR::null(), PCWSTR(wide.as_ptr())) }.ok()?;
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-        if pid == unsafe { GetCurrentProcessId() } && !unsafe { IsWindowVisible(h) }.as_bool() {
+        if pid == unsafe { GetCurrentProcessId() } && !(hidden_only && unsafe { IsWindowVisible(h) }.as_bool()) {
             return Some(h.0 as WindowId);
         }
         after = Some(h);
@@ -282,13 +288,11 @@ pub fn exclude_from_capture(hwnd: WindowId) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
 
-/// Find one of our windows by its exact title.
+/// Find one of our windows by its exact title: only this process's, never another program's
+/// window that happens to have the same title.
 #[cfg(windows)]
 pub fn find_window(title: &str) -> Option<WindowId> {
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    use windows::core::PCWSTR;
-    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())).ok().map(|h| h.0 as WindowId) }
+    find_own(title, false)
 }
 
 #[cfg(windows)]

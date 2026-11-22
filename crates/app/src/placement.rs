@@ -10,7 +10,7 @@
 use eframe::egui;
 use mythicshot_capture::{MonitorInfo, PxRect};
 
-use crate::capture_log::Placed;
+use crate::capture_log;
 use crate::capture_window;
 use crate::platform::{self, WindowId};
 
@@ -101,23 +101,12 @@ pub fn guess_points(r: PxRect, scale: f32) -> (egui::Pos2, egui::Vec2) {
     (egui::pos2(r.x as f32 / scale, r.y as f32 / scale), egui::vec2(r.w as f32 / scale, r.h as f32 / scale))
 }
 
-/// Most `SetWindowPos` calls one window gets before it is shown wherever it is.
+/// Most `SetWindowPos` calls one window gets.
 const MAX_MOVES: u8 = 6;
 
-/// Puts one of our windows, created hidden by egui, on its rectangle in pixels and then shows
-/// it. It never moves a window once shown.
-#[derive(Debug)]
-pub struct Placer {
-    title: &'static str,
-    target: PxRect,
-    hwnd: Option<WindowId>,
-    moves: u8,
-    /// Looks that found no window to place.
-    misses: u8,
-    shown: bool,
-    /// Take the keyboard when shown.
-    focus: Focus,
-}
+/// Looks one window gets in all, from the frame egui is first asked for it: then it is shown
+/// (and uncloaked) wherever it is, and nothing about it is looked at or repainted for again.
+pub const MAX_LOOKS: u8 = 12;
 
 /// Whether and how a window takes the keyboard once shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,57 +118,147 @@ pub enum Focus {
     PlainThenWinit,
 }
 
-/// Looks without finding the window before it is shown wherever egui put it: a window that
-/// cannot be found must still appear.
-const MAX_MISSES: u8 = 10;
+/// Where a window is in being placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceStage {
+    /// Hidden, being found and placed.
+    Seeking,
+    /// Shown, cloaked when Windows allowed it; put back on its pixels if a scale change on show
+    /// resized it, uncloaked once a look finds it in place.
+    Showing { moved_after_show: bool },
+    /// Over: shown, or hidden after an uncloak that failed. Never looked at again.
+    Done,
+}
+
+/// What one look found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Look {
+    /// The window was found and its rectangles could be read.
+    pub readable: bool,
+    pub on_target: bool,
+    /// It was moved in this look.
+    pub moved: bool,
+}
+
+/// What to do after a look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceStep {
+    Wait,
+    /// In place and not moved in this look: show it, cloaked.
+    Show,
+    /// Shown and found in place: uncloak. `put_back`: a scale change on show had resized it.
+    Uncloak { put_back: bool },
+    /// Out of looks: show it (or uncloak it) wherever it is, and stop.
+    Anyway { shown: bool },
+}
+
+/// The decision after look number `looks` (1 for the first).
+pub fn place_step(stage: PlaceStage, looks: u8, look: Look) -> PlaceStep {
+    let in_place = look.readable && look.on_target && !look.moved;
+    match stage {
+        PlaceStage::Done => PlaceStep::Wait,
+        PlaceStage::Seeking if in_place => PlaceStep::Show,
+        PlaceStage::Showing { moved_after_show } if in_place => PlaceStep::Uncloak { put_back: moved_after_show },
+        PlaceStage::Seeking if looks >= MAX_LOOKS => PlaceStep::Anyway { shown: false },
+        PlaceStage::Showing { .. } if looks >= MAX_LOOKS => PlaceStep::Anyway { shown: true },
+        _ => PlaceStep::Wait,
+    }
+}
+
+/// The stage after a step.
+pub fn place_advance(stage: PlaceStage, step: PlaceStep, look: Look) -> PlaceStage {
+    match (stage, step) {
+        (_, PlaceStep::Uncloak { .. } | PlaceStep::Anyway { .. }) => PlaceStage::Done,
+        (PlaceStage::Seeking, PlaceStep::Show) => PlaceStage::Showing { moved_after_show: false },
+        (PlaceStage::Showing { moved_after_show }, _) => PlaceStage::Showing { moved_after_show: moved_after_show || look.moved },
+        (s, _) => s,
+    }
+}
+
+/// Puts one of our windows, created hidden by egui, on its rectangle in pixels and shows it:
+/// cloaked first, so a scale change Windows only delivers on show (winit then resizes the
+/// window to keep its size in points) is undone before anyone sees it, and so its first frame
+/// at the new size is never seen stale. Every look counts toward [`MAX_LOOKS`].
+#[derive(Debug)]
+pub struct Placer {
+    title: &'static str,
+    target: PxRect,
+    hwnd: Option<WindowId>,
+    stage: PlaceStage,
+    looks: u8,
+    moves: u8,
+    cloaked: bool,
+    /// Take the keyboard once uncloaked.
+    focus: Focus,
+}
 
 impl Placer {
     pub fn new(title: &'static str, target: PxRect, focus: Focus) -> Self {
-        Self { title, target, hwnd: None, moves: 0, misses: 0, shown: false, focus }
+        Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus }
     }
 
     /// Each frame after the viewport `id` was asked for. Its window appears at the end of the
     /// frame it was first asked for, so the first look may find nothing.
     pub fn tick(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
-        if self.shown {
-            // The frame after it was shown: take the keyboard, with a plain request first and
-            // winit's (with its synthetic Alt key) only when Windows refuses.
-            let focus = std::mem::replace(&mut self.focus, Focus::None);
-            if focus != Focus::None
-                && let Some(hwnd) = self.hwnd
-                && !platform::take_foreground(hwnd)
-                && focus == Focus::PlainThenWinit
-            {
-                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
-            }
+        if self.stage == PlaceStage::Done {
             return;
         }
-        // Look again soon: the window is new and waits for this to appear.
-        ctx.request_repaint();
-        let Some(hwnd) = self.hwnd.or_else(|| platform::find_own_hidden_window(self.title)) else {
-            self.misses += 1;
-            if !cfg!(windows) || self.misses >= MAX_MISSES {
-                // No native window to place: shown where egui put it.
-                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
-                self.shown = true;
+        self.looks = self.looks.saturating_add(1);
+        // A hidden window is found by its title; once shown, it is the handle found before.
+        if self.hwnd.is_none() && self.stage == PlaceStage::Seeking {
+            self.hwnd = platform::find_own_hidden_window(self.title);
+        }
+        let mut look = Look::default();
+        if let Some(hwnd) = self.hwnd {
+            let placed = capture_window::place(hwnd, self.target, MAX_MOVES.saturating_sub(self.moves).min(capture_window::TRIES));
+            self.moves += placed.tries;
+            look = Look { readable: placed.readable, on_target: placed.on_target, moved: placed.moved };
+            if !placed.readable {
+                // Gone or made again: looked up afresh, within the same looks.
+                self.hwnd = None;
             }
-            return;
-        };
-        self.hwnd = Some(hwnd);
-        let budget = MAX_MOVES.saturating_sub(self.moves).min(capture_window::TRIES);
-        let placed = capture_window::place(hwnd, self.target, budget);
-        self.moves += placed.tries;
-        if show_child(placed, self.moves >= MAX_MOVES) {
-            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
-            self.shown = true;
+        }
+        let step = place_step(self.stage, self.looks, look);
+        match step {
+            PlaceStep::Wait => {}
+            PlaceStep::Show => {
+                self.cloaked = self.hwnd.is_some_and(|h| platform::set_cloaked(h, true));
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
+            }
+            PlaceStep::Uncloak { put_back } => self.finish(ctx, id, if put_back { "placed; scale changed on show, put back" } else { "placed" }),
+            PlaceStep::Anyway { shown } => {
+                if !shown {
+                    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
+                }
+                let why = if self.hwnd.is_some() { "NOT in place in time, shown where it is" } else { "window not found or lost, shown where egui put it" };
+                self.finish(ctx, id, why);
+            }
+        }
+        self.stage = place_advance(self.stage, step, look);
+        if self.stage != PlaceStage::Done {
+            // Look again soon: the window waits for this to appear.
+            ctx.request_repaint();
         }
     }
-}
 
-/// Whether a hidden window is shown after a placement: once it sits on its target and was not
-/// moved in this look (so its content has been laid out for that size), or out of moves.
-pub fn show_child(placed: Placed, out_of_moves: bool) -> bool {
-    (placed.on_target && !placed.moved) || out_of_moves
+    /// Uncloak, take the keyboard if asked, and log the one line for this window.
+    fn finish(&mut self, ctx: &egui::Context, id: egui::ViewportId, why: &str) {
+        let mut why = why.to_string();
+        let cloaked = std::mem::take(&mut self.cloaked);
+        if cloaked && let Some(hwnd) = self.hwnd && !platform::set_cloaked(hwnd, false) {
+            // Never an invisible window left on top: hidden instead.
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(false));
+            why = format!("UNCLOAK FAILED, hidden ({why})");
+        } else if let Some(hwnd) = self.hwnd
+            && self.focus != Focus::None
+            && !platform::take_foreground(hwnd)
+            && self.focus == Focus::PlainThenWinit
+        {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        let now = self.hwnd.and_then(capture_window::state);
+        capture_log::append(&[capture_log::placed_line(&capture_log::now(), self.title, self.target, now, self.moves, self.looks, &why)]);
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +283,15 @@ mod tests {
                 out.push((format!("200% {w}x{h} left, primary {big_primary}"), vec![mon(pair_x, 0, 2560, 1440, 1.0, !big_primary), mon(pair_x + 2560, 0, 2560, 1440, 1.0, false), mon(big_x, 0, w, h, 2.0, big_primary)]));
             }
         }
+        // Scales between 100% and 200%, where a size in points times the scale is not whole.
+        out.push(("125% primary, 150% left, 100% right".into(), vec![mon(0, 0, 2560, 1440, 1.25, true), mon(-1920, 0, 1920, 1080, 1.5, false), mon(2560, 0, 2560, 1440, 1.0, false)]));
+        out.push(("150% primary, 125% right".into(), vec![mon(0, 0, 1920, 1080, 1.5, true), mon(-2560, 0, 2560, 1440, 1.0, false), mon(1920, 0, 2560, 1440, 1.25, false)]));
         out
+    }
+
+    /// Points times a scale, rounded to whole pixels as the code does.
+    fn rnd(v: f32) -> i32 {
+        v.round() as i32
     }
 
     fn inside(r: PxRect, m: PxRect) -> bool {
@@ -217,8 +304,8 @@ mod tests {
             let p = mons.iter().find(|m| m.primary).unwrap();
             let t = toast_rect(&mons).unwrap();
             let s = p.scale;
-            assert_eq!((t.w, t.h), ((380.0 * s) as u32, (96.0 * s) as u32), "{name}: the toast's size at its monitor's scale");
-            assert_eq!((t.right(), t.bottom()), (p.rect.right() - (16.0 * s) as i32, p.rect.bottom() - (64.0 * s) as i32), "{name}: its corner");
+            assert_eq!((t.w, t.h), (rnd(380.0 * s) as u32, rnd(96.0 * s) as u32), "{name}: the toast's size at its monitor's scale");
+            assert_eq!((t.right(), t.bottom()), (p.rect.right() - rnd(16.0 * s), p.rect.bottom() - rnd(64.0 * s)), "{name}: its corner");
             assert!(inside(t, p.rect), "{name}");
             assert_eq!(scale_for(t, &mons), s, "{name}: the window gets the scale it was sized for");
         }
@@ -232,8 +319,8 @@ mod tests {
                 // With room around it: just below and right of the pointer.
                 let c = (m.rect.x + m.rect.w as i32 / 4, m.rect.y + m.rect.h as i32 / 4);
                 let r = picker_rect(c, &mons);
-                assert_eq!((r.x, r.y), (c.0 + (12.0 * s) as i32, c.1 + (12.0 * s) as i32), "{name}");
-                assert_eq!((r.w, r.h), ((270.0 * s) as u32, (262.0 * s) as u32), "{name}");
+                assert_eq!((r.x, r.y), (c.0 + rnd(12.0 * s), c.1 + rnd(12.0 * s)), "{name}");
+                assert_eq!((r.w, r.h), (rnd(270.0 * s) as u32, rnd(262.0 * s) as u32), "{name}");
                 assert!(inside(r, m.rect) && scale_for(r, &mons) == s, "{name}");
                 // In the bottom-right corner: pushed back onto the same monitor.
                 let r = picker_rect((m.rect.right() - 1, m.rect.bottom() - 1), &mons);
@@ -252,16 +339,16 @@ mod tests {
                 let s = m.scale;
                 let region = PxRect::new(m.rect.x + 300, m.rect.y + 400, 800, 500);
                 let bar = bar_rect(region, m.rect, s);
-                assert_eq!((bar.w, bar.h), ((680.0 * s) as u32, (46.0 * s) as u32), "{name}: the bar's size in its monitor's scale");
-                assert_eq!(bar.bottom(), region.y - (10.0 * s) as i32, "{name}: above the area");
+                assert_eq!((bar.w, bar.h), (rnd(680.0 * s) as u32, rnd(46.0 * s) as u32), "{name}: the bar's size in its monitor's scale");
+                assert_eq!(bar.bottom(), region.y - rnd(10.0 * s), "{name}: above the area");
                 assert!(inside(bar, m.rect) && scale_for(bar, &mons) == s, "{name}: on the area's monitor {bar:?}");
                 let f = frame_rect(region, &mons);
-                let b = (4.0 * s) as i32;
+                let b = rnd(4.0 * s);
                 assert_eq!(f, PxRect::new(region.x - b, region.y - b, region.w + 2 * b as u32, region.h + 2 * b as u32), "{name}");
                 assert_eq!(scale_for(f, &mons), s);
                 // A whole monitor: the bar goes inside its top edge, the frame just outside it.
                 let bar = bar_rect(m.rect, m.rect, s);
-                assert_eq!(bar.y, m.rect.y + (10.0 * s) as i32, "{name}");
+                assert_eq!(bar.y, m.rect.y + rnd(10.0 * s), "{name}");
                 assert!(inside(bar, m.rect));
                 assert_eq!(scale_for(frame_rect(m.rect, &mons), &mons), s, "{name}: the frame over a whole monitor keeps its scale");
             }
@@ -300,12 +387,66 @@ mod tests {
         assert_eq!(scale_for(PxRect::new(9000, 100, 10, 10), &mons), 2.0);
     }
 
+    /// Runs the placement decisions over looks; returns the steps.
+    fn looks(seq: &[Look]) -> Vec<PlaceStep> {
+        let mut stage = PlaceStage::Seeking;
+        seq.iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let s = place_step(stage, i as u8 + 1, *l);
+                stage = place_advance(stage, s, *l);
+                s
+            })
+            .collect()
+    }
+
+    const NONE: Look = Look { readable: false, on_target: false, moved: false };
+    const IN: Look = Look { readable: true, on_target: true, moved: false };
+    const MOVED: Look = Look { readable: true, on_target: true, moved: true };
+
     #[test]
-    fn a_hidden_window_is_shown_once_in_place_or_out_of_moves() {
-        let p = |moved, on_target| Placed { moved, tries: u8::from(moved), on_target };
-        assert!(show_child(p(false, true), false));
-        assert!(!show_child(p(true, true), false), "moved in this look: its content is still the old size");
-        assert!(!show_child(p(false, false), false));
-        assert!(show_child(p(true, false), true), "out of moves: shown where it is");
+    fn a_window_is_shown_cloaked_once_in_place_and_uncloaked_at_the_next_look() {
+        // Not there yet, then moved onto its pixels, then in place: shown; in place: uncloaked.
+        assert_eq!(looks(&[NONE, MOVED, IN, IN]), [PlaceStep::Wait, PlaceStep::Wait, PlaceStep::Show, PlaceStep::Uncloak { put_back: false }]);
+    }
+
+    #[test]
+    fn a_scale_change_on_show_is_put_back_before_the_window_is_uncloaked() {
+        // Shown; on show winit resized it to keep its size in points, so it was moved back to
+        // its pixels in that look; the next look finds it in place.
+        assert_eq!(looks(&[IN, MOVED, IN]), [PlaceStep::Show, PlaceStep::Wait, PlaceStep::Uncloak { put_back: true }]);
+        // No change on show.
+        assert_eq!(looks(&[IN, IN]), [PlaceStep::Show, PlaceStep::Uncloak { put_back: false }]);
+    }
+
+    #[test]
+    fn every_look_counts_and_a_lost_window_ends_shown_within_the_limit() {
+        // Found once, then its handle goes bad: every look after that reads nothing.
+        let mut seq = vec![MOVED];
+        seq.extend(std::iter::repeat_n(NONE, MAX_LOOKS as usize - 1));
+        let steps = looks(&seq);
+        assert_eq!(steps[MAX_LOOKS as usize - 1], PlaceStep::Anyway { shown: false }, "shown wherever egui put it at the last look");
+        assert!(steps[..MAX_LOOKS as usize - 1].iter().all(|s| *s == PlaceStep::Wait));
+        // Lost after it was shown: uncloaked where it is at the limit.
+        let mut seq = vec![IN];
+        seq.extend(std::iter::repeat_n(NONE, MAX_LOOKS as usize - 1));
+        assert_eq!(*looks(&seq).last().unwrap(), PlaceStep::Anyway { shown: true });
+        // After that nothing more is decided, so nothing more is repainted for.
+        let mut stage = PlaceStage::Seeking;
+        for (i, l) in seq.iter().enumerate() {
+            let s = place_step(stage, i as u8 + 1, *l);
+            stage = place_advance(stage, s, *l);
+        }
+        assert_eq!(stage, PlaceStage::Done);
+        assert_eq!(place_step(stage, 200, IN), PlaceStep::Wait);
+        assert_eq!(place_advance(stage, PlaceStep::Wait, IN), PlaceStage::Done);
+    }
+
+    #[test]
+    fn a_window_that_never_settles_stops_at_the_limit() {
+        let seq = vec![MOVED; MAX_LOOKS as usize];
+        let steps = looks(&seq);
+        assert_eq!(steps.last(), Some(&PlaceStep::Anyway { shown: false }));
+        assert_eq!(steps.iter().filter(|s| **s != PlaceStep::Wait).count(), 1);
     }
 }

@@ -664,10 +664,19 @@ impl App {
 
     /// Each frame while recording: countdown, frame window, errors, focus.
     fn tick_recording(&mut self, ctx: &egui::Context) {
-        if let Some(bar) = self.bar_showing.as_mut()
-            && bar.tick(ctx, self.root)
-        {
-            self.bar_showing = None;
+        match self.bar_showing.as_mut().map(|bar| bar.tick(ctx, self.root)) {
+            Some(capture_window::BarState::Shown) => self.bar_showing = None,
+            Some(capture_window::BarState::Failed) => {
+                // An unseen bar for a whole recording is worse than no recording.
+                self.bar_showing = None;
+                if let Some(s) = self.session.take() {
+                    s.discard();
+                }
+                self.end_session(ctx);
+                self.notify("The recording bar could not be shown, so the recording did not start.".into());
+                return;
+            }
+            Some(capture_window::BarState::Pending) | None => {}
         }
         // Once recording is live, point the input hook at it.
         if let Some(clock) = self.session.as_ref().and_then(|s| s.clock()) {
@@ -1289,6 +1298,7 @@ impl eframe::App for App {
                     let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
                     if after == Some(capture_window::After::Abort) {
                         self.finish_overlay(&ctx, Outcome::Cancel);
+                        self.notify("The region selector could not be shown.".into());
                     }
                 }
                 outcome => self.finish_overlay(&ctx, outcome),

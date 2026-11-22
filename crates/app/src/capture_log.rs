@@ -39,6 +39,8 @@ pub struct Placed {
     pub tries: u8,
     /// Its client area is on the target now.
     pub on_target: bool,
+    /// Its rectangles could be read (the window exists).
+    pub readable: bool,
 }
 
 pub fn px(r: PxRect) -> String {
@@ -103,6 +105,10 @@ pub fn uncloak_line(frame: u32, ok: bool, anyway: bool, dpi_pending: bool, dpi: 
     format!("{result} after frame {frame}: {why} · dpi {}", opt(dpi, |d| d.to_string()))
 }
 
+pub fn uncloak_at_end_line(frame: u32, ok: bool) -> String {
+    format!("{} after frame {frame}: the selection ended while it was still cloaked", if ok { "uncloaked" } else { "UNCLOAK FAILED" })
+}
+
 pub fn limit_line(frame: u32, moves: u8, shown: bool, client: Option<PxRect>) -> String {
     let why = if shown { "on screen".to_string() } else { format!("{moves} moves used") };
     format!("frame {frame}: placement stopped ({why}); not on target, mapping follows client {}", opt(client, px))
@@ -114,6 +120,11 @@ pub fn focus_line(plain: bool) -> String {
 
 pub fn finish_line(outcome: &str, sel_pt: Option<Rect>, sel_px: Option<PxRect>, crop: Option<PxRect>) -> String {
     format!("finish: {outcome} · selection {} pt = {} px · crop {}", opt(sel_pt, pt), opt(sel_px, px), opt(crop, px))
+}
+
+/// One line per small window placed (toast, picker, recording frame, live draw, bar).
+pub fn placed_line(time: &str, title: &str, target: PxRect, now: Option<WinState>, moves: u8, looks: u8, why: &str) -> String {
+    format!("-- {time} \"{title}\" asked for {} · {} · {moves} moves, {looks} looks · {why}", px(target), win(now))
 }
 
 pub fn park_line(time: &str, why: &str, target: PxRect, now: Option<WinState>, tries: u32) -> String {
@@ -170,12 +181,16 @@ mod tests {
         let note = FrameNote { content: (0.0, 0.0, 4480.0, 1080.0), ppp: 2.0, client: Some(PxRect::new(-3840, 0, 8960, 2160)), hover_px: Some((10, 12)), texture_new: true };
         let now = WinState { outer: PxRect::new(-3840, 0, 8960, 2160), client: PxRect::new(-3840, 0, 8960, 2160), dpi: Some(192), visible: false };
         assert_eq!(
-            frame_line(1, 4, Some(now), Placed { moved: true, tries: 2, on_target: true }, &note, Some((10, 11)), false),
+            frame_line(1, 4, Some(now), Placed { moved: true, tries: 2, on_target: true, readable: true }, &note, Some((10, 11)), false),
             "frame 1 +4ms: window -3840,0 8960x2160 client -3840,0 8960x2160 dpi 192 hidden · moved (2 tries), on target yes · ppp 2.00 · content 0.0,0.0 4480.0x1080.0 · settled no · cursor 10,11 mapped 10,12 (off by 0,1) · texture new"
         );
         assert_eq!(
             finish_line("capture", Some(Rect::from_min_max(pos2(5.0, 6.0), pos2(55.0, 26.0))), Some(PxRect::new(-3830, 12, 100, 40)), Some(PxRect::new(-3830, 12, 100, 40))),
             "finish: capture · selection 5.0,6.0 50.0x20.0 pt = -3830,12 100x40 px · crop -3830,12 100x40"
+        );
+        assert_eq!(
+            placed_line("t", "Mythicshot notification", PxRect::new(1, 2, 760, 192), Some(now), 1, 3, "placed"),
+            "-- t \"Mythicshot notification\" asked for 1,2 760x192 · window -3840,0 8960x2160 client -3840,0 8960x2160 dpi 192 hidden · 1 moves, 3 looks · placed"
         );
         assert_eq!(finish_line("cancel", None, None, None), "finish: cancel · selection - pt = - px · crop -");
         assert_eq!(shown_line(2, true, false, false), "shown after frame 2: NOT settled, shown anyway · not cloaked");

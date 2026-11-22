@@ -48,6 +48,7 @@ pub fn state(hwnd: WindowId) -> Option<WinState> {
 pub fn place(hwnd: WindowId, target: PxRect, budget: u8) -> Placed {
     let mut placed = Placed::default();
     while let Some((outer, client)) = platform::window_rects(hwnd) {
+        placed.readable = true;
         if client == target {
             placed.on_target = true;
             break;
@@ -321,7 +322,7 @@ impl Presenting {
             && matches!(self.stage, Stage::Cloaked { .. })
         {
             let ok = platform::set_cloaked(hwnd, false);
-            self.lines.push(capture_log::uncloak_line(self.frame, ok, true, false, None));
+            self.lines.push(capture_log::uncloak_at_end_line(self.frame, ok));
         }
         self.lines.push(finish);
         self.flush();
@@ -332,28 +333,36 @@ impl Presenting {
     }
 }
 
-/// Showing the root window as the recording bar: placed in pixels on the bar's monitor while
-/// it is hidden, shown once egui draws it at that size and scale.
+/// Showing the root window as the recording bar, the selector's way: placed in pixels on the
+/// bar's monitor while hidden, shown cloaked once drawn at that size, placed again while
+/// cloaked if a scale change on show resized it, uncloaked after a right frame.
 #[derive(Debug)]
 pub struct BarShowing {
     target: PxRect,
+    stage: Stage,
     frames: u32,
     moves: u8,
+    /// Frames spent waiting for the selector before it to be hidden.
+    waits: u32,
+    cloaked: bool,
 }
 
-/// Whether the bar is shown after a frame: in place, not moved in this frame, drawn at its
-/// size and scale (or Windows' scale word has had two frames to arrive), or out of time.
-pub fn show_bar(frame: u32, f: Facts) -> bool {
-    (!f.moved && f.on_target && f.content_matches && (f.dpi_matches || frame >= 3)) || frame >= MAX_HIDDEN_FRAMES
+/// Where showing the bar is after a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarState {
+    Pending,
+    Shown,
+    /// It could not be uncloaked: it was hidden again, and the recording must not start.
+    Failed,
 }
 
 impl BarShowing {
     pub fn new(target: PxRect) -> Self {
-        Self { target, frames: 0, moves: 0 }
+        Self { target, stage: Stage::Hidden, frames: 0, moves: 0, waits: 0, cloaked: false }
     }
 
-    /// Each frame until shown; true once it was asked to show.
-    pub fn tick(&mut self, ctx: &egui::Context, hwnd: Option<WindowId>) -> bool {
+    /// Each frame until it is shown or has failed.
+    pub fn tick(&mut self, ctx: &egui::Context, hwnd: Option<WindowId>) -> BarState {
         let Some(hwnd) = hwnd else {
             // No native window: in points, as before.
             let ppp = ctx.pixels_per_point();
@@ -361,14 +370,19 @@ impl BarShowing {
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            return true;
+            return BarState::Shown;
         };
         // The selector it may follow is hidden at the end of its last frame: wait for that.
-        if platform::is_window_visible(hwnd) {
-            return false;
+        if self.stage == Stage::Hidden && platform::is_window_visible(hwnd) && self.waits < MAX_HIDDEN_FRAMES {
+            self.waits += 1;
+            return BarState::Pending;
+        }
+        if self.stage == Stage::Hidden && self.frames == 0 {
+            // A selector that ended still cloaked must not leave the bar unseen.
+            platform::set_cloaked(hwnd, false);
         }
         self.frames += 1;
-        let placed = place(hwnd, self.target, MAX_MOVES.saturating_sub(self.moves).min(TRIES));
+        let placed = place(hwnd, self.target, move_budget(self.stage, self.moves));
         self.moves += placed.tries;
         let now = state(hwnd);
         let client = now.map(|s| s.client).unwrap_or(self.target);
@@ -380,13 +394,38 @@ impl BarShowing {
             dpi_matches: geometry::dpi_matches(ppp, ctx.zoom_factor(), now.and_then(|s| s.dpi)),
             content_matches: geometry::content_matches(ppp, (content.width(), content.height()), client),
         };
-        if !show_bar(self.frames, f) {
-            return false;
+        let decided = step(self.stage, self.frames, f);
+        let mut result = BarState::Pending;
+        let mut why = None;
+        match decided {
+            Step::Wait => {}
+            Step::Show { anyway, .. } => {
+                self.cloaked = platform::set_cloaked(hwnd, true);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                if !self.cloaked {
+                    result = BarState::Shown;
+                    why = Some(if anyway { "NOT settled, shown anyway, not cloaked" } else { "placed, not cloaked" }.to_string());
+                }
+            }
+            Step::Uncloak { anyway } => {
+                let ok = platform::set_cloaked(hwnd, false);
+                let Stage::Cloaked { dpi_pending, .. } = self.stage else { unreachable!("uncloak only follows cloaked") };
+                let how = if anyway { "NOT settled in time" } else if dpi_pending { "placed; scale changed on show" } else { "placed" };
+                if ok {
+                    result = BarState::Shown;
+                    why = Some(format!("{how}, uncloaked"));
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                    result = BarState::Failed;
+                    why = Some(format!("UNCLOAK FAILED, hidden ({how})"));
+                }
+            }
         }
-        // Never shown cloaked: a selector that ended with an uncloak that failed hid itself.
-        platform::set_cloaked(hwnd, false);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        true
+        self.stage = advance(self.stage, decided, f, self.cloaked);
+        if let Some(why) = why {
+            capture_log::append(&[capture_log::placed_line(&capture_log::now(), "recording bar", self.target, state(hwnd), self.moves, self.frames.min(255) as u8, &why)]);
+        }
+        result
     }
 }
 
@@ -490,12 +529,14 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_is_shown_once_drawn_at_its_size_or_after_eight_frames() {
-        assert!(show_bar(1, RIGHT));
-        assert!(!show_bar(1, Facts { moved: true, ..RIGHT }));
-        assert!(!show_bar(1, Facts { content_matches: false, ..RIGHT }), "still laid out for the parked desktop size");
-        assert!(!show_bar(2, Facts { dpi_matches: false, ..RIGHT }));
-        assert!(show_bar(3, Facts { dpi_matches: false, ..RIGHT }), "Windows' scale word did not come: shown as drawn");
-        assert!(show_bar(MAX_HIDDEN_FRAMES, Facts { on_target: false, ..RIGHT }));
+    fn the_bar_follows_the_selectors_steps_with_a_scale_change_on_show_and_without() {
+        // The bar uses `step` and `advance` too. Parked at the desktop's size: its content is
+        // still laid out for that, so it waits; then it is drawn at the bar's size and shown.
+        let parked = Facts { content_matches: false, ..RIGHT };
+        assert_eq!(run(&[parked, RIGHT, RIGHT, RIGHT])[1..], [Step::Show { dpi_pending: false, anyway: false }, Step::Wait, Step::Uncloak { anyway: false }]);
+        // Windows tells it its new scale only on show: resized, placed again, then uncloaked.
+        let pending = Facts { dpi_matches: false, ..RIGHT };
+        let resized = Facts { moved: true, content_matches: false, ..RIGHT };
+        assert_eq!(run(&[pending, resized, RIGHT, RIGHT]), [Step::Show { dpi_pending: true, anyway: false }, Step::Wait, Step::Wait, Step::Uncloak { anyway: false }]);
     }
 }
