@@ -151,6 +151,48 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
 /// A native window handle as a plain number, so it can cross threads.
 pub type WindowId = isize;
 
+/// A window's outer and client rectangles in desktop pixels.
+#[cfg(windows)]
+pub fn window_rects(hwnd: WindowId) -> Option<(mythicshot_capture::PxRect, mythicshot_capture::PxRect)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowInfo, WINDOWINFO};
+    let mut info = WINDOWINFO { cbSize: std::mem::size_of::<WINDOWINFO>() as u32, ..Default::default() };
+    unsafe { GetWindowInfo(HWND(hwnd as *mut _), &mut info).ok()? };
+    let px = |r: RECT| mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32);
+    Some((px(info.rcWindow), px(info.rcClient)))
+}
+
+/// The DPI Windows has given a window (96 is 100%).
+#[cfg(windows)]
+pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    let dpi = unsafe { GetDpiForWindow(HWND(hwnd as *mut _)) };
+    (dpi != 0).then_some(dpi)
+}
+
+#[cfg(windows)]
+pub fn is_window_visible(hwnd: WindowId) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+}
+
+#[cfg(not(windows))]
+pub fn window_rects(_hwnd: WindowId) -> Option<(mythicshot_capture::PxRect, mythicshot_capture::PxRect)> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn window_dpi(_hwnd: WindowId) -> Option<u32> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn is_window_visible(_hwnd: WindowId) -> bool {
+    false
+}
+
 /// Keep a window out of every screen capture, ours and other apps' (OBS
 /// included), so the recording controls never appear in a recording.
 #[cfg(windows)]

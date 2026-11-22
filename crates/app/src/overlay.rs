@@ -18,8 +18,24 @@ pub enum Outcome {
     Capture(PxRect),
 }
 
+/// What one frame of the selector saw, for the capture log.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrameNote {
+    /// egui's content area, in points.
+    pub content: (f32, f32, f32, f32),
+    pub ppp: f32,
+    /// The desktop pixel the selector takes to be under the pointer.
+    pub hover_px: Option<(i32, i32)>,
+    /// The frozen picture was handed to the GPU this frame.
+    pub texture_new: bool,
+}
+
 pub struct Overlay {
     pub desktop: Desktop,
+    /// The last frame, for the capture log.
+    pub note: FrameNote,
+    /// The selection of the last capture, in points of the frame it was made in.
+    pub selection_pt: Option<Rect>,
     texture: Option<TextureHandle>,
     window_mode: bool,
     drag_from: Option<(i32, i32)>,
@@ -30,12 +46,13 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new(desktop: Desktop, magnifier: bool, record: bool) -> Self {
-        Self { desktop, texture: None, window_mode: false, drag_from: None, magnifier, record }
+        Self { desktop, note: FrameNote::default(), selection_pt: None, texture: None, window_mode: false, drag_from: None, magnifier, record }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Outcome {
         let ctx = ui.ctx().clone();
         let b = self.desktop.bounds;
+        let texture_new = self.texture.is_none();
         let tex = self
             .texture
             .get_or_insert_with(|| {
@@ -94,6 +111,7 @@ impl Overlay {
             .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
             .or_else(|| platform::cursor_pos().map(|(x, y)| pos2((x - b.x) as f32 / ppp, (y - b.y) as f32 / ppp)));
         let cursor = hover.map(to_px);
+        self.note = FrameNote { content: (full.min.x, full.min.y, full.width(), full.height()), ppp, hover_px: cursor, texture_new };
         let hovered_window = cursor.and_then(|(x, y)| self.desktop.window_at(x, y)).map(|w| w.rect);
 
         if !self.window_mode {
@@ -108,6 +126,7 @@ impl Overlay {
 
         if response.drag_stopped() {
             if let Some(sel) = selection.filter(|s| s.w >= 2 && s.h >= 2) {
+                self.selection_pt = Some(to_pt(sel));
                 return Outcome::Capture(sel);
             }
             self.drag_from = None;
@@ -115,6 +134,7 @@ impl Overlay {
         if response.clicked() || enter {
             // A click without a drag takes the window under the pointer, in either mode.
             if let Some(w) = hovered_window {
+                self.selection_pt = Some(to_pt(w));
                 return Outcome::Capture(w);
             }
         }

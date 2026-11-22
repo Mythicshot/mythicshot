@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod capture_log;
+mod capture_window;
 mod editor_ui;
 mod home_ui;
 mod hotkeys;
@@ -156,6 +158,10 @@ struct App {
     rx: Receiver<AppEvent>,
     tx: Sender<AppEvent>,
     overlay: Option<Overlay>,
+    /// The capture log's lines for the capture on screen.
+    trace: Option<capture_window::Trace>,
+    /// What started the command being run, for the capture log.
+    trigger: &'static str,
     /// The main window's state, shared with its viewport.
     window: Arc<std::sync::Mutex<main_window::Shared>>,
     /// The page the main window was asked to open on, until its next frame.
@@ -187,6 +193,8 @@ struct App {
     encoding: Vec<recorder_ui::EncodeJob>,
     /// The root window is kept out of screen capture once its handle is known.
     root_hidden_from_capture: bool,
+    /// The root window's native handle, from the frame being drawn.
+    root: Option<platform::WindowId>,
     /// When to give focus back to the app being recorded.
     refocus_at: Option<Instant>,
     hidden_at_start: bool,
@@ -283,6 +291,8 @@ impl App {
             rx,
             tx,
             overlay: None,
+            trace: None,
+            trigger: "other",
             window,
             window_request: main_window::start_request(std::env::args()),
             last_foreground: main_window::LastForeground::default(),
@@ -303,6 +313,7 @@ impl App {
             save_retry,
             encoding: Vec::new(),
             root_hidden_from_capture: false,
+            root: None,
             refocus_at: None,
             hidden_at_start: false,
             started: Instant::now(),
@@ -351,15 +362,18 @@ impl App {
                         }
                         continue;
                     }
+                    self.trigger = "hotkey";
                     self.run(ctx, Command::from_action(action));
                 }
                 AppEvent::Menu(id) => {
                     if let Some(cmd) = self.tray.command(&id) {
+                        self.trigger = "tray menu";
                         self.run(ctx, cmd);
                     }
                 }
                 AppEvent::TrayClick => {
                     if let Some(cmd) = tray::left_click(self.settings.tray_left_click, self.activity()) {
+                        self.trigger = "tray click";
                         self.run(ctx, cmd);
                     }
                 }
@@ -448,12 +462,17 @@ impl App {
         if self.session.is_some() {
             return;
         }
+        let started = Instant::now();
         let desktop = match grab_desktop() {
             Ok(d) => d,
             Err(e) => return self.notify(format!("Capture failed: {e}")),
         };
         let ppp = ctx.pixels_per_point();
         let b = desktop.bounds;
+        let mut lines = vec![capture_log::header(&capture_log::now(), std::mem::replace(&mut self.trigger, "other"), record)];
+        lines.extend(desktop.monitors.iter().enumerate().map(|(i, m)| capture_log::monitor_line(i, m)));
+        lines.push(capture_log::request_line(b, ppp, b, self.root.and_then(capture_window::state)));
+        self.trace = Some(capture_window::Trace::new(b, started, lines));
         ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(b.x as f32 / ppp, b.y as f32 / ppp)));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(b.w as f32 / ppp, b.h as f32 / ppp)));
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -476,6 +495,13 @@ impl App {
     fn finish_overlay(&mut self, ctx: &egui::Context, outcome: Outcome) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         let Some(ov) = self.overlay.take() else { return };
+        if let Some(t) = self.trace.take() {
+            let finish = match outcome {
+                Outcome::Capture(rect) => capture_log::finish_line("capture", ov.selection_pt, Some(rect), rect.intersect(&ov.desktop.bounds)),
+                _ => capture_log::finish_line("cancel", None, None, None),
+            };
+            t.end(finish);
+        }
         self.settings.magnifier = ov.magnifier;
         if let Outcome::Capture(rect) = outcome {
             self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
@@ -1155,6 +1181,7 @@ impl App {
             if tray::pending_may_run(self.activity()) {
                 // "Window" never captures one of our own windows.
                 let front = platform::foreground_window().map(platform::window_kind);
+                self.trigger = "app window";
                 self.run(ctx, main_window::tile_command(cmd, front));
             }
         }
@@ -1211,8 +1238,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.root = root_window(frame);
         if !self.root_hidden_from_capture {
-            self.root_hidden_from_capture = root_window(frame).is_some_and(platform::exclude_from_capture);
+            self.root_hidden_from_capture = self.root.is_some_and(platform::exclude_from_capture);
         }
         if !self.hidden_at_start {
             // eframe shows the root window after its first frame even when it was
@@ -1244,7 +1272,11 @@ impl eframe::App for App {
 
         if let Some(ov) = self.overlay.as_mut() {
             match ov.ui(ui) {
-                Outcome::Continue => {}
+                Outcome::Continue => {
+                    if let Some(t) = self.trace.as_mut() {
+                        t.after_frame(self.root, &ov.note);
+                    }
+                }
                 outcome => self.finish_overlay(&ctx, outcome),
             }
         } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui, self.settings.record_keys)) {

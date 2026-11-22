@@ -153,6 +153,12 @@ The app icon (`assets/mythicshot.ico`) and the two marks in the wizard's picture
 | `crates/recording` | Recording to compressed frames on disk, and export |
 | `spikes/phase0` | The first feasibility tests and small test helpers |
 
+## Troubleshooting
+
+Panics are written to `crash.log` beside the settings file (`%AppData%\Mythicshot\config\` on Windows; Preferences › "Open settings folder" opens it).
+
+Every region capture (Region, Record GIF › Region, and Last region when there is none yet) adds a few lines to `capture.log` in the same folder: when it started and what started it (hotkey, tray menu, tray click, app window), every monitor's rectangle in pixels, its scale factor and which is primary, the desktop's bounds, the scale the selector had before the capture and where its window was asked to go, then for its first three frames where the window really was (rectangle, client area, DPI, shown or hidden), the scale and content area it drew with, the pointer as Windows reports it next to the pixel the selector took to be under it, and whether the picture was uploaded in that frame; and at the end the selection in points and in pixels and the rectangle cropped. If a capture looks wrong, especially the first one after Mythicshot starts, send that file. It holds no picture, window titles or file paths, and stays under 256 KB: a full file becomes `capture.old.log` and a new one starts.
+
 ## Privacy
 
 Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to": then that tour, image or clip goes to the server you set in Settings, and nothing else. Key presses are only logged while you record with Keys turned on, stay in memory, and are deleted with the recording. Recordings are kept in the temp folder until you export or discard them.
