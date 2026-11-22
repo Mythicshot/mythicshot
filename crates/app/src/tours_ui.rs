@@ -4713,6 +4713,39 @@ pub(crate) mod tests {
 
     /// A page that lists the three tours and holds these saved recordings, with no site and no
     /// folder behind it.
+    /// The rows were fitted to the old interface font: in Manrope every row's buttons, title,
+    /// badge and details still fit inside the row's card and the page, and no two buttons overlap.
+    #[test]
+    fn every_row_fits_the_page_in_the_interface_font() {
+        let saved: Vec<ProjectInfo> = [A, B, C].iter().map(|id| info(id, CH1, "Chapter one", mb(12.0), None)).collect();
+        let mut state = page_with(saved);
+        let (ctx, conn) = (crate::theme::test_context(), conn(TokenStatus::Saved));
+        let (text, _) = drawn(&ctx, &mut state, &conn);
+        for word in ["Copy link", "Open", "Edit", "Rename", "Unpublish", "Delete", "Publish"] {
+            assert!(text.lines().any(|l| l == word), "{word:?} in:\n{text}");
+        }
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), ..Default::default() };
+        let mut page_out = PageOut::default();
+        let mut out = ctx.run_ui(input, |ui| super::ui(ui, &mut state, &conn, &mut page_out));
+        out.textures_delta.clear();
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the Tours page") >= 10);
+        // The row buttons: inside the page, and apart.
+        let mut buttons = Vec::new();
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape
+                && ["Copy link", "Open", "Edit", "Rename", "Unpublish", "Delete", "Publish"].contains(&t.galley.text())
+            {
+                buttons.push(t.visual_bounding_rect());
+            }
+        }
+        for (i, a) in buttons.iter().enumerate() {
+            assert!(a.right() <= 590.0, "{a:?} past the page");
+            for b in &buttons[i + 1..] {
+                assert!(!a.intersects(*b), "{a:?} and {b:?} overlap");
+            }
+        }
+    }
+
     fn page_with(saved: Vec<ProjectInfo>) -> ToursState {
         let state = page();
         *lock(&state.model) = loaded_with(three(), saved);

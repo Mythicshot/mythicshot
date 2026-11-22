@@ -303,3 +303,26 @@ fn the_page_on_another_host_is_shown_in_full() {
     assert_eq!(v.lines[2], Line::Help { address: "connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections".into() });
     assert!(v.texts().iter().any(|t| t.ends_with("or go to connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections.")));
 }
+
+/// The sign-in window paints an opaque surface-raised frame, while it waits and once it has a code.
+#[test]
+fn the_window_is_an_opaque_dialog() {
+    let (mut d, _sender, ..) = dialog(Some(code(Some("https://example.com/device"), Some("10"))));
+    let ctx = crate::theme::test_context();
+    let frames = |d: &mut SignInDialog| {
+        let mut last = None;
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                d.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        last.unwrap()
+    };
+    crate::theme::checks::assert_dialog_opaque(&frames(&mut d), "the sign-in window, waiting");
+    until_code(&mut d);
+    crate::theme::checks::assert_dialog_opaque(&frames(&mut d), "the sign-in window with its code");
+}

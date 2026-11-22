@@ -1220,3 +1220,46 @@ fn a_site_that_could_not_be_asked_offers_only_anyone_and_says_so() {
     let at = v.lines.iter().position(|l| matches!(l, Line::Who { .. })).unwrap();
     assert_eq!(&v.lines[at..], &[anyone_line(vec![who::Choice::Anyone]), Line::Muted("Could not ask the site whether it can restrict who can view.".into()), Line::Warning(warning(Kind::Image))]);
 }
+
+// ---- The theme: an opaque window, and a caution in its box ----
+
+/// The window paints an opaque surface-raised frame, and what goes public is said in a caution
+/// box: the caution tint, a 1px caution-border edge and the warning icon in caution-border.
+#[test]
+fn the_window_is_opaque_and_its_caution_is_an_orange_box_with_an_icon() {
+    let ctx = crate::theme::test_context();
+    let mut d = image_form();
+    let out = draw(&ctx, &mut d);
+    crate::theme::checks::assert_dialog_opaque(&out, "the share window");
+    let boxes: Vec<egui::Rect> = shapes_of(&out)
+        .iter()
+        .filter_map(|s| match s {
+            egui::Shape::Rect(r) if r.fill == theme::CAUTION_TINT => {
+                assert_eq!(r.stroke, egui::Stroke::new(1.0, theme::CAUTION_BORDER), "the caution's edge");
+                Some(r.rect)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boxes.len(), 1, "one caution box");
+    // The warning icon: lines in caution-border inside the box.
+    let icon = shapes_of(&out).iter().any(|s| match s {
+        egui::Shape::Path(p) => p.stroke.color == egui::epaint::ColorMode::Solid(theme::CAUTION_BORDER) && p.points.iter().all(|q| boxes[0].contains(*q)),
+        _ => false,
+    });
+    assert!(icon, "the warning icon in the box");
+    // And the text in caution-text.
+    assert!(shapes_of(&out).iter().any(|s| matches!(s, egui::Shape::Text(t) if boxes[0].contains_rect(t.visual_bounding_rect()) && t.galley.job.sections.iter().all(|sec| sec.format.color == theme::CAUTION_TEXT))), "the caution's text");
+}
+
+/// No label of the window sticks out of its button, field or box in Manrope, at any stage the
+/// form shows before anything is sent.
+#[test]
+fn every_label_fits_its_button_in_the_interface_font() {
+    let ctx = crate::theme::test_context();
+    for mut d in [image_form(), clip_form(MediaType::Mp4), ShareDialog::new(Kind::Image, String::new(), "x", String::new(), false, Some("No server is set.".into()), None)] {
+        let out = draw(&ctx, &mut d);
+        let checked = crate::theme::checks::assert_texts_fit(&out, "the share window");
+        assert!(checked >= 1, "the buttons were checked: {checked}");
+    }
+}

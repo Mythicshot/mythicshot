@@ -778,6 +778,35 @@ mod tests {
         Shared::new(settings_ui::Shared { settings, errors: Default::default(), snipping_tool: None, autostart: false, state: Default::default(), actions: Vec::new() })
     }
 
+    /// Every page, and every tab of Preferences, paints the whole window opaque in the theme's
+    /// colours: the menu on surface, the page on ground.
+    #[test]
+    fn every_page_paints_the_whole_window_opaque() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        let ctx = crate::theme::test_context();
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], SIZE[1]));
+        let input = || egui::RawInput { screen_rect: Some(window), ..Default::default() };
+        let mut pages: Vec<(Page, Option<settings_ui::Tab>)> = Page::ALL.iter().map(|p| (*p, None)).collect();
+        pages.extend([settings_ui::Tab::General, settings_ui::Tab::Output, settings_ui::Tab::Hotkeys].map(|t| (Page::Preferences, Some(t))));
+        for (page, tab) in pages {
+            s.nav.request(page);
+            if let Some(tab) = tab {
+                s.prefs.state.tab = tab;
+            }
+            for _ in 0..2 {
+                ctx.run_ui(input(), |ui| window_ui(ui, &mut s)).textures_delta.clear();
+            }
+            let mut out = ctx.run_ui(input(), |ui| window_ui(ui, &mut s));
+            out.textures_delta.clear();
+            crate::theme::checks::assert_window_opaque(&out, window, &format!("{page:?} {tab:?}"));
+            crate::theme::checks::assert_texts_fit(&out, &format!("{page:?} {tab:?}"));
+            let fills = crate::theme::checks::fills(&out);
+            assert!(fills.iter().any(|(r, c, _)| *c == theme::SURFACE && r.height() >= window.height() - 1.0), "{page:?}: the menu on surface");
+            assert!(fills.iter().any(|(r, c, _)| *c == theme::GROUND && r.height() >= window.height() - 1.0), "{page:?}: the page on ground");
+        }
+    }
+
     /// Every piece of text one frame of the window draws.
     fn drawn(ctx: &egui::Context, s: &mut Shared) -> String {
         fn collect(shape: &egui::Shape, into: &mut Vec<String>) {

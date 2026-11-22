@@ -2425,6 +2425,24 @@ mod tests {
             Editor::new_video(rec, Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
         };
         crate::editor_ui::dialog_checks::assert_inert_and_solid(make, |ed| ed.open_site_dialog(), |ed| ed.site_dialog_open());
+        // The video editor paints its whole window opaque, alone and with the dialog open, which is opaque too.
+        {
+            let ctx = crate::theme::test_context();
+            let mut ed = make();
+            let run = |ed: &mut Editor| {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                out
+            };
+            run(&mut ed);
+            crate::theme::checks::assert_window_opaque(&run(&mut ed), crate::editor_ui::dialog_checks::WINDOW, "the video editor");
+            ed.open_site_dialog();
+            run(&mut ed);
+            let out = run(&mut ed);
+            crate::theme::checks::assert_window_opaque(&out, crate::editor_ui::dialog_checks::WINDOW, "the video editor with add to site open");
+            crate::theme::checks::assert_dialog_opaque(&out, "add to site over the video editor");
+        }
         // A click outside it closes nothing.
         let ctx = crate::theme::test_context();
         let mut ed = make();

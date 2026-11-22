@@ -304,6 +304,24 @@ mod tests {
         egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() }
     }
 
+    /// "Add to site" paints an opaque surface-raised frame.
+    #[test]
+    fn the_dialog_is_opaque() {
+        let ctx = crate::theme::test_context();
+        let mut d = SiteDialog::new("", "", "Raid groups");
+        let mut last = None;
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                d.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        crate::theme::checks::assert_dialog_opaque(&last.unwrap(), "add to site");
+    }
+
     /// Run frames until the background look at the folder has finished.
     fn settle(ctx: &egui::Context, d: &mut SiteDialog) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

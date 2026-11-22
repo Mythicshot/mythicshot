@@ -414,6 +414,92 @@ pub fn over(fg: Color32, alpha: f32, bg: Color32) -> Color32 {
     Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
 }
 
+/// Checks the frame tests of every window share: what a frame painted under each point.
+#[cfg(test)]
+pub mod checks {
+    use super::*;
+    use egui::{Rect, Shape};
+
+    /// The filled rectangles of a frame in paint order: where each shows (cut to its clip), its
+    /// fill and its corner radius.
+    pub fn fills(out: &egui::FullOutput) -> Vec<(Rect, Color32, u8)> {
+        fn open(clip: Rect, s: &Shape, into: &mut Vec<(Rect, Color32, u8)>) {
+            match s {
+                Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, into)),
+                Shape::Rect(r) if r.fill.a() > 0 => into.push((r.rect.intersect(clip), r.fill, r.corner_radius.nw)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        for c in &out.shapes {
+            open(c.clip_rect, &c.shape, &mut all);
+        }
+        all
+    }
+
+    /// A window's background: at every point of a 16-point grid over `window`, the first fill
+    /// painted there is fully opaque, so nothing behind the window shows through; and every card
+    /// or dialog (radius-lg) on it is opaque too.
+    pub fn assert_window_opaque(out: &egui::FullOutput, window: Rect, what: &str) {
+        let fills = fills(out);
+        let mut y = window.top() + 2.0;
+        while y < window.bottom() {
+            let mut x = window.left() + 2.0;
+            while x < window.right() {
+                let p = egui::pos2(x, y);
+                let first = fills.iter().find(|(r, ..)| r.contains(p));
+                assert!(first.is_some_and(|(_, c, _)| c.a() == 255), "{what}: at {p:?} the first fill is {first:?}");
+                x += 16.0;
+            }
+            y += 16.0;
+        }
+        for (r, c, radius) in &fills {
+            if *radius >= RADIUS_LG && r.area() >= 4000.0 {
+                assert_eq!(c.a(), 255, "{what}: a see-through card or dialog at {r:?}");
+            }
+        }
+    }
+
+    /// No label sticks out of what holds it: every text that is not cut short with "…" lies
+    /// wholly inside the smallest button, field, chip or card (a filled or outlined rectangle
+    /// under 150 000 square points) that holds its middle. Returns how many texts were checked.
+    pub fn assert_texts_fit(out: &egui::FullOutput, what: &str) -> usize {
+        fn open<'a>(clip: Rect, s: &'a Shape, boxes: &mut Vec<Rect>, texts: &mut Vec<(Rect, Rect, &'a egui::epaint::TextShape)>) {
+            match s {
+                Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, boxes, texts)),
+                Shape::Rect(r) if (r.fill.a() > 0 || r.stroke.width > 0.0) && r.rect.area() < 150_000.0 => boxes.push(r.rect),
+                Shape::Text(t) if !t.galley.text().trim().is_empty() && !t.galley.elided => texts.push((t.visual_bounding_rect(), clip, t)),
+                _ => {}
+            }
+        }
+        let (mut boxes, mut texts) = (Vec::new(), Vec::new());
+        for c in &out.shapes {
+            open(c.clip_rect, &c.shape, &mut boxes, &mut texts);
+        }
+        let mut checked = 0;
+        for (rect, clip, t) in texts {
+            // A text the page has scrolled out of sight is not a text that sticks out.
+            if !clip.contains(rect.center()) {
+                continue;
+            }
+            let holder = boxes.iter().filter(|b| b.contains(rect.center())).min_by(|a, b| a.area().total_cmp(&b.area()));
+            if let Some(holder) = holder {
+                assert!(holder.expand(1.0).contains_rect(rect), "{what}: {:?} at {rect:?} sticks out of {holder:?}", t.galley.text());
+                checked += 1;
+            }
+        }
+        checked
+    }
+
+    /// A dialog's frame: the biggest fill with a dialog's corners is surface-raised and opaque.
+    pub fn assert_dialog_opaque(out: &egui::FullOutput, what: &str) {
+        let frame = fills(out).into_iter().filter(|(_, _, radius)| *radius == RADIUS_LG).max_by(|a, b| a.0.area().total_cmp(&b.0.area()));
+        let (rect, fill, _) = frame.unwrap_or_else(|| panic!("{what}: no dialog frame was painted"));
+        assert!(rect.area() >= 40_000.0, "{what}: the frame {rect:?}");
+        assert_eq!(fill, RAISED, "{what}: the frame is surface-raised and opaque");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

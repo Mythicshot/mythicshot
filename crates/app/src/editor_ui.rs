@@ -2442,6 +2442,28 @@ mod tests {
         dialog_checks::assert_inert_and_solid(make, |ed| ed.share = Some(share_dialog()), |ed| ed.share.is_some());
     }
 
+    /// The editor paints its whole window opaque in the theme, alone and with a dialog open,
+    /// and the dialog's own frame is opaque surface-raised.
+    #[test]
+    fn the_editor_window_and_its_dialog_are_opaque() {
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        // Frames a second apart, so a dialog has faded in.
+        let run = |ed: &mut Editor| {
+            let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..dialog_checks::input(vec![]) };
+            let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+            out.textures_delta.clear();
+            out
+        };
+        run(&mut ed);
+        crate::theme::checks::assert_window_opaque(&run(&mut ed), dialog_checks::WINDOW, "the editor");
+        ed.share = Some(share_dialog());
+        run(&mut ed);
+        let out = run(&mut ed);
+        crate::theme::checks::assert_window_opaque(&out, dialog_checks::WINDOW, "the editor with a dialog open");
+        crate::theme::checks::assert_dialog_opaque(&out, "the share dialog over the editor");
+    }
+
     /// Every dialog is made by the one helper that leaves the window undimmed.
     #[test]
     fn every_dialog_is_made_without_dimming() {

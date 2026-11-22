@@ -2742,6 +2742,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// The tour picker and the result screen paint an opaque surface-raised frame.
+    #[test]
+    fn the_picker_and_the_result_screen_are_opaque_dialogs() {
+        let ctx = crate::theme::test_context();
+        let mut p = Picker::new(String::new(), "Demo");
+        let mut last = None;
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                p.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        crate::theme::checks::assert_dialog_opaque(&last.unwrap(), "the tour picker");
+        let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
+        crate::theme::checks::assert_dialog_opaque(&draw_result(&ctx, &mut d), "the result screen");
+    }
+
     /// A few frames of the result screen, a second apart so it has faded in; the last one.
     fn draw_result(ctx: &egui::Context, d: &mut ResultDialog) -> egui::FullOutput {
         let mut last = None;
