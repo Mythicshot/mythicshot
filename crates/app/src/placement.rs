@@ -166,6 +166,12 @@ pub fn place_step(stage: PlaceStage, looks: u8, look: Look) -> PlaceStep {
 }
 
 /// The stage after a step.
+/// Whether the window is asked to paint after this step: every step that shows or uncloaks it.
+/// The repaints its own contents ask for are not relied on across those two moments.
+pub fn paints_after(step: PlaceStep) -> bool {
+    !matches!(step, PlaceStep::Wait)
+}
+
 pub fn place_advance(stage: PlaceStage, step: PlaceStep, look: Look) -> PlaceStage {
     match (stage, step) {
         (_, PlaceStep::Uncloak { .. } | PlaceStep::Anyway { .. }) => PlaceStage::Done,
@@ -233,6 +239,11 @@ impl Placer {
                 let why = if self.hwnd.is_some() { "NOT in place in time, shown where it is" } else { "window not found or lost, shown where egui put it" };
                 self.finish(ctx, id, why);
             }
+        }
+        if paints_after(step) {
+            // Its contents ask for their own repaints, but a request made around the show or the
+            // uncloak can go unanswered and end that chain: ask once more from here.
+            ctx.request_repaint_of(id);
         }
         self.stage = place_advance(self.stage, step, look);
         if self.stage != PlaceStage::Done {
@@ -440,6 +451,14 @@ mod tests {
         assert_eq!(stage, PlaceStage::Done);
         assert_eq!(place_step(stage, 200, IN), PlaceStep::Wait);
         assert_eq!(place_advance(stage, PlaceStep::Wait, IN), PlaceStage::Done);
+    }
+
+    #[test]
+    fn every_step_that_shows_or_uncloaks_a_window_asks_it_to_paint() {
+        assert!(!paints_after(PlaceStep::Wait));
+        for step in [PlaceStep::Show, PlaceStep::Uncloak { put_back: false }, PlaceStep::Uncloak { put_back: true }, PlaceStep::Anyway { shown: false }, PlaceStep::Anyway { shown: true }] {
+            assert!(paints_after(step), "{step:?}");
+        }
     }
 
     #[test]

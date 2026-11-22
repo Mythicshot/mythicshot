@@ -48,6 +48,26 @@ pub enum BarAction {
 struct FrameState {
     countdown: Option<u32>,
     paused: bool,
+    /// How the countdown was really drawn, for `capture.log`.
+    drawn: CountdownDrawn,
+}
+
+/// What the red frame's window drew of the countdown.
+#[derive(Default, Clone, Copy)]
+struct CountdownDrawn {
+    /// Times a number above zero was drawn.
+    times: u32,
+    first: Option<Instant>,
+    /// The last number drawn.
+    last: Option<u32>,
+}
+
+/// The log line for one countdown: whether its numbers reached the screen.
+fn countdown_line(time: &str, secs: u32, times: u32, first_ms: Option<u128>, last: Option<u32>) -> String {
+    match (first_ms, last) {
+        (Some(ms), Some(n)) => format!("-- {time} countdown of {secs} s · number drawn {times} times, first {ms} ms after it began, last number {n}"),
+        _ => format!("-- {time} countdown of {secs} s · number NEVER drawn"),
+    }
 }
 
 pub struct Session {
@@ -62,6 +82,9 @@ pub struct Session {
     frame_placer: Placer,
     /// The frame's rectangle in points for egui, a first guess the placer corrects.
     frame_guess: (egui::Pos2, egui::Vec2),
+    /// When the countdown began and its length, for `capture.log`.
+    began: Instant,
+    countdown_secs: u32,
     phase: Phase,
     fps: u32,
     frame: Arc<Mutex<FrameState>>,
@@ -100,6 +123,8 @@ impl Session {
             monitor_scale: mon.scale,
             frame_placer: Placer::new(FRAME_TITLE, frame, Focus::None),
             frame_guess,
+            began: Instant::now(),
+            countdown_secs,
             phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(countdown_secs as u64) },
             fps,
             frame: Arc::new(Mutex::new(FrameState::default())),
@@ -123,6 +148,11 @@ impl Session {
     pub fn tick(&mut self) -> Result<(), String> {
         if let Phase::Countdown { until } = self.phase {
             if Instant::now() >= until {
+                if let Ok(f) = self.frame.lock() {
+                    let d = f.drawn;
+                    let first_ms = d.first.map(|t| t.saturating_duration_since(self.began).as_millis());
+                    crate::capture_log::append(&[countdown_line(&crate::capture_log::now(), self.countdown_secs, d.times, first_ms, d.last)]);
+                }
                 self.go_live()?;
             }
         }
@@ -202,7 +232,7 @@ impl Session {
         let state = self.frame.clone();
         let frame_id = egui::ViewportId::from_hash_of("rec-frame");
         ctx.show_viewport_deferred(frame_id, builder, move |ui, _| {
-            let Ok(f) = state.lock() else { return };
+            let Ok(mut f) = state.lock() else { return };
             let full = ui.ctx().content_rect();
             let painter = ui.painter();
             let color = if f.paused { theme::RECORD_PAUSED } else { theme::RECORD };
@@ -210,10 +240,18 @@ impl Session {
             if let Some(n) = f.countdown.filter(|n| *n > 0) {
                 painter.circle_filled(full.center(), 64.0, theme::SCRIM_COUNTDOWN);
                 painter.text(full.center(), egui::Align2::CENTER_CENTER, n.to_string(), FontId::proportional(80.0), theme::ON_PICTURE);
+                f.drawn.times += 1;
+                f.drawn.first.get_or_insert_with(Instant::now);
+                f.drawn.last = Some(n);
             }
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         });
         self.frame_placer.tick(ctx, frame_id);
+        if matches!(self.phase, Phase::Countdown { .. }) {
+            // The number is this session's state: the frame is asked to draw it at every tick,
+            // whatever its own window has or has not asked for.
+            ctx.request_repaint_of(frame_id);
+        }
         if !self.frame_hidden_from_capture {
             if let Some(h) = platform::find_window(FRAME_TITLE) {
                 self.frame_hidden_from_capture = platform::exclude_from_capture(h);
@@ -400,6 +438,8 @@ mod tests {
             monitor_scale: 1.0,
             frame_placer: Placer::new(FRAME_TITLE, placement::frame_rect(rect, &[]), Focus::None),
             frame_guess: placement::guess_points(rect, 1.0),
+            began: Instant::now(),
+            countdown_secs: 3,
             phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(3600) },
             fps: 15,
             frame: Default::default(),
@@ -410,6 +450,12 @@ mod tests {
     }
 
     /// The recording bar, a window of its own, paints all of itself opaque, pixel by pixel at 125%.
+    #[test]
+    fn the_log_says_whether_the_countdown_numbers_were_drawn() {
+        assert_eq!(countdown_line("T", 3, 28, Some(140), Some(1)), "-- T countdown of 3 s · number drawn 28 times, first 140 ms after it began, last number 1");
+        assert_eq!(countdown_line("T", 3, 0, None, None), "-- T countdown of 3 s · number NEVER drawn");
+    }
+
     #[test]
     fn the_recording_bar_is_opaque_pixel_by_pixel() {
         let s = counting_down();
