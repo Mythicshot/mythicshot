@@ -81,34 +81,15 @@ pub fn outer_for(target: PxRect, outer: PxRect, client: PxRect) -> PxRect {
     PxRect::new(target.x - left, target.y - top, (target.w as i32 + left + right).max(1) as u32, (target.h as i32 + top + bottom).max(1) as u32)
 }
 
-/// Whether egui's scale this frame is the window's real one and its content area covers the
-/// client area: then what is painted lands where the mapping says.
-pub fn scale_settled(ppp: f32, zoom: f32, window_dpi: Option<u32>, content_pt: (f32, f32), client: PxRect) -> bool {
-    let dpi_ok = window_dpi.is_none_or(|dpi| (ppp - zoom * dpi as f32 / 96.0).abs() < 1e-3);
-    dpi_ok && (content_pt.0 * ppp - client.w as f32).abs() <= PX_EPSILON && (content_pt.1 * ppp - client.h as f32).abs() <= PX_EPSILON
+/// Whether egui's scale is the DPI Windows reports for the window. No DPI to compare: yes.
+pub fn dpi_matches(ppp: f32, zoom: f32, window_dpi: Option<u32>) -> bool {
+    window_dpi.is_none_or(|dpi| (ppp - zoom * dpi as f32 / 96.0).abs() < 1e-3)
 }
 
-/// What to do with the hidden window after a frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Show {
-    /// Keep it hidden: it was moved this frame, or is not where it belongs yet.
-    Wait,
-    /// The frame just painted is right: show it.
-    Now,
-    /// It did not settle in [`MAX_HIDDEN_FRAMES`]: show it anyway.
-    Anyway,
-}
-
-/// After frame `frame` (1 for the first) of a capture: show the window when it was not moved
-/// this frame, sits on its target, egui's scale is the window's and the picture is uploaded.
-pub fn decide_show(frame: u32, moved: bool, on_target: bool, settled: bool, texture: bool) -> Show {
-    if !moved && on_target && settled && texture {
-        Show::Now
-    } else if frame >= MAX_HIDDEN_FRAMES {
-        Show::Anyway
-    } else {
-        Show::Wait
-    }
+/// Whether egui's content area, times its scale, covers the client area: then what is painted
+/// was laid out for the window's real size.
+pub fn content_matches(ppp: f32, content_pt: (f32, f32), client: PxRect) -> bool {
+    (content_pt.0 * ppp - client.w as f32).abs() <= PX_EPSILON && (content_pt.1 * ppp - client.h as f32).abs() <= PX_EPSILON
 }
 
 #[cfg(test)]
@@ -126,18 +107,95 @@ mod tests {
         Mon { rect: PxRect::new(x, y, w, h), scale }
     }
 
-    /// The pointer position egui gets for a pixel: winit's physical position in the client
-    /// area divided by the scale, in f32 as egui-winit does it.
-    fn pointer(m: &Mapping, x: i32, y: i32) -> Pos2 {
-        pos2((x - m.client.x) as f32 / m.ppp, (y - m.client.y) as f32 / m.ppp)
+    /// The pointer position egui gets for a desktop pixel: winit's physical position in the
+    /// REAL window's client area divided by the scale, in f32 as egui-winit does it.
+    fn pointer(real: PxRect, ppp: f32, x: i32, y: i32) -> Pos2 {
+        pos2((x - real.x) as f32 / ppp, (y - real.y) as f32 / ppp)
     }
 
-    /// What egui-glow does with a point: times the scale, in pixels of the client area.
-    fn painted_px(m: &Mapping, p: Pos2) -> (f32, f32) {
-        (m.client.x as f32 + p.x * m.ppp, m.client.y as f32 + p.y * m.ppp)
+    /// The desktop pixel egui-glow paints a point on: the REAL client area's origin plus the
+    /// point times the scale.
+    fn painted_px(real: PxRect, ppp: f32, p: Pos2) -> (f32, f32) {
+        (real.x as f32 + p.x * ppp, real.y as f32 + p.y * ppp)
     }
 
-    /// Every check of the mapping for one layout and every scale the window may be given.
+    /// Every check of a mapping against the window as it really is: `real` is where Windows
+    /// put the client area, `m` what the selector maps with. Returns what went wrong.
+    fn check_window(mons: &[Mon], bounds: PxRect, real: PxRect, m: Mapping, exact_drag: bool) -> Vec<String> {
+        let mut bad = Vec::new();
+        let ppp = m.ppp;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // The picture covers the bounds pixel for pixel: one texel per screen pixel.
+        let pic = m.picture_rect(bounds);
+        let (x0, y0) = painted_px(real, ppp, pic.min);
+        let (x1, y1) = painted_px(real, ppp, pic.max);
+        if !(near(x0, bounds.x as f32) && near(y0, bounds.y as f32) && near(x1, bounds.right() as f32) && near(y1, bounds.bottom() as f32)) {
+            bad.push(format!("picture painted on {x0},{y0} to {x1},{y1}, not on {bounds:?}"));
+        }
+        for mon in mons {
+            let r = mon.rect;
+            // Every pixel on each edge of each monitor, and its corners.
+            let mut pixels = Vec::new();
+            for x in [r.x, r.x + 1, r.right() - 2, r.right() - 1] {
+                for y in (r.y..r.bottom()).step_by(7).chain([r.bottom() - 1]) {
+                    pixels.push((x, y));
+                }
+            }
+            for y in [r.y, r.y + 1, r.bottom() - 2, r.bottom() - 1] {
+                for x in (r.x..r.right()).step_by(7).chain([r.right() - 1]) {
+                    pixels.push((x, y));
+                }
+            }
+            for (x, y) in pixels.into_iter().filter(|(x, y)| real.contains(*x, *y)) {
+                // The pointer on a pixel is read as that pixel.
+                let got = m.to_px(pointer(real, ppp, x, y));
+                if got != (x, y) {
+                    bad.push(format!("pointer on {x},{y} read as {got:?}"));
+                    continue;
+                }
+                // The frozen texel painted on that pixel is that pixel's.
+                let (px, py) = painted_px(real, ppp, m.px_to_pt(x, y));
+                let tx = bounds.x as f32 + (px - x0) * bounds.w as f32 / (x1 - x0);
+                let ty = bounds.y as f32 + (py - y0) * bounds.h as f32 / (y1 - y0);
+                if !(near(px, x as f32) && near(py, y as f32) && near(tx, x as f32) && near(ty, y as f32)) {
+                    bad.push(format!("pixel {x},{y}: drawn at {px},{py} with texel {tx},{ty}"));
+                }
+            }
+            // A drag over a whole monitor crops exactly it, and its outline is drawn on it.
+            let (ax, ay) = (r.x.max(real.x), r.y.max(real.y));
+            let (bx, by) = ((r.right() - 1).min(real.right() - 1), (r.bottom() - 1).min(real.bottom() - 1));
+            if ax < bx && ay < by {
+                let a = m.to_px(pointer(real, ppp, ax, ay));
+                let b = m.to_px(pointer(real, ppp, bx, by));
+                let sel = PxRect::from_corners(a.0, a.1, b.0, b.1);
+                if exact_drag && sel != PxRect::new(r.x, r.y, r.w - 1, r.h - 1) {
+                    bad.push(format!("drag over {r:?} selected {sel:?}"));
+                }
+                let pt = m.to_pt(sel);
+                let (sx, sy) = painted_px(real, ppp, pt.min);
+                let (ex, ey) = painted_px(real, ppp, pt.max);
+                if !(near(sx, sel.x as f32) && near(sy, sel.y as f32) && near(ex, sel.right() as f32) && near(ey, sel.bottom() as f32)) {
+                    bad.push(format!("outline of {sel:?} drawn at {sx},{sy} to {ex},{ey}"));
+                }
+            }
+        }
+        // A selection across a monitor edge keeps every pixel: none lost or gained.
+        if mons.len() > 1 {
+            let (l, r) = (mons[0].rect, mons[1].rect);
+            let (ax, ay) = (l.x + l.w as i32 / 2, l.y + 10);
+            let (bx, by) = (r.x + r.w as i32 / 2, r.y + 20);
+            if real.contains(ax, ay) && real.contains(bx, by) {
+                let a = m.to_px(pointer(real, ppp, ax, ay));
+                let b = m.to_px(pointer(real, ppp, bx, by));
+                if PxRect::from_corners(a.0, a.1, b.0, b.1) != PxRect::from_corners(ax, ay, bx, by) {
+                    bad.push("selection across a monitor edge changed".into());
+                }
+            }
+        }
+        bad
+    }
+
+    /// Every check for one layout and every scale the window may be given.
     fn check_layout(name: &str, mons: &[Mon]) {
         let bounds = union(mons.iter().map(|m| m.rect)).unwrap();
         // Windows assigns the window the scale of one monitor; which one does not matter.
@@ -147,68 +205,13 @@ mod tests {
             // On the bounds; inset by a pixel; and where a scale change mid-move left the old
             // code's window (half size, nudged): the mapping follows the real client area.
             let stray = PxRect::new(bounds.x + 161, bounds.y, bounds.w / 2, bounds.h / 2);
-            for (inset, client) in [(0, window_rect(bounds, 0)), (1, window_rect(bounds, 1)), (2, stray)] {
-                let m = Mapping { client, ppp };
-                let ctx = format!("{name}, scale {ppp}, client {client:?}");
-                // The picture covers the bounds pixel for pixel: one texel per screen pixel.
-                let pic = m.picture_rect(bounds);
-                let (x0, y0) = painted_px(&m, pic.min);
-                let (x1, y1) = painted_px(&m, pic.max);
-                assert!((x0 - bounds.x as f32).abs() < 0.01 && (y0 - bounds.y as f32).abs() < 0.01, "{ctx}: picture origin {x0},{y0}");
-                assert!((x1 - bounds.right() as f32).abs() < 0.01 && (y1 - bounds.bottom() as f32).abs() < 0.01, "{ctx}: picture end {x1},{y1}");
-                for mon in mons {
-                    let r = mon.rect;
-                    // Every pixel on each edge of each monitor, and its corners, round trip.
-                    let mut pixels = Vec::new();
-                    for x in [r.x, r.x + 1, r.right() - 2, r.right() - 1] {
-                        for y in (r.y..r.bottom()).step_by(7).chain([r.bottom() - 1]) {
-                            pixels.push((x, y));
-                        }
-                    }
-                    for y in [r.y, r.y + 1, r.bottom() - 2, r.bottom() - 1] {
-                        for x in (r.x..r.right()).step_by(7).chain([r.right() - 1]) {
-                            pixels.push((x, y));
-                        }
-                    }
-                    for (x, y) in pixels {
-                        let client = m.client;
-                        if !client.contains(x, y) {
-                            continue; // under the inset strip: not in the window
-                        }
-                        assert_eq!(m.to_px(pointer(&m, x, y)), (x, y), "{ctx}: pixel {x},{y}");
-                        // The frozen pixel drawn there is the same desktop pixel.
-                        let (px, py) = painted_px(&m, m.px_to_pt(x, y));
-                        let tx = bounds.x as f32 + (px - x0) * bounds.w as f32 / (x1 - x0);
-                        let ty = bounds.y as f32 + (py - y0) * bounds.h as f32 / (y1 - y0);
-                        assert!((px - x as f32).abs() < 0.01 && (py - y as f32).abs() < 0.01, "{ctx}: point of {x},{y} painted at {px},{py}");
-                        assert!((tx - x as f32).abs() < 0.01 && (ty - y as f32).abs() < 0.01, "{ctx}: texel {tx},{ty} drawn on pixel {x},{y}");
-                    }
-                    // A whole monitor selected by a drag from corner to corner crops exactly it.
-                    let a = m.to_px(pointer(&m, r.x.max(m.client.x), r.y.max(m.client.y)));
-                    let b = m.to_px(pointer(&m, (r.right() - 1).min(m.client.right() - 1), (r.bottom() - 1).min(m.client.bottom() - 1)));
-                    let sel = PxRect::from_corners(a.0, a.1, b.0, b.1);
-                    if inset == 0 {
-                        assert_eq!(sel, PxRect::new(r.x, r.y, r.w - 1, r.h - 1), "{ctx}: drag over {r:?}");
-                    }
-                    // The selection's outline is drawn on exactly those pixels.
-                    let pt = m.to_pt(sel);
-                    let (sx, sy) = painted_px(&m, pt.min);
-                    let (ex, ey) = painted_px(&m, pt.max);
-                    assert!((sx - sel.x as f32).abs() < 0.01 && (sy - sel.y as f32).abs() < 0.01 && (ex - sel.right() as f32).abs() < 0.01 && (ey - sel.bottom() as f32).abs() < 0.01, "{ctx}: outline of {sel:?}");
-                }
-                // A selection across a monitor edge keeps every pixel: none lost or gained.
-                if mons.len() > 1 {
-                    let (l, r) = (mons[0].rect, mons[1].rect);
-                    let (ax, ay) = (l.x + l.w as i32 / 2, l.y + 10);
-                    let (bx, by) = (r.x + r.w as i32 / 2, r.y + 20);
-                    if m.client.contains(ax, ay) && m.client.contains(bx, by) {
-                        let a = m.to_px(pointer(&m, ax, ay));
-                        let b = m.to_px(pointer(&m, bx, by));
-                        let sel = PxRect::from_corners(a.0, a.1, b.0, b.1);
-                        assert_eq!(sel, PxRect::from_corners(ax, ay, bx, by), "{ctx}: across the edge");
-                    }
-                }
+            for (exact, real) in [(true, window_rect(bounds, 0)), (false, window_rect(bounds, 1)), (false, stray)] {
+                let bad = check_window(mons, bounds, real, Mapping { client: real, ppp }, exact);
+                assert!(bad.is_empty(), "{name}, scale {ppp}, window {real:?}: {:?}", &bad[..bad.len().min(5)]);
             }
+            // The old code's assumption, a window on the bounds, fails against the stray window.
+            let old = check_window(mons, bounds, stray, Mapping { client: bounds, ppp }, false);
+            assert!(!old.is_empty(), "{name}, scale {ppp}: a wrong client rectangle must be caught");
         }
     }
 
@@ -276,7 +279,7 @@ mod tests {
         let real = Mapping { client: PxRect::new(-1759, 0, 3520, 720), ppp: 1.0 };
         let old_to_px = |p: Pos2| (bounds.x + (p.x * real.ppp).round() as i32, bounds.y + (p.y * real.ppp).round() as i32);
         let cursor = (100, 100);
-        let p = pointer(&real, cursor.0, cursor.1);
+        let p = pointer(real.client, real.ppp, cursor.0, cursor.1);
         assert_eq!(old_to_px(p), (-61, 100), "the old code read the cursor 161 px to the left");
         assert_eq!(real.to_px(p), cursor, "the mapping from the real window does not");
         // And the old picture filled the window: the whole desktop at half size.
@@ -309,18 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_shown_only_when_placed_settled_and_painted() {
+    fn the_scale_and_the_content_area_are_checked_against_the_real_window() {
         let client = PxRect::new(0, 0, 3000, 2000);
-        assert!(scale_settled(1.5, 1.0, Some(144), (2000.0, 2000.0 / 1.5), client));
-        assert!(!scale_settled(1.0, 1.0, Some(144), (3000.0, 2000.0), client), "egui has not caught up with the window's 150%");
-        assert!(!scale_settled(1.5, 1.0, Some(144), (1000.0, 1000.0), client), "the content area is still the old size");
-        assert!(scale_settled(2.0, 1.0, None, (1500.0, 1000.0), client), "no DPI to compare: the sizes decide");
-        assert_eq!(decide_show(1, false, true, true, true), Show::Now);
-        assert_eq!(decide_show(1, true, true, true, true), Show::Wait, "moved this frame: what was painted was laid out for the old size");
-        assert_eq!(decide_show(2, false, false, true, true), Show::Wait);
-        assert_eq!(decide_show(2, false, true, false, true), Show::Wait);
-        assert_eq!(decide_show(2, false, true, true, false), Show::Wait);
-        assert_eq!(decide_show(MAX_HIDDEN_FRAMES, true, false, false, false), Show::Anyway);
+        assert!(dpi_matches(1.5, 1.0, Some(144)));
+        assert!(!dpi_matches(1.0, 1.0, Some(144)), "egui has not caught up with the window's 150%");
+        assert!(dpi_matches(2.0, 1.0, None), "no DPI to compare");
+        assert!(content_matches(1.5, (2000.0, 2000.0 / 1.5), client));
+        assert!(!content_matches(1.5, (1000.0, 1000.0), client), "the content area is still the old size");
     }
 
     #[test]

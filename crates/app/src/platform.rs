@@ -210,6 +210,34 @@ pub fn set_cloaked(hwnd: WindowId, cloaked: bool) -> bool {
     unsafe { DwmSetWindowAttribute(HWND(hwnd as *mut _), DWMWA_CLOAK, &value as *const _ as *const _, std::mem::size_of_val(&value) as u32).is_ok() }
 }
 
+/// One of this process's hidden top-level windows with this exact title: a window egui has just
+/// created hidden, to be placed before it is shown.
+#[cfg(windows)]
+pub fn find_own_hidden_window(title: &str) -> Option<WindowId> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut after: Option<HWND> = None;
+    // A bound on the windows looked at, in case the list changes while it is walked.
+    for _ in 0..64 {
+        let h = unsafe { FindWindowExW(None, after, PCWSTR::null(), PCWSTR(wide.as_ptr())) }.ok()?;
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if pid == unsafe { GetCurrentProcessId() } && !unsafe { IsWindowVisible(h) }.as_bool() {
+            return Some(h.0 as WindowId);
+        }
+        after = Some(h);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn find_own_hidden_window(_title: &str) -> Option<WindowId> {
+    None
+}
+
 #[cfg(not(windows))]
 pub fn set_cloaked(_hwnd: WindowId, _cloaked: bool) -> bool {
     false

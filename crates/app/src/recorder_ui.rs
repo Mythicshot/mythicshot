@@ -18,12 +18,12 @@ use mythicshot_recording::{Recorder, Recording, Target};
 use crate::theme::{self, Strong as _};
 use crate::icons::{self, Icon};
 use crate::live_draw::LiveDraw;
+use crate::placement::{self, Focus, Placer};
 use crate::platform::{self, WindowId};
 use crate::video::{self, Edit};
 
 pub const FRAME_TITLE: &str = "Mythicshot recording frame";
-pub const BAR_SIZE: [f32; 2] = [680.0, 46.0];
-const BORDER: f32 = 4.0;
+const BORDER: f32 = placement::FRAME_BORDER;
 /// GIF size relative to the compressed frames on disk, measured on game
 /// footage (94 MB of frames became a 13.4 MB GIF). Only an estimate.
 const GIF_RATIO: f64 = 0.14;
@@ -55,8 +55,13 @@ pub struct Session {
     pub rect: PxRect,
     pub title: String,
     target: Target,
-    /// The monitor the area is on, to keep the bar on screen.
+    /// The monitor the area is on, to keep the bar on screen, and its scale.
     monitor: PxRect,
+    monitor_scale: f32,
+    /// Puts the red frame's window around the area in pixels, then shows it.
+    frame_placer: Placer,
+    /// The frame's rectangle in points for egui, a first guess the placer corrects.
+    frame_guess: (egui::Pos2, egui::Vec2),
     phase: Phase,
     fps: u32,
     frame: Arc<Mutex<FrameState>>,
@@ -85,11 +90,16 @@ impl Session {
             width: clipped.w,
             height: clipped.h,
         };
+        let frame = placement::frame_rect(clipped, &monitors);
+        let frame_guess = placement::guess_points(frame, placement::scale_for(frame, &monitors));
         let mut s = Session {
             rect: clipped,
             title,
             target,
             monitor: mon.rect,
+            monitor_scale: mon.scale,
+            frame_placer: Placer::new(FRAME_TITLE, frame, Focus::None),
+            frame_guess,
             phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(countdown_secs as u64) },
             fps,
             frame: Arc::new(Mutex::new(FrameState::default())),
@@ -161,25 +171,13 @@ impl Session {
         self.go_live()
     }
 
-    /// Where the control bar goes, in points: above the area, else below it,
-    /// else inside its top edge (it is hidden from capture either way).
-    pub fn bar_position(&self, ppp: f32) -> egui::Pos2 {
-        let (bw, bh) = ((BAR_SIZE[0] * ppp) as i32, (BAR_SIZE[1] * ppp) as i32);
-        let gap = (10.0 * ppp) as i32;
-        let x = (self.rect.x + self.rect.w as i32 / 2 - bw / 2).clamp(self.monitor.x, self.monitor.right() - bw);
-        let y = if self.rect.y - bh - gap >= self.monitor.y {
-            self.rect.y - bh - gap
-        } else if self.rect.bottom() + gap + bh <= self.monitor.bottom() {
-            self.rect.bottom() + gap
-        } else {
-            self.rect.y + gap
-        };
-        egui::pos2(x as f32 / ppp, y as f32 / ppp)
+    /// Where the control bar goes, in desktop pixels, sized in its monitor's scale.
+    pub fn bar_rect(&self) -> PxRect {
+        placement::bar_rect(self.rect, self.monitor, self.monitor_scale)
     }
 
     /// The red frame: a transparent, click-through window just outside the area.
     pub fn show_frame(&mut self, ctx: &egui::Context) {
-        let ppp = ctx.pixels_per_point();
         {
             let mut f = self.frame.lock().expect("frame state");
             f.countdown = match self.phase {
@@ -188,11 +186,12 @@ impl Session {
             };
             f.paused = matches!(&self.phase, Phase::Live(r) if r.is_paused());
         }
-        let r = self.rect;
+        // Created hidden, put on its pixels around the area, then shown (see `Placer`).
         let builder = egui::ViewportBuilder::default()
             .with_title(FRAME_TITLE)
-            .with_position(egui::pos2(r.x as f32 / ppp - BORDER, r.y as f32 / ppp - BORDER))
-            .with_inner_size([r.w as f32 / ppp + BORDER * 2.0, r.h as f32 / ppp + BORDER * 2.0])
+            .with_position(self.frame_guess.0)
+            .with_inner_size(self.frame_guess.1)
+            .with_visible(false)
             .with_decorations(false)
             .with_transparent(true)
             .with_mouse_passthrough(true)
@@ -201,7 +200,8 @@ impl Session {
             .with_resizable(false)
             .with_active(false);
         let state = self.frame.clone();
-        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("rec-frame"), builder, move |ui, _| {
+        let frame_id = egui::ViewportId::from_hash_of("rec-frame");
+        ctx.show_viewport_deferred(frame_id, builder, move |ui, _| {
             let Ok(f) = state.lock() else { return };
             let full = ui.ctx().content_rect();
             let painter = ui.painter();
@@ -213,6 +213,7 @@ impl Session {
             }
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         });
+        self.frame_placer.tick(ctx, frame_id);
         if !self.frame_hidden_from_capture {
             if let Some(h) = platform::find_window(FRAME_TITLE) {
                 self.frame_hidden_from_capture = platform::exclude_from_capture(h);

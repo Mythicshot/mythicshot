@@ -1,11 +1,13 @@
-//! Placing and showing the region selector's window, which is the app's hidden root window.
+//! Placing and showing the app's hidden root window: as the region selector and as the
+//! recording bar.
 //!
-//! The window is placed over the desktop in physical pixels with `SetWindowPos` and checked
-//! with `GetWindowInfo`, never through a size in points: moving a window across monitors with
+//! The window is placed in physical pixels with `SetWindowPos` and checked with
+//! `GetWindowInfo`, never through a size in points: moving a window across monitors with
 //! different scale factors changes its scale half-way, and winit then resizes it to keep its
-//! size in points. It is shown only once it sits on its target, egui's scale is the window's
-//! and a frame has been painted at that size; cloaked for that frame where Windows allows it,
-//! so nothing half-drawn reaches the screen.
+//! size in points. The selector is shown only once it sits on its target and a frame has been
+//! painted at that size; cloaked for that frame where Windows allows it, so nothing half-drawn
+//! reaches the screen. Once it is on screen it is never moved again: if it is not where it was
+//! asked to go, the selector maps from where it is.
 //!
 //! The hidden window is also parked over the desktop at start-up and after a recording (the
 //! recording bar moves it onto one monitor), so its scale has settled before a capture starts
@@ -18,18 +20,23 @@ use mythicshot_capture::PxRect;
 
 use crate::capture_log::{self, Placed, WinState};
 use crate::overlay::FrameNote;
-use crate::overlay::geometry::{self, Show};
+use crate::overlay::geometry::{self, MAX_HIDDEN_FRAMES};
 use crate::platform::{self, WindowId};
 
-/// Times one placement asks Windows to put the window on its target: a scale change during
-/// the first move is answered by winit with a resize of its own, which the second undoes.
-const TRIES: u8 = 3;
+/// Times one placement asks Windows at most to put the window on its target: a scale change
+/// during the first move is answered by winit with a resize of its own, which the second undoes.
+pub const TRIES: u8 = 3;
+
+/// `SetWindowPos` calls one capture may make in all, before and while it is cloaked.
+pub const MAX_MOVES: u8 = 6;
+
+/// Frames the selector may stay cloaked waiting for a settled frame.
+pub const MAX_CLOAKED_FRAMES: u32 = 8;
 
 /// Frames the parking of the hidden window is tried before it waits for the next capture.
 const PARK_FRAMES: u32 = 20;
 
-/// Frame lines one capture may log at most: its first frames, the one it is shown in, and
-/// frames it had to be moved in.
+/// Frame lines one capture may log at most.
 const MAX_FRAME_LINES: u32 = 12;
 
 pub fn state(hwnd: WindowId) -> Option<WinState> {
@@ -37,15 +44,15 @@ pub fn state(hwnd: WindowId) -> Option<WinState> {
     Some(WinState { outer, client, dpi: platform::window_dpi(hwnd), visible: platform::is_window_visible(hwnd) })
 }
 
-/// Put the window's client area on `target`, in pixels.
-pub fn place(hwnd: WindowId, target: PxRect) -> Placed {
+/// Put the window's client area on `target`, in pixels, with at most `budget` moves.
+pub fn place(hwnd: WindowId, target: PxRect, budget: u8) -> Placed {
     let mut placed = Placed::default();
     while let Some((outer, client)) = platform::window_rects(hwnd) {
         if client == target {
             placed.on_target = true;
             break;
         }
-        if placed.tries >= TRIES {
+        if placed.tries >= budget.min(TRIES) {
             break;
         }
         placed.tries += 1;
@@ -66,6 +73,7 @@ pub struct Parking {
     /// Why it is due ("start", "after recording"); None when it is parked.
     due: Option<&'static str>,
     frames: u32,
+    tries: u32,
     /// Frames to let pass first: eframe shows the root window after its first frame, and the
     /// app hides it again only then; a window parked before that would flash over the desktop.
     skip: u8,
@@ -73,11 +81,11 @@ pub struct Parking {
 
 impl Parking {
     pub fn start() -> Self {
-        Self { due: Some("start"), frames: 0, skip: 2 }
+        Self { due: Some("start"), frames: 0, tries: 0, skip: 2 }
     }
 
     pub fn request(&mut self, why: &'static str) {
-        *self = Self { due: Some(why), frames: 0, skip: 1 };
+        *self = Self { due: Some(why), frames: 0, tries: 0, skip: 1 };
     }
 
     /// Each frame with no capture or recording on screen: park the window if it is hidden.
@@ -93,20 +101,104 @@ impl Parking {
         }
         let Some(target) = desktop_target() else { return };
         self.frames += 1;
-        let placed = place(hwnd, target);
+        let placed = place(hwnd, target, TRIES);
+        self.tries += u32::from(placed.tries);
         if placed.on_target || self.frames >= PARK_FRAMES {
             self.due = None;
-            capture_log::append(&[capture_log::park_line(&capture_log::now(), why, target, state(hwnd), self.frames)]);
+            capture_log::append(&[capture_log::park_line(&capture_log::now(), why, target, state(hwnd), self.tries)]);
         }
     }
 }
 
+/// What was true of the selector's window after a frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// It was moved before this frame was laid out.
+    pub moved: bool,
+    pub on_target: bool,
+    /// egui's scale is the DPI Windows reports for the window.
+    pub dpi_matches: bool,
+    /// egui's content area times its scale is the client area.
+    pub content_matches: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
+pub enum Stage {
     Hidden,
-    /// Shown but cloaked; the number of frames painted since.
-    Cloaked(u8),
+    /// Shown but cloaked. `settled`: the frame painted last was right, so it can be uncloaked.
+    /// `dpi_pending`: it was shown before Windows told it its new scale.
+    Cloaked { frames: u32, settled: bool, dpi_pending: bool },
     Shown,
+}
+
+/// What to do after a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Wait,
+    /// Show it, cloaked. `dpi_pending`: in place and painted at its size, but egui's scale is
+    /// not the window's yet: Windows may not tell a hidden window its new scale, so it is
+    /// shown cloaked for the change to arrive. `anyway`: it did not settle in time.
+    Show { dpi_pending: bool, anyway: bool },
+    /// The last frame painted while cloaked was right (or time is up): uncloak.
+    Uncloak { anyway: bool },
+}
+
+/// The decision after frame `frame` (1 for the first) of a capture.
+pub fn step(stage: Stage, frame: u32, f: Facts) -> Step {
+    match stage {
+        Stage::Hidden => {
+            let in_place = !f.moved && f.on_target && f.content_matches;
+            if in_place {
+                Step::Show { dpi_pending: !f.dpi_matches, anyway: false }
+            } else if frame >= MAX_HIDDEN_FRAMES {
+                Step::Show { dpi_pending: false, anyway: true }
+            } else {
+                Step::Wait
+            }
+        }
+        Stage::Cloaked { settled: true, .. } => Step::Uncloak { anyway: false },
+        Stage::Cloaked { frames, .. } if frames >= MAX_CLOAKED_FRAMES => Step::Uncloak { anyway: true },
+        Stage::Cloaked { .. } | Stage::Shown => Step::Wait,
+    }
+}
+
+/// The stage after `step`, `cloaked` saying whether Windows cloaked the window when it was shown.
+pub fn advance(stage: Stage, step: Step, f: Facts, cloaked: bool) -> Stage {
+    match (stage, step) {
+        (Stage::Hidden, Step::Show { dpi_pending, .. }) if cloaked => Stage::Cloaked { frames: 0, settled: false, dpi_pending },
+        (Stage::Hidden, Step::Show { .. }) => Stage::Shown,
+        (Stage::Cloaked { .. }, Step::Uncloak { .. }) => Stage::Shown,
+        (Stage::Cloaked { frames, dpi_pending, .. }, _) => {
+            // A scale change comes, if at all, as the window is shown: two frames after that a
+            // window still on Windows' old word keeps it, and the mapping follows egui's scale.
+            let dpi_ok = f.dpi_matches || frames >= 2;
+            Stage::Cloaked { frames: frames + 1, settled: !f.moved && f.on_target && f.content_matches && dpi_ok, dpi_pending }
+        }
+        (s, _) => s,
+    }
+}
+
+/// How many moves the window may get before a frame: none once it is on screen.
+pub fn move_budget(stage: Stage, used: u8) -> u8 {
+    match stage {
+        Stage::Shown => 0,
+        _ => MAX_MOVES.saturating_sub(used).min(TRIES),
+    }
+}
+
+/// What the app must do after a frame of the selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum After {
+    Continue,
+    /// The window could not be uncloaked: it was hidden, and the capture ends as cancelled,
+    /// so no invisible window is left over the desktop.
+    Abort,
+}
+
+/// After an uncloak that worked or did not: a window Windows will not uncloak is shown but never
+/// seen, a topmost window over every monitor that takes every click; it is hidden at once.
+pub fn after_uncloak(ok: bool) -> After {
+    if ok { After::Continue } else { After::Abort }
 }
 
 /// One capture's window, from the frozen desktop to the end of the selection.
@@ -118,17 +210,20 @@ pub struct Presenting {
     started: Instant,
     focus_due: bool,
     placed: Placed,
+    moves: u8,
+    limit_logged: bool,
     lines: Vec<String>,
     frame_lines: u32,
 }
 
 impl Presenting {
     pub fn new(target: PxRect, started: Instant, lines: Vec<String>) -> Self {
-        Self { target, hwnd: None, stage: Stage::Hidden, frame: 0, started, focus_due: false, placed: Placed::default(), lines, frame_lines: 0 }
+        Self { target, hwnd: None, stage: Stage::Hidden, frame: 0, started, focus_due: false, placed: Placed::default(), moves: 0, limit_logged: false, lines, frame_lines: 0 }
     }
 
-    /// Before each frame of the selector: put the window on its target and say where its
-    /// client area is now, for the mapping. None without a native window.
+    /// Before each frame of the selector: put the window on its target while it is not on
+    /// screen yet, and say where its client area is now, for the mapping. None without a
+    /// native window.
     pub fn before_frame(&mut self, ctx: &egui::Context, hwnd: Option<WindowId>) -> Option<PxRect> {
         self.hwnd = hwnd;
         let Some(hwnd) = hwnd else {
@@ -144,68 +239,89 @@ impl Presenting {
             }
             return None;
         };
-        self.placed = place(hwnd, self.target);
+        let budget = move_budget(self.stage, self.moves);
+        self.placed = place(hwnd, self.target, budget);
+        self.moves += self.placed.tries;
+        if !self.placed.on_target && move_budget(self.stage, self.moves) == 0 && !self.limit_logged {
+            self.limit_logged = true;
+            let client = platform::window_rects(hwnd).map(|(_, c)| c);
+            self.lines.push(capture_log::limit_line(self.frame + 1, self.moves, self.stage == Stage::Shown, client));
+        }
         platform::window_rects(hwnd).map(|(_, client)| client)
     }
 
     /// After each frame of the selector: show the window once the frame was right.
-    pub fn after_frame(&mut self, ctx: &egui::Context, note: &FrameNote) {
+    pub fn after_frame(&mut self, ctx: &egui::Context, note: &FrameNote) -> After {
         self.frame += 1;
-        let Some(hwnd) = self.hwnd else { return };
+        let Some(hwnd) = self.hwnd else { return After::Continue };
         let now = state(hwnd);
         let client = now.map(|s| s.client).unwrap_or(self.target);
-        let settled = geometry::scale_settled(note.ppp, ctx.zoom_factor(), now.and_then(|s| s.dpi), (note.content.2, note.content.3), client);
+        let facts = Facts {
+            moved: self.placed.moved,
+            on_target: self.placed.on_target,
+            dpi_matches: geometry::dpi_matches(note.ppp, ctx.zoom_factor(), now.and_then(|s| s.dpi)),
+            content_matches: geometry::content_matches(note.ppp, (note.content.2, note.content.3), client),
+        };
+        let settled = facts.dpi_matches && facts.content_matches;
         let mut log_this = self.frame <= capture_log::FRAMES_LOGGED || self.placed.moved;
-        let mut after = None;
-        match self.stage {
-            Stage::Hidden => match geometry::decide_show(self.frame, self.placed.moved, self.placed.on_target, settled, note.texture_ready) {
-                Show::Wait => {}
-                show => {
-                    // Cloaked, the window is shown and painted once at this size before it is composited.
-                    let cloaked = platform::set_cloaked(hwnd, true);
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                    self.stage = if cloaked { Stage::Cloaked(0) } else { Stage::Shown };
-                    self.focus_due = !cloaked;
-                    after = Some(capture_log::shown_line(self.frame, show, cloaked));
-                    log_this = true;
-                }
-            },
-            // The frame painted after the window was shown has been presented: uncloak it.
-            Stage::Cloaked(n) if n >= 1 => {
-                platform::set_cloaked(hwnd, false);
-                self.stage = Stage::Shown;
-                self.focus_due = true;
+        let mut after = Vec::new();
+        let mut result = After::Continue;
+        let decided = step(self.stage, self.frame, facts);
+        let mut cloaked = false;
+        match decided {
+            Step::Wait => {}
+            Step::Show { dpi_pending, anyway } => {
+                // Cloaked, the window is shown and painted once at this size before it is composited.
+                cloaked = platform::set_cloaked(hwnd, true);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                self.focus_due = !cloaked;
+                after.push(capture_log::shown_line(self.frame, anyway, dpi_pending, cloaked));
+                log_this = true;
             }
-            Stage::Cloaked(n) => self.stage = Stage::Cloaked(n + 1),
-            Stage::Shown if self.focus_due => {
-                self.focus_due = false;
-                // A plain request first; winit's, with its synthetic Alt key, only when refused.
-                let plain = platform::take_foreground(hwnd);
-                if !plain {
-                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+            Step::Uncloak { anyway } => {
+                let ok = platform::set_cloaked(hwnd, false);
+                let Stage::Cloaked { dpi_pending, .. } = self.stage else { unreachable!("uncloak only follows cloaked") };
+                after.push(capture_log::uncloak_line(self.frame, ok, anyway, dpi_pending, now.and_then(|s| s.dpi)));
+                result = after_uncloak(ok);
+                if result == After::Continue {
+                    self.focus_due = true;
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                 }
-                after = Some(capture_log::focus_line(plain));
+                log_this = true;
             }
-            Stage::Shown => {}
+        }
+        let was_shown = self.stage == Stage::Shown;
+        self.stage = advance(self.stage, decided, facts, cloaked);
+        if was_shown && self.focus_due {
+            self.focus_due = false;
+            // A plain request first; winit's, with its synthetic Alt key, only when refused.
+            let plain = platform::take_foreground(hwnd);
+            if !plain {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            after.push(capture_log::focus_line(plain));
         }
         if log_this && self.frame_lines < MAX_FRAME_LINES {
             self.frame_lines += 1;
             let line = capture_log::frame_line(self.frame, self.started.elapsed().as_millis(), now, self.placed, note, platform::cursor_pos(), settled);
             self.lines.push(line);
         }
-        let focused = after.is_some() && self.stage == Stage::Shown && !self.focus_due;
+        let flush = !after.is_empty() || self.frame == capture_log::FRAMES_LOGGED + 1;
         self.lines.extend(after);
-        if self.frame == capture_log::FRAMES_LOGGED + 1 || focused {
+        if flush && self.frame > capture_log::FRAMES_LOGGED {
             self.flush();
         }
+        result
     }
 
     /// The selection ended: uncloak (it may end before the window was ever composited) and log.
     pub fn end(mut self, finish: String) {
         if let Some(hwnd) = self.hwnd
-            && matches!(self.stage, Stage::Cloaked(_))
+            && matches!(self.stage, Stage::Cloaked { .. })
         {
-            platform::set_cloaked(hwnd, false);
+            let ok = platform::set_cloaked(hwnd, false);
+            self.lines.push(capture_log::uncloak_line(self.frame, ok, true, false, None));
         }
         self.lines.push(finish);
         self.flush();
@@ -213,5 +329,173 @@ impl Presenting {
 
     fn flush(&mut self) {
         capture_log::append(&std::mem::take(&mut self.lines));
+    }
+}
+
+/// Showing the root window as the recording bar: placed in pixels on the bar's monitor while
+/// it is hidden, shown once egui draws it at that size and scale.
+#[derive(Debug)]
+pub struct BarShowing {
+    target: PxRect,
+    frames: u32,
+    moves: u8,
+}
+
+/// Whether the bar is shown after a frame: in place, not moved in this frame, drawn at its
+/// size and scale (or Windows' scale word has had two frames to arrive), or out of time.
+pub fn show_bar(frame: u32, f: Facts) -> bool {
+    (!f.moved && f.on_target && f.content_matches && (f.dpi_matches || frame >= 3)) || frame >= MAX_HIDDEN_FRAMES
+}
+
+impl BarShowing {
+    pub fn new(target: PxRect) -> Self {
+        Self { target, frames: 0, moves: 0 }
+    }
+
+    /// Each frame until shown; true once it was asked to show.
+    pub fn tick(&mut self, ctx: &egui::Context, hwnd: Option<WindowId>) -> bool {
+        let Some(hwnd) = hwnd else {
+            // No native window: in points, as before.
+            let ppp = ctx.pixels_per_point();
+            let (pos, size) = crate::placement::guess_points(self.target, ppp);
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            return true;
+        };
+        // The selector it may follow is hidden at the end of its last frame: wait for that.
+        if platform::is_window_visible(hwnd) {
+            return false;
+        }
+        self.frames += 1;
+        let placed = place(hwnd, self.target, MAX_MOVES.saturating_sub(self.moves).min(TRIES));
+        self.moves += placed.tries;
+        let now = state(hwnd);
+        let client = now.map(|s| s.client).unwrap_or(self.target);
+        let content = ctx.content_rect();
+        let ppp = ctx.pixels_per_point();
+        let f = Facts {
+            moved: placed.moved,
+            on_target: placed.on_target,
+            dpi_matches: geometry::dpi_matches(ppp, ctx.zoom_factor(), now.and_then(|s| s.dpi)),
+            content_matches: geometry::content_matches(ppp, (content.width(), content.height()), client),
+        };
+        if !show_bar(self.frames, f) {
+            return false;
+        }
+        // Never shown cloaked: a selector that ended with an uncloak that failed hid itself.
+        platform::set_cloaked(hwnd, false);
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RIGHT: Facts = Facts { moved: false, on_target: true, dpi_matches: true, content_matches: true };
+
+    /// Runs the state machine over frames of facts, as `after_frame` does, with cloaking
+    /// available; returns the steps.
+    fn run(frames: &[Facts]) -> Vec<Step> {
+        let mut stage = Stage::Hidden;
+        frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let s = step(stage, i as u32 + 1, *f);
+                stage = advance(stage, s, *f, true);
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_parked_window_is_shown_at_once_and_uncloaked_after_one_painted_frame() {
+        let steps = run(&[RIGHT, RIGHT, RIGHT, RIGHT]);
+        assert_eq!(steps, [Step::Show { dpi_pending: false, anyway: false }, Step::Wait, Step::Uncloak { anyway: false }, Step::Wait]);
+    }
+
+    #[test]
+    fn a_window_moved_this_frame_waits_for_a_frame_laid_out_at_its_size() {
+        let moved = Facts { moved: true, ..RIGHT };
+        let steps = run(&[moved, RIGHT, RIGHT, RIGHT]);
+        assert_eq!(steps[0], Step::Wait);
+        assert_eq!(steps[1], Step::Show { dpi_pending: false, anyway: false });
+        assert_eq!(steps[3], Step::Uncloak { anyway: false });
+    }
+
+    #[test]
+    fn a_scale_windows_reports_only_at_show_time_does_not_cost_the_full_wait() {
+        // Hidden, Windows reports 200% but egui still draws at 100%: shown cloaked at once.
+        let pending = Facts { dpi_matches: false, ..RIGHT };
+        let steps = run(&[pending]);
+        assert_eq!(steps, [Step::Show { dpi_pending: true, anyway: false }]);
+        // The change arrives on show: winit resizes the window, it is placed again while
+        // cloaked, then a right frame is painted and it is uncloaked.
+        let resized = Facts { moved: true, on_target: true, dpi_matches: true, content_matches: false };
+        let steps = run(&[pending, resized, RIGHT, RIGHT]);
+        assert_eq!(steps[1], Step::Wait, "not right yet: placed again");
+        assert_eq!(steps[2], Step::Wait, "the right frame is painted");
+        assert_eq!(steps[3], Step::Uncloak { anyway: false });
+        // The change never arrives: two frames later the window is taken as it is.
+        let steps = run(&[pending, pending, pending, pending, pending]);
+        assert_eq!(steps[1..4], [Step::Wait, Step::Wait, Step::Wait]);
+        assert_eq!(steps[4], Step::Uncloak { anyway: false }, "uncloaked after frame 5, not after 8 frames");
+    }
+
+    #[test]
+    fn a_window_that_never_settles_is_shown_after_eight_frames_and_uncloaked_after_eight_more() {
+        let wrong = Facts { on_target: false, ..RIGHT };
+        let mut stage = Stage::Hidden;
+        for frame in 1..MAX_HIDDEN_FRAMES {
+            assert_eq!(step(stage, frame, wrong), Step::Wait);
+            stage = advance(stage, Step::Wait, wrong, true);
+        }
+        let s = step(stage, MAX_HIDDEN_FRAMES, wrong);
+        assert_eq!(s, Step::Show { dpi_pending: false, anyway: true });
+        stage = advance(stage, s, wrong, true);
+        for frame in 0..MAX_CLOAKED_FRAMES {
+            let s = step(stage, MAX_HIDDEN_FRAMES + 1 + frame, wrong);
+            assert_eq!(s, Step::Wait);
+            stage = advance(stage, s, wrong, true);
+        }
+        assert_eq!(step(stage, 99, wrong), Step::Uncloak { anyway: true });
+    }
+
+    #[test]
+    fn without_cloaking_the_window_is_shown_directly() {
+        let s = step(Stage::Hidden, 1, RIGHT);
+        assert_eq!(advance(Stage::Hidden, s, RIGHT, false), Stage::Shown);
+    }
+
+    #[test]
+    fn a_window_on_screen_is_never_moved_again_and_moves_are_limited() {
+        assert_eq!(move_budget(Stage::Hidden, 0), TRIES);
+        assert_eq!(move_budget(Stage::Hidden, 5), 1);
+        assert_eq!(move_budget(Stage::Hidden, MAX_MOVES), 0, "the capture's moves are used up");
+        assert_eq!(move_budget(Stage::Cloaked { frames: 0, settled: false, dpi_pending: true }, 3), TRIES, "placed again once while cloaked");
+        assert_eq!(move_budget(Stage::Shown, 0), 0, "on screen: never moved, mapped from where it is");
+        // A shown window that is not on its target stays shown and asks for nothing.
+        let off = Facts { on_target: false, content_matches: false, ..RIGHT };
+        assert_eq!(step(Stage::Shown, 30, off), Step::Wait);
+        assert_eq!(advance(Stage::Shown, Step::Wait, off, true), Stage::Shown);
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_uncloaked_ends_the_capture() {
+        assert_eq!(after_uncloak(true), After::Continue);
+        assert_eq!(after_uncloak(false), After::Abort);
+    }
+
+    #[test]
+    fn the_bar_is_shown_once_drawn_at_its_size_or_after_eight_frames() {
+        assert!(show_bar(1, RIGHT));
+        assert!(!show_bar(1, Facts { moved: true, ..RIGHT }));
+        assert!(!show_bar(1, Facts { content_matches: false, ..RIGHT }), "still laid out for the parked desktop size");
+        assert!(!show_bar(2, Facts { dpi_matches: false, ..RIGHT }));
+        assert!(show_bar(3, Facts { dpi_matches: false, ..RIGHT }), "Windows' scale word did not come: shown as drawn");
+        assert!(show_bar(MAX_HIDDEN_FRAMES, Facts { on_target: false, ..RIGHT }));
     }
 }

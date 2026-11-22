@@ -33,7 +33,6 @@ pub struct FrameNote {
     pub hover_px: Option<(i32, i32)>,
     /// The frozen picture was handed to the GPU this frame.
     pub texture_new: bool,
-    pub texture_ready: bool,
 }
 
 pub struct Overlay {
@@ -119,7 +118,7 @@ impl Overlay {
             .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
             .or_else(|| platform::cursor_pos().map(|(x, y)| map.px_to_pt(x, y)));
         let cursor = hover.map(to_px);
-        self.note = FrameNote { content: (full.min.x, full.min.y, full.width(), full.height()), ppp, client, hover_px: cursor, texture_new, texture_ready: true };
+        self.note = FrameNote { content: (full.min.x, full.min.y, full.width(), full.height()), ppp, client, hover_px: cursor, texture_new };
         let hovered_window = cursor.and_then(|(x, y)| self.desktop.window_at(x, y)).map(|w| w.rect);
 
         if !self.window_mode {
@@ -261,30 +260,44 @@ mod tests {
         (ctx, out)
     }
 
+    /// Where the frozen picture (the first textured mesh) was painted, in points.
+    fn picture(ctx: &egui::Context, out: egui::FullOutput, ppp: f32) -> Rect {
+        ctx.tessellate(out.shapes, ppp)
+            .iter()
+            .find_map(|c| match &c.primitive {
+                egui::epaint::Primitive::Mesh(m) if m.texture_id != egui::TextureId::default() => Some(m.calc_bounds()),
+                _ => None,
+            })
+            .expect("the picture is painted")
+    }
+
     #[test]
     fn the_pointer_and_picture_follow_the_real_window_not_the_bounds() {
         let bounds = PxRect::new(-1920, 0, 400, 200);
         // The window a scale change left half-size and 161 px to the right of the bounds.
         let stray = PxRect::new(-1759, 0, 200, 100);
         let mut ov = Overlay::new(desktop(bounds), false, false);
-        frame(&mut ov, 1.0, stray, Some(stray), pos2(10.0, 20.0));
+        let (ctx, out) = frame(&mut ov, 1.0, stray, Some(stray), pos2(10.0, 20.0));
         assert_eq!(ov.note.hover_px, Some((-1749, 20)), "the pixel under the pointer, from the real window");
-        assert!(ov.note.texture_new && ov.note.texture_ready);
+        assert!(ov.note.texture_new);
+        // The picture starts 161 px left of that window, at the bounds, at full size: each of
+        // its pixels on the screen pixel it was captured from (the window shows part of it).
+        let pic = picture(&ctx, out, 1.0);
+        assert_eq!((pic.min, pic.max), (pos2(-161.0, 0.0), pos2(239.0, 200.0)));
+        // The same misplaced window at 200%.
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        let (ctx, out) = frame(&mut ov, 2.0, stray, Some(stray), pos2(10.0, 20.0));
+        assert_eq!(ov.note.hover_px, Some((-1739, 40)));
+        let pic = picture(&ctx, out, 2.0);
+        assert_eq!((pic.min, pic.max), (pos2(-80.5, 0.0), pos2(119.5, 100.0)), "400x200 pixels at 200% from -1920,0");
         // On its bounds at 200%: a pointer at 10,20 points is 20,40 pixels into the desktop.
         let mut ov = Overlay::new(desktop(bounds), false, false);
         let (ctx, out) = frame(&mut ov, 2.0, bounds, Some(bounds), pos2(10.0, 20.0));
         assert_eq!(ov.note.hover_px, Some((-1900, 40)));
         assert_eq!(ov.note.ppp, 2.0);
         assert_eq!((ov.note.content.2, ov.note.content.3), (200.0, 100.0));
-        // The frozen picture is the first textured mesh: it covers the window pixel for pixel.
-        let meshes = ctx.tessellate(out.shapes, 2.0);
-        let picture = meshes
-            .iter()
-            .find_map(|c| match &c.primitive {
-                egui::epaint::Primitive::Mesh(m) if m.texture_id != egui::TextureId::default() => Some(m.calc_bounds()),
-                _ => None,
-            })
-            .expect("the picture is painted");
-        assert_eq!((picture.min, picture.max), (pos2(0.0, 0.0), pos2(200.0, 100.0)), "200x100 points at 200% = 400x200 pixels, the picture's size");
+        // On the bounds the picture covers the window pixel for pixel.
+        let pic = picture(&ctx, out, 2.0);
+        assert_eq!((pic.min, pic.max), (pos2(0.0, 0.0), pos2(200.0, 100.0)), "200x100 points at 200% = 400x200 pixels, the picture's size");
     }
 }

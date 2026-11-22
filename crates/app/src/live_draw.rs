@@ -17,6 +17,7 @@ use mythicshot_recording::{ClockHandle, Recording};
 
 use crate::theme;
 use crate::icons::{self, Icon};
+use crate::placement::{self, Focus, Placer};
 use crate::platform;
 
 pub const DRAW_TITLE: &str = "Mythicshot live draw";
@@ -100,6 +101,8 @@ impl State {
 pub struct LiveDraw {
     state: Arc<Mutex<State>>,
     on: bool,
+    /// Puts the draw window on its area in pixels, then shows it; None while draw mode is off.
+    placer: Option<(Placer, (egui::Pos2, egui::Vec2))>,
 }
 
 impl Default for LiveDraw {
@@ -115,7 +118,7 @@ impl Default for LiveDraw {
             hidden_from_capture: false,
             done: false,
         };
-        Self { state: Arc::new(Mutex::new(state)), on: false }
+        Self { state: Arc::new(Mutex::new(state)), on: false, placer: None }
     }
 }
 
@@ -171,13 +174,20 @@ impl LiveDraw {
     /// The draw window over `rect` (desktop pixels), while draw mode is on.
     pub fn show(&mut self, ctx: &egui::Context, rect: mythicshot_capture::PxRect) {
         if !self.on {
+            self.placer = None;
             return;
         }
-        let ppp = ctx.pixels_per_point();
+        let (placer, (pos, size)) = self.placer.get_or_insert_with(|| {
+            let guess = placement::guess_points(rect, placement::scale_for(rect, &mythicshot_capture::list_monitors()));
+            (Placer::new(DRAW_TITLE, rect, Focus::Plain), guess)
+        });
+        // Created hidden, put on the area's pixels, then shown and given the keyboard with a
+        // plain request (never a synthetic key press over a recording); see `Placer`.
         let builder = egui::ViewportBuilder::default()
             .with_title(DRAW_TITLE)
-            .with_position(egui::pos2(rect.x as f32 / ppp, rect.y as f32 / ppp))
-            .with_inner_size([rect.w as f32 / ppp, rect.h as f32 / ppp])
+            .with_position(*pos)
+            .with_inner_size(*size)
+            .with_visible(false)
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -186,10 +196,12 @@ impl LiveDraw {
             .with_active(true);
         let state = self.state.clone();
         let size = (rect.w, rect.h);
-        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("live-draw"), builder, move |ui, _| {
+        let id = egui::ViewportId::from_hash_of("live-draw");
+        ctx.show_viewport_deferred(id, builder, move |ui, _| {
             let Ok(mut s) = state.lock() else { return };
             draw_window(ui, &mut s, size);
         });
+        placer.tick(ctx, id);
         let hidden = self.state.lock().map(|s| s.hidden_from_capture).unwrap_or(true);
         if !hidden {
             if let Some(h) = platform::find_window(DRAW_TITLE) {
@@ -197,7 +209,7 @@ impl LiveDraw {
                     if let Ok(mut s) = self.state.lock() {
                         s.hidden_from_capture = true;
                     }
-                    platform::set_foreground(h);
+                    // The keyboard comes with the window, once it is placed and shown (`Placer`).
                 }
             }
         }
