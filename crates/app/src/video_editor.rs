@@ -767,6 +767,9 @@ struct Replaceable {
     /// Save over the project whatever the keep setting says.
     keep_always: bool,
     logo_missing: bool,
+    /// The site said this chapter is no longer there, when it was last replaced from this editor:
+    /// Replace is not offered again, and its tour stays picked for a new chapter.
+    gone: bool,
 }
 
 /// What `v`'s Publish dialog replaces: the chapter this editor uploaded last, else the one it
@@ -775,10 +778,19 @@ fn replaceable(v: &VideoState) -> Option<Replaceable> {
     if let Some(r) = &v.remembered {
         let target = EditTarget { tour_id: r.key.tour_id.clone(), chapter_id: r.key.chapter_id.clone(), tour_title: r.tour_title.clone() };
         // Its upload went without the logo if it had none: replacing it takes nothing away.
-        return Some(Replaceable { key: r.key.clone(), target, chapter_title: Some(r.chapter_title.clone()), keep_always: r.kept, logo_missing: false });
+        let gone = v.chapter_gone.as_ref() == Some(&r.key);
+        return Some(Replaceable { key: r.key.clone(), target, chapter_title: Some(r.chapter_title.clone()), keep_always: r.kept, logo_missing: false, gone });
     }
     let origin = v.origin.as_ref()?;
-    Some(Replaceable { key: origin.key.clone(), target: edit_target(origin), chapter_title: None, keep_always: true, logo_missing: logo_missing(origin, &v.edit) })
+    let gone = v.chapter_gone.as_ref() == Some(&origin.key);
+    Some(Replaceable { key: origin.key.clone(), target: edit_target(origin), chapter_title: None, keep_always: true, logo_missing: logo_missing(origin, &v.edit), gone })
+}
+
+/// The chapter to stop offering to replace after an update of `r` failed with `error`: only
+/// when the site said the chapter is no longer part of the tour. A tour that is gone is seen in
+/// the site's list by every new dialog, and any other failure may work the next time.
+fn gone_after(error: &str, r: Option<&Replaceable>) -> Option<ProjectKey> {
+    crate::publish::is_chapter_gone(error).then(|| r.map(|r| r.key.clone())).flatten()
 }
 
 /// What "Update tour" replaces for an editor opened from the project `origin`.
@@ -806,6 +818,8 @@ enum Dialog {
     New(String),
     /// Replace the chapter, add a new chapter or make a new tour; `title` is the chapter's.
     Replace { title: String, target: EditTarget, logo_missing: bool },
+    /// A new chapter (of the chapter's tour, picked) or a new tour: the site said the chapter is gone.
+    ChapterGone { title: String, target: EditTarget },
     /// The same, for a chapter of another site address than the one configured: no Replace.
     Elsewhere { title: String, target: EditTarget },
 }
@@ -814,6 +828,7 @@ enum Dialog {
 fn dialog_for(v: &VideoState, server: &str, title: String) -> Dialog {
     match replaceable(v) {
         None => Dialog::New(title),
+        Some(r) if r.gone && on_this_site(&r.key, server) => Dialog::ChapterGone { title: r.chapter_title.unwrap_or(title), target: r.target },
         Some(r) if on_this_site(&r.key, server) => Dialog::Replace { title: r.chapter_title.unwrap_or(title), target: r.target, logo_missing: r.logo_missing },
         Some(r) => Dialog::Elsewhere { title: r.chapter_title.unwrap_or(title), target: r.target },
     }
@@ -1038,6 +1053,8 @@ pub struct VideoState {
     pub(crate) remembered: Option<Remembered>,
     /// Where the publish running now goes, until it has ended.
     publishing_to: Option<Pending>,
+    /// A chapter the site said it no longer has when this editor tried to replace it.
+    chapter_gone: Option<ProjectKey>,
     /// The saved project this editor was opened from; None for a new recording. Declared last:
     /// it lets go of the project only after the reader above has closed the frames file.
     pub origin: Option<Origin>,
@@ -1150,6 +1167,7 @@ impl Editor {
             drag: None,
             remembered: None,
             publishing_to: None,
+            chapter_gone: None,
             origin: None,
         });
         editor.init_pulse_history();
@@ -1475,6 +1493,12 @@ impl Editor {
                     // offers a new tour. A cancel is the user's own doing and brings nothing back.
                     // A workspace without room brings back the dialog as it was left, for a
                     // new tour or chapter too: its message is more than a status line.
+                    if updating && let Some(v) = self.video.as_mut() {
+                        // A chapter the site no longer has is not offered as the default again.
+                        if let Some(key) = gone_after(&e, replaceable(v).as_ref()) {
+                            v.chapter_gone = Some(key);
+                        }
+                    }
                     self.bring_dialog_back(left, e, updating);
                 }
                 Err(e) if is_site => {
@@ -1664,6 +1688,7 @@ impl Editor {
             Dialog::New(title) => Picker::open(server, title),
             Dialog::Replace { title, target, logo_missing } => Picker::open_for_edit(server, title, target).with_logo_missing(logo_missing),
             Dialog::Elsewhere { title, target } => Picker::open_for_edit_elsewhere(server, title, target),
+            Dialog::ChapterGone { title, target } => Picker::open_for_edit_chapter_gone(server, title, target),
         });
     }
 
@@ -1710,7 +1735,12 @@ impl Editor {
         let r = replaceable(v);
         v.picker = publish_ui::dialog_after_refusal(left, error, updating, |error| {
             let r = r?;
-            Some(Picker::open_after_failed_update(publish_ui::server(), r.chapter_title.unwrap_or(title), r.target, error).with_logo_missing(r.logo_missing))
+            let server = publish_ui::server();
+            // The address was changed while the update ran: no Replace for the other site's tour.
+            if !on_this_site(&r.key, &server) {
+                return Some(Picker::open_for_edit_elsewhere(server, r.chapter_title.unwrap_or(title), r.target));
+            }
+            Some(Picker::open_after_failed_update(server, r.chapter_title.unwrap_or(title), r.target, error).with_logo_missing(r.logo_missing))
         });
     }
 
@@ -1727,7 +1757,7 @@ impl Editor {
         }
         let Some(r) = replaceable(v) else { return };
         let server = publish_ui::server();
-        if !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) {
+        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) {
             return;
         }
         let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
@@ -3914,6 +3944,42 @@ mod tests {
         assert_eq!((r.target.tour_id.as_str(), r.target.tour_title.as_str(), r.chapter_title.as_deref()), (OTHER_TOUR, "A second tour", Some("A second tour")));
         assert!(!r.keep_always, "its recording was not kept: a replace follows the keep setting");
         assert_eq!(v.origin.as_ref().unwrap().key, key, "the project it was opened from stays its origin");
+    }
+
+    #[test]
+    fn a_chapter_the_site_no_longer_has_is_not_offered_to_replace_again() {
+        const GONE: &str = "Could not start the upload: that chapter is no longer part of the tour.";
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let mut ed = editor_of(&st);
+        let server = "https://tours.example.com";
+        let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: key.clone(), chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
+        // Only the site saying the chapter is gone counts: a gone tour shows in every new
+        // dialog's list, and anything else may work the next time.
+        let r = replaceable(ed.video.as_ref().unwrap());
+        assert_eq!(gone_after(GONE, r.as_ref()), Some(key.clone()));
+        for other in ["Could not start the upload: that tour no longer exists.", "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.", "Could not send step 3: the server could not be reached."] {
+            assert_eq!(gone_after(other, r.as_ref()), None, "{other}");
+        }
+        // An update that ends that way, in the editor. (A screen is open, so no dialog is made
+        // here: making one would ask a site.)
+        let failing = EncodeJob::spawn(|_| Err::<PublishDone, String>(GONE.into()));
+        let v = ed.video.as_mut().unwrap();
+        v.publish_result = Some(ResultDialog::new(TOUR_TITLE.into(), Before::new_tour(), PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 1, outcome: Outcome::Draft }, kept: Kept::Off }));
+        v.job = Some(ExportJob::Publish(failing, Arc::new(Run::default()), TOUR_TITLE.into(), Before::new_tour(), true));
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(dialog_for(v, server, TITLE.into()), Dialog::ChapterGone { title: TITLE.into(), target: target.clone() }, "a new chapter of its tour, or a new tour");
+        assert!(replaceable(v).is_some_and(|r| r.gone));
+        // Asked to replace it all the same, nothing starts.
+        ed.start_update(TITLE.into(), target.clone(), Before::new_tour());
+        assert!(!ed.exporting());
+        // A new upload from this editor is a chapter the site has: Replace is offered for it.
+        let other = ProjectKey { chapter_id: "ch_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..key };
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: other, chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        assert!(matches!(dialog_for(ed.video.as_ref().unwrap(), server, TITLE.into()), Dialog::Replace { .. }));
     }
 
     #[test]

@@ -1252,6 +1252,12 @@ pub fn replace_hint(chapter_title: &str, tour_title: &str) -> String {
     format!("\"{}\" in {}. The link stays the same.", short_title(chapter_title, ROW_TITLE_MAX), short_title(tour_title, ROW_TITLE_MAX))
 }
 
+/// Under "Replace this chapter", what replacing does to a tour that is public now. Wording
+/// given by the owner's review.
+pub const REPLACE_PUBLIC: &str = "The public page changes when the update is done.";
+/// The same for a draft, or a tour that is not published now. Wording given by the owner's review.
+pub const REPLACE_DRAFT: &str = "The tour stays a draft.";
+
 /// The third choice. Approved wording.
 pub const NEW_TOUR_LABEL: &str = "New tour";
 pub const NEW_TOUR_HINT: &str = "A new link. The existing tour is left as it is.";
@@ -1259,11 +1265,14 @@ pub const UPDATE_BUTTON: &str = "Update tour";
 /// Why Update is not offered on an older site. The wording is proposed and waits for the owner's approval.
 pub const UPDATE_NEEDS_NEWER_SITE: &str = "Updating a tour over the same link needs a site running version 0.1.4 or newer.";
 /// Why Update is not offered for a tour the site does not list. The wording is proposed and waits for the owner's approval.
-pub const TOUR_NOT_ON_SITE: &str = "This tour is no longer on the site, so it can only be published as a new tour.";
+pub const TOUR_NOT_ON_SITE: &str = "This tour is no longer on the site, so it can be published as a new tour or a new chapter.";
 /// Why Update is not offered when the site address in Workspace is not the one the recording
 /// was saved for: its tour may well exist, on the other site. The wording is proposed and waits
 /// for the owner's approval.
-pub const SAVED_FOR_ANOTHER_ADDRESS: &str = "This recording was saved for another site address, so here it can only be published as a new tour.";
+pub const SAVED_FOR_ANOTHER_ADDRESS: &str = "This recording was saved for another site address, so here it can be published as a new tour or a new chapter.";
+/// Why Replace is not offered for a chapter the site said it no longer has, when the editor
+/// last tried to replace it. The wording is proposed and waits for the owner's approval.
+pub const CHAPTER_NOT_ON_SITE: &str = "This chapter is no longer on the site, so it can be published as a new tour or a new chapter.";
 /// Under the Update choice, when the cover logo could not be opened with the recording and
 /// has not been added again: an update of the tour's first chapter carries the tour's
 /// settings, so the tour on the site would lose its logo. The wording is proposed and waits
@@ -1529,6 +1538,14 @@ impl Picker {
         logo_warning(shown, self.edit.as_ref().is_some_and(|e| e.logo_missing))
     }
 
+    /// The same dialog for a chapter the site said it no longer has: Replace is not offered, with
+    /// the line that says why; its tour stays picked for a new chapter.
+    pub fn open_for_edit_chapter_gone(server: String, title: String, target: EditTarget) -> Picker {
+        let picker = Picker::new_for_edit(server, &title, target, Block::Because(CHAPTER_NOT_ON_SITE));
+        picker.load_for_edit();
+        picker
+    }
+
     /// The same dialog after an update failed with `error`: it says why, and offers Update
     /// again only when pressing it again can work. A new chapter and a new tour are offered
     /// either way, and the site is asked again for its tours.
@@ -1683,7 +1700,7 @@ impl Picker {
             let into = self.goes();
             let restricted = who_shown == WhoShown::Choice && self.who.chosen() != who::Choice::Anyone;
             for mode in Mode::ALL {
-                if ui.add_enabled(!replacing, egui::RadioButton::new(self.mode == mode, mode.label())).clicked() {
+                if ui.add_enabled(!replacing, egui::RadioButton::new(!replacing && self.mode == mode, mode.label())).clicked() {
                     self.mode = mode;
                 }
                 if !replacing && let Some(line) = self.hint_line(mode, into, restricted) {
@@ -1721,6 +1738,9 @@ impl Picker {
                     pick = Some(EditChoice::Update);
                 }
                 hint(ui, &replace_hint(&self.default_title, &tour_title));
+                if let Shown::Update { public } = shown {
+                    hint(ui, if public { REPLACE_PUBLIC } else { REPLACE_DRAFT });
+                }
                 if let Some(line) = logo_line {
                     hint(ui, line);
                 }
@@ -1753,7 +1773,28 @@ impl Picker {
                             }
                         });
                     }
-                    // The spinner or the reason is above already.
+                    // The spinner and the reason are above while Replace waits for the same answer;
+                    // otherwise the list shows them itself, as the dialog of a new recording does.
+                    ListState::Loading if !matches!(shown, Shown::Asking) => {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            ui.add(egui::Spinner::new());
+                            ui.label(RichText::new("Loading tours…").color(theme::MUTED));
+                        });
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    }
+                    ListState::Failed(e) if !matches!(shown, Shown::Failed(_)) => {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT)).wrap());
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            if ui.button("Retry").clicked() {
+                                retry = true;
+                            }
+                        });
+                    }
                     ListState::Loading | ListState::Failed(_) => {}
                 }
             }
@@ -1767,10 +1808,10 @@ impl Picker {
                 ui.add_space(24.0);
                 let count = title_count(&self.title);
                 let width = ui.available_width() - if count.is_some() { 70.0 } else { 0.0 };
+                // Only while "New tour" is chosen, as in the dialog of a new recording: focus that
+                // reaches it never changes the choice, so Enter after Tab still does what was chosen.
                 let field = egui::TextEdit::singleline(&mut self.title).char_limit(TITLE_MAX).hint_text("Tour title").desired_width(width);
-                if ui.add(field).gained_focus() && !new_chosen {
-                    pick = Some(EditChoice::NewTour);
-                }
+                ui.add_enabled(new_chosen, field);
                 if let Some(count) = count {
                     ui.label(RichText::new(count).color(theme::MUTED).size(12.0));
                 }
@@ -3120,7 +3161,7 @@ pub(crate) mod tests {
         assert_eq!(update_offer(true, Some("0.1.4"), Some(&[]), TOUR_ID), UpdateOffer::TourGone);
         let mut p = edit_picker(Some(Some("0.1.4")), Some(others));
         let shown = p.shown();
-        assert_eq!(shown, Shown::OnlyNew(Some("This tour is no longer on the site, so it can only be published as a new tour.")));
+        assert_eq!(shown, Shown::OnlyNew(Some("This tour is no longer on the site, so it can be published as a new tour or a new chapter.")));
         assert!(p.edit_outcome(&shown).is_none());
         assert!(draw(&mut p, key_press(egui::Key::Enter)).is_none());
         pick_new(&mut p);
@@ -3134,7 +3175,7 @@ pub(crate) mod tests {
         // asked for its tours, for a new chapter: `open_for_edit_elsewhere` loads, this does not.)
         let mut p = Picker::new_for_edit(String::new(), "Chapter one", edit_target(), Block::Because(SAVED_FOR_ANOTHER_ADDRESS));
         let shown = p.shown();
-        assert_eq!(shown, Shown::OnlyNew(Some("This recording was saved for another site address, so here it can only be published as a new tour.")));
+        assert_eq!(shown, Shown::OnlyNew(Some("This recording was saved for another site address, so here it can be published as a new tour or a new chapter.")));
         assert_ne!(SAVED_FOR_ANOTHER_ADDRESS, TOUR_NOT_ON_SITE);
         assert!(p.edit_outcome(&shown).is_none());
         assert!(draw(&mut p, key_press(egui::Key::Enter)).is_none());
@@ -3537,7 +3578,7 @@ pub(crate) mod tests {
     fn a_remembered_tour_that_is_gone_from_the_site_falls_back_without_losing_the_choice_or_the_title() {
         // The editor uploaded this chapter earlier; the tour has since been deleted on the site.
         let mut p = edit_picker(Some(Some("0.1.8")), Some(vec![tour("Another", 1, 3, "draft")]));
-        assert_eq!(p.shown(), Shown::OnlyNew(Some(TOUR_NOT_ON_SITE)));
+        assert_eq!(p.shown(), Shown::OnlyNew(Some("This tour is no longer on the site, so it can be published as a new tour or a new chapter.")));
         assert_eq!(p.edit_outcome(&p.shown()).map(|_| ()), None);
         // Its own tour is not in the list, so a new chapter waits for a tour to be picked.
         p.edit_pick(EditChoice::Chapter);
@@ -3575,6 +3616,111 @@ pub(crate) mod tests {
         p.edit_pick(EditChoice::Update);
         assert!(!p.opens_remembered());
         settle_restriction(id);
+    }
+
+    // ---- Review fixes: keyboard, what Replace does, the reasons, the list's states ----
+
+    /// Frames of `p` in one context with `events` each, after it has settled.
+    fn frames_of(p: &mut Picker, ctx: &egui::Context, events: Vec<Vec<egui::Event>>) -> (Vec<PickerOutcome>, egui::FullOutput) {
+        let mut outcomes = Vec::new();
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(crate::share_ui::tests::frame_with(ctx, vec![], 0.05, &mut |c| outcomes.extend(p.show(c))));
+        }
+        for ev in events {
+            last = Some(crate::share_ui::tests::frame_with(ctx, ev, 0.05, &mut |c| outcomes.extend(p.show(c))));
+        }
+        (outcomes, last.unwrap())
+    }
+
+    #[test]
+    fn tab_through_the_dialog_never_changes_replace_and_enter_still_replaces() {
+        use crate::share_ui::tests::key_event;
+        let ctx = crate::theme::test_context();
+        let mut p = edit_picker(Some(Some("0.1.4")), Some(vec![tour("Another", 1, 3, "draft"), listed_tour("published")]));
+        let tabs: Vec<Vec<egui::Event>> = (0..20).map(|_| vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)]).collect();
+        let (outcomes, _) = frames_of(&mut p, &ctx, tabs);
+        assert!(outcomes.is_empty());
+        assert_eq!(p.edit_choice_now(&p.shown()), Some(EditChoice::Update), "focus alone never picks a choice");
+        // Typing goes nowhere while "New tour" is not chosen: its title field is disabled.
+        let (outcomes, _) = frames_of(&mut p, &ctx, vec![vec![egui::Event::Text("x".into())]]);
+        assert!(outcomes.is_empty());
+        assert_eq!(p.title, "Chapter one");
+        let (outcomes, _) = frames_of(&mut p, &ctx, vec![vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)]]);
+        assert!(matches!(outcomes.as_slice(), [PickerOutcome::Update { target, .. }] if *target == edit_target()), "Enter replaces the chapter");
+    }
+
+    #[test]
+    fn while_replace_is_chosen_no_mode_is_selected_and_a_line_says_what_happens() {
+        assert_eq!(REPLACE_PUBLIC, "The public page changes when the update is done.");
+        assert_eq!(REPLACE_DRAFT, "The tour stays a draft.");
+        let ctx = crate::theme::test_context();
+        // A public tour, after the user picked "Upload draft": the public page still changes.
+        let mut p = edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("published")]));
+        p.edit_pick(EditChoice::NewTour);
+        p.mode = Mode::Draft;
+        p.edit_pick(EditChoice::Update);
+        let (_, out) = frames_of(&mut p, &ctx, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "The public page changes when the update is done.").is_some());
+        assert!(crate::share_ui::tests::text_rect(&out, "The tour stays a draft.").is_none());
+        assert_eq!(selected_modes(&out), 0, "neither Publish now nor a draft looks chosen");
+        // Back to a new tour: the mode the user picked is there again.
+        p.edit_pick(EditChoice::NewTour);
+        let (_, out) = frames_of(&mut p, &ctx, vec![]);
+        assert_eq!(selected_modes(&out), 1);
+        assert_eq!(p.mode, Mode::Draft);
+        // A draft tour, or one not published: it stays a draft.
+        for status in ["draft", "unpublished"] {
+            let mut p = edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour(status)]));
+            let (_, out) = frames_of(&mut p, &ctx, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&out, "The tour stays a draft.").is_some(), "{status}");
+            assert!(crate::share_ui::tests::text_rect(&out, "The public page changes when the update is done.").is_none(), "{status}");
+        }
+    }
+
+    /// How many radio buttons of the two modes are drawn selected: the filled dot inside a radio
+    /// (a small filled circle) on the row of each mode's label.
+    fn selected_modes(out: &egui::FullOutput) -> usize {
+        let shapes = crate::share_ui::tests::shapes_of(out);
+        [Mode::PublishNow.label(), Mode::Draft.label()]
+            .iter()
+            .filter(|label| {
+                let row = crate::share_ui::tests::text_rect(out, label).unwrap();
+                shapes.iter().any(|s| matches!(s, egui::Shape::Circle(c) if c.radius < 4.0 && c.fill.a() > 0 && (c.center.y - row.center().y).abs() < 6.0 && c.center.x < row.left()))
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_reasons_say_that_a_new_tour_or_a_new_chapter_is_still_possible() {
+        assert_eq!(TOUR_NOT_ON_SITE, "This tour is no longer on the site, so it can be published as a new tour or a new chapter.");
+        assert_eq!(SAVED_FOR_ANOTHER_ADDRESS, "This recording was saved for another site address, so here it can be published as a new tour or a new chapter.");
+        assert_eq!(CHAPTER_NOT_ON_SITE, "This chapter is no longer on the site, so it can be published as a new tour or a new chapter.");
+        let mut gone = Picker::new_for_edit(String::new(), "Chapter one", edit_target(), Block::Because(CHAPTER_NOT_ON_SITE));
+        *gone.list.lock().unwrap() = ListState::Loaded(vec![listed_tour("published")]);
+        *gone.edit.as_ref().unwrap().version.lock().unwrap() = Some(Some("0.1.4".into()));
+        assert_eq!(gone.shown(), Shown::OnlyNew(Some("This chapter is no longer on the site, so it can be published as a new tour or a new chapter.")));
+        // Its tour is still picked for a new chapter.
+        gone.edit_pick(EditChoice::Chapter);
+        assert_eq!(pressed(&mut gone), format!(r#"upload "Chapter one" Chapter("{TOUR_ID}") PublishNow"#));
+    }
+
+    #[test]
+    fn the_tour_list_of_a_dialog_without_replace_shows_its_loading_its_error_and_retry() {
+        let ctx = crate::theme::test_context();
+        for block in [Block::Because(SAVED_FOR_ANOTHER_ADDRESS), Block::Said] {
+            let mut p = Picker::new_for_edit(String::new(), "Chapter one", edit_target(), block);
+            // Loading: the spinner's words, and the next frame is asked for.
+            let (_, out) = frames_of(&mut p, &ctx, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&out, "Loading tours…").is_some(), "{block:?}");
+            assert!(crate::share_ui::tests::repaint_delay(&out) <= Duration::from_millis(100), "{block:?}");
+            // A token that cannot be used here: its reason, with Retry.
+            let why = format!("The saved token belongs to tours.example.com, so it is not sent to this address. {FIX_ON_WORKSPACE}");
+            *p.list.lock().unwrap() = ListState::Failed(why.clone());
+            let (_, out) = frames_of(&mut p, &ctx, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&out, &why).is_some(), "{block:?}");
+            assert!(crate::share_ui::tests::text_rect(&out, "Retry").is_some(), "{block:?}");
+        }
     }
 
     // ---- The result screen after an update ----
