@@ -2,6 +2,11 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.23 (2026-11-22)
+
+- A likely fix for the red recording frame and its countdown number, missing since 0.2.20: the frame's window becomes click-through only after it is shown. Made click-through while still hidden, Windows kept it blank. Not confirmed on a real screen yet.
+- The line `capture.log` writes for each placed window now also says how Windows composites it (its style, whether it is cloaked), which settles the cause if the frame is still missing.
+
 ## 0.2.22 (2026-11-22)
 
 - The countdown before a recording is shown in the recording bar ("Starting in 3…"), which is always on screen. The large number over the recorded area still did not appear for everyone after 0.2.21; it is still drawn when it can be.

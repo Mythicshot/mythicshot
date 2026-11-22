@@ -203,6 +203,12 @@ impl Placer {
         Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus }
     }
 
+    /// Whether the window has been shown (cloaked or not). A click-through window takes that
+    /// style only from here on: Windows does not draw a window that became layered while hidden.
+    pub fn shown(&self) -> bool {
+        self.stage != PlaceStage::Seeking
+    }
+
     /// Each frame after the viewport `id` was asked for. Its window appears at the end of the
     /// frame it was first asked for, so the first look may find nothing.
     pub fn tick(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
@@ -266,6 +272,9 @@ impl Placer {
             && self.focus == Focus::PlainThenWinit
         {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        if let Some(hwnd) = self.hwnd {
+            why = format!("{why} · {}", platform::composition_note(hwnd));
         }
         let now = self.hwnd.and_then(capture_window::state);
         capture_log::append(&[capture_log::placed_line(&capture_log::now(), self.title, self.target, now, self.moves, self.looks, &why)]);
