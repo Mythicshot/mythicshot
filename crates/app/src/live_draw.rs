@@ -15,6 +15,7 @@ use eframe::egui::{self, Color32, CornerRadius, Pos2, Stroke, StrokeKind, Textur
 use mythicshot_editor::{Bounds, Item, Pixmap, Pt, Rgba, Shape, Style, render_items_onto};
 use mythicshot_recording::{ClockHandle, Recording};
 
+use crate::theme;
 use crate::icons::{self, Icon};
 use crate::platform;
 
@@ -22,9 +23,6 @@ pub const DRAW_TITLE: &str = "Mythicshot live draw";
 
 const COLORS: [Rgba; 5] = [Rgba::RED, Rgba::YELLOW, Rgba([46, 204, 113, 255]), Rgba([52, 152, 219, 255]), Rgba::WHITE];
 const WIDTH: f32 = 4.0;
-/// A faint tint so draw mode is visible on screen; the window is not recorded.
-const TINT: Color32 = Color32::from_black_alpha(28);
-const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
@@ -227,7 +225,7 @@ fn draw_window(ui: &mut egui::Ui, s: &mut State, size: (u32, u32)) {
         ctx.request_repaint_after(std::time::Duration::from_millis(30));
         return;
     }
-    painter.rect_filled(full, 0.0, TINT);
+    painter.rect_filled(full, 0.0, theme::SCRIM_FAINT);
 
     // Finished strokes, drawn by the export renderer so they look the same as in the GIF.
     if s.texture.as_ref().is_none_or(|(v, _)| *v != s.version) {
@@ -239,7 +237,7 @@ fn draw_window(ui: &mut egui::Ui, s: &mut State, size: (u32, u32)) {
         }
     }
     if let Some((_, tex)) = &s.texture {
-        painter.image(tex.id(), full, egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+        painter.image(tex.id(), full, egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), theme::IMAGE_TINT);
     }
 
     let over_bar = toolbar(ui, s, full);
@@ -327,7 +325,7 @@ fn toolbar(ui: &mut egui::Ui, s: &mut State, full: egui::Rect) -> bool {
     let width = 420.0f32.min(full.width() - 8.0).max(60.0);
     let max = egui::Rect::from_min_size(egui::pos2(full.center().x - width / 2.0, full.min.y + 6.0), vec2(width, full.height() - 12.0));
     let shown = ui.scope_builder(egui::UiBuilder::new().max_rect(max), |ui| {
-        egui::Frame::new().fill(BAR_BG).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+        egui::Frame::new().fill(theme::RAISED).stroke(Stroke::new(1.0, theme::BORDER_STRONG)).corner_radius(CornerRadius::same(theme::RADIUS_MD)).inner_margin(egui::Margin::symmetric(7, 4)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 for (tool, icon, tip) in [(Tool::Pen, Icon::Freehand, "Pen (P)"), (Tool::Arrow, Icon::Arrow, "Arrow (A)"), (Tool::Rect, Icon::Rect, "Rectangle (R)"), (Tool::Ellipse, Icon::Ellipse, "Ellipse (E)")] {
@@ -340,7 +338,7 @@ fn toolbar(ui: &mut egui::Ui, s: &mut State, full: egui::Rect) -> bool {
                     let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::click());
                     ui.painter().circle_filled(r.center(), 8.0, color32(c));
                     if s.color == c {
-                        ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(1.5, Color32::WHITE));
+                        ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(1.5, theme::TEXT));
                     }
                     if resp.on_hover_text(format!("Colour ({})", n + 1)).clicked() {
                         s.color = c;

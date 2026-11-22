@@ -10,8 +10,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
+use crate::theme;
 use crate::home_ui::{self, HomeState};
 use crate::platform::{WindowId, WindowKind};
 use crate::project::ProjectKey;
@@ -21,7 +22,6 @@ use crate::tours_ui::{self, ToursState};
 use crate::workspace_ui::{self, WorkspaceState};
 use crate::tray::Command;
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 
 pub const TITLE: &str = "Mythicshot";
 pub const SIZE: [f32; 2] = [760.0, 520.0];
@@ -359,7 +359,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
 /// The window's contents: the menu on the left, the selected page beside it.
 pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
     let mut out = PageOut::default();
-    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
+    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
     egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, &mut out));
     s.take(out);
 }
@@ -381,11 +381,11 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
         ui.add_space(8.0);
         match host {
             Some(host) => {
-                ui.add(egui::Label::new(RichText::new(host).size(12.0).color(MUTED)).truncate());
-                ui.label(RichText::new("Connected to").size(12.0).color(MUTED));
+                ui.add(egui::Label::new(RichText::new(host).size(12.0).color(theme::MUTED)).truncate());
+                ui.label(RichText::new("Connected to").size(12.0).color(theme::MUTED));
             }
             None => {
-                ui.label(RichText::new("Not connected").size(12.0).color(MUTED));
+                ui.label(RichText::new("Not connected").size(12.0).color(theme::MUTED));
             }
         }
     });
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!((s.nav.page(), s.capture), (Page::Tours, None), "nothing else is asked for, and the window stays on its page");
         // Frames that ask for nothing do not take it away before the app has seen it.
         s.take(PageOut::default());
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         drawn(&ctx, &mut s);
         assert_eq!(s.edit_project, Some(key.clone()));
         // The app takes it, as it takes a capture: once.
@@ -453,7 +453,7 @@ mod tests {
         s.nav.request(Page::Tours);
         let key = |tour: &str| ProjectKey { server: "https://tours.example.com".into(), tour_id: tour.into(), chapter_id: "ch_aaaaaaaaaaaaaaaaaaaaaaaa".into() };
         let (first, second) = (key("tour_aaaaaaaaaaaaaaaaaaaaaaaa"), key("tour_bbbbbbbbbbbbbbbbbbbbbbbb"));
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // The app took a request and is opening that recording on its own thread: the window
         // goes on being drawn, and the request is not asked a second time.
         s.take(PageOut { edit_project: Some(first.clone()), ..Default::default() });
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn a_tray_click_on_an_open_window_raises_it_and_keeps_its_page_and_what_is_typed() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut s = shared(tmp.path());
         s.nav.request(Page::Workspace);
         s.nav.take_focus();
@@ -739,7 +739,7 @@ mod tests {
         let mut s = shared(tmp.path());
         s.nav.request(Page::Preferences);
         s.prefs.state.tab = settings_ui::Tab::Output;
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], 2000.0));
         // Find the link where it was drawn, then click it.
         fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
@@ -799,7 +799,7 @@ mod tests {
     fn each_page_draws_its_wording_beside_the_menu() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = shared(tmp.path());
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         s.nav.request(Page::Home);
         // The first frame says the folder is being read; the answer follows.
         let first = drawn(&ctx, &mut s);
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn leaving_workspace_wipes_an_unsaved_token_and_leaving_preferences_stops_a_shortcut_recording() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         for leave in [|n: &mut Nav| n.go(Page::Home), |n: &mut Nav| n.close(), |n: &mut Nav| n.request(Page::Tours)] {
             let mut s = shared(tmp.path());
             s.nav.request(Page::Workspace);
@@ -871,7 +871,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = shared(tmp.path());
         s.nav.request(Page::Home);
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], SIZE[1]));
         // The first tile sits just right of the menu, under the "Capture" heading.
         let at = egui::pos2(NAV_WIDTH + 60.0, 100.0);

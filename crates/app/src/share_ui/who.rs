@@ -11,6 +11,7 @@ use std::fmt;
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::theme::Strong as _;
 use crate::publish::access::{self, Access, Granted, Refused, Viewers};
 
 pub const LABEL: &str = "Who can view";
@@ -367,7 +368,7 @@ impl Form {
 pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32) {
     match part {
         Part::Choice { offered, chosen } => {
-            ui.label(RichText::new(LABEL).strong());
+            ui.label(RichText::new(LABEL).bold());
             let mut choice = *chosen;
             egui::ComboBox::from_id_salt("who-can-view").width(220.0).selected_text(chosen.label()).show_ui(ui, |ui| {
                 for c in offered {
@@ -379,7 +380,7 @@ pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32
             }
         }
         Part::Addresses => {
-            ui.label(RichText::new(ADDRESSES_LABEL).strong());
+            ui.label(RichText::new(ADDRESSES_LABEL).bold());
             let id = form.id;
             // The first time the field shows, nothing stored under its id is taken over.
             if form.ctx.is_none() {
@@ -528,7 +529,7 @@ mod tests {
 
     #[test]
     fn the_address_fields_stored_state_goes_with_its_window() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut f = Form::default();
         f.set_site(Site::Takes);
         f.choose(Choice::People);

@@ -4,20 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
+use eframe::egui::{self, Align, Align2, CornerRadius, FontId, Layout, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::hotkeys::{self, Action};
 use crate::icons::{self, Icon};
 use crate::main_window::PageOut;
 use crate::platform;
 use crate::settings::Settings;
+use crate::theme;
 use crate::tray::Command;
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const TEXT: Color32 = Color32::from_rgb(214, 218, 226);
-const CARD: Color32 = Color32::from_rgb(27, 31, 39);
-const CARD_HOVER: Color32 = Color32::from_rgb(44, 50, 62);
-const CARD_EDGE: Color32 = Color32::from_rgb(52, 59, 72);
 
 /// How many files "Recent" lists.
 pub const RECENT_LIMIT: usize = 5;
@@ -222,20 +218,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: b
         }
     });
     ui.add_space(10.0);
-    ui.label(RichText::new(RECORD_A_TOUR).color(MUTED).size(12.0));
+    ui.label(RichText::new(RECORD_A_TOUR).color(theme::MUTED).size(12.0));
 
     ui.add_space(18.0);
     ui.heading("Recent");
     ui.add_space(8.0);
     match state.recent(&settings.output_dir) {
         RecentView::Reading => {
-            ui.label(RichText::new(READING_RECENT).color(MUTED));
+            ui.label(RichText::new(READING_RECENT).color(theme::MUTED));
         }
         RecentView::Unreadable => {
-            ui.label(RichText::new(CANNOT_READ_RECENT).color(MUTED));
+            ui.label(RichText::new(CANNOT_READ_RECENT).color(theme::MUTED));
         }
         RecentView::Empty => {
-            ui.label(RichText::new(NOTHING_RECENT).color(MUTED));
+            ui.label(RichText::new(NOTHING_RECENT).color(theme::MUTED));
         }
         RecentView::Files(files) => {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -254,8 +250,8 @@ fn tile(ui: &mut egui::Ui, t: &Tile, hotkey: &str, width: f32, enabled: bool) ->
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 112.0), if enabled { Sense::click() } else { Sense::hover() });
     let hovered = enabled && resp.hovered();
     let p = ui.painter();
-    p.rect(rect, CornerRadius::same(8), if hovered { CARD_HOVER } else { CARD }, Stroke::new(1.0, CARD_EDGE), StrokeKind::Inside);
-    let (fg, dim) = if enabled { (TEXT, MUTED) } else { (Color32::from_gray(100), Color32::from_gray(90)) };
+    p.rect(rect, CornerRadius::same(theme::RADIUS_LG), if hovered { theme::RAISED } else { theme::SURFACE }, Stroke::new(1.0, theme::BORDER_STRONG), StrokeKind::Inside);
+    let (fg, dim) = if enabled { (theme::TEXT, theme::MUTED) } else { (theme::DISABLED, theme::DISABLED) };
     icons::paint(p, egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 34.0), vec2(28.0, 28.0)), t.icon, fg);
     p.text(pos2(rect.center().x, rect.top() + 70.0), Align2::CENTER_CENTER, t.name, FontId::proportional(14.0), fg);
     if !hotkey.is_empty() {
@@ -265,7 +261,7 @@ fn tile(ui: &mut egui::Ui, t: &Tile, hotkey: &str, width: f32, enabled: bool) ->
 }
 
 fn recent_row(ui: &mut egui::Ui, f: &Recent) {
-    egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+    egui::Frame::new().fill(theme::SURFACE).corner_radius(CornerRadius::same(theme::RADIUS_LG)).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.set_min_height(30.0);

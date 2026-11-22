@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, FontId, RichText, Stroke, StrokeKind, vec2};
+use eframe::egui::{self, FontId, RichText, Stroke, StrokeKind, vec2};
 use mythicshot_capture::PxRect;
 use mythicshot_editor::Item;
 use mythicshot_editor::overlays::InputEvent;
 use mythicshot_recording::export::{self, Format, Job};
 use mythicshot_recording::{Recorder, Recording, Target};
 
+use crate::theme::{self, Strong as _};
 use crate::icons::{self, Icon};
 use crate::live_draw::LiveDraw;
 use crate::platform::{self, WindowId};
@@ -23,10 +24,6 @@ use crate::video::{self, Edit};
 pub const FRAME_TITLE: &str = "Mythicshot recording frame";
 pub const BAR_SIZE: [f32; 2] = [680.0, 46.0];
 const BORDER: f32 = 4.0;
-const RED: Color32 = Color32::from_rgb(229, 72, 77);
-const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
-const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 /// GIF size relative to the compressed frames on disk, measured on game
 /// footage (94 MB of frames became a 13.4 MB GIF). Only an estimate.
 const GIF_RATIO: f64 = 0.14;
@@ -208,11 +205,11 @@ impl Session {
             let Ok(f) = state.lock() else { return };
             let full = ui.ctx().content_rect();
             let painter = ui.painter();
-            let color = if f.paused { AMBER } else { RED };
+            let color = if f.paused { theme::RECORD_PAUSED } else { theme::RECORD };
             painter.rect_stroke(full.shrink(BORDER / 2.0), 0.0, Stroke::new(BORDER - 1.0, color), StrokeKind::Middle);
             if let Some(n) = f.countdown.filter(|n| *n > 0) {
-                painter.circle_filled(full.center(), 64.0, Color32::from_black_alpha(170));
-                painter.text(full.center(), egui::Align2::CENTER_CENTER, n.to_string(), FontId::proportional(80.0), Color32::WHITE);
+                painter.circle_filled(full.center(), 64.0, theme::SCRIM_COUNTDOWN);
+                painter.text(full.center(), egui::Align2::CENTER_CENTER, n.to_string(), FontId::proportional(80.0), theme::ON_PICTURE);
             }
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         });
@@ -227,7 +224,7 @@ impl Session {
     /// `keys_on` is whether key presses are being logged right now.
     pub fn bar_ui(&self, ui: &mut egui::Ui, keys_on: bool) -> Option<BarAction> {
         let mut action = None;
-        let frame = egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, Color32::from_rgb(52, 59, 72)));
+        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, theme::BORDER_STRONG));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -235,17 +232,17 @@ impl Session {
                     Phase::Live(r) => (true, r.is_paused(), r.stats()),
                     Phase::Countdown { .. } => (false, false, Default::default()),
                 };
-                let dot = if paused { AMBER } else { RED };
+                let dot = if paused { theme::RECORD_PAUSED } else { theme::RECORD };
                 let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 6.0, dot);
                 let t = stats.active_ms as f64 / 1000.0;
-                ui.label(RichText::new(format!("{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).monospace().size(15.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(format!("{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).monospace().size(theme::STRONG_SIZE).bold().color(theme::TEXT));
                 let status = match (live, paused) {
                     (false, _) => "Starting…",
                     (true, true) => "Paused",
                     (true, false) => "Recording",
                 };
-                ui.label(RichText::new(status).color(MUTED));
+                ui.label(RichText::new(status).color(theme::MUTED));
                 ui.separator();
                 let (icon, tip) = if paused { (Icon::Play, "Resume") } else { (Icon::Pause, "Pause") };
                 if ui.add_enabled_ui(live, |ui| icons::button(ui, icon, 30.0, false, tip)).inner.clicked() {
@@ -271,7 +268,7 @@ impl Session {
                 }
                 ui.separator();
                 let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;
-                ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(MUTED));
+                ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(theme::MUTED));
             });
         });
         ui.ctx().request_repaint_after(Duration::from_millis(100));

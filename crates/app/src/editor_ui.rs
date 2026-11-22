@@ -14,13 +14,11 @@ use mythicshot_editor::{Bounds, Document, Item, MAX_DIM, MIN_DIM, ObfuscateMode,
 
 use mythicshot_destinations::{self as dest, Context, DestId, Sent};
 
+use crate::theme::{self, Strong as _};
 use crate::hotkeys::{self, EditorAction};
 use crate::icons::{self, Icon};
 
-const ACCENT: Color32 = Color32::from_rgb(91, 141, 239);
-const CANVAS_BG: Color32 = Color32::from_rgb(16, 18, 22);
 const HANDLE: f32 = 8.0;
-const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
 /// Toolbar icon button size and tool rail width.
 const ICON: f32 = 28.0;
 const RAIL: f32 = 84.0;
@@ -30,9 +28,9 @@ const TOOL_BUTTON: f32 = 36.0;
 /// The Spotlight and Guide card tools show only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
-    (Some("DRAW"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
-    (Some("SHAPES"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
-    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
+    (Some("Draw"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
+    (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
+    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,7 +932,7 @@ impl Editor {
     /// Two rows like Greenshot's editor: actions on top, then the properties of
     /// the selected item (or of the next one drawn).
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
+        egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if self.video.is_some() {
@@ -1116,13 +1114,13 @@ impl Editor {
 
     /// A narrow column of tool icons, grouped like Greenshot's.
     fn tool_rail(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
+        egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
             egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 for (title, tools) in RAIL_GROUPS {
                     if let Some(title) = title {
                         ui.add_space(4.0);
-                        ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(10.0).strong().color(ACCENT)));
+                        ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(theme::SMALL_SIZE).bold().color(theme::MUTED)));
                     }
                     let tools: Vec<Tool> = tools.iter().copied().filter(|t| !matches!(t, Tool::Spotlight | Tool::Card) || self.video.is_some()).collect();
                     for row in tools.chunks(2) {
@@ -1147,7 +1145,7 @@ impl Editor {
         let key = hotkeys::display(binding);
         if !key.is_empty() && key.chars().count() <= 2 {
             let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
-            let color = if self.tool == tool { Color32::WHITE } else { Color32::from_rgb(140, 148, 164) };
+            let color = if self.tool == tool { theme::ON_PRIMARY } else { theme::MUTED };
             ui.painter().text(corner, egui::Align2::RIGHT_BOTTOM, key, FontId::proportional(9.0), color);
         }
         if resp.clicked() {
@@ -1157,9 +1155,9 @@ impl Editor {
 
     /// Size, last action with its time, and zoom, like Greenshot's status bar.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
+        egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let muted = Color32::from_rgb(163, 170, 184);
+                let muted = theme::MUTED;
                 ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).monospace().color(muted));
                 ui.separator();
                 let dirty = match (&self.saved, self.doc.dirty) {
@@ -1216,7 +1214,7 @@ impl Editor {
                 if let Some(m) = &more {
                     ui.scope(|ui| {
                         ui.set_max_width(status_width(ui.available_width()));
-                        ui.add(egui::Label::new(egui::RichText::new(m).color(Color32::from_rgb(245, 165, 36))).truncate()).on_hover_text(&whole);
+                        ui.add(egui::Label::new(egui::RichText::new(m).color(theme::CAUTION_TEXT)).truncate()).on_hover_text(&whole);
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1293,7 +1291,7 @@ impl Editor {
     // ---- canvas -------------------------------------------------------------
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS_BG)).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::GROUND)).show(ui, |ui| {
             let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
             let avail = ui.available_size();
             let fit = ((avail.x - 32.0) / w).min((avail.y - 32.0) / h).clamp(0.05, 1.0);
@@ -1315,9 +1313,9 @@ impl Editor {
                 let to_scr = |p: Pt| img_rect.min + vec2(p.x * z, p.y * z);
 
                 if let Some(tex) = &self.texture {
-                    ui.painter().image(tex.id(), img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    ui.painter().image(tex.id(), img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), theme::IMAGE_TINT);
                 }
-                ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), StrokeKind::Outside);
+                ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Outside);
 
                 self.hover = resp.hover_pos().map(to_img).filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= w && p.y <= h);
                 self.handle_pointer(&resp, z, &to_img);
@@ -1606,7 +1604,7 @@ impl Editor {
                     if ui.button("Done").clicked() {
                         commit = true;
                     }
-                    ui.label(egui::RichText::new("Enter done · Shift+Enter new line · Esc cancel").weak().size(11.0));
+                    ui.label(egui::RichText::new("Enter done · Shift+Enter new line · Esc cancel").weak().size(theme::SMALL_SIZE));
                 });
             });
         });
@@ -1645,7 +1643,7 @@ impl Editor {
                 ui.spacing_mut().item_spacing.x = GAP;
                 let row = 3.0 * BUTTON.x + 2.0 * GAP;
                 ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
-                let primary = egui::Button::new(egui::RichText::new(if is_video { "Export and close" } else { "Save" }).strong()).fill(Color32::from_rgb(47, 111, 235)).min_size(BUTTON);
+                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON);
                 if ui.add(primary).clicked() {
                     choice = Some(0);
                 }
@@ -1750,12 +1748,12 @@ impl Editor {
         };
         if let Some(b) = crop {
             let r = scr_rect(b);
-            let dim = Color32::from_black_alpha(150);
+            let dim = theme::SCRIM_STRONG;
             painter.rect_filled(Rect::from_min_max(img_rect.min, pos2(img_rect.max.x, r.min.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.max.y), img_rect.max), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.min.y), pos2(r.min.x, r.max.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(img_rect.max.x, r.max.y)), 0.0, dim);
-            painter.rect_stroke(r, 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+            painter.rect_stroke(r, 0.0, Stroke::new(2.0, theme::SELECTION_EDGE), StrokeKind::Outside);
             if self.crop.is_some() {
                 let mut apply = false;
                 let mut cancel = false;
@@ -1781,11 +1779,11 @@ impl Editor {
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
-            painter.rect_stroke(scr_rect(b).expand(3.0), 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+            painter.rect_stroke(scr_rect(b).expand(3.0), 2.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
             for (pos, _) in handles(it) {
                 let c = to_scr(pos);
-                painter.rect_filled(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Color32::WHITE);
-                painter.rect_stroke(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+                painter.rect_filled(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, theme::ON_PICTURE);
+                painter.rect_stroke(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
             }
         }
     }
@@ -2073,8 +2071,8 @@ pub(crate) mod dialog_checks {
     /// status bar and canvas backgrounds are all there.
     pub(crate) fn assert_solid(with_dialog: &Painted, solid: &Painted) {
         let fills = big_fills(&with_dialog.editor);
-        assert!(fills.iter().filter(|(_, c)| *c == BAR_BG).count() >= 3, "the toolbar, rail and status bar backgrounds: {fills:?}");
-        assert!(fills.iter().any(|(_, c)| *c == CANVAS_BG), "the canvas background: {fills:?}");
+        assert!(fills.iter().filter(|(_, c)| *c == theme::SURFACE).count() >= 3, "the toolbar, rail and status bar backgrounds: {fills:?}");
+        assert!(fills.iter().any(|(_, c)| *c == theme::GROUND), "the canvas background: {fills:?}");
         assert!(fills.iter().all(|(_, c)| c.a() == 255), "nothing of the editor's background is see-through: {fills:?}");
         assert_eq!(fills, big_fills(&solid.editor), "the same backgrounds as with no dialog open");
         // The picture itself is not faded either.
@@ -2108,7 +2106,7 @@ pub(crate) mod dialog_checks {
     pub(crate) fn assert_inert_and_solid(make: impl Fn() -> Editor, open: impl Fn(&mut Editor), is_open: impl Fn(&Editor) -> bool) {
         // Find a tool button on the rail: a point a click on which changes the tool with no dialog open.
         let rail = (0..80).map(|i| pos2(RAIL / 2.0, 40.0 + i as f32 * 8.0)).find(|&at| {
-            let (mut ed, ctx) = (make(), egui::Context::default());
+            let (mut ed, ctx) = (make(), crate::theme::test_context());
             frame(&mut ed, &ctx, vec![]);
             let before = ed.tool;
             click(&mut ed, &ctx, at);
@@ -2116,7 +2114,7 @@ pub(crate) mod dialog_checks {
         });
         let rail = rail.expect("a tool button on the rail");
 
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = make();
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
         frame(&mut ed, &ctx, vec![]);
@@ -2181,7 +2179,7 @@ mod tests {
     fn copy_paste_duplicate_and_cut_annotations() {
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let rect = |x: f32| Shape::Rect(Bounds::new(mythicshot_editor::pt(x, 10.0), mythicshot_editor::pt(x + 20.0, 30.0)));
         ed.style.stroke = Rgba::YELLOW;
         let id = ed.add_item(rect(5.0));
@@ -2267,7 +2265,7 @@ mod tests {
         assert_eq!(shown(&mut ed, 0, true).as_deref(), Some("This recording was opened without the cover logo."));
         assert_eq!(shown(&mut ed, 500, false).as_deref(), Some("This recording was opened without the cover logo."));
         // The status bar draws it, and a key press in the window is the first action.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         ed.notify_held("This recording was opened without the cover logo.");
         ed.notify("Saved");
@@ -2281,7 +2279,7 @@ mod tests {
 
     #[test]
     fn copying_the_picture_means_closing_does_not_ask_to_save() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let rect = Shape::Rect(Bounds::new(mythicshot_editor::pt(5.0, 5.0), mythicshot_editor::pt(20.0, 20.0)));
         // Edited and neither saved nor copied: closing asks.
         let mut ed = editor(EditorPrefs::default());
@@ -2307,7 +2305,7 @@ mod tests {
     fn pasted_pictures_become_image_elements_that_fit() {
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // A small picture keeps its size and lands in the middle of the 64×48 capture.
         let small = egui::ColorImage::new([20, 10], vec![egui::Color32::GREEN; 200]);
         press(&mut ed, &ctx, vec![egui::Event::PasteImage(Arc::new(small))]);
@@ -2467,7 +2465,7 @@ mod tests {
     /// A click outside "Publish to…" closes nothing, as before the dimming went.
     #[test]
     fn a_click_outside_publish_to_does_not_close_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         ed.share = Some(share_dialog());
         dialog_checks::frame(&mut ed, &ctx, vec![]);
@@ -2479,7 +2477,7 @@ mod tests {
     /// outside it still dismisses it without closing the window, as it did with the dimming.
     #[test]
     fn the_close_question_is_undimmed_and_a_click_outside_still_dismisses_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         dialog_checks::frame(&mut ed, &ctx, vec![]);
         let solid = dialog_checks::frame(&mut ed, &ctx, vec![]);
@@ -2501,7 +2499,7 @@ mod tests {
     /// nothing, as before.
     #[test]
     fn the_close_question_takes_the_keys_and_escape_dismisses_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let key = |k: Key, modifiers: Modifiers| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers };
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();

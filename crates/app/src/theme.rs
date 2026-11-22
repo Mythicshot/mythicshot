@@ -12,6 +12,10 @@
 //! every window paints an opaque [`GROUND`] or [`SURFACE`], dialogs and menus an opaque
 //! [`RAISED`] with a 1px [`BORDER_STRONG`] edge, and nothing here has a shadow.
 
+// The module lists every token of the brand (the whole spacing scale, every role), not only the
+// ones some screen draws today.
+#![allow(dead_code)]
+
 use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText, Shadow, Stroke, Style, TextStyle, Visuals};
 
 /// A colour from its `0xRRGGBB` value, as the brand's tokens write it.
@@ -139,6 +143,9 @@ pub const SCRIM_FAINT: Color32 = Color32::from_black_alpha(28);
 pub const CARD_SHADOW: Color32 = Color32::from_black_alpha(80);
 /// The shadow the Shadow icon depicts.
 pub const ICON_SHADOW: Color32 = Color32::from_black_alpha(200);
+/// The outline and handles of what is selected on the canvas, and the edge of a crop: the gold of
+/// selection highlights, which reads on most pictures.
+pub const SELECTION_EDGE: Color32 = DARK.accent;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
 /// The pixel grid lines of the magnifier, over the desktop.
@@ -147,8 +154,16 @@ pub const PICTURE_GUIDE: Color32 = Color32::from_rgba_unmultiplied_const(0xf5, 0
 pub const PICTURE_BACKDROP: Color32 = Color32::BLACK;
 /// A texture drawn as it is (egui multiplies a picture by this).
 pub const IMAGE_TINT: Color32 = Color32::WHITE;
+/// The usage meter: its track, what is used, and what is used past the limit.
+pub const METER_TRACK: Color32 = DARK.border;
+pub const METER_USED: Color32 = DARK.primary;
+pub const METER_OVER: Color32 = DARK.caution_border;
+/// A neutral status chip's fill (a draft, an idle connection): the border colour, so it shows on a card.
+pub const CHIP: Color32 = DARK.border;
 /// The recording indicator and the frames cut from a recording: a functional red from the danger role.
 pub const RECORD: Color32 = DARK.danger_border;
+/// The recording frame and dot while paused: the brand's gold, near the amber it replaces.
+pub const RECORD_PAUSED: Color32 = DARK.gold;
 
 // Type: Manrope for the interface (the brand's dense desktop scale), Hack for monospace.
 
@@ -322,9 +337,35 @@ pub fn popup_frame() -> egui::Frame {
     egui::Frame::new().fill(RAISED).stroke(Stroke::new(1.0, BORDER_STRONG)).corner_radius(RADIUS_LG)
 }
 
-/// The box around a caution: caution-tint fill, a 1px caution-border edge, radius-md.
+/// A small window of its own (the destination picker, a toast): the whole window painted opaque
+/// in ground, and on it a surface-raised card with a 1px border-strong edge and radius-lg that
+/// fills it, so the rounded corners show ground and never the desktop. `margin` is the space
+/// between the card's edge and what `add` draws.
+pub fn window_card<R>(ui: &mut egui::Ui, margin: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(GROUND))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().rect(rect, RADIUS_LG, RAISED, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Inside);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(margin + 1.0)), add).inner
+        })
+        .inner
+}
+
+/// The box around a caution: caution-tint fill, a 1px caution-border edge, radius-md. The edge
+/// takes one point of the 10 the boxes had around their text, so nothing moves.
 pub fn caution_frame() -> egui::Frame {
-    egui::Frame::new().fill(CAUTION_TINT).stroke(Stroke::new(1.0, CAUTION_BORDER)).corner_radius(RADIUS_MD).inner_margin(Margin::same(10))
+    egui::Frame::new().fill(CAUTION_TINT).stroke(Stroke::new(1.0, CAUTION_BORDER)).corner_radius(RADIUS_MD).inner_margin(Margin::same(9))
+}
+
+/// The box around an error or a delete question: danger-tint fill, a 1px danger-border edge, radius-md.
+pub fn danger_frame() -> egui::Frame {
+    egui::Frame::new().fill(DANGER_TINT).stroke(Stroke::new(1.0, DANGER_BORDER)).corner_radius(RADIUS_MD).inner_margin(Margin::same(9))
+}
+
+/// A card on a page: surface, radius-lg.
+pub fn card_frame() -> egui::Frame {
+    egui::Frame::new().fill(SURFACE).corner_radius(RADIUS_LG)
 }
 
 /// A caution box: [`caution_frame`] with the warning icon in caution-border beside `add`,
@@ -410,6 +451,10 @@ mod tests {
             ("on-primary on primary", ON_PRIMARY, PRIMARY, 4.5),
             ("on-primary on primary-hover", ON_PRIMARY, PRIMARY_HOVER, 4.5),
             ("on-primary on danger-fill", ON_PRIMARY, DANGER_FILL, 4.5),
+            ("text-muted on a neutral chip", MUTED, CHIP, 4.5),
+            ("meter used against its track", METER_USED, METER_TRACK, 1.5),
+            ("meter used on ground", METER_USED, GROUND, 3.0),
+            ("meter over the limit on ground", METER_OVER, GROUND, 3.0),
             ("text on selection", TEXT, SELECTION, 4.5),
             ("accent-text on selection (selected label)", ACCENT, SELECTION, 4.5),
             ("success-text on success-tint", SUCCESS_TEXT, SUCCESS_TINT, 4.5),

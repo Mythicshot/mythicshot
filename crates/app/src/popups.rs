@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, Modifiers, RichText};
+use eframe::egui::{self, Key, Modifiers, RichText};
 use image::RgbaImage;
 use mythicshot_destinations::DestId;
 
 use crate::icons::{self, Icon};
 use crate::platform;
+use crate::theme;
 
 const PICKER_SIZE: [f32; 2] = [270.0, 262.0];
 const TOAST_SIZE: [f32; 2] = [380.0, 96.0];
@@ -93,8 +94,7 @@ impl Picker {
             self.pick = Pick::Cancelled;
         }
         // A compact menu like Greenshot's destination menu.
-        let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(6.0).stroke(egui::Stroke::new(1.0, Color32::from_rgb(52, 59, 72)));
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        theme::window_card(ui, 6.0, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(RichText::new(format!("  Send capture ({} × {}) to", self.img.width(), self.img.height())).weak().size(12.0));
             ui.add_space(4.0);
@@ -181,8 +181,8 @@ impl Toast {
             let Ok(mut guard) = state.lock() else { return };
             let Some(t) = guard.as_mut() else { return };
             t.hovered = ui.ctx().input(|i| i.pointer.has_pointer());
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(12.0).stroke(egui::Stroke::new(1.0, Color32::from_rgb(52, 59, 72)))).show(ui, |ui| {
-                ui.label(RichText::new(&t.msg).color(Color32::from_rgb(230, 232, 236)));
+            theme::window_card(ui, 12.0, |ui| {
+                ui.label(RichText::new(&t.msg).color(theme::TEXT));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if let Some(p) = t.path.clone() {

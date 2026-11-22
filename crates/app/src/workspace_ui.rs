@@ -23,19 +23,15 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
+use crate::theme;
 use crate::publish::connect::{self, Clock, ConnectError};
 use crate::publish::{self, RemoteTour};
 use crate::publish_ui::{self, TokenStatus};
 use crate::sign_in_ui::{self, Code, Opener, Reporter, SignInAction, SignInDialog, SignInJob, Starter};
 use crate::tours_ui::Site;
 
-const WARN_TEXT: Color32 = Color32::from_rgb(255, 196, 107);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const OK_TEXT: Color32 = Color32::from_rgb(125, 211, 140);
-const OK_BG: Color32 = Color32::from_rgb(24, 52, 34);
-const IDLE_BG: Color32 = Color32::from_rgb(44, 50, 62);
 
 pub const NOT_CONNECTED: &str = "Not connected";
 pub const CHECKING: &str = "Checking…";
@@ -559,7 +555,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     ui.add_space(12.0);
 
     let row = |ui: &mut egui::Ui, name: &str| {
-        ui.label(RichText::new(name).color(MUTED));
+        ui.label(RichText::new(name).color(theme::MUTED));
     };
     let value = |ui: &mut egui::Ui, text: Option<String>| {
         ui.label(text.unwrap_or_else(|| NOTHING.to_string()));
@@ -571,7 +567,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 Some(t) => {
                     let mut shown = t.clone();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
-                    ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(MUTED).size(12.0));
+                    ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(theme::MUTED).size(12.0));
                 }
                 None => {
                     if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(340.0)).changed() {
@@ -587,7 +583,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             if !effective.trim().is_empty()
                 && let Err(e) = publish::check_server(&effective)
             {
-                ui.label(RichText::new(e).color(WARN_TEXT).size(12.0));
+                ui.label(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0));
             }
         });
         ui.end_row();
@@ -595,16 +591,16 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         row(ui, "Status");
         ui.vertical(|ui| {
             let label = status(&conn.token, checking && conn.token == TokenStatus::Saved, info.as_ref().map(|i| i.workspace.as_str()));
-            let (fg, bg) = if is_connected_status(&label) { (OK_TEXT, OK_BG) } else { (MUTED, IDLE_BG) };
+            let (fg, bg) = if is_connected_status(&label) { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
             egui::Frame::new().fill(bg).corner_radius(egui::CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
                 ui.label(RichText::new(label).color(fg));
             });
             if refused && conn.token == TokenStatus::Saved {
-                ui.add(egui::Label::new(RichText::new(publish::REJECTED_TOKEN).color(WARN_TEXT).size(12.0)).wrap());
+                ui.add(egui::Label::new(RichText::new(publish::REJECTED_TOKEN).color(theme::CAUTION_TEXT).size(12.0)).wrap());
             }
             if let Some(line) = p.account.as_ref().and_then(|(name, _)| signed_in_as(name)) {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(line).color(MUTED).size(12.0));
+                    ui.label(RichText::new(line).color(theme::MUTED).size(12.0));
                     if ui.add_enabled(!busy, egui::Link::new(RichText::new(NOT_YOU).size(12.0))).clicked() {
                         sign_out(ui.ctx(), p);
                     }
@@ -617,7 +613,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             row(ui, THIS_COMPUTER);
             ui.horizontal(|ui| {
                 ui.label(connect::device_name());
-                ui.label(RichText::new("·").color(MUTED));
+                ui.label(RichText::new("·").color(theme::MUTED));
                 // Today's "forget the token": it is removed from this computer; nothing changes on the site.
                 if ui.add_enabled(!busy, egui::Link::new(SIGN_OUT)).clicked() {
                     sign_out(ui.ctx(), p);
@@ -654,14 +650,14 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     // The token was saved for another address: say so, and send nothing until the user decides.
     if let Some(problem) = &problem {
         ui.add_space(10.0);
-        ui.add(egui::Label::new(RichText::new(problem).color(WARN_TEXT)).wrap());
+        ui.add(egui::Label::new(RichText::new(problem).color(theme::CAUTION_TEXT)).wrap());
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy, egui::Button::new(publish_ui::USE_IT_HERE)).clicked() {
                 (p.bind)(publish::check_server(&effective).ok());
                 p.clear_message();
             }
         });
-        ui.add(egui::Label::new(RichText::new(publish_ui::USE_IT_HERE_MEANS).color(MUTED).size(12.0)).wrap());
+        ui.add(egui::Label::new(RichText::new(publish_ui::USE_IT_HERE_MEANS).color(theme::MUTED).size(12.0)).wrap());
     }
 
     ui.add_space(12.0);
@@ -688,17 +684,17 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         if busy || checking {
             ui.add(egui::Spinner::new());
         } else if let Some((text, ok)) = p.current_message(&effective) {
-            ui.add(egui::Label::new(RichText::new(text).color(if ok { OK_TEXT } else { WARN_TEXT })).wrap());
+            ui.add(egui::Label::new(RichText::new(text).color(if ok { theme::SUCCESS_TEXT } else { theme::CAUTION_TEXT })).wrap());
         } else if site.is_some() && !asked {
-            ui.label(RichText::new(PRESS_TEST).color(MUTED).size(12.0));
+            ui.label(RichText::new(PRESS_TEST).color(theme::MUTED).size(12.0));
         }
     });
     ui.add_space(6.0);
     if rows.sign_in && conn.token != TokenStatus::Checking {
-        ui.add(egui::Label::new(RichText::new(SIGN_IN_HINT).color(MUTED).size(12.0)).wrap());
+        ui.add(egui::Label::new(RichText::new(SIGN_IN_HINT).color(theme::MUTED).size(12.0)).wrap());
     }
     if conn.token == TokenStatus::Saved || p.pasting {
-        ui.label(RichText::new(TOKEN_NOTE).color(MUTED).size(12.0));
+        ui.label(RichText::new(TOKEN_NOTE).color(theme::MUTED).size(12.0));
     }
 
     // The "Sign in" window, over the page.
@@ -751,7 +747,7 @@ fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, address: &st
     };
     match token_row(&conn.token, p.pasting) {
         TokenRow::Checking => {
-            ui.label(RichText::new("Checking for a saved token…").color(MUTED));
+            ui.label(RichText::new("Checking for a saved token…").color(theme::MUTED));
         }
         TokenRow::Link => {
             if ui.add_enabled(!busy, egui::Link::new(PASTE_INSTEAD)).clicked() {
@@ -767,11 +763,11 @@ fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, address: &st
                 }
             });
             if replacing {
-                ui.label(RichText::new("The saved token stays until the new one is saved.").color(MUTED).size(12.0));
+                ui.label(RichText::new("The saved token stays until the new one is saved.").color(theme::MUTED).size(12.0));
             }
         }
         TokenRow::Unavailable(e) => {
-            ui.label(RichText::new(e).color(WARN_TEXT).size(12.0));
+            ui.label(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0));
             ui.horizontal(|ui| {
                 paste(ui, p, "Paste the token from the site's setup page");
                 // Forget stays available when the store holds something it cannot read, so it can be removed.
@@ -818,7 +814,7 @@ mod tests {
 
     #[test]
     fn after_save_the_token_cannot_be_brought_back_by_undo() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut p = WorkspaceState::default();
         frame(&ctx, &mut p, 0.0, vec![]);
         focus(&ctx, &p);
@@ -844,7 +840,7 @@ mod tests {
 
     #[test]
     fn undo_never_restores_a_token_even_in_the_same_field() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut p = WorkspaceState::default();
         frame(&ctx, &mut p, 0.0, vec![]);
         focus(&ctx, &p);
@@ -864,7 +860,7 @@ mod tests {
 
     #[test]
     fn closing_or_leaving_the_page_clears_an_unsaved_token() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut p = WorkspaceState { token_input: TOKEN.into(), pasting: true, ..Default::default() };
         let before = p.field;
         p.clear_token_field(&ctx);
@@ -1048,7 +1044,7 @@ mod tests {
     #[test]
     fn a_connected_page_shows_the_workspace_the_tours_and_the_version() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), String::new(), bound_to(&s, TokenStatus::Saved));
+        let (ctx, mut p, mut server, c) = (crate::theme::test_context(), page(), String::new(), bound_to(&s, TokenStatus::Saved));
         server.clone_from(&s.base);
         // Opening the page asks the site without a click.
         let first = drawn(&ctx, &mut p, &mut server, &c);
@@ -1082,14 +1078,14 @@ mod tests {
     #[test]
     fn an_older_site_is_connected_with_its_version_unknown() {
         let s = site_stub(r#"{"workspace":"Acme"}"#);
-        let (ctx, mut p, mut server, c) = (egui::Context::default(), page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
+        let (ctx, mut p, mut server, c) = (crate::theme::test_context(), page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
         let text = until(&ctx, &mut p, &mut server, &c, connected);
         assert!(has_line(&text, "Connected to Acme") && has_line(&text, "unknown") && has_line(&text, "2 (1 public, 1 draft)"), "{text}");
     }
 
     #[test]
     fn a_page_without_a_token_or_with_a_failing_site_is_not_connected_and_asks_nothing_more() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // No token: Sign in, the way to paste a token instead, the hint, and no request to anyone.
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
         let (mut p, mut server) = (page(), s.base.clone());
@@ -1144,7 +1140,7 @@ mod tests {
     #[test]
     fn an_address_being_typed_is_never_asked_on_its_own() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, c) = (egui::Context::default(), page(), bound_to(&s, TokenStatus::Saved));
+        let (ctx, mut p, c) = (crate::theme::test_context(), page(), bound_to(&s, TokenStatus::Saved));
         // The address in the field is the token's own, typed just now: what the field's change handler does.
         let mut server = s.base.clone();
         if let Some(typed) = c.site(&server) {
@@ -1166,7 +1162,7 @@ mod tests {
     fn a_token_saved_for_another_address_is_not_sent_until_the_user_says_so() {
         let home = site_stub(r#"{"workspace":"Home"}"#);
         let typo = site_stub(r#"{"workspace":"Somebody else"}"#);
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // Which address the token is tied to, as the page's button would set it.
         let bound = Arc::new(Mutex::new(Some(home.base.clone())));
         let record = bound.clone();
@@ -1228,7 +1224,7 @@ mod tests {
     #[test]
     fn typing_in_the_address_field_reports_a_change_and_sends_nothing() {
         let s = site_stub(r#"{"workspace":"Acme","version":"0.1.1"}"#);
-        let (ctx, mut p, c) = (egui::Context::default(), page(), bound_to(&s, TokenStatus::Saved));
+        let (ctx, mut p, c) = (crate::theme::test_context(), page(), bound_to(&s, TokenStatus::Saved));
         let mut server = String::new();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 520.0));
         let run = |p: &mut WorkspaceState, server: &mut String, events: Vec<egui::Event>| {
@@ -1323,7 +1319,7 @@ mod tests {
     fn sign_in_shows_the_code_opens_the_page_and_saves_the_token_for_that_address() {
         let s = connect_stub(|seen| if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected_answer() });
         let record = Arc::new(Record::default());
-        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
         drawn(&ctx, &mut p, &mut server, &c);
         p.begin_sign_in(&ctx, &server);
@@ -1363,7 +1359,7 @@ mod tests {
         let g = go.clone();
         let s = connect_stub(move |_| if *g.lock().unwrap() { connected_answer() } else { reply(200, r#"{"status":"pending"}"#) });
         let record = Arc::new(Record::default());
-        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
         p.begin_sign_in(&ctx, &server);
         until(&ctx, &mut p, &mut server, &c, |t| t.contains(CODE));
@@ -1384,7 +1380,7 @@ mod tests {
     fn leaving_the_page_or_cancel_stops_the_sign_in_and_stores_nothing() {
         let s = connect_stub(|_| reply(200, r#"{"status":"pending"}"#));
         let record = Arc::new(Record::default());
-        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
         p.begin_sign_in(&ctx, &server);
         until(&ctx, &mut p, &mut server, &c, |t| t.contains(CODE));
@@ -1415,7 +1411,7 @@ mod tests {
     fn an_older_site_says_it_has_no_sign_in_and_nothing_is_stored() {
         let s = stub(|_, _| reply(404, r#"{"error":"not_found","detail":"Cannot POST /api/v1/connect/start"}"#));
         let record = Arc::new(Record::default());
-        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
         p.begin_sign_in(&ctx, &server);
         let text = until(&ctx, &mut p, &mut server, &c, |t| has_line(t, connect::NOT_OFFERED));
@@ -1436,14 +1432,14 @@ mod tests {
         assert!(!sign_in_enabled(false, true, "https://tours.example.com"), "not twice");
         // Pressed anyway with such an address: nothing opens, nothing is sent.
         let record = Arc::new(Record::default());
-        let (ctx, mut p) = (egui::Context::default(), signing_page(&record));
+        let (ctx, mut p) = (crate::theme::test_context(), signing_page(&record));
         p.begin_sign_in(&ctx, "https://");
         assert!(!p.is_signing_in());
     }
 
     #[test]
     fn sign_in_is_offered_without_a_token_or_for_a_refused_one_but_not_for_an_unreachable_site() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // 1. No token.
         let s = site_stub(r#"{"workspace":"Acme"}"#);
         let (mut p, mut server) = (page(), s.base.clone());
@@ -1482,7 +1478,7 @@ mod tests {
         let forgot = Arc::new(Mutex::new(0usize));
         let f = forgot.clone();
         let vault = Vault { store: Arc::new(|_| Ok(())), forget: Arc::new(move || { *f.lock().unwrap() += 1; Ok(()) }), refresh: Arc::new(|| {}) };
-        let (ctx, mut p, c) = (egui::Context::default(), WorkspaceState { vault, bind: Arc::new(|_| {}), ..page() }, bound_to(&s, TokenStatus::Saved));
+        let (ctx, mut p, c) = (crate::theme::test_context(), WorkspaceState { vault, bind: Arc::new(|_| {}), ..page() }, bound_to(&s, TokenStatus::Saved));
         let mut server = s.base.clone();
         // What the window hands the page after a sign-in the site named an account for.
         p.account = Some(("alex".into(), None));
@@ -1519,7 +1515,7 @@ mod tests {
     fn a_sign_in_whose_answer_named_an_account_shows_it_on_the_page() {
         let s = connect_stub(|_| reply(200, &format!(r#"{{"status":"connected","token":"{NEW_TOKEN}","workspace":{{"name":"Cowfee"}},"account":{{"username":"alex"}}}}"#)));
         let record = Arc::new(Record::default());
-        let (ctx, mut p, c) = (egui::Context::default(), signing_page(&record), conn(TokenStatus::Missing));
+        let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
         p.begin_sign_in(&ctx, &server);
         let deadline = Instant::now() + Duration::from_secs(20);

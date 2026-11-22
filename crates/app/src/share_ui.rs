@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, StrokeKind, vec2};
 
+use crate::theme::{self, Strong as _};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::publish::{
@@ -26,14 +27,6 @@ use crate::publish::{
 };
 use crate::publish_ui::{self, Run};
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
-const WARNING_BG: Color32 = Color32::from_rgb(74, 58, 22);
-const WARNING_TEXT: Color32 = Color32::from_rgb(245, 214, 150);
-/// "Copied": the green the app already uses for good news (a public tour, a working connection).
-const SUCCESS: Color32 = Color32::from_rgb(125, 211, 140);
-/// Text on [`SUCCESS`]: the app's card colour, the dark it draws on green with.
-const ON_SUCCESS: Color32 = Color32::from_rgb(27, 31, 39);
 
 // The window's measures, from the mockup the owner approved. The tour result screen uses them too.
 /// The width of what the window holds.
@@ -48,7 +41,7 @@ pub const LINK_ROW_HEIGHT: f32 = 46.0;
 pub const BUTTON_HEIGHT: f32 = 44.0;
 /// Between the buttons of the action row.
 pub const BUTTON_GAP: f32 = 12.0;
-pub const HEADING_SIZE: f32 = 20.0;
+pub const HEADING_SIZE: f32 = theme::HEADING_SIZE;
 /// What Copy link says for a moment after a copy that worked.
 pub const COPIED_LABEL: &str = "Copied";
 pub const OPEN_IN_BROWSER: &str = "Open in browser";
@@ -790,39 +783,38 @@ impl ShareDialog {
         let online = matches!(self.stage, Stage::Online { .. });
         modal(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(WINDOW_WIDTH);
-            ui.label(RichText::new(view.caption).color(MUTED).size(12.0));
+            ui.label(RichText::new(view.caption).color(theme::MUTED).size(12.0));
             ui.add_space(4.0);
             heading_label(ui, &view.heading);
             for line in &view.lines {
                 ui.add_space(6.0);
                 match line {
                     Line::Muted(t) => {
-                        ui.add(egui::Label::new(RichText::new(t).color(MUTED)).wrap());
+                        ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED)).wrap());
                     }
                     Line::Text(t) => {
                         ui.add(egui::Label::new(t.as_str()).wrap());
                     }
                     Line::Note(t) => {
-                        ui.add(egui::Label::new(RichText::new(t).color(MUTED).size(12.0)).wrap());
+                        ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED).size(12.0)).wrap());
                     }
                     Line::Warning(t) => {
-                        egui::Frame::new().fill(WARNING_BG).corner_radius(8.0).inner_margin(10.0).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(egui::Label::new(RichText::new(t).color(WARNING_TEXT)).wrap());
+                        theme::caution_box(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(t).color(theme::CAUTION_TEXT)).wrap());
                         });
                     }
                     Line::Title => {
-                        ui.label(RichText::new(TITLE_LABEL).strong());
+                        ui.label(RichText::new(TITLE_LABEL).bold());
                         ui.add(egui::TextEdit::singleline(&mut self.title).char_limit(share::TITLE_MAX).desired_width(f32::INFINITY));
                     }
-                    Line::Who { offered, chosen } => who::draw_part(ui, &who::Part::Choice { offered: offered.clone(), chosen: *chosen }, &mut self.who, MUTED),
-                    Line::Addresses => who::draw_part(ui, &who::Part::Addresses, &mut self.who, MUTED),
+                    Line::Who { offered, chosen } => who::draw_part(ui, &who::Part::Choice { offered: offered.clone(), chosen: *chosen }, &mut self.who, theme::MUTED),
+                    Line::Addresses => who::draw_part(ui, &who::Part::Addresses, &mut self.who, theme::MUTED),
                 }
             }
             // Without a link the lock line follows the sentence; with one it goes under the link row.
             if let (None, Some(lock)) = (&view.link, &view.lock) {
                 ui.add_space(6.0);
-                who::lock_line(ui, lock, MUTED);
+                who::lock_line(ui, lock, theme::MUTED);
             }
             if let Some(p) = view.progress {
                 ui.add_space(8.0);
@@ -836,7 +828,7 @@ impl ShareDialog {
                     }
                     if let Some(lock) = &view.lock {
                         ui.add_space(8.0);
-                        who::lock_line(ui, lock, MUTED);
+                        who::lock_line(ui, lock, theme::MUTED);
                     }
                 }
                 gap(ui, BLOCK_GAP);
@@ -854,7 +846,7 @@ impl ShareDialog {
                     for (i, button) in view.buttons.iter().enumerate().rev() {
                         let main = i + 1 == view.buttons.len();
                         let text = RichText::new(view.label(*button)).size(BUTTON_TEXT);
-                        let b = if main { egui::Button::new(text.strong()).fill(PRIMARY) } else { egui::Button::new(text) };
+                        let b = if main { egui::Button::new(theme::strong(text.color(theme::ON_PRIMARY))).fill(theme::PRIMARY) } else { egui::Button::new(text) };
                         if ui.add_enabled(view.disabled != Some(*button), b.min_size(vec2(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))).clicked() {
                             pressed = Some(*button);
                         }
@@ -900,12 +892,11 @@ const BUTTON_PADDING_X: f32 = 18.0;
 const FIELD_PADDING_X: f32 = 14.0;
 const LINK_TEXT: f32 = 13.0;
 
-/// The window's frame: the app's popup frame, as every window of the app has, with the
-/// mockup's padding and corners a little rounder than a popup's.
+/// The window's frame: the app's popup frame, as every window of the app has (surface-raised,
+/// a 1px border-strong edge, radius-lg), with the mockup's padding.
 pub fn window_frame(ctx: &egui::Context) -> egui::Frame {
     let style = ctx.global_style();
-    let corner = style.visuals.menu_corner_radius.nw.saturating_add(4);
-    egui::Frame::popup(&style).inner_margin(WINDOW_PADDING).corner_radius(CornerRadius::same(corner))
+    egui::Frame::popup(&style).inner_margin(WINDOW_PADDING).corner_radius(CornerRadius::same(theme::RADIUS_LG))
 }
 
 /// Every dialog of the app: an [`egui::Modal`] whose backdrop still covers the whole window and
@@ -930,13 +921,13 @@ pub fn gap(ui: &mut egui::Ui, space: f32) {
 /// line, cut short with "…" when it does not fit (the whole link shows on hover). The field
 /// takes keyboard focus before the button; a click or double-click on it selects it whole,
 /// and Ctrl+C while it has focus copies the whole link, never only the part that shows. The
-/// button closes the row on the right: the accent with a copy icon and `copy_label`, or while
-/// `copied` the success green with a tick and [`COPIED_LABEL`]. It is as wide for both, so
+/// button closes the row on the right: primary with a copy icon and `copy_label`, or while
+/// `copied` the success tint and text with a tick and [`COPIED_LABEL`]. It is as wide for both, so
 /// nothing moves. The button's response.
 pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -> egui::Response {
     let visuals = ui.visuals().clone();
     let font = egui::FontId::proportional(BUTTON_TEXT);
-    let text_width = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x;
+    let text_width = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), theme::TEXT).size().x;
     let button_width = text_width(ui, copy_label).max(text_width(ui, COPIED_LABEL)) + ICON_SIZE + ICON_GAP + 2.0 * BUTTON_PADDING_X;
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LINK_ROW_HEIGHT), Sense::hover());
     let r = visuals.widgets.inactive.corner_radius.nw.saturating_add(2);
@@ -972,14 +963,12 @@ pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -
 
     // After the field: keyboard focus goes link, then this button, then the action row.
     let response = ui.interact(button, ui.make_persistent_id("link-row-copy"), Sense::click());
-    let (base, fg, icon, label) = if copied { (SUCCESS, ON_SUCCESS, Icon::Check, COPIED_LABEL) } else { (PRIMARY, Color32::WHITE, Icon::Copy, copy_label) };
-    let fill = if response.is_pointer_button_down_on() {
-        base.lerp_to_gamma(Color32::BLACK, 0.12)
-    } else if response.hovered() {
-        base.lerp_to_gamma(Color32::WHITE, 0.12)
+    let (base, hover, fg, icon, label) = if copied {
+        (theme::SUCCESS_TINT, theme::SUCCESS_TINT.lerp_to_gamma(theme::SUCCESS_BORDER, 0.25), theme::SUCCESS_TEXT, Icon::Check, COPIED_LABEL)
     } else {
-        base
+        (theme::PRIMARY, theme::PRIMARY_HOVER, theme::ON_PRIMARY, Icon::Copy, copy_label)
     };
+    let fill = if response.is_pointer_button_down_on() || response.hovered() { hover } else { base };
     let right = CornerRadius { nw: 0, sw: 0, ne: r, se: r };
     ui.painter().rect_filled(button, right, fill);
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, fg);
@@ -1015,7 +1004,7 @@ pub fn action_row(ui: &mut egui::Ui, buttons: &[ActionButton]) -> Vec<egui::Resp
         .map(|(i, b)| {
             let rect = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * (each + BUTTON_GAP), row.top()), vec2(each, BUTTON_HEIGHT));
             let text = RichText::new(b.label).size(BUTTON_TEXT);
-            let button = if b.accent { egui::Button::new(text.strong()).fill(PRIMARY) } else { egui::Button::new(text) };
+            let button = if b.accent { egui::Button::new(theme::strong(text.color(theme::ON_PRIMARY))).fill(theme::PRIMARY) } else { egui::Button::new(text) };
             ui.put(rect, button.min_size(rect.size()))
         })
         .collect()

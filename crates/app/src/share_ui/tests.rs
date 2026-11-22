@@ -363,7 +363,7 @@ fn a_whole_share_through_the_window_ends_with_the_link_copied() {
 
 #[test]
 fn every_stage_draws_and_escape_and_enter_stand_for_its_buttons() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
     let refused = Stage::Refused(ShareError::Full { needed: 1, left: 0, allowance: 1 }.refusal(Kind::Image).unwrap());
     let online = Stage::Online { link: Some("https://img.example.com/i/a".into()), copied: true };
@@ -728,7 +728,7 @@ pub(crate) fn near(a: f32, b: f32) -> bool {
 #[test]
 fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below() {
     for (kind, form) in every_kind() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let (mut d, now) = clocked(form);
         d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
         let out = draw(&ctx, &mut d);
@@ -752,8 +752,8 @@ fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below(
         assert!(near(open.left(), window.left()) && near(done.right(), window.right()), "{open:?} {done:?} {window:?}");
         assert!(near(open.top() - copy.bottom(), 20.0), "{open:?} {copy:?}");
         // Neither action has the accent: it belongs to Copy link.
-        assert!(fills_on(&out, copy).contains(&PRIMARY));
-        assert!(!fills_on(&out, open).contains(&PRIMARY) && !fills_on(&out, done).contains(&PRIMARY));
+        assert!(fills_on(&out, copy).contains(&theme::PRIMARY));
+        assert!(!fills_on(&out, open).contains(&theme::PRIMARY) && !fills_on(&out, done).contains(&theme::PRIMARY));
 
         // After a press: "Copied" in the success colour, on a button just as wide, and a repaint for when it goes.
         let (log, copy_works) = copier(true);
@@ -762,7 +762,7 @@ fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below(
         let out = draw(&ctx, &mut d);
         let copied = button_rect(&out, "Copied");
         assert_eq!(copied, copy, "the row does not move when the label changes");
-        assert!(fills_on(&out, copied).contains(&SUCCESS));
+        assert!(fills_on(&out, copied).contains(&theme::SUCCESS_TINT));
         assert!(text_rect(&out, "Copy link").is_none());
         let delay = out.viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay;
         assert!(delay <= Duration::from_millis(500), "a repaint for when Copied goes: {delay:?}");
@@ -774,7 +774,7 @@ fn the_link_and_copy_link_share_one_row_and_the_two_actions_split_the_row_below(
 
 #[test]
 fn a_very_long_link_is_cut_short_and_never_widens_the_window() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let mut d = image_form();
     d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
     let short = draw(&ctx, &mut d);
@@ -790,7 +790,7 @@ fn a_very_long_link_is_cut_short_and_never_widens_the_window() {
 
 #[test]
 fn every_other_stage_draws_at_the_same_width_with_buttons_as_high() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let mut d = image_form();
     d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
     let width = window_rect(&ctx, &draw(&ctx, &mut d)).width();
@@ -891,7 +891,7 @@ fn click_share(ctx: &egui::Context, d: &mut ShareDialog, at: egui::Pos2, copy: &
 #[test]
 fn a_click_on_copy_link_copies_and_the_very_next_frame_says_copied() {
     for works in [true, false] {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let (mut d, _now) = clocked(image_form());
         d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
         let copy_at = button_rect(&draw(&ctx, &mut d), "Copy link").center();
@@ -913,7 +913,7 @@ fn a_click_on_copy_link_copies_and_the_very_next_frame_says_copied() {
 
 #[test]
 fn clicks_on_open_in_browser_and_done_reach_the_editor() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let mut d = clip_form(MediaType::Mp4);
     d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
     let out = draw(&ctx, &mut d);
@@ -928,7 +928,7 @@ fn clicks_on_open_in_browser_and_done_reach_the_editor() {
 
 #[test]
 fn once_copied_has_gone_the_window_asks_for_no_more_frames() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let (mut d, now) = clocked(image_form());
     d.stage = Stage::Online { link: Some(LINK.into()), copied: false };
     let (log, copier_fn) = copier(true);
@@ -946,7 +946,7 @@ fn once_copied_has_gone_the_window_asks_for_no_more_frames() {
 
 #[test]
 fn tab_goes_from_the_link_field_to_copy_link_to_open_in_browser_to_done() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let mut d = image_form();
     d.stage = Stage::Online { link: Some(LINK.into()), copied: true };
     let out = draw(&ctx, &mut d);
@@ -964,7 +964,7 @@ fn tab_goes_from_the_link_field_to_copy_link_to_open_in_browser_to_done() {
 
 #[test]
 fn ctrl_c_on_the_focused_link_field_copies_the_whole_link_never_the_part_that_shows() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let long_link = format!("https://img.example.com/i/{}", "abcdefghij".repeat(200));
     let mut d = image_form();
     d.stage = Stage::Online { link: Some(long_link.clone()), copied: false };
@@ -998,7 +998,7 @@ fn ctrl_c_on_the_focused_link_field_copies_the_whole_link_never_the_part_that_sh
     // Reached by keyboard only, the same.
     let mut d = image_form();
     d.stage = Stage::Online { link: Some(long_link.clone()), copied: false };
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     draw(&ctx, &mut d);
     frame_with(&ctx, vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)], 0.05, &mut |c| {
         d.show(c, &mut |_| false);
@@ -1011,7 +1011,7 @@ fn ctrl_c_on_the_focused_link_field_copies_the_whole_link_never_the_part_that_sh
 
 #[test]
 fn the_frame_that_sees_the_upload_end_draws_the_link_at_once() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let (mut d, _now) = clocked(image_form());
     let (job, tx) = held_job(Kind::Image, Ok(Shared { id: "x".into(), link: Some(LINK.into()), access: None }));
     let waiter = job.waiter();
@@ -1195,7 +1195,7 @@ fn no_print_status_or_log_of_the_window_holds_an_address() {
 
 #[test]
 fn enter_in_the_address_field_is_a_new_line_not_publish() {
-    let ctx = egui::Context::default();
+    let ctx = crate::theme::test_context();
     let mut d = image_form();
     d.set_site_version(Some("0.1.51"));
     d.who.choose(who::Choice::People);
