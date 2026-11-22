@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.22 (2026-11-22)
+
+- A tour step's pulse can be moved: in Tour settings, under This step, "Pulse" offers "Where I clicked" or "A spot I pick". With a spot picked, drag the pulse on the picture, or click where it should go; "Put it back where I clicked" returns it to the recorded click, which is never lost. Each drag is one undo step.
+- A moved pulse is used everywhere the step's click was: the pulse in the Tour view, the preview, the exported or published tour, a guide card that points at the hotspot, the zoom, and the spot a viewer clicks to go on. It is saved with the recording for later editing. If a crop leaves the spot outside the picture, the step uses the recorded click again until the crop takes it back in.
+- Publishing again from an editor that has already published or uploaded a draft now offers "Replace this chapter" first, so a fix replaces the chapter over the same link instead of adding a duplicate. The dialog of an editor opened through Edit offers the same three choices: "Replace this chapter", "Add as a new chapter to" (with your tours, the editor's own picked) and "New tour".
+- When the chapter cannot be replaced (the site is too old, the tour is gone, the site is still being asked, or the recording belongs to another site address), the dialog says why as before, and a new chapter or a new tour can still be chosen.
+
 ## 0.2.21 (2026-11-22)
 
 - A likely fix for the countdown before a recording, which stopped appearing in 0.2.20: the red recording frame is now asked to draw at every tick of the countdown, and every window that is shown once in place (the frame, the notification, the "Send capture to" menu, the live-draw layer) is asked to draw as it is shown. The cause is not confirmed yet.
