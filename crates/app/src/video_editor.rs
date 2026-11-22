@@ -2452,6 +2452,30 @@ mod tests {
         assert!(ed.site_dialog_open());
     }
 
+    /// Filled in pixel by pixel at 125% scaling, the video editor lets nothing behind its window
+    /// show: with its timeline, and in the Tour view with the Tour settings panel open.
+    #[test]
+    fn the_video_editor_its_timeline_and_tour_settings_are_opaque_pixel_by_pixel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let s = Settings::default();
+            Editor::new_video(recorded(&tmp.path().join(name)), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+        };
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = make("timeline");
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with its timeline");
+        let mut ed = make("tour");
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let ctx = crate::theme::test_context();
+        assert_eq!(crate::snapshot::uncovered(&ctx, size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with Tour settings open");
+        // And the panel was there to be checked: 304 points wide (a point of it the separator), on surface.
+        let mut out = ctx.run_ui(crate::editor_ui::dialog_checks::input(vec![]), |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        let fills = crate::theme::checks::fills(&out);
+        assert!(fills.iter().any(|(r, c, _)| *c == crate::theme::SURFACE && (r.width() - 304.0).abs() <= 2.0), "the Tour settings panel was drawn: {:?}", fills.iter().filter(|(r, ..)| r.width() > 200.0).collect::<Vec<_>>());
+    }
+
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {
         let s = Settings::default();
         Editor::open_project(store.load(key).unwrap(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()

@@ -2544,18 +2544,18 @@ mod tests {
         let make = || Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
         let size = dialog_checks::WINDOW.size();
         let mut ed = make();
-        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
-        assert_eq!(crate::snapshot::save(&image, "editor"), 0, "the editor: nothing behind the window shows");
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+        assert_eq!(crate::snapshot::save(&shot, "editor"), 0, "the editor: nothing behind the window shows");
         // The dialog's form drawn over the editor in the same frame. Through the editor it would
         // first look for a saved token on this computer; here it is shown as it is once one is found.
         let mut ed = make();
         let details = crate::share_ui::image_details(960, 600, crate::publish::share::MediaType::Png, 412_000);
         let mut share = crate::share_ui::ShareDialog::new(crate::publish::share::Kind::Image, "https://tours.example.com".into(), "Loot window", details, false, None, None);
-        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| {
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| {
             ed.ui(ui);
             share.show(ui.ctx(), &mut |_| false);
         });
-        assert_eq!(crate::snapshot::save(&image, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
+        assert_eq!(crate::snapshot::save(&shot, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
     }
 
     /// Every dialog is made by the one helper that leaves the window undimmed.

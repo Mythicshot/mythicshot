@@ -365,10 +365,15 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
 
 /// The window's contents: the menu on the left, the selected page beside it.
 pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
+    window_ui_with(ui, s, &tours_ui::Conn::current());
+}
+
+/// [`window_ui`] with the Tours page's site connection given: tests draw the window this way.
+fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn) {
     theme::window_background(ui);
     let mut out = PageOut::default();
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
-    egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, &mut out));
+    egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, tours_conn, &mut out));
     s.take(out);
 }
 
@@ -400,10 +405,10 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
 }
 
 /// Draw the selected page. Each page gets the part of [`Shared`] it owns and a [`PageOut`].
-fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
+fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: &mut PageOut) {
     match s.nav.page() {
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
-        Page::Tours => tours_ui::ui(ui, &mut s.tours, &tours_ui::Conn::current(), out),
+        Page::Tours => tours_ui::ui(ui, &mut s.tours, tours_conn, out),
         Page::Workspace => {
             // The site address is a setting like any other: the app saves it on its next frame.
             if workspace_ui::ui(ui, &mut s.workspace, &mut s.prefs.settings.publish_server, &workspace_ui::Conn::current()) {
@@ -867,18 +872,16 @@ pub(crate) mod tests {
             if let Some(tab) = tab {
                 s.prefs.state.tab = tab;
             }
-            let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| window_ui(ui, &mut s));
-            assert_eq!(crate::snapshot::save(&image, name), 0, "{name}: nothing behind the window shows");
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| window_ui(ui, &mut s));
+            assert_eq!(crate::snapshot::save(&shot, name), 0, "{name}: nothing behind the window shows");
         }
-        // The Tours page with its rows, beside the menu as the window draws it.
-        let mut tours = crate::tours_ui::tests::page_with(Vec::new());
+        // The Tours page with its rows, drawn the way the window draws it, with a site connection given.
+        let mut s = shared(tmp.path());
+        s.tours = crate::tours_ui::tests::page_with(Vec::new());
+        s.nav.request(Page::Tours);
         let conn = crate::tours_ui::tests::conn(TokenStatus::Saved);
-        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| {
-            let mut out = PageOut::default();
-            egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, Page::Tours, &mut out));
-            egui::CentralPanel::default().show(ui, |ui| tours_ui::ui(ui, &mut tours, &conn, &mut out));
-        });
-        assert_eq!(crate::snapshot::save(&image, "main-tours"), 0, "the Tours page: nothing behind the window shows");
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| window_ui_with(ui, &mut s, &conn));
+        assert_eq!(crate::snapshot::save(&shot, "main-tours"), 0, "the Tours page: nothing behind the window shows");
     }
 
     /// Every piece of text one frame of the window draws.

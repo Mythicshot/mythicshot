@@ -144,28 +144,8 @@ impl Painter {
 }
 
 /// Draw `frames` frames of `ui` in a window `size` points big, a second apart (so anything that
-/// fades in has), at `ppp` pixels per point, and return a picture of the last one.
-pub fn picture(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, mut ui: impl FnMut(&mut egui::Ui)) -> RgbaImage {
-    ctx.set_pixels_per_point(ppp);
-    let mut painter = Painter::default();
-    let mut last = None;
-    for _ in 0..frames.max(1) {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            time: Some(ctx.input(|i| i.time) + 1.0),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(input, &mut ui);
-        painter.update(&mut out.textures_delta);
-        last = Some(out.shapes);
-    }
-    painter.paint(ctx, last.unwrap_or_default(), size, ppp)
-}
-
-/// How many pixels of the last of `frames` frames of `ui` let what is behind the window show,
-/// even a little: the frame is filled in twice, over magenta and over green, and every pixel that
-/// comes out different was not covered by something opaque.
-pub fn uncovered(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, mut ui: impl FnMut(&mut egui::Ui)) -> usize {
+/// fades in has), at `ppp` pixels per point: the textures of all of them and the shapes of the last.
+fn last_frame(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, mut ui: impl FnMut(&mut egui::Ui)) -> (Painter, Vec<epaint::ClippedShape>) {
     ctx.set_pixels_per_point(ppp);
     let mut painter = Painter::default();
     let mut last = None;
@@ -175,21 +155,49 @@ pub fn uncovered(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize,
         painter.update(&mut out.textures_delta);
         last = Some(out.shapes);
     }
-    let shapes = last.unwrap_or_default();
-    let a = painter.paint_over(ctx, shapes.clone(), size, ppp, SEE_THROUGH);
-    let b = painter.paint_over(ctx, shapes, size, ppp, [0, 255, 0, 255]);
-    a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count()
+    (painter, last.unwrap_or_default())
 }
 
-/// Save `image` as `<folder>/<name>.png` when a folder was asked for; how many of its pixels
-/// show what is behind the window.
-pub fn save(image: &RgbaImage, name: &str) -> usize {
-    let see_through = image.pixels().filter(|p| p.0 == SEE_THROUGH).count();
+/// A picture of the last of `frames` frames of `ui` (see [`last_frame`]), over magenta.
+pub fn picture(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> RgbaImage {
+    let (painter, shapes) = last_frame(ctx, size, ppp, frames, ui);
+    painter.paint(ctx, shapes, size, ppp)
+}
+
+/// A picture of a window, and how many of its pixels let what is behind the window show.
+pub struct Shot {
+    pub image: RgbaImage,
+    /// Pixels that come out different over magenta and over green: not covered by something
+    /// opaque, even where they look blended rather than magenta.
+    pub uncovered: usize,
+    /// The first few of those pixels, for a failing test to say where they are.
+    pub uncovered_at: Vec<(u32, u32)>,
+}
+
+/// A [`Shot`] of the last of `frames` frames of `ui`: the frame filled in over magenta (the
+/// picture) and over green, and every pixel that differs counted as uncovered.
+pub fn shot(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> Shot {
+    let (painter, shapes) = last_frame(ctx, size, ppp, frames, ui);
+    let image = painter.paint_over(ctx, shapes.clone(), size, ppp, SEE_THROUGH);
+    let green = painter.paint_over(ctx, shapes, size, ppp, [0, 255, 0, 255]);
+    let differ: Vec<(u32, u32)> = image.enumerate_pixels().zip(green.pixels()).filter(|((_, _, p), q)| p != q).map(|((x, y, _), _)| (x, y)).collect();
+    Shot { image, uncovered: differ.len(), uncovered_at: differ.into_iter().take(12).collect() }
+}
+
+/// How many pixels of the last of `frames` frames of `ui` let what is behind the window show,
+/// even a little (see [`Shot::uncovered`]).
+pub fn uncovered(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> usize {
+    shot(ctx, size, ppp, frames, ui).uncovered
+}
+
+/// Save the shot's picture as `<folder>/<name>.png` when a folder was asked for; how many of its
+/// pixels let what is behind the window show, blended or not.
+pub fn save(shot: &Shot, name: &str) -> usize {
     if let Some(dir) = folder() {
         std::fs::create_dir_all(&dir).unwrap();
-        image.save(dir.join(format!("{name}.png"))).unwrap();
+        shot.image.save(dir.join(format!("{name}.png"))).unwrap();
     }
-    see_through
+    shot.uncovered
 }
 
 #[cfg(test)]
@@ -207,5 +215,24 @@ mod tests {
         let p = crate::theme::PRIMARY;
         assert_eq!(image.get_pixel(20, 15).0, [p.r(), p.g(), p.b(), 255]);
         assert_eq!(image.get_pixel(2, 2).0, SEE_THROUGH, "nothing painted there");
+    }
+
+    /// A see-through fill shows as blended magenta, never as pure magenta: a shot still counts
+    /// every one of its pixels as uncovered.
+    #[test]
+    fn a_shot_counts_blended_see_through_pixels() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(40.0, 30.0);
+        let shot = shot(&ctx, size, 1.0, 2, |ui| {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, crate::theme::GROUND);
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(20.0, 10.0)), 0.0, crate::theme::GROUND);
+        });
+        assert_eq!(save(&shot, "test-opaque"), 0);
+        let see_through = egui::Color32::from_rgba_unmultiplied(0x16, 0x12, 0x1c, 230);
+        let shot = super::shot(&ctx, size, 1.0, 2, |ui| {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, see_through);
+        });
+        assert!(shot.image.pixels().all(|p| p.0 != SEE_THROUGH), "no pixel is pure magenta");
+        assert!(shot.uncovered >= 40 * 30 - 8, "yet (but for the feathered corners) every pixel lets the desktop through: {}", shot.uncovered);
     }
 }

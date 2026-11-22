@@ -550,20 +550,27 @@ pub mod checks {
     }
 
     /// A window's background: at every point of a 16-point grid over `window`, the first fill
-    /// painted there is fully opaque, so nothing behind the window shows through; and every card
-    /// or dialog (radius-lg) on it is opaque too.
+    /// painted there is fully opaque, so nothing behind the window shows through. A ground
+    /// painted under the whole window first ([`window_background`]) only covers the seams
+    /// between panels, so the check is made again without it: the window's own panels, cards
+    /// and bars cover every point themselves, opaque. And every card or dialog (radius-lg) on it
+    /// is opaque too.
     pub fn assert_window_opaque(out: &egui::FullOutput, window: Rect, what: &str) {
         let fills = fills(out);
-        let mut y = window.top() + 2.0;
-        while y < window.bottom() {
-            let mut x = window.left() + 2.0;
-            while x < window.right() {
-                let p = egui::pos2(x, y);
-                let first = fills.iter().find(|(r, ..)| r.contains(p));
-                assert!(first.is_some_and(|(_, c, _)| c.a() == 255), "{what}: at {p:?} the first fill is {first:?}");
-                x += 16.0;
+        let under_all = fills.first().filter(|(r, ..)| r.contains_rect(window)).is_some();
+        let panels = &fills[usize::from(under_all)..];
+        for (layer, fills) in [("the window", &fills[..]), ("its panels", panels)] {
+            let mut y = window.top() + 2.0;
+            while y < window.bottom() {
+                let mut x = window.left() + 2.0;
+                while x < window.right() {
+                    let p = egui::pos2(x, y);
+                    let first = fills.iter().find(|(r, ..)| r.contains(p));
+                    assert!(first.is_some_and(|(_, c, _)| c.a() == 255), "{what}, {layer}: at {p:?} the first fill is {first:?}");
+                    x += 16.0;
+                }
+                y += 16.0;
             }
-            y += 16.0;
         }
         for (r, c, radius) in &fills {
             if *radius >= RADIUS_LG && r.area() >= 4000.0 {
@@ -865,6 +872,20 @@ pub(crate) mod tests {
         assert!(bare.is_empty(), "cautions without their icon:
 {}", bare.join("
 "));
+    }
+
+    /// The ground under the whole window alone does not pass for a window's panels.
+    #[test]
+    #[should_panic(expected = "its panels")]
+    fn the_ground_under_a_window_alone_does_not_make_it_opaque() {
+        let ctx = test_context();
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), ..Default::default() }, |ui| {
+            window_background(ui);
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)), 0.0, SURFACE);
+        });
+        out.textures_delta.clear();
+        checks::assert_window_opaque(&out, window, "half a window");
     }
 
     #[test]
