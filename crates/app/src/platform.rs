@@ -210,6 +210,34 @@ pub fn set_cloaked(hwnd: WindowId, cloaked: bool) -> bool {
     unsafe { DwmSetWindowAttribute(HWND(hwnd as *mut _), DWMWA_CLOAK, &value as *const _ as *const _, std::mem::size_of_val(&value) as u32).is_ok() }
 }
 
+/// What Windows says about how a window is composited, for `capture.log`: its extended style,
+/// whether it is a layered window and if so whether its layered attributes were ever set (a
+/// layered window without them is not drawn on screen), and whether it is cloaked.
+#[cfg(windows)]
+pub fn composition_note(hwnd: WindowId) -> String {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetLayeredWindowAttributes, GetWindowLongPtrW, WS_EX_LAYERED};
+    let h = HWND(hwnd as *mut _);
+    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
+    let layered = if ex & WS_EX_LAYERED.0 == 0 {
+        "not layered"
+    } else if unsafe { GetLayeredWindowAttributes(h, None, None, None) }.is_ok() {
+        "layered, attributes set"
+    } else {
+        "layered, attributes NOT set"
+    };
+    let mut cloaked = 0u32;
+    let read = unsafe { DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, std::mem::size_of_val(&cloaked) as u32) }.is_ok();
+    let cloak = if read { cloaked.to_string() } else { "?".to_string() };
+    format!("exstyle {ex:#x} · {layered} · cloaked {cloak}")
+}
+
+#[cfg(not(windows))]
+pub fn composition_note(_hwnd: WindowId) -> String {
+    String::new()
+}
+
 /// One of this process's hidden top-level windows with this exact title: a window egui has just
 /// created hidden, to be placed before it is shown.
 #[cfg(windows)]

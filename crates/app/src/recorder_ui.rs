@@ -156,7 +156,11 @@ impl Session {
                 if let Ok(f) = self.frame.lock() {
                     let d = f.drawn;
                     let first_ms = d.first.map(|t| t.saturating_duration_since(self.began).as_millis());
-                    crate::capture_log::append(&[countdown_line(&crate::capture_log::now(), self.countdown_secs, d.times, first_ms, d.last)]);
+                    let mut line = countdown_line(&crate::capture_log::now(), self.countdown_secs, d.times, first_ms, d.last);
+                    if let Some(h) = platform::find_window(FRAME_TITLE) {
+                        line = format!("{line} · frame window: {}", platform::composition_note(h));
+                    }
+                    crate::capture_log::append(&[line]);
                 }
                 self.go_live()?;
             }
@@ -222,6 +226,8 @@ impl Session {
             f.paused = matches!(&self.phase, Phase::Live(r) if r.is_paused());
         }
         // Created hidden, put on its pixels around the area, then shown (see `Placer`).
+        // Click-through only once shown: that style makes the window a layered one, and a
+        // window made layered while hidden stayed blank on screen (no frame, no countdown).
         let builder = egui::ViewportBuilder::default()
             .with_title(FRAME_TITLE)
             .with_position(self.frame_guess.0)
@@ -229,7 +235,7 @@ impl Session {
             .with_visible(false)
             .with_decorations(false)
             .with_transparent(true)
-            .with_mouse_passthrough(true)
+            .with_mouse_passthrough(self.frame_placer.shown())
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
