@@ -1644,14 +1644,14 @@ impl Editor {
                 ui.spacing_mut().item_spacing.x = GAP;
                 let row = 3.0 * BUTTON.x + 2.0 * GAP;
                 ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
-                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON);
+                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y));
                 if ui.add(primary).clicked() {
                     choice = Some(0);
                 }
-                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(1);
                 }
-                if ui.add(egui::Button::new("Cancel").min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new("Cancel").min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(2);
                 }
             });

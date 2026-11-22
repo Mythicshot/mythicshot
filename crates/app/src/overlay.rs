@@ -204,6 +204,6 @@ impl Overlay {
 fn label(painter: &egui::Painter, at: Pos2, align: Align2, text: &str) {
     let galley = painter.layout_no_wrap(text.to_string(), FontId::proportional(13.0), theme::TEXT);
     let rect = align.anchor_size(at, galley.size()).expand2(vec2(8.0, 4.0));
-    painter.rect_filled(rect, f32::from(theme::RADIUS_MD), theme::RAISED);
+    painter.rect_filled(rect, f32::from(theme::control_radius(rect.height())), theme::RAISED);
     painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT);
 }

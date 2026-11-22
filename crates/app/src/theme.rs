@@ -193,10 +193,19 @@ const MANROPE: &[u8] = include_bytes!("../../../assets/fonts/manrope/Manrope[wgh
 
 // Shape and space.
 
-/// radius-sm: menu rows.
+// Corners. A button is never a pill: a control's corner radius is at most a quarter of its
+// height. egui's own controls and fields are dense (about 21 points high), so they take
+// radius-sm; radius-md is for controls at least 36 points high (the 44-point buttons of the
+// share, publish and sign-in windows, the link row, the close question's buttons, big icon
+// buttons) and for caution and notice boxes; [`control_radius`] picks between them. Chips and
+// badges are fully rounded, so a badge never looks like a button.
+
+/// radius-sm: egui's dense controls and fields, menu rows, small icon buttons.
 pub const RADIUS_SM: u8 = 4;
-/// radius-md: buttons, fields, icon buttons, caution and notice boxes.
+/// radius-md: controls 36 points high or more, caution and notice boxes.
 pub const RADIUS_MD: u8 = 8;
+/// Chips and badges: fully rounded (egui caps a radius at half the height).
+pub const RADIUS_FULL: u8 = u8::MAX;
 /// radius-lg: cards, dialogs, popovers.
 pub const RADIUS_LG: u8 = 12;
 pub const SPACE_1: f32 = 4.0;
@@ -208,6 +217,11 @@ pub const SPACE_8: f32 = 32.0;
 pub const SPACE_12: f32 = 48.0;
 /// The focus ring's width.
 pub const FOCUS_WIDTH: f32 = 2.0;
+
+/// The corner radius of a control `height` points high: radius-md from 36 points up, radius-sm below.
+pub fn control_radius(height: f32) -> u8 {
+    if height >= 36.0 { RADIUS_MD } else { RADIUS_SM }
+}
 
 /// Fix the app to the dark theme, with the brand's look and fonts. Called once, at start-up.
 pub fn apply(ctx: &egui::Context) {
@@ -269,7 +283,8 @@ impl Strong for RichText {
 /// egui's look from a palette.
 pub fn visuals(p: &Palette) -> Visuals {
     let mut v = Visuals::dark();
-    let md = CornerRadius::same(RADIUS_MD);
+    // egui's controls are dense: radius-sm (see the rule above `RADIUS_SM`).
+    let md = CornerRadius::same(RADIUS_SM);
     let w = &mut v.widgets;
     // Labels, separators and frames that take no input.
     w.noninteractive.bg_fill = p.surface;
@@ -709,6 +724,34 @@ pub(crate) mod tests {
             }
         }
         assert!(failed.is_empty(), "lost on the picture: {failed:?}");
+    }
+
+    /// A button is never a pill: egui's buttons, fields and dropdowns have a corner radius of at
+    /// most a quarter of their height, and so do the tall buttons of the share window, at
+    /// radius-md. (A checkbox's 14-point box keeps radius-sm: a rounded square, not a pill.)
+    #[test]
+    fn a_button_is_never_a_pill() {
+        let ctx = test_context();
+        let mut text = String::from("Name");
+        let mut out = None;
+        for _ in 0..2 {
+            let o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.button("Save");
+                ui.text_edit_singleline(&mut text);
+                egui::ComboBox::from_id_salt("pick").selected_text("PNG").show_ui(ui, |_| {});
+                ui.allocate_ui(egui::vec2(520.0, 60.0), |ui| crate::share_ui::action_row(ui, &[crate::share_ui::ActionButton { label: "Done", accent: false }]));
+            });
+            out = Some(o);
+            out.as_mut().unwrap().textures_delta.clear();
+        }
+        let out = out.unwrap();
+        let controls: Vec<_> = checks::fills(&out).into_iter().filter(|(r, ..)| r.height() >= 10.0 && r.width() >= 10.0).collect();
+        assert!(controls.len() >= 4, "{controls:?}");
+        for (r, c, radius) in &controls {
+            assert!(f32::from(*radius) <= r.height() / 4.0, "a control {r:?} filled {c:?} has radius {radius}");
+        }
+        assert!(controls.iter().any(|(r, _, radius)| (r.height() - crate::share_ui::BUTTON_HEIGHT).abs() < 0.5 && *radius == RADIUS_MD), "the tall button keeps radius-md: {controls:?}");
+        assert!(controls.iter().any(|(r, _, radius)| r.height() < 30.0 && *radius == RADIUS_SM), "a dense control takes radius-sm: {controls:?}");
     }
 
     #[test]

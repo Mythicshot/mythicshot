@@ -592,7 +592,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         ui.vertical(|ui| {
             let label = status(&conn.token, checking && conn.token == TokenStatus::Saved, info.as_ref().map(|i| i.workspace.as_str()));
             let (fg, bg) = if is_connected_status(&label) { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
-            egui::Frame::new().fill(bg).corner_radius(egui::CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+            egui::Frame::new().fill(bg).corner_radius(egui::CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
                 ui.label(RichText::new(label).color(fg));
             });
             if refused && conn.token == TokenStatus::Saved {

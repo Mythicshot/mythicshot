@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, StrokeKind, vec2};
+use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Stroke, StrokeKind, vec2};
 
 use crate::theme::{self, Strong as _};
 use crate::editor_ui::Editor;
@@ -847,7 +847,7 @@ impl ShareDialog {
                         let main = i + 1 == view.buttons.len();
                         let text = RichText::new(view.label(*button)).size(BUTTON_TEXT);
                         let b = if main { egui::Button::new(theme::strong(text.color(theme::ON_PRIMARY))).fill(theme::PRIMARY) } else { egui::Button::new(text) };
-                        if ui.add_enabled(view.disabled != Some(*button), b.min_size(vec2(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))).clicked() {
+                        if ui.add_enabled(view.disabled != Some(*button), b.min_size(vec2(BUTTON_MIN_WIDTH, BUTTON_HEIGHT)).corner_radius(theme::control_radius(BUTTON_HEIGHT))).clicked() {
                             pressed = Some(*button);
                         }
                     }
@@ -930,7 +930,7 @@ pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -
     let text_width = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), theme::TEXT).size().x;
     let button_width = text_width(ui, copy_label).max(text_width(ui, COPIED_LABEL)) + ICON_SIZE + ICON_GAP + 2.0 * BUTTON_PADDING_X;
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LINK_ROW_HEIGHT), Sense::hover());
-    let r = visuals.widgets.inactive.corner_radius.nw.saturating_add(2);
+    let r = theme::control_radius(LINK_ROW_HEIGHT);
     let button = egui::Rect::from_min_max(egui::pos2(row.right() - button_width, row.top()), row.max);
     let field = egui::Rect::from_min_max(row.min, egui::pos2(button.left(), row.bottom()));
 
@@ -976,7 +976,7 @@ pub fn link_row(ui: &mut egui::Ui, link: &str, copy_label: &str, copied: bool) -
     let left = button.center().x - content / 2.0;
     icons::paint(ui.painter(), egui::Rect::from_center_size(egui::pos2(left + ICON_SIZE / 2.0, button.center().y), egui::Vec2::splat(ICON_SIZE)), icon, fg);
     ui.painter().galley(egui::pos2(left + ICON_SIZE + ICON_GAP, button.center().y - galley.size().y / 2.0), galley, fg);
-    ui.painter().rect_stroke(row, r, visuals.widgets.noninteractive.bg_stroke, StrokeKind::Inside);
+    ui.painter().rect_stroke(row, r, Stroke::new(1.0, theme::BORDER_STRONG), StrokeKind::Inside);
     if response.has_focus() {
         ui.painter().rect_stroke(button.shrink(2.0), right, visuals.selection.stroke, StrokeKind::Inside);
     }
@@ -1005,7 +1005,7 @@ pub fn action_row(ui: &mut egui::Ui, buttons: &[ActionButton]) -> Vec<egui::Resp
             let rect = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * (each + BUTTON_GAP), row.top()), vec2(each, BUTTON_HEIGHT));
             let text = RichText::new(b.label).size(BUTTON_TEXT);
             let button = if b.accent { egui::Button::new(theme::strong(text.color(theme::ON_PRIMARY))).fill(theme::PRIMARY) } else { egui::Button::new(text) };
-            ui.put(rect, button.min_size(rect.size()))
+            ui.put(rect, button.min_size(rect.size()).corner_radius(theme::control_radius(BUTTON_HEIGHT)))
         })
         .collect()
 }

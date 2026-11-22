@@ -79,7 +79,7 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, selected: bool, tip: &str) -> 
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, f32::from(theme::RADIUS_MD), fill);
+    ui.painter().rect_filled(rect, f32::from(theme::control_radius(size)), fill);
     let color = if !enabled { theme::DISABLED } else if selected { theme::ON_PRIMARY } else { theme::TEXT };
     paint(ui.painter(), rect.shrink(size * 0.22), icon, color);
     resp.on_hover_text(tip)
