@@ -2,6 +2,17 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.19 (2026-11-21)
+
+- A new look: deep violet backgrounds, purple main buttons with white labels and gold for links, focus and selected items. Mythicshot is always dark now, whatever Windows is set to.
+- Text is set in Manrope, built into the program; links and shortcuts keep their monospace face. The font's licence is installed beside LICENSE.txt.
+- Warnings are orange boxes with a warning sign and an edge; deleting and errors are red, done and connected are teal, and each still says what it means in words.
+- Buttons and fields have softer corners, cards, dialogs, menus and the small "Send capture to" and saved-capture windows rounder ones with a thin edge.
+- Section names in Preferences and the editor's tool groups are no longer in capitals ("After capture", "Shapes").
+- The keyboard focus is a gold ring.
+- New icon for the program, the taskbar, the notification area and Apps in Windows Settings, and new pictures in the installer.
+- The thin line where the main window's menu meets the page, and where the editor's bars meet, no longer lets the desktop show through.
+
 ## 0.2.18 (2026-11-21)
 
 - "Publish image" and "Publish recording" ask who can view: "Anyone with the link" (as before, and always the first choice), "Only people I choose" (email addresses, one per line; each person gets a one-time link by email) or "Only me". The choice is made when something is shared, and is not remembered for the next time.
