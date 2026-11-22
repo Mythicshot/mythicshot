@@ -151,6 +151,129 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
 /// A native window handle as a plain number, so it can cross threads.
 pub type WindowId = isize;
 
+/// A window's outer and client rectangles in desktop pixels.
+#[cfg(windows)]
+pub fn window_rects(hwnd: WindowId) -> Option<(mythicshot_capture::PxRect, mythicshot_capture::PxRect)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowInfo, WINDOWINFO};
+    let mut info = WINDOWINFO { cbSize: std::mem::size_of::<WINDOWINFO>() as u32, ..Default::default() };
+    unsafe { GetWindowInfo(HWND(hwnd as *mut _), &mut info).ok()? };
+    let px = |r: RECT| mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32);
+    Some((px(info.rcWindow), px(info.rcClient)))
+}
+
+/// The DPI Windows has given a window (96 is 100%).
+#[cfg(windows)]
+pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    let dpi = unsafe { GetDpiForWindow(HWND(hwnd as *mut _)) };
+    (dpi != 0).then_some(dpi)
+}
+
+/// Move and size a window to an outer rectangle in desktop pixels, without showing it,
+/// activating it or changing its place in the stack.
+#[cfg(windows)]
+pub fn place_window(hwnd: WindowId, outer: mythicshot_capture::PxRect) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos};
+    unsafe { SetWindowPos(HWND(hwnd as *mut _), None, outer.x, outer.y, outer.w as i32, outer.h as i32, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER).is_ok() }
+}
+
+#[cfg(windows)]
+pub fn is_window_visible(hwnd: WindowId) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+}
+
+/// Bring one of our windows to the front with a plain request, without the synthetic Alt key
+/// press winit's focus request sends. False when Windows did not allow it.
+#[cfg(windows)]
+pub fn take_foreground(hwnd: WindowId) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let _ = SetForegroundWindow(h);
+        GetForegroundWindow() == h
+    }
+}
+
+/// Cloak or uncloak a window: a cloaked window is shown but never composited, so it can be
+/// shown and painted once at its final size before anyone sees it.
+#[cfg(windows)]
+pub fn set_cloaked(hwnd: WindowId, cloaked: bool) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    let value = windows::core::BOOL::from(cloaked);
+    unsafe { DwmSetWindowAttribute(HWND(hwnd as *mut _), DWMWA_CLOAK, &value as *const _ as *const _, std::mem::size_of_val(&value) as u32).is_ok() }
+}
+
+/// One of this process's hidden top-level windows with this exact title: a window egui has just
+/// created hidden, to be placed before it is shown.
+#[cfg(windows)]
+pub fn find_own_hidden_window(title: &str) -> Option<WindowId> {
+    find_own(title, true)
+}
+
+/// This process's first top-level window with this exact title, hidden ones only if asked.
+#[cfg(windows)]
+fn find_own(title: &str, hidden_only: bool) -> Option<WindowId> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut after: Option<HWND> = None;
+    // A bound on the windows looked at, in case the list changes while it is walked.
+    for _ in 0..64 {
+        let h = unsafe { FindWindowExW(None, after, PCWSTR::null(), PCWSTR(wide.as_ptr())) }.ok()?;
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if pid == unsafe { GetCurrentProcessId() } && !(hidden_only && unsafe { IsWindowVisible(h) }.as_bool()) {
+            return Some(h.0 as WindowId);
+        }
+        after = Some(h);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn find_own_hidden_window(_title: &str) -> Option<WindowId> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn set_cloaked(_hwnd: WindowId, _cloaked: bool) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn window_rects(_hwnd: WindowId) -> Option<(mythicshot_capture::PxRect, mythicshot_capture::PxRect)> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn window_dpi(_hwnd: WindowId) -> Option<u32> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn place_window(_hwnd: WindowId, _outer: mythicshot_capture::PxRect) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_window_visible(_hwnd: WindowId) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn take_foreground(_hwnd: WindowId) -> bool {
+    false
+}
+
 /// Keep a window out of every screen capture, ours and other apps' (OBS
 /// included), so the recording controls never appear in a recording.
 #[cfg(windows)]
@@ -165,13 +288,11 @@ pub fn exclude_from_capture(hwnd: WindowId) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
 
-/// Find one of our windows by its exact title.
+/// Find one of our windows by its exact title: only this process's, never another program's
+/// window that happens to have the same title.
 #[cfg(windows)]
 pub fn find_window(title: &str) -> Option<WindowId> {
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    use windows::core::PCWSTR;
-    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())).ok().map(|h| h.0 as WindowId) }
+    find_own(title, false)
 }
 
 #[cfg(windows)]

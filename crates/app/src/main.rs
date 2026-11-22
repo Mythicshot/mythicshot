@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod capture_log;
+mod capture_window;
 mod editor_ui;
 mod home_ui;
 mod hotkeys;
@@ -18,6 +20,7 @@ mod input;
 mod live_draw;
 mod main_window;
 mod overlay;
+mod placement;
 mod password;
 mod platform;
 mod popups;
@@ -50,7 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, ViewportBuilder, ViewportCommand, pos2, vec2};
+use eframe::egui::{self, ViewportBuilder, ViewportCommand};
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use mythicshot_capture::{PxRect, grab_desktop};
 use mythicshot_destinations::{self as dest, DestId, Sent};
@@ -156,6 +159,14 @@ struct App {
     rx: Receiver<AppEvent>,
     tx: Sender<AppEvent>,
     overlay: Option<Overlay>,
+    /// Placing and showing the overlay's window for the capture on screen.
+    presenting: Option<capture_window::Presenting>,
+    /// Keeping the hidden root window over the desktop between captures.
+    parking: capture_window::Parking,
+    /// Showing the root window as the recording bar, until it is on screen.
+    bar_showing: Option<capture_window::BarShowing>,
+    /// What started the command being run, for the capture log.
+    trigger: &'static str,
     /// The main window's state, shared with its viewport.
     window: Arc<std::sync::Mutex<main_window::Shared>>,
     /// The page the main window was asked to open on, until its next frame.
@@ -187,6 +198,8 @@ struct App {
     encoding: Vec<recorder_ui::EncodeJob>,
     /// The root window is kept out of screen capture once its handle is known.
     root_hidden_from_capture: bool,
+    /// The root window's native handle, from the frame being drawn.
+    root: Option<platform::WindowId>,
     /// When to give focus back to the app being recorded.
     refocus_at: Option<Instant>,
     hidden_at_start: bool,
@@ -283,6 +296,10 @@ impl App {
             rx,
             tx,
             overlay: None,
+            presenting: None,
+            parking: capture_window::Parking::start(),
+            bar_showing: None,
+            trigger: "other",
             window,
             window_request: main_window::start_request(std::env::args()),
             last_foreground: main_window::LastForeground::default(),
@@ -303,6 +320,7 @@ impl App {
             save_retry,
             encoding: Vec::new(),
             root_hidden_from_capture: false,
+            root: None,
             refocus_at: None,
             hidden_at_start: false,
             started: Instant::now(),
@@ -351,15 +369,18 @@ impl App {
                         }
                         continue;
                     }
+                    self.trigger = if matches!(ev, AppEvent::Taken(_)) { "hotkey (hook)" } else { "hotkey" };
                     self.run(ctx, Command::from_action(action));
                 }
                 AppEvent::Menu(id) => {
                     if let Some(cmd) = self.tray.command(&id) {
+                        self.trigger = "tray menu";
                         self.run(ctx, cmd);
                     }
                 }
                 AppEvent::TrayClick => {
                     if let Some(cmd) = tray::left_click(self.settings.tray_left_click, self.activity()) {
+                        self.trigger = "tray click";
                         self.run(ctx, cmd);
                     }
                 }
@@ -445,19 +466,22 @@ impl App {
     }
 
     fn start_overlay_mode(&mut self, ctx: &egui::Context, record: bool) {
-        if self.session.is_some() {
+        // One selector at a time: a second (from the tray menu, say) would take the first one's
+        // place without ending it.
+        if self.session.is_some() || self.overlay.is_some() {
             return;
         }
+        let started = Instant::now();
         let desktop = match grab_desktop() {
             Ok(d) => d,
             Err(e) => return self.notify(format!("Capture failed: {e}")),
         };
-        let ppp = ctx.pixels_per_point();
-        let b = desktop.bounds;
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(b.x as f32 / ppp, b.y as f32 / ppp)));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(b.w as f32 / ppp, b.h as f32 / ppp)));
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        // The window is placed in pixels and shown once it is right, frame by frame: see `capture_window`.
+        let target = overlay::geometry::window_rect(desktop.bounds, 0);
+        let mut lines = vec![capture_log::header(&capture_log::now(), std::mem::replace(&mut self.trigger, "other"), record)];
+        lines.extend(desktop.monitors.iter().enumerate().map(|(i, m)| capture_log::monitor_line(i, m)));
+        lines.push(capture_log::request_line(desktop.bounds, ctx.pixels_per_point(), target, self.root.and_then(capture_window::state)));
+        self.presenting = Some(capture_window::Presenting::new(target, started, lines));
         self.overlay = Some(Overlay::new(desktop, self.settings.magnifier, record));
     }
 
@@ -476,6 +500,13 @@ impl App {
     fn finish_overlay(&mut self, ctx: &egui::Context, outcome: Outcome) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         let Some(ov) = self.overlay.take() else { return };
+        if let Some(p) = self.presenting.take() {
+            let finish = match outcome {
+                Outcome::Capture(rect) => capture_log::finish_line("capture", ov.selection_pt, Some(rect), rect.intersect(&ov.desktop.bounds)),
+                _ => capture_log::finish_line("cancel", None, None, None),
+            };
+            p.end(finish);
+        }
         self.settings.magnifier = ov.magnifier;
         if let Outcome::Capture(rect) = outcome {
             self.settings.last_region = Some([rect.x, rect.y, rect.w as i32, rect.h as i32]);
@@ -491,17 +522,16 @@ impl App {
     }
 
     /// Show the red frame and control bar, count down, then record `rect`.
-    fn start_recording(&mut self, ctx: &egui::Context, rect: PxRect, title: String) {
+    fn start_recording(&mut self, _ctx: &egui::Context, rect: PxRect, title: String) {
         if self.session.is_some() {
             return;
         }
         match recorder_ui::Session::new(rect, title, self.settings.countdown_secs, self.settings.record_fps) {
             Ok(s) => {
                 self.rec_events.clear();
-                let ppp = ctx.pixels_per_point();
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(s.bar_position(ppp)));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(recorder_ui::BAR_SIZE[0], recorder_ui::BAR_SIZE[1])));
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                // The bar (the root window) is placed in pixels on the area's monitor, at that
+                // monitor's scale, and shown once drawn there: see `capture_window::BarShowing`.
+                self.bar_showing = Some(capture_window::BarShowing::new(s.bar_rect()));
                 self.refocus_at = Some(Instant::now() + Duration::from_millis(150));
                 self.session = Some(s);
                 self.draw_when_live = false;
@@ -594,6 +624,9 @@ impl App {
     /// it is no longer shown.
     fn end_session(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.bar_showing = None;
+        // The bar moved the root window onto one monitor: back over the desktop once it is hidden.
+        self.parking.request("after recording");
         self.refocus_at = None;
         if let Ok(mut t) = self.tap.lock() {
             *t = None;
@@ -631,6 +664,20 @@ impl App {
 
     /// Each frame while recording: countdown, frame window, errors, focus.
     fn tick_recording(&mut self, ctx: &egui::Context) {
+        match self.bar_showing.as_mut().map(|bar| bar.tick(ctx, self.root)) {
+            Some(capture_window::BarState::Shown) => self.bar_showing = None,
+            Some(capture_window::BarState::Failed) => {
+                // An unseen bar for a whole recording is worse than no recording.
+                self.bar_showing = None;
+                if let Some(s) = self.session.take() {
+                    s.discard();
+                }
+                self.end_session(ctx);
+                self.notify("The recording bar could not be shown, so the recording did not start.".into());
+                return;
+            }
+            Some(capture_window::BarState::Pending) | None => {}
+        }
         // Once recording is live, point the input hook at it.
         if let Some(clock) = self.session.as_ref().and_then(|s| s.clock()) {
             let origin = self.session.as_ref().map(|s| (s.rect.x, s.rect.y)).unwrap_or_default();
@@ -689,9 +736,9 @@ impl App {
     }
 
     /// A new capture: show the picker, or send it to every chosen destination.
-    fn captured(&mut self, ctx: &egui::Context, img: image::RgbaImage, title: String) {
+    fn captured(&mut self, _ctx: &egui::Context, img: image::RgbaImage, title: String) {
         if self.settings.has_destination(DestId::Picker) {
-            self.pickers.push(popups::PickerWindow::new(img, title, ctx.pixels_per_point()));
+            self.pickers.push(popups::PickerWindow::new(img, title));
         } else {
             let list: Vec<DestId> = self.settings.destinations().to_vec();
             self.send_to(img, title, &list);
@@ -1155,6 +1202,7 @@ impl App {
             if tray::pending_may_run(self.activity()) {
                 // "Window" never captures one of our own windows.
                 let front = platform::foreground_window().map(platform::window_kind);
+                self.trigger = "app window";
                 self.run(ctx, main_window::tile_command(cmd, front));
             }
         }
@@ -1211,8 +1259,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.root = root_window(frame);
         if !self.root_hidden_from_capture {
-            self.root_hidden_from_capture = root_window(frame).is_some_and(platform::exclude_from_capture);
+            self.root_hidden_from_capture = self.root.is_some_and(platform::exclude_from_capture);
         }
         if !self.hidden_at_start {
             // eframe shows the root window after its first frame even when it was
@@ -1243,12 +1292,22 @@ impl eframe::App for App {
         }
 
         if let Some(ov) = self.overlay.as_mut() {
-            match ov.ui(ui) {
-                Outcome::Continue => {}
+            let client = self.presenting.as_mut().and_then(|p| p.before_frame(&ctx, self.root));
+            match ov.ui(ui, client) {
+                Outcome::Continue => {
+                    let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
+                    if after == Some(capture_window::After::Abort) {
+                        self.finish_overlay(&ctx, Outcome::Cancel);
+                        self.notify("The region selector could not be shown.".into());
+                    }
+                }
                 outcome => self.finish_overlay(&ctx, outcome),
             }
         } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui, self.settings.record_keys)) {
             self.recording_action(&ctx, action);
+        }
+        if self.overlay.is_none() && self.session.is_none() {
+            self.parking.tick(self.root);
         }
         self.tick_recording(&ctx);
         self.show_editors(&ctx);

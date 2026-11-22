@@ -11,11 +11,14 @@ use image::RgbaImage;
 use mythicshot_destinations::DestId;
 
 use crate::icons::{self, Icon};
+use crate::placement::{self, Focus, Placer, TOAST_SIZE};
 use crate::platform;
 use crate::theme;
 
-const PICKER_SIZE: [f32; 2] = [270.0, 262.0];
-const TOAST_SIZE: [f32; 2] = [380.0, 96.0];
+/// The picker's window title, also how its window is found to be placed.
+const PICKER_TITLE: &str = "Send capture to";
+/// The toast's window title: its own, so it is never taken for the root window ("Mythicshot").
+const TOAST_TITLE: &str = "Mythicshot notification";
 const TOAST_TIME: Duration = Duration::from_secs(5);
 
 /// What the picker resolved to.
@@ -35,35 +38,35 @@ pub struct Picker {
 pub struct PickerWindow {
     id: egui::ViewportId,
     pub state: Arc<Mutex<Picker>>,
-    pos: egui::Pos2,
-    first: bool,
+    /// Puts the window beside the pointer in pixels, then shows it.
+    placer: Placer,
+    /// Its rectangle in points for egui, a first guess the placer corrects.
+    guess: (egui::Pos2, egui::Vec2),
 }
 
 impl PickerWindow {
-    /// A picker for `img`, placed at the mouse pointer (in points) and kept on screen.
-    pub fn new(img: RgbaImage, title: String, ppp: f32) -> Self {
-        let (cx, cy) = platform::cursor_pos().unwrap_or((200, 200));
-        let mon = mythicshot_capture::list_monitors().into_iter().find(|m| m.rect.contains(cx, cy));
-        let (mut x, mut y) = (cx as f32 + 12.0, cy as f32 + 12.0);
-        if let Some(m) = mon {
-            x = x.min((m.rect.right() as f32) - PICKER_SIZE[0] * ppp - 8.0);
-            y = y.min((m.rect.bottom() as f32) - PICKER_SIZE[1] * ppp - 48.0);
-        }
+    /// A picker for `img`, beside the mouse pointer on its monitor, in that monitor's scale.
+    pub fn new(img: RgbaImage, title: String) -> Self {
+        let monitors = mythicshot_capture::list_monitors();
+        let target = placement::picker_rect(platform::cursor_pos().unwrap_or((200, 200)), &monitors);
+        let guess = placement::guess_points(target, placement::scale_for(target, &monitors));
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             id: egui::ViewportId::from_hash_of(("picker", n)),
             state: Arc::new(Mutex::new(Picker { img, title, pick: Pick::Waiting, had_focus: false })),
-            pos: egui::pos2(x / ppp, y / ppp),
-            first: true,
+            placer: Placer::new(PICKER_TITLE, target, Focus::PlainThenWinit),
+            guess,
         }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) {
+        // Created hidden, put on its pixels, then shown and given the keyboard (see `Placer`).
         let builder = egui::ViewportBuilder::default()
-            .with_title("Send capture to")
-            .with_inner_size(PICKER_SIZE)
-            .with_position(self.pos)
+            .with_title(PICKER_TITLE)
+            .with_inner_size(self.guess.1)
+            .with_position(self.guess.0)
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top()
@@ -74,9 +77,7 @@ impl PickerWindow {
                 p.ui(ui);
             }
         });
-        if std::mem::take(&mut self.first) {
-            ctx.send_viewport_cmd_to(self.id, egui::ViewportCommand::Focus);
-        }
+        self.placer.tick(ctx, self.id);
     }
 }
 
@@ -137,11 +138,13 @@ pub struct ToastState {
 /// takes focus, so it does not interrupt a game.
 pub struct Toast {
     state: Arc<Mutex<Option<ToastState>>>,
+    /// Puts the window in the corner in pixels while it is shown; None while there is no toast.
+    placer: Option<(Placer, (egui::Pos2, egui::Vec2))>,
 }
 
 impl Toast {
     pub fn new() -> Self {
-        Self { state: Arc::new(Mutex::new(None)) }
+        Self { state: Arc::new(Mutex::new(None)), placer: None }
     }
 
     pub fn post(&self, msg: String, path: Option<PathBuf>) {
@@ -150,7 +153,7 @@ impl Toast {
         }
     }
 
-    pub fn show(&self, ctx: &egui::Context) {
+    pub fn show(&mut self, ctx: &egui::Context) {
         let visible = {
             let Ok(mut s) = self.state.lock() else { return };
             let keep = s.as_ref().is_some_and(|t| !t.dismissed && (t.hovered || t.at.elapsed() < TOAST_TIME));
@@ -160,17 +163,21 @@ impl Toast {
             keep
         };
         if !visible {
+            // The window goes; the next toast gets a new one, placed again.
+            self.placer = None;
             return;
         }
-        let ppp = ctx.pixels_per_point();
-        let primary = mythicshot_capture::list_monitors().into_iter().find(|m| m.primary);
-        let pos = primary
-            .map(|m| egui::pos2((m.rect.right() as f32) / ppp - TOAST_SIZE[0] - 16.0, (m.rect.bottom() as f32) / ppp - TOAST_SIZE[1] - 64.0))
-            .unwrap_or(egui::pos2(100.0, 100.0));
+        let (placer, (pos, size)) = self.placer.get_or_insert_with(|| {
+            let monitors = mythicshot_capture::list_monitors();
+            let target = placement::toast_rect(&monitors).unwrap_or(mythicshot_capture::PxRect::new(100, 100, TOAST_SIZE[0] as u32, TOAST_SIZE[1] as u32));
+            (Placer::new(TOAST_TITLE, target, Focus::None), placement::guess_points(target, placement::scale_for(target, &monitors)))
+        });
+        // Created hidden, put on its pixels, then shown without taking focus (see `Placer`).
         let builder = egui::ViewportBuilder::default()
-            .with_title("Mythicshot")
-            .with_inner_size(TOAST_SIZE)
-            .with_position(pos)
+            .with_title(TOAST_TITLE)
+            .with_inner_size(*size)
+            .with_position(*pos)
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top()
@@ -182,6 +189,7 @@ impl Toast {
             let Some(t) = guard.as_mut() else { return };
             t.ui(ui);
         });
+        placer.tick(ctx, egui::ViewportId::from_hash_of("toast"));
     }
 }
 
@@ -215,6 +223,7 @@ impl ToastState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement::PICKER_SIZE;
     use crate::theme::checks;
 
     fn window(size: [f32; 2]) -> egui::RawInput {

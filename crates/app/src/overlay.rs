@@ -9,6 +9,9 @@ use mythicshot_capture::{Desktop, PxRect};
 use crate::theme;
 use crate::platform;
 
+pub mod geometry;
+use geometry::Mapping;
+
 const MAGNIFIER: f32 = 128.0;
 const ZOOM: f32 = 8.0;
 
@@ -18,8 +21,26 @@ pub enum Outcome {
     Capture(PxRect),
 }
 
+/// What one frame of the selector saw, for the capture log.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrameNote {
+    /// egui's content area, in points.
+    pub content: (f32, f32, f32, f32),
+    pub ppp: f32,
+    /// The window's client area the mapping used, in desktop pixels.
+    pub client: Option<PxRect>,
+    /// The desktop pixel the selector takes to be under the pointer.
+    pub hover_px: Option<(i32, i32)>,
+    /// The frozen picture was handed to the GPU this frame.
+    pub texture_new: bool,
+}
+
 pub struct Overlay {
     pub desktop: Desktop,
+    /// The last frame, for the capture log.
+    pub note: FrameNote,
+    /// The selection of the last capture, in points of the frame it was made in.
+    pub selection_pt: Option<Rect>,
     texture: Option<TextureHandle>,
     window_mode: bool,
     drag_from: Option<(i32, i32)>,
@@ -30,12 +51,16 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new(desktop: Desktop, magnifier: bool, record: bool) -> Self {
-        Self { desktop, texture: None, window_mode: false, drag_from: None, magnifier, record }
+        Self { desktop, note: FrameNote::default(), selection_pt: None, texture: None, window_mode: false, drag_from: None, magnifier, record }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Outcome {
+    /// One frame. `client` is the window's client area in desktop pixels as Windows reports
+    /// it now; every mapping comes from it and the current scale, never from where the window
+    /// was asked to go. None (no native window) takes it to be on the desktop's bounds.
+    pub fn ui(&mut self, ui: &mut egui::Ui, client: Option<PxRect>) -> Outcome {
         let ctx = ui.ctx().clone();
         let b = self.desktop.bounds;
+        let texture_new = self.texture.is_none();
         let tex = self
             .texture
             .get_or_insert_with(|| {
@@ -44,10 +69,9 @@ impl Overlay {
             })
             .clone();
         let ppp = ctx.pixels_per_point();
-        let to_px = |p: Pos2| (b.x + (p.x * ppp).round() as i32, b.y + (p.y * ppp).round() as i32);
-        let to_pt = |r: PxRect| {
-            Rect::from_min_size(pos2((r.x - b.x) as f32 / ppp, (r.y - b.y) as f32 / ppp), vec2(r.w as f32 / ppp, r.h as f32 / ppp))
-        };
+        let map = Mapping { client: client.unwrap_or(b), ppp };
+        let to_px = |p: Pos2| map.to_px(p);
+        let to_pt = |r: PxRect| map.to_pt(r);
 
         let full = ctx.content_rect();
         let response = ui.interact(full, ui.scope_id().with("overlay"), Sense::click_and_drag());
@@ -91,8 +115,9 @@ impl Overlay {
         let hover = response
             .hover_pos()
             .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
-            .or_else(|| platform::cursor_pos().map(|(x, y)| pos2((x - b.x) as f32 / ppp, (y - b.y) as f32 / ppp)));
+            .or_else(|| platform::cursor_pos().map(|(x, y)| map.px_to_pt(x, y)));
         let cursor = hover.map(to_px);
+        self.note = FrameNote { content: (full.min.x, full.min.y, full.width(), full.height()), ppp, client, hover_px: cursor, texture_new };
         let hovered_window = cursor.and_then(|(x, y)| self.desktop.window_at(x, y)).map(|w| w.rect);
 
         if !self.window_mode {
@@ -107,6 +132,7 @@ impl Overlay {
 
         if response.drag_stopped() {
             if let Some(sel) = selection.filter(|s| s.w >= 2 && s.h >= 2) {
+                self.selection_pt = Some(to_pt(sel));
                 return Outcome::Capture(sel);
             }
             self.drag_from = None;
@@ -114,12 +140,14 @@ impl Overlay {
         if response.clicked() || enter {
             // A click without a drag takes the window under the pointer, in either mode.
             if let Some(w) = hovered_window {
+                self.selection_pt = Some(to_pt(w));
                 return Outcome::Capture(w);
             }
         }
 
         let painter = ui.painter();
-        painter.image(tex.id(), full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), theme::IMAGE_TINT);
+        // Each pixel of the frozen desktop on one pixel of the screen, where it was captured.
+        painter.image(tex.id(), map.picture_rect(b), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), theme::IMAGE_TINT);
 
         let hole = selection.or(if self.window_mode || self.drag_from.is_none() { hovered_window.filter(|_| self.window_mode) } else { None });
         match hole.map(to_pt) {
@@ -154,11 +182,11 @@ impl Overlay {
                 painter.vline(p.x, full.y_range(), line);
             }
             if self.magnifier {
-                self.draw_magnifier(painter, &tex, p, full, ppp);
+                self.draw_magnifier(painter, &tex, p, full, map);
             }
         }
 
-        let screen = cursor.and_then(|(x, y)| self.desktop.monitor_at(x, y)).map(|m| to_pt(m.rect)).unwrap_or(full);
+        let screen = cursor.and_then(|(x, y)| self.desktop.monitor_at(x, y)).map(|m| to_pt(m.rect).intersect(full)).filter(|r| r.is_positive()).unwrap_or(full);
         let mode = match (self.record, self.window_mode) {
             (false, false) => "Screenshot · Region",
             (false, true) => "Screenshot · Window",
@@ -177,7 +205,7 @@ impl Overlay {
         Outcome::Continue
     }
 
-    fn draw_magnifier(&self, painter: &egui::Painter, tex: &TextureHandle, p: Pos2, full: Rect, ppp: f32) {
+    fn draw_magnifier(&self, painter: &egui::Painter, tex: &TextureHandle, p: Pos2, full: Rect, map: Mapping) {
         let mut at = p + vec2(24.0, 24.0);
         if at.x + MAGNIFIER > full.max.x {
             at.x = p.x - 24.0 - MAGNIFIER;
@@ -188,7 +216,9 @@ impl Overlay {
         let rect = Rect::from_min_size(at, vec2(MAGNIFIER, MAGNIFIER));
         let (w, h) = (self.desktop.bounds.w as f32, self.desktop.bounds.h as f32);
         let half = MAGNIFIER / ZOOM / 2.0;
-        let (cx, cy) = (p.x * ppp, p.y * ppp);
+        // The pointer in pixels of the frozen picture.
+        let (px, py) = map.to_px(p);
+        let (cx, cy) = ((px - self.desktop.bounds.x) as f32, (py - self.desktop.bounds.y) as f32);
         let uv = Rect::from_min_max(pos2((cx - half) / w, (cy - half) / h), pos2((cx + half) / w, (cy + half) / h));
         painter.rect_filled(rect, 4.0, theme::PICTURE_BACKDROP);
         painter.image(tex.id(), rect, uv, theme::IMAGE_TINT);
@@ -196,8 +226,7 @@ impl Overlay {
         painter.hline(rect.x_range(), rect.center().y, red);
         painter.vline(rect.center().x, rect.y_range(), red);
         painter.rect_stroke(rect, 4.0, Stroke::new(2.0, theme::ON_PICTURE), StrokeKind::Outside);
-        let (x, y) = (self.desktop.bounds.x + cx.round() as i32, self.desktop.bounds.y + cy.round() as i32);
-        label(painter, rect.center_bottom() + vec2(0.0, 20.0), Align2::CENTER_BOTTOM, &format!("x {x} · y {y}"));
+        label(painter, rect.center_bottom() + vec2(0.0, 20.0), Align2::CENTER_BOTTOM, &format!("x {px} · y {py}"));
     }
 }
 
@@ -206,4 +235,73 @@ fn label(painter: &egui::Painter, at: Pos2, align: Align2, text: &str) {
     let rect = align.anchor_size(at, galley.size()).expand2(vec2(8.0, 4.0));
     painter.rect_filled(rect, f32::from(theme::control_radius(rect.height())), theme::RAISED);
     painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mythicshot_capture::MonitorInfo;
+    use mythicshot_capture::image::RgbaImage;
+
+    fn desktop(bounds: PxRect) -> Desktop {
+        let monitors = vec![MonitorInfo { name: String::new(), primary: true, rect: bounds, scale: 2.0 }];
+        Desktop { bounds, image: RgbaImage::new(bounds.w, bounds.h), monitors, windows: Vec::new() }
+    }
+
+    /// One frame of the selector at `ppp`, a window of `client_px`, the pointer at `pointer` points.
+    fn frame(ov: &mut Overlay, ppp: f32, client_px: PxRect, client: Option<PxRect>, pointer: Pos2) -> (egui::Context, egui::FullOutput) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(client_px.w as f32 / ppp, client_px.h as f32 / ppp))),
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let mut out = ctx.run_ui(input, |ui| {
+            let _ = ov.ui(ui, client);
+        });
+        out.textures_delta.clear();
+        (ctx, out)
+    }
+
+    /// Where the frozen picture (the first textured mesh) was painted, in points.
+    fn picture(ctx: &egui::Context, out: egui::FullOutput, ppp: f32) -> Rect {
+        ctx.tessellate(out.shapes, ppp)
+            .iter()
+            .find_map(|c| match &c.primitive {
+                egui::epaint::Primitive::Mesh(m) if m.texture_id != egui::TextureId::default() => Some(m.calc_bounds()),
+                _ => None,
+            })
+            .expect("the picture is painted")
+    }
+
+    #[test]
+    fn the_pointer_and_picture_follow_the_real_window_not_the_bounds() {
+        let bounds = PxRect::new(-1920, 0, 400, 200);
+        // The window a scale change left half-size and 161 px to the right of the bounds.
+        let stray = PxRect::new(-1759, 0, 200, 100);
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        let (ctx, out) = frame(&mut ov, 1.0, stray, Some(stray), pos2(10.0, 20.0));
+        assert_eq!(ov.note.hover_px, Some((-1749, 20)), "the pixel under the pointer, from the real window");
+        assert!(ov.note.texture_new);
+        // The picture starts 161 px left of that window, at the bounds, at full size: each of
+        // its pixels on the screen pixel it was captured from (the window shows part of it).
+        let pic = picture(&ctx, out, 1.0);
+        assert_eq!((pic.min, pic.max), (pos2(-161.0, 0.0), pos2(239.0, 200.0)));
+        // The same misplaced window at 200%.
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        let (ctx, out) = frame(&mut ov, 2.0, stray, Some(stray), pos2(10.0, 20.0));
+        assert_eq!(ov.note.hover_px, Some((-1739, 40)));
+        let pic = picture(&ctx, out, 2.0);
+        assert_eq!((pic.min, pic.max), (pos2(-80.5, 0.0), pos2(119.5, 100.0)), "400x200 pixels at 200% from -1920,0");
+        // On its bounds at 200%: a pointer at 10,20 points is 20,40 pixels into the desktop.
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        let (ctx, out) = frame(&mut ov, 2.0, bounds, Some(bounds), pos2(10.0, 20.0));
+        assert_eq!(ov.note.hover_px, Some((-1900, 40)));
+        assert_eq!(ov.note.ppp, 2.0);
+        assert_eq!((ov.note.content.2, ov.note.content.3), (200.0, 100.0));
+        // On the bounds the picture covers the window pixel for pixel.
+        let pic = picture(&ctx, out, 2.0);
+        assert_eq!((pic.min, pic.max), (pos2(0.0, 0.0), pos2(200.0, 100.0)), "200x100 points at 200% = 400x200 pixels, the picture's size");
+    }
 }
