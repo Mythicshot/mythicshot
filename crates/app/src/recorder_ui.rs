@@ -214,6 +214,11 @@ impl Session {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         });
         self.frame_placer.tick(ctx, frame_id);
+        if matches!(self.phase, Phase::Countdown { .. }) {
+            // The number is this session's state: the frame is asked to draw it at every tick,
+            // whatever its own window has or has not asked for.
+            ctx.request_repaint_of(frame_id);
+        }
         if !self.frame_hidden_from_capture {
             if let Some(h) = platform::find_window(FRAME_TITLE) {
                 self.frame_hidden_from_capture = platform::exclude_from_capture(h);

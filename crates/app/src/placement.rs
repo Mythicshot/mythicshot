@@ -166,6 +166,13 @@ pub fn place_step(stage: PlaceStage, looks: u8, look: Look) -> PlaceStep {
 }
 
 /// The stage after a step.
+/// Whether the window must be asked to paint after this step. It was created hidden, and a hidden
+/// window runs no pass at all, so the repaints its own contents ask for have never been asked:
+/// every step that shows or uncloaks it asks once, and its contents carry on from there.
+pub fn paints_after(step: PlaceStep) -> bool {
+    !matches!(step, PlaceStep::Wait)
+}
+
 pub fn place_advance(stage: PlaceStage, step: PlaceStep, look: Look) -> PlaceStage {
     match (stage, step) {
         (_, PlaceStep::Uncloak { .. } | PlaceStep::Anyway { .. }) => PlaceStage::Done,
@@ -233,6 +240,11 @@ impl Placer {
                 let why = if self.hwnd.is_some() { "NOT in place in time, shown where it is" } else { "window not found or lost, shown where egui put it" };
                 self.finish(ctx, id, why);
             }
+        }
+        if paints_after(step) {
+            // A hidden window runs no pass, so nothing in it has asked for a repaint yet: without
+            // this it could stay unpainted after it is shown (the recording countdown did).
+            ctx.request_repaint_of(id);
         }
         self.stage = place_advance(self.stage, step, look);
         if self.stage != PlaceStage::Done {
@@ -440,6 +452,14 @@ mod tests {
         assert_eq!(stage, PlaceStage::Done);
         assert_eq!(place_step(stage, 200, IN), PlaceStep::Wait);
         assert_eq!(place_advance(stage, PlaceStep::Wait, IN), PlaceStage::Done);
+    }
+
+    #[test]
+    fn every_step_that_shows_or_uncloaks_a_window_asks_it_to_paint() {
+        assert!(!paints_after(PlaceStep::Wait));
+        for step in [PlaceStep::Show, PlaceStep::Uncloak { put_back: false }, PlaceStep::Uncloak { put_back: true }, PlaceStep::Anyway { shown: false }, PlaceStep::Anyway { shown: true }] {
+            assert!(paints_after(step), "{step:?}");
+        }
     }
 
     #[test]

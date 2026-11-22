@@ -2,6 +2,10 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.21 (2026-11-22)
+
+- The countdown before a recording shows again. Since 0.2.20 the red recording frame is made hidden and shown once in place, and nothing asked it to draw after that, so the number never appeared. Every window shown this way (the frame, the notification, the "Send capture to" menu, the live-draw layer) is now asked to draw as it is shown.
+
 ## 0.2.20 (2026-11-21)
 
 - The first region capture after Mythicshot starts works like every later one on computers with monitors at different scale settings (for example one at 200% beside two at 100%): before, the frozen desktop could appear zoomed or shifted, the selection and the hint bar could land on another screen than the pointer, and the picture saved did not match what was selected. The same could happen to the first screenshot after a GIF recording.
