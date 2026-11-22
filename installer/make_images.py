@@ -23,15 +23,22 @@ d = ImageDraw.Draw(side)
 d.rectangle([0, 0, 163, 311], fill=GROUND)
 big = Image.open("installer/images/side-mark.png").convert("RGBA")
 side.paste(big, ((164 - big.width) // 2, 72), big)
-font = ImageFont.truetype("assets/fonts/cinzel/Cinzel[wght].ttf", 18)
+SIZE = 18
+font = ImageFont.truetype("assets/fonts/cinzel/Cinzel[wght].ttf", SIZE)
 font.set_variation_by_axes([600])
 name = "MYTHICSHOT"
-# The wordmark's letter spacing, 0.04 em, drawn a letter at a time.
-spacing = 0.04 * 18
-widths = [d.textlength(c, font=font) for c in name]
-w = sum(widths) + spacing * (len(name) - 1)
+# Cinzel keeps its kerning in its GPOS table, which Pillow's layout reads only when built with
+# raqm; without it a whole string comes out unkerned, as letter-by-letter drawing did. So the
+# font's own kerning after each letter, in font units (1000 to the em) at weight 600, is written
+# here: what HarfBuzz's Rust port (harfrust 0.12, the shaper egui uses) applies to "MYTHICSHOT"
+# with Cinzel's default features, against the same word shaped with kern off.
+KERN = [-24, 20, 0, 0, -20, 0, -4, -20, -23, 0]
+# The wordmark's letter spacing, 0.04 em, on top of the kerning.
+spacing = 0.04 * SIZE
+steps = [d.textlength(c, font=font) + k * SIZE / 1000 + spacing for c, k in zip(name, KERN)]
+w = sum(steps) - steps[-1] + d.textlength(name[-1], font=font)
 x = (164 - w) / 2
-for c, cw in zip(name, widths):
+for c, step in zip(name, steps):
     d.text((x, 196), c, font=font, fill=GOLD)
-    x += cw + spacing
+    x += step
 side.save("installer/images/dialog.bmp")
