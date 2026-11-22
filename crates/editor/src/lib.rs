@@ -342,7 +342,12 @@ struct Snapshot {
     base: Arc<RgbaImage>,
     items: Vec<Item>,
     next_id: u64,
+    extra: Option<Extra>,
 }
+
+/// State the host program keeps beside the items and wants undone and redone with them, such as
+/// where a tour step's hotspot was moved to. The document never looks inside it.
+pub type Extra = Arc<dyn std::any::Any + Send + Sync>;
 
 const UNDO_LIMIT: usize = 100;
 
@@ -352,6 +357,7 @@ pub struct Document {
     next_id: u64,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    extra: Option<Extra>,
     /// Bumped on every change, so views know when to redraw.
     pub version: u64,
     /// Changed since the last save.
@@ -360,7 +366,7 @@ pub struct Document {
 
 impl Document {
     pub fn new(base: RgbaImage) -> Self {
-        Self { base: Arc::new(base), items: Vec::new(), next_id: 1, undo: Vec::new(), redo: Vec::new(), version: 0, dirty: false }
+        Self { base: Arc::new(base), items: Vec::new(), next_id: 1, undo: Vec::new(), redo: Vec::new(), extra: None, version: 0, dirty: false }
     }
 
     pub fn width(&self) -> u32 {
@@ -384,13 +390,14 @@ impl Document {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { base: self.base.clone(), items: self.items.clone(), next_id: self.next_id }
+        Snapshot { base: self.base.clone(), items: self.items.clone(), next_id: self.next_id, extra: self.extra.clone() }
     }
 
     fn restore(&mut self, s: Snapshot) {
         self.base = s.base;
         self.items = s.items;
         self.next_id = s.next_id;
+        self.extra = s.extra;
         self.touch();
     }
 
@@ -421,6 +428,23 @@ impl Document {
         self.undo.push(self.snapshot());
         self.restore(s);
         true
+    }
+
+    /// The host's state as of now: see [`Extra`]. Undo and redo bring back what it was at each step.
+    pub fn extra(&self) -> Option<&Extra> {
+        self.extra.as_ref()
+    }
+
+    /// The host's state at the start: no undo step, and not an unsaved change.
+    pub fn init_extra(&mut self, extra: Extra) {
+        self.extra = Some(extra);
+    }
+
+    /// A change of the host's state, without a checkpoint: the caller makes one before the change
+    /// (once per drag), as for [`Document::update`].
+    pub fn set_extra(&mut self, extra: Extra) {
+        self.extra = Some(extra);
+        self.touch();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -551,6 +575,29 @@ mod tests {
         assert!(d.redo());
         assert!(d.items().is_empty());
         assert!(!d.redo());
+    }
+
+    #[test]
+    fn host_state_travels_with_undo_and_redo() {
+        let mut d = doc();
+        let read = |d: &Document| d.extra().and_then(|e| e.downcast_ref::<u32>()).copied();
+        // Set at the start, it is no edit: nothing to undo and nothing unsaved.
+        d.init_extra(Arc::new(1u32));
+        assert_eq!((read(&d), d.can_undo(), d.dirty), (Some(1), false, false));
+        // A change of it, after a checkpoint, is one undo step like any other.
+        d.checkpoint();
+        d.set_extra(Arc::new(2u32));
+        assert!(d.dirty);
+        let id = d.add(Shape::Step { center: pt(5.0, 5.0), number: 1 }, Style::default());
+        assert!(d.undo());
+        assert_eq!((read(&d), d.items().len()), (Some(2), 0), "undoing the item keeps the host state");
+        assert!(d.undo());
+        assert_eq!(read(&d), Some(1));
+        assert!(d.redo());
+        assert_eq!(read(&d), Some(2));
+        assert!(d.redo());
+        assert_eq!((read(&d), d.item(id).is_some()), (Some(2), true));
+        assert!(doc().extra().is_none(), "a document without host state has none");
     }
 
     #[test]

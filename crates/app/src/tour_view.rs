@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use mythicshot_editor::{Bounds, Item, Pt, Shape, pt};
 use crate::theme;
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
-use crate::tour::{self, HotspotStyle, StepPlan, TourDoc};
+use crate::tour::{self, HotspotStyle, Point, Pulses, StepPlan, TourDoc};
 use crate::tour_cards::{CardUi, SettingsUi, card_has_text, parse_hex};
 use crate::video::{Edit, crop_px};
 use crate::video_editor::{VideoState, VideoView};
@@ -37,16 +38,54 @@ struct PlanKey {
     deleted: BTreeSet<usize>,
     crop: Option<Bounds>,
     removed: BTreeSet<usize>,
+    /// The steps' moved hotspots, which are their clicks.
+    pulses: Pulses,
 }
 
 impl PlanKey {
     fn of(edit: &Edit) -> Self {
-        Self { trim: edit.trim, deleted: edit.deleted.clone(), crop: edit.crop, removed: edit.tour_removed.clone() }
+        Self { trim: edit.trim, deleted: edit.deleted.clone(), crop: edit.crop, removed: edit.tour_removed.clone(), pulses: tour::pulses(&edit.tour_doc) }
     }
 
     fn matches(&self, edit: &Edit) -> bool {
-        self.trim == edit.trim && self.crop == edit.crop && self.deleted == edit.deleted && self.removed == edit.tour_removed
+        self.trim == edit.trim && self.crop == edit.crop && self.deleted == edit.deleted && self.removed == edit.tour_removed && self.pulses == tour::pulses(&edit.tour_doc)
     }
+}
+
+/// Moving the shown step's hotspot ("Pulse: A spot I pick"): the step whose pulse the picture
+/// takes, and whether a drag of it is under way.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PulseUi {
+    /// While Some, a press on the picture puts that step's pulse there and a drag moves it; the
+    /// tools wait. Ends on Esc, on another step or view, with "Where I clicked", and when the Tour
+    /// settings panel closes.
+    pub(crate) placing: Option<usize>,
+    /// A drag is under way.
+    dragging: bool,
+    /// The drag under way has made its undo step: it moved the pulse at least once.
+    drag_saved: bool,
+}
+
+/// What the "Pulse" row asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PulseAction {
+    /// "Where I clicked": the recorded click, and stop placing.
+    Recorded,
+    /// "A spot I pick": the picture takes the pulse.
+    Pick,
+    /// "Put it back where I clicked".
+    PutBack,
+}
+
+/// The hint while the picture takes the pulse. Approved wording.
+pub(crate) const PULSE_HINT: &str = "Drag the pulse on the picture";
+
+/// `p` moved inside the kept picture `crop` (x, y, width, height in frame pixels), so a moved
+/// pulse is always one the tour can use.
+pub fn pulse_inside(p: Pt, crop: (u32, u32, u32, u32)) -> Point {
+    let (cx, cy, cw, ch) = (crop.0 as f32, crop.1 as f32, crop.2 as f32, crop.3 as f32);
+    let fit = |v: f32, lo: f32, len: f32| if v.is_finite() { v.clamp(lo, lo + (len - 1.0).max(0.0)) } else { lo };
+    Point { x: fit(p.x, cx, cw), y: fit(p.y, cy, ch) }
 }
 
 /// A step plan, or why there is none.
@@ -69,11 +108,13 @@ pub struct TourState {
     pub(crate) card: CardUi,
     /// The Tour settings panel.
     pub(crate) settings: SettingsUi,
+    /// Moving the shown step's pulse.
+    pub(crate) pulse: PulseUi,
 }
 
 impl Default for TourState {
     fn default() -> Self {
-        Self { instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed), plan: RefCell::new(None), thumbs: HashMap::new(), dim_dragging: false, card: CardUi::default(), settings: SettingsUi::default() }
+        Self { instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed), plan: RefCell::new(None), thumbs: HashMap::new(), dim_dragging: false, card: CardUi::default(), settings: SettingsUi::default(), pulse: PulseUi::default() }
     }
 }
 
@@ -321,6 +362,111 @@ impl Editor {
         painter.circle_filled(at, 4.0, accent);
     }
 
+    /// The step whose pulse the picture takes now: only while the Tour view shows that very step
+    /// and the Tour settings panel, where its "Pulse" row is, is open.
+    pub(crate) fn placing_pulse(&self) -> Option<usize> {
+        let v = self.video.as_ref()?;
+        let src = v.tour.pulse.placing?;
+        (v.tour.settings.open && self.tour_src() == Some(src)).then_some(src)
+    }
+
+    /// Stop the picture taking the pulse.
+    pub(crate) fn forget_pulse_ui(&mut self) {
+        if let Some(v) = self.video.as_mut() {
+            v.tour.pulse = PulseUi::default();
+        }
+    }
+
+    /// Esc while the picture takes the pulse stops it. True when it took the key.
+    pub(crate) fn pulse_escape(&mut self) -> bool {
+        if self.placing_pulse().is_none() {
+            return false;
+        }
+        self.forget_pulse_ui();
+        true
+    }
+
+    /// The moved pulses as they are now, for undo: set at the start, with no undo step.
+    pub(crate) fn init_pulse_history(&mut self) {
+        let Some(v) = self.video.as_ref() else { return };
+        self.doc.init_extra(Arc::new(tour::pulses(&v.edit.tour_doc)));
+    }
+
+    /// After undo or redo: the moved pulses as they were at that step.
+    pub(crate) fn pulses_from_history(&mut self) {
+        let Some(p) = self.doc.extra().and_then(|e| e.downcast_ref::<Pulses>()).cloned() else { return };
+        if let Some(v) = self.video.as_mut() {
+            tour::set_pulses(&mut v.edit.tour_doc, &p);
+        }
+    }
+
+    /// Move step `src`'s pulse to `at` (frame pixels, kept inside the kept picture), or put it back
+    /// where the step was clicked (None). `checkpoint` starts a new undo step: once per drag.
+    /// True when it changed anything; nothing that changes nothing makes an undo step.
+    pub(crate) fn set_pulse(&mut self, src: usize, at: Option<Pt>, checkpoint: bool) -> bool {
+        let Some(v) = self.video.as_mut() else { return false };
+        let crop = crop_px(&v.rec, &v.edit);
+        let at = at.map(|p| pulse_inside(p, crop));
+        if v.edit.tour_doc.steps.get(&src).and_then(|s| s.pulse.as_ref()) == at.as_ref() {
+            return false;
+        }
+        if checkpoint {
+            self.doc.checkpoint();
+        }
+        let Some(v) = self.video.as_mut() else { return false };
+        v.edit.tour_doc.steps.entry(src).or_default().pulse = at;
+        let pulses = tour::pulses(&v.edit.tour_doc);
+        self.doc.set_extra(Arc::new(pulses));
+        true
+    }
+
+    /// The canvas's pointer while the picture takes the pulse: a press puts the pulse there, a
+    /// drag moves it, one undo step for each. True while the pulse has the canvas, so no tool acts.
+    pub(crate) fn pulse_pointer(&mut self, resp: &Response, to_img: &dyn Fn(egui::Pos2) -> Pt) -> bool {
+        let Some(src) = self.placing_pulse() else { return false };
+        let ui = self.video.as_ref().map(|v| v.tour.pulse).unwrap_or_default();
+        // Where the button went down starts the drag, as for every other drag on the canvas.
+        let start = resp.drag_started().then(|| resp.ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())).flatten();
+        let now = if resp.drag_started() { start } else if resp.dragged() && ui.dragging { resp.interact_pointer_pos() } else { None };
+        if let Some(p) = now.map(to_img) {
+            let first = resp.drag_started() || !ui.drag_saved;
+            let changed = self.set_pulse(src, Some(p), first);
+            if let Some(v) = self.video.as_mut() {
+                v.tour.pulse.dragging = true;
+                v.tour.pulse.drag_saved = (ui.drag_saved && !resp.drag_started()) || changed;
+            }
+        }
+        if resp.drag_stopped()
+            && let Some(v) = self.video.as_mut()
+        {
+            (v.tour.pulse.dragging, v.tour.pulse.drag_saved) = (false, false);
+        }
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos().map(to_img)
+        {
+            self.set_pulse(src, Some(p), true);
+        }
+        true
+    }
+
+    /// What the "Pulse" row asked for, on the shown step `src`.
+    pub(crate) fn pulse_action(&mut self, src: usize, action: PulseAction) {
+        match action {
+            PulseAction::Pick => {
+                if let Some(v) = self.video.as_mut() {
+                    v.tour.pulse = PulseUi { placing: Some(src), ..Default::default() };
+                }
+            }
+            PulseAction::Recorded => {
+                self.forget_pulse_ui();
+                self.set_pulse(src, None, true);
+            }
+            PulseAction::PutBack => {
+                self.set_pulse(src, None, true);
+            }
+        }
+    }
+
     /// The Tour view is open, whether or not there are steps.
     pub(crate) fn in_tour_view(&self) -> bool {
         self.video.as_ref().is_some_and(|v| v.view == VideoView::Tour)
@@ -381,6 +527,7 @@ impl Editor {
         if view != VideoView::Tour {
             // Nothing of a guide card stays selected, typed or half-picked off screen, and its tool goes with it.
             self.forget_card_ui();
+            self.forget_pulse_ui();
             if self.tool_is_card() {
                 self.use_select_tool();
             }
@@ -413,6 +560,7 @@ impl Editor {
         v.playing = None;
         if changed {
             self.forget_card_ui();
+            self.forget_pulse_ui();
         }
         self.drop_hidden_selection();
     }
@@ -479,6 +627,7 @@ impl Editor {
         if moved {
             self.drop_hidden_selection();
             self.forget_card_ui();
+            self.forget_pulse_ui();
         }
         let doc = &self.video.as_ref().expect("video").edit.tour_doc;
         let marks: Vec<StepMarks> = steps.as_ref().map(|s| s.iter().map(|st| step_marks(self.doc.items(), doc, st.src)).collect()).unwrap_or_default();
@@ -555,6 +704,7 @@ impl Editor {
                     v.tour_step = if next > i { i } else { next };
                     self.drop_hidden_selection();
                     self.forget_card_ui();
+                    self.forget_pulse_ui();
                     ctx.request_repaint();
                 }
             }

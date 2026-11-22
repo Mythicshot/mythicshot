@@ -290,6 +290,11 @@ pub struct SavedStep {
     pub card: Option<SavedCard>,
     pub advance: String,
     pub zoom: Option<bool>,
+    /// Where the step's hotspot was moved to, `[x, y]` in frame pixels; left out when it was not
+    /// moved, so a project without moved hotspots is written exactly as before. An older version
+    /// skips the field, as every reader of this format skips a field it does not know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pulse: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -653,7 +658,7 @@ fn save_step(s: &StepExtras) -> SavedStep {
         point: c.point.as_ref().map(|p| [fin(p.x), fin(p.y)]),
         placement: placement_name(c.placement),
     });
-    SavedStep { card, advance: advance_name(s.advance), zoom: s.zoom }
+    SavedStep { card, advance: advance_name(s.advance), zoom: s.zoom, pulse: s.pulse.as_ref().filter(|p| p.x.is_finite() && p.y.is_finite()).map(|p| [p.x, p.y]) }
 }
 
 /// Mouse events only: a key press never reaches a project.
@@ -844,7 +849,9 @@ fn load_step(s: SavedStep) -> StepExtras {
         point: c.point.map(|p| Point { x: fin(p[0]), y: fin(p[1]) }),
         placement: placement_from(&c.placement).unwrap_or_default(),
     });
-    StepExtras { card, advance: advance_from(&s.advance).unwrap_or_default(), zoom: s.zoom }
+    // A spot that is not a number is dropped, and the step's hotspot is its click again.
+    let pulse = s.pulse.filter(|p| p[0].is_finite() && p[1].is_finite()).map(|p| Point { x: p[0], y: p[1] });
+    StepExtras { card, advance: advance_from(&s.advance).unwrap_or_default(), zoom: s.zoom, pulse }
 }
 
 /// The file for `snap`, the files that go beside it (the pasted pictures as PNG and the cover
@@ -1055,8 +1062,8 @@ pub(super) mod tests {
             end: Some(EndCard { text: "That is all.".into(), primary: link("Sign up", "https://example.com/signup"), secondary: link("Read more", "https://example.com/docs"), replay: false }),
             autoplay: Autoplay { enabled: true, seconds: 8 },
             steps: BTreeMap::from([
-                (2, StepExtras { card: Some(Card { title: "Open the menu".into(), body: "It is **here**.".into(), next_label: "Go on".into(), anchor: Anchor::Point, point: Some(Point { x: 40.0, y: 30.5 }), placement: Placement::Top }), advance: Advance::Anywhere, zoom: Some(false) }),
-                (5, StepExtras { card: Some(Card { title: "Save".into(), body: String::new(), next_label: String::new(), anchor: Anchor::Hotspot, point: None, placement: Placement::Auto }), advance: Advance::Hotspot, zoom: None }),
+                (2, StepExtras { card: Some(Card { title: "Open the menu".into(), body: "It is **here**.".into(), next_label: "Go on".into(), anchor: Anchor::Point, point: Some(Point { x: 40.0, y: 30.5 }), placement: Placement::Top }), advance: Advance::Anywhere, zoom: Some(false), pulse: None }),
+                (5, StepExtras { card: Some(Card { title: "Save".into(), body: String::new(), next_label: String::new(), anchor: Anchor::Hotspot, point: None, placement: Placement::Auto }), advance: Advance::Hotspot, zoom: None, pulse: None }),
             ]),
         };
         e
@@ -1185,6 +1192,32 @@ pub(super) mod tests {
         assert_eq!(again, file);
         assert_eq!(blobs_again.len(), 2);
         assert!(blobs_again.iter().all(|b| blobs.contains(b)));
+    }
+
+    #[test]
+    fn a_moved_hotspot_is_saved_restored_and_left_out_when_there_is_none() {
+        let rec = rec();
+        let mut edit = Edit::new(&rec, OverlayStyle::default());
+        edit.tour_doc.steps.entry(2).or_default().pulse = Some(Point { x: 40.5, y: 12.0 });
+        edit.tour_doc.steps.entry(5).or_default().zoom = Some(true);
+        let (file, _) = build(&rec, &edit, &[], &[]);
+        let text = to_text(&file).unwrap();
+        assert_eq!(file.edit.tour_doc.steps[&2].pulse, Some([40.5, 12.0]));
+        assert_eq!(text.matches("\"pulse\": ").count(), 1, "a step whose hotspot was not moved has no such field");
+        // Read back, the step's hotspot is where it was moved to, and saved again it is the same file.
+        let project = tempfile::tempdir().unwrap();
+        let back = from_file(parse(&text).unwrap(), project.path(), &rec);
+        assert_eq!(back.edit.tour_doc.steps[&2].pulse, Some(Point { x: 40.5, y: 12.0 }));
+        assert_eq!(back.edit.tour_doc.steps[&5].pulse, None);
+        assert_eq!(build(&rec, &back.edit, &[], &[]).0, file);
+        // A file from before this field, or with a spot that is not a number: the recorded click.
+        for step in [r#"{"advance": "anywhere"}"#, r#"{"pulse": [1e39, 5]}"#] {
+            let back = from_file(parse(&format!(r#"{{"format": 1, "edit": {{"tour_doc": {{"steps": {{"2": {step}}}}}}}}}"#)).unwrap(), project.path(), &rec);
+            assert_eq!(back.edit.tour_doc.steps.get(&2).and_then(|s| s.pulse.clone()), None, "{step}");
+        }
+        // A spot that is not a number is never written either.
+        edit.tour_doc.steps.get_mut(&2).unwrap().pulse = Some(Point { x: f32::NAN, y: 3.0 });
+        assert!(!to_text(&build(&rec, &edit, &[], &[]).0).unwrap().contains("\"pulse\": "));
     }
 
     #[test]
@@ -1383,7 +1416,7 @@ pub(super) mod tests {
         assert_eq!((doc.zoom.clone(), doc.autoplay.clone()), (Zoom::default(), Autoplay::default()));
         assert_eq!(doc.cover, Some(Cover { title: "Hi".into(), body: String::new(), button: String::new(), logo: None }));
         assert_eq!(doc.end, Some(EndCard { text: String::new(), primary: None, secondary: None, replay: true }));
-        assert_eq!(doc.steps[&3], StepExtras { card: Some(Card { title: "T".into(), body: String::new(), next_label: String::new(), anchor: Anchor::default(), point: None, placement: Placement::default() }), advance: Advance::default(), zoom: None });
+        assert_eq!(doc.steps[&3], StepExtras { card: Some(Card { title: "T".into(), body: String::new(), next_label: String::new(), anchor: Anchor::default(), point: None, placement: Placement::default() }), advance: Advance::default(), zoom: None, pulse: None });
         assert_eq!(back.events, vec![InputEvent { t_ms: 5, kind: InputKind::MouseDown(MouseButton::Left, 0, 0) }]);
         assert_eq!(back.items, vec![
             Item { id: 1, shape: Shape::Rect(b(1.0, 2.0, 3.0, 4.0)), style: Style::default(), frames: None, pin: None },

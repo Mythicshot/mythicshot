@@ -591,6 +591,8 @@ impl Editor {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             if self.card_escape() {
                 // The guide card stopped typing or was unselected.
+            } else if self.pulse_escape() {
+                // The picture no longer takes the step's pulse.
             } else if self.text.take().is_none() && self.crop.take().is_none() && self.drag.take().is_none() {
                 self.select(None);
             }
@@ -642,11 +644,13 @@ impl Editor {
         match action {
             EditorAction::Undo => {
                 self.doc.undo();
+                self.pulses_from_history();
                 self.fix_selection();
                 self.reload_frame();
             }
             EditorAction::Redo => {
                 self.doc.redo();
+                self.pulses_from_history();
                 self.fix_selection();
                 self.reload_frame();
             }
@@ -1341,6 +1345,9 @@ impl Editor {
     }
 
     fn cursor(&self, p: Option<Pt>, z: f32) -> CursorIcon {
+        if self.placing_pulse().is_some() {
+            return CursorIcon::Crosshair;
+        }
         match self.tool {
             Tool::Select => match (p, self.selected) {
                 (Some(p), Some(id)) if self.handle_at(id, p, z).is_some() => CursorIcon::Grab,
@@ -1353,6 +1360,10 @@ impl Editor {
     }
 
     fn handle_pointer(&mut self, resp: &egui::Response, z: f32, to_img: &dyn Fn(egui::Pos2) -> Pt) {
+        // While the step's pulse is being moved, the picture is the pulse's.
+        if self.pulse_pointer(resp, to_img) {
+            return;
+        }
         let tol = 6.0 / z;
         if resp.drag_started() {
             // Where the button went down, not where the pointer is once it has

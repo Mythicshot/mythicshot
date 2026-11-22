@@ -722,6 +722,77 @@ fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, a
     share::share(server, &token, &item, access, |sent, total| r.uploading(sent, total))
 }
 
+/// The tour and chapter a publish or a draft upload of a new tour or chapter from this editor
+/// put on the site: what its Publish dialog offers to replace from then on, as for an editor
+/// opened through Edit. Its key is the one the upload's saved project has.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Remembered {
+    pub(crate) key: ProjectKey,
+    /// The chapter's title as it was uploaded: a replace sends it again, so it is not renamed.
+    pub(crate) chapter_title: String,
+    pub(crate) tour_title: String,
+    /// The upload's recording was saved on this computer: a replace saves over it whatever the
+    /// keep setting says now, as an update of an opened project does.
+    pub(crate) kept: bool,
+}
+
+/// What a publish started from this editor goes to, until it has ended.
+#[derive(Debug, Clone, PartialEq)]
+struct Pending {
+    server: String,
+    chapter_title: String,
+}
+
+/// What an editor remembers once the publish `pending` ended with `done`: the tour and chapter
+/// it uploaded, under the address rule's form of the address, as the saved project is keyed.
+/// Nothing when nothing is left on the site to replace: a tour taken away again after a
+/// restricted publish did not finish, or an answer without a chapter.
+fn remember_upload(pending: &Pending, tour_title: &str, done: &PublishDone, left: Option<publish_ui::Left>) -> Option<Remembered> {
+    let f = &done.finished;
+    if left == Some(publish_ui::Left::Deleted) || f.tour_id.is_empty() || f.chapter_id.is_empty() {
+        return None;
+    }
+    let server = crate::publish::check_server(&pending.server).unwrap_or_else(|_| pending.server.clone());
+    let key = ProjectKey { server, tour_id: f.tour_id.clone(), chapter_id: f.chapter_id.clone() };
+    Some(Remembered { key, chapter_title: pending.chapter_title.clone(), tour_title: tour_title.to_string(), kept: matches!(done.kept, Kept::Saved { .. }) })
+}
+
+/// The tour and chapter an editor's Publish dialog replaces, and how.
+#[derive(Debug, Clone, PartialEq)]
+struct Replaceable {
+    key: ProjectKey,
+    target: EditTarget,
+    /// The chapter's title to send; None for the editor's own title (an opened project's).
+    chapter_title: Option<String>,
+    /// Save over the project whatever the keep setting says.
+    keep_always: bool,
+    logo_missing: bool,
+    /// The site said this chapter is no longer there, when it was last replaced from this editor:
+    /// Replace is not offered again, and its tour stays picked for a new chapter.
+    gone: bool,
+}
+
+/// What `v`'s Publish dialog replaces: the chapter this editor uploaded last, else the one it
+/// was opened from through Edit; None for a new recording that was never uploaded.
+fn replaceable(v: &VideoState) -> Option<Replaceable> {
+    if let Some(r) = &v.remembered {
+        let target = EditTarget { tour_id: r.key.tour_id.clone(), chapter_id: r.key.chapter_id.clone(), tour_title: r.tour_title.clone() };
+        // Its upload went without the logo if it had none: replacing it takes nothing away.
+        let gone = v.chapter_gone.as_ref() == Some(&r.key);
+        return Some(Replaceable { key: r.key.clone(), target, chapter_title: Some(r.chapter_title.clone()), keep_always: r.kept, logo_missing: false, gone });
+    }
+    let origin = v.origin.as_ref()?;
+    let gone = v.chapter_gone.as_ref() == Some(&origin.key);
+    Some(Replaceable { key: origin.key.clone(), target: edit_target(origin), chapter_title: None, keep_always: true, logo_missing: logo_missing(origin, &v.edit), gone })
+}
+
+/// The chapter to stop offering to replace after an update of `r` failed with `error`: only
+/// when the site said the chapter is no longer part of the tour. A tour that is gone is seen in
+/// the site's list by every new dialog, and any other failure may work the next time.
+fn gone_after(error: &str, r: Option<&Replaceable>) -> Option<ProjectKey> {
+    crate::publish::is_chapter_gone(error).then(|| r.map(|r| r.key.clone())).flatten()
+}
+
 /// What "Update tour" replaces for an editor opened from the project `origin`.
 fn edit_target(origin: &Origin) -> EditTarget {
     EditTarget { tour_id: origin.key.tour_id.clone(), chapter_id: origin.key.chapter_id.clone(), tour_title: origin.tour_title.clone() }
@@ -730,8 +801,37 @@ fn edit_target(origin: &Origin) -> EditTarget {
 /// Whether `target` is the tour and chapter the project `origin` was saved for. The title is
 /// not part of that: the dialog hands on the tour's title as the site has it now, which is
 /// another one after a rename.
+#[cfg(test)]
 fn is_origin(target: &EditTarget, origin: &Origin) -> bool {
-    target.tour_id == origin.key.tour_id && target.chapter_id == origin.key.chapter_id
+    is_chapter(target, &origin.key)
+}
+
+/// Whether `target` is the tour and chapter of `key`, whatever the titles.
+fn is_chapter(target: &EditTarget, key: &ProjectKey) -> bool {
+    target.tour_id == key.tour_id && target.chapter_id == key.chapter_id
+}
+
+/// Which Publish dialog an editor opens.
+#[derive(Debug, Clone, PartialEq)]
+enum Dialog {
+    /// A new recording: a new tour, or a new chapter of one; with the recording's title.
+    New(String),
+    /// Replace the chapter, add a new chapter or make a new tour; `title` is the chapter's.
+    Replace { title: String, target: EditTarget, logo_missing: bool },
+    /// A new chapter (of the chapter's tour, picked) or a new tour: the site said the chapter is gone.
+    ChapterGone { title: String, target: EditTarget },
+    /// The same, for a chapter of another site address than the one configured: no Replace.
+    Elsewhere { title: String, target: EditTarget },
+}
+
+/// The Publish dialog of `v` for the site at `server`; `title` is the editor's.
+fn dialog_for(v: &VideoState, server: &str, title: String) -> Dialog {
+    match replaceable(v) {
+        None => Dialog::New(title),
+        Some(r) if r.gone && on_this_site(&r.key, server) => Dialog::ChapterGone { title: r.chapter_title.unwrap_or(title), target: r.target },
+        Some(r) if on_this_site(&r.key, server) => Dialog::Replace { title: r.chapter_title.unwrap_or(title), target: r.target, logo_missing: r.logo_missing },
+        Some(r) => Dialog::Elsewhere { title: r.chapter_title.unwrap_or(title), target: r.target },
+    }
 }
 
 /// Whether the dialog should say that updating removes the tour's cover logo: the project was
@@ -949,6 +1049,12 @@ pub struct VideoState {
     notices: Notices,
     /// A "Publish to" job of this recording, until it has ended: the recording's files stay until then.
     pub(crate) share_waiter: Option<crate::share_ui::JobWaiter>,
+    /// The tour and chapter this editor uploaded last: its Publish dialog replaces it from then on.
+    pub(crate) remembered: Option<Remembered>,
+    /// Where the publish running now goes, until it has ended.
+    publishing_to: Option<Pending>,
+    /// A chapter the site said it no longer has when this editor tried to replace it.
+    chapter_gone: Option<ProjectKey>,
     /// The saved project this editor was opened from; None for a new recording. Declared last:
     /// it lets go of the project only after the reader above has closed the frames file.
     pub origin: Option<Origin>,
@@ -1059,8 +1165,12 @@ impl Editor {
             exported: false,
             close_after_export: false,
             drag: None,
+            remembered: None,
+            publishing_to: None,
+            chapter_gone: None,
             origin: None,
         });
+        editor.init_pulse_history();
         // Test hook: start with one selected annotation, to check the range bar.
         #[cfg(debug_assertions)]
         if std::env::var_os("MYTHICSHOT_TEST_ANNOTATE").is_some() {
@@ -1107,6 +1217,8 @@ impl Editor {
             let logo_dropped = dropped.iter().any(|d| d == crate::project::COVER_LOGO);
             v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, logo_dropped, open: Arc::new(open) });
         }
+        // The moved pulses it was saved with are where undo starts from.
+        editor.init_pulse_history();
         // Kept in front of whatever the editor reports next, until the user has had the time to read it.
         if let Some(note) = opened_note(&dropped) {
             editor.notify_held(note);
@@ -1288,6 +1400,10 @@ impl Editor {
         if let Some(r) = finished {
             v.job = None;
             let left = v.picker_left.take();
+            // Only a publish that uploaded is remembered: the Published branch below takes it.
+            if r.is_err() {
+                v.publishing_to = None;
+            }
             let next = after_export(is_tour, r.is_ok(), v.close_after_export);
             match r {
                 Ok(done) => {
@@ -1350,9 +1466,19 @@ impl Editor {
                             eprintln!("{msg}");
                             self.notify(msg);
                             if let Some(v) = self.video.as_mut() {
-                                // The saved project now holds the title the update was sent under.
-                                if let (true, Some(origin)) = (update, v.origin.as_mut()) {
-                                    origin.tour_title = title.clone();
+                                let pending = v.publishing_to.take();
+                                if update {
+                                    // The saved project now holds the title the update was sent under.
+                                    match (v.remembered.as_mut(), v.origin.as_mut()) {
+                                        (Some(r), _) => r.tour_title = title.clone(),
+                                        (None, Some(origin)) => origin.tour_title = title.clone(),
+                                        (None, None) => {}
+                                    }
+                                } else if let Some(pending) = pending {
+                                    // From now on Publish offers to replace what was just uploaded.
+                                    if let Some(r) = remember_upload(&pending, &title, &done, viewing.left) {
+                                        v.remembered = Some(r);
+                                    }
                                 }
                                 v.publish_result = Some(if update { ResultDialog::after_update(title, before, done) } else { ResultDialog::new(title, before, done) }.with_viewing(viewing));
                             }
@@ -1367,6 +1493,12 @@ impl Editor {
                     // offers a new tour. A cancel is the user's own doing and brings nothing back.
                     // A workspace without room brings back the dialog as it was left, for a
                     // new tour or chapter too: its message is more than a status line.
+                    if updating && let Some(v) = self.video.as_mut() {
+                        // A chapter the site no longer has is not offered as the default again.
+                        if let Some(key) = gone_after(&e, replaceable(v).as_ref()) {
+                            v.chapter_gone = Some(key);
+                        }
+                    }
                     self.bring_dialog_back(left, e, updating);
                 }
                 Err(e) if is_site => {
@@ -1552,13 +1684,11 @@ impl Editor {
             return;
         }
         let server = publish_ui::server();
-        v.picker = Some(match &v.origin {
-            // A new recording: a new tour, or a new chapter of one.
-            None => Picker::open(server, title),
-            // Opened through Edit: update the tour it was saved for, or publish a new one.
-            Some(origin) if on_this_site(&origin.key, &server) => Picker::open_for_edit(server, title, edit_target(origin)).with_logo_missing(logo_missing(origin, &v.edit)),
-            // The address was changed since: the recording was saved for a tour of another site.
-            Some(origin) => Picker::open_for_edit_elsewhere(server, title, edit_target(origin)),
+        v.picker = Some(match dialog_for(v, &server, title) {
+            Dialog::New(title) => Picker::open(server, title),
+            Dialog::Replace { title, target, logo_missing } => Picker::open_for_edit(server, title, target).with_logo_missing(logo_missing),
+            Dialog::Elsewhere { title, target } => Picker::open_for_edit_elsewhere(server, title, target),
+            Dialog::ChapterGone { title, target } => Picker::open_for_edit_chapter_gone(server, title, target),
         });
     }
 
@@ -1602,10 +1732,15 @@ impl Editor {
         if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
             return;
         }
-        let (origin, edit) = (&v.origin, &v.edit);
+        let r = replaceable(v);
         v.picker = publish_ui::dialog_after_refusal(left, error, updating, |error| {
-            let origin = origin.as_ref()?;
-            Some(Picker::open_after_failed_update(publish_ui::server(), title, edit_target(origin), error).with_logo_missing(logo_missing(origin, edit)))
+            let r = r?;
+            let server = publish_ui::server();
+            // The address was changed while the update ran: no Replace for the other site's tour.
+            if !on_this_site(&r.key, &server) {
+                return Some(Picker::open_for_edit_elsewhere(server, r.chapter_title.unwrap_or(title), r.target));
+            }
+            Some(Picker::open_after_failed_update(server, r.chapter_title.unwrap_or(title), r.target, error).with_logo_missing(r.logo_missing))
         });
     }
 
@@ -1620,18 +1755,19 @@ impl Editor {
         if v.job.is_some() {
             return;
         }
-        let Some(origin) = v.origin.as_ref() else { return };
+        let Some(r) = replaceable(v) else { return };
         let server = publish_ui::server();
-        if !on_this_site(&origin.key, &server) || !is_origin(&target, origin) {
+        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) {
             return;
         }
         let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
-        // The job reads the recording from the project's folder and saves over that project
-        // in place: it holds the project open for as long as it runs, also past this editor.
-        let open = origin.open.clone();
-        // The project is rewritten whatever the keep setting says: it exists already, and
-        // left as it is it would no longer match the tour.
-        let keeping = keeping(true, Store::default_root());
+        // A recording opened from a project is read from the project's folder, and may be saved
+        // over it in place: the job holds the project open for as long as it runs, also past
+        // this editor.
+        let open = v.origin.as_ref().map(|o| o.open.clone());
+        // A project that exists is rewritten whatever the keep setting says: left as it is it
+        // would no longer match the tour. One that was never kept follows the setting.
+        let keeping = if r.keep_always { keeping(true, Store::default_root()) } else { keeping_now() };
         let run = Run::begin();
         let worker = run.clone();
         let tour_title = target.tour_title.clone();
@@ -1662,6 +1798,7 @@ impl Editor {
         let run = Run::begin();
         let worker = run.clone();
         let kept_as = tour_title.clone();
+        let pending = Pending { server: server.clone(), chapter_title: title.clone() };
         let job = EncodeJob::spawn(move |progress| {
             let result = guarded(&worker, || publish_job_as(&state, &title, &kept_as, &server, || publish_ui::token_for(&server), &target, mode == Mode::PublishNow, &access, &keeping, &worker, progress));
             // The addresses go with the job.
@@ -1673,6 +1810,7 @@ impl Editor {
         });
         if let Some(v) = self.video.as_mut() {
             v.job = Some(ExportJob::Publish(job, run, tour_title, before, false));
+            v.publishing_to = Some(pending);
         }
         self.notify("Publishing tour… 0%");
     }
@@ -2505,6 +2643,201 @@ mod tests {
         ed.video.as_mut().unwrap().tour.settings.open = true;
         let out = frames(&mut ed);
         assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
+    }
+
+    // ---- Moving a step's pulse in the Tour view ----
+
+    /// One frame of `ed` with `events`, a second after the last, in the editor's own window size.
+    fn tour_frame(ed: &mut Editor, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(events) };
+        let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// A press and release on the text `label`, as a user clicks it; Tour settings is scrolled to
+    /// its end first, where "This step" is, when the text is not in sight.
+    fn click_text(ed: &mut Editor, ctx: &egui::Context, label: &str) {
+        let mut out = tour_frame(ed, ctx, vec![]);
+        if crate::share_ui::tests::text_rect(&out, label).is_none() {
+            let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -4000.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+            tour_frame(ed, ctx, vec![egui::Event::PointerMoved(egui::pos2(1200.0, 400.0)), wheel]);
+            for _ in 0..3 {
+                out = tour_frame(ed, ctx, vec![]);
+            }
+        }
+        let at = crate::share_ui::tests::text_rect(&out, label).unwrap_or_else(|| panic!("{label} is drawn")).center();
+        crate::editor_ui::dialog_checks::click(ed, ctx, at);
+    }
+
+    /// Where the hotspot ring is drawn on the screen, if it is.
+    fn hotspot_on_screen(out: &egui::FullOutput) -> Option<egui::Pos2> {
+        crate::share_ui::tests::shapes_of(out).into_iter().find_map(|s| match s {
+            egui::Shape::Circle(c) if (c.radius - 15.0).abs() < 0.01 && c.stroke.width > 0.0 => Some(c.center),
+            _ => None,
+        })
+    }
+
+    /// A drag with the primary button from `from` to `to`, over a few frames.
+    fn drag(ed: &mut Editor, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        tour_frame(ed, ctx, vec![egui::Event::PointerMoved(from)]);
+        tour_frame(ed, ctx, vec![button(from, true)]);
+        for i in 1..=4 {
+            tour_frame(ed, ctx, vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 4.0))]);
+        }
+        tour_frame(ed, ctx, vec![button(to, false)]);
+        tour_frame(ed, ctx, vec![]);
+    }
+
+    fn ctrl(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND }
+    }
+
+    fn plain_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// The shown step's moved pulse, and its click as the tour has it.
+    fn shown_pulse(ed: &Editor) -> (Option<crate::tour::Point>, Option<(f32, f32)>) {
+        let v = ed.video.as_ref().unwrap();
+        let steps = crate::tour_view::planned_steps(v).unwrap();
+        let step = steps.iter().find(|s| s.src == v.current).unwrap();
+        (v.edit.tour_doc.steps.get(&step.src).and_then(|s| s.pulse.clone()), step.click)
+    }
+
+    /// An editor of `state(root)` with its edit (the crop, trim and removed step) and no annotations, in the Tour view.
+    fn tour_editor(root: &Path) -> Editor {
+        let mut st = state(root);
+        st.items.clear();
+        let mut ed = editor_of(&st);
+        ed.video.as_mut().unwrap().edit = st.edit.clone();
+        ed.init_pulse_history();
+        ed.set_view(VideoView::Tour);
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        ed
+    }
+
+    #[test]
+    fn the_pulse_is_dragged_on_the_picture_undone_in_one_step_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = tour_editor(tmp.path());
+        ed.keys = crate::hotkeys::EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        ed.use_select_tool();
+        let ctx = crate::theme::test_context();
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        let (none, recorded) = shown_pulse(&ed);
+        assert_eq!(none, None);
+        let ring = hotspot_on_screen(&out).expect("the hotspot is drawn where the step was clicked");
+        // Nothing moves the pulse until "A spot I pick" is chosen: a drag on it is a drag of the tools.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(30.0, 20.0));
+        assert_eq!(shown_pulse(&ed).0, None);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+        assert!(!ed.doc.can_undo(), "a drag on the empty picture with the Select tool changes nothing");
+
+        click_text(&mut ed, &ctx, "A spot I pick");
+        let src = ed.tour_src().unwrap();
+        assert_eq!(ed.placing_pulse(), Some(src));
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "Drag the pulse on the picture").is_some(), "the hint shows");
+        assert!(crate::share_ui::tests::text_rect(&out, "Put it back where I clicked").is_none(), "nothing to put back yet");
+        assert!(!ed.doc.can_undo(), "choosing it changes nothing yet");
+
+        // A drag of the pulse moves it, and the tour's click with it.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(30.0, 20.0));
+        let (moved, click) = shown_pulse(&ed);
+        assert!(moved.is_some());
+        assert_ne!(click, recorded, "the step's click is where the pulse went");
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        let at = hotspot_on_screen(&out).unwrap();
+        assert!((at - (ring + egui::vec2(30.0, 20.0))).length() < 1.5, "drawn where it was dropped: {at:?} from {ring:?}");
+        assert!(crate::share_ui::tests::text_rect(&out, "Put it back where I clicked").is_some());
+
+        // The whole drag is one undo step, and redo brings it back.
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed), (None, recorded));
+        assert!(!ed.doc.can_undo(), "one step for the drag");
+        assert!((hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap() - ring).length() < 0.5);
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Y)]);
+        assert_eq!(shown_pulse(&ed), (moved.clone(), click));
+
+        // A click on the picture puts it there too: one more undo step.
+        crate::editor_ui::dialog_checks::click(&mut ed, &ctx, ring + egui::vec2(-20.0, 10.0));
+        let (clicked, _) = shown_pulse(&ed);
+        assert!(clicked.is_some() && clicked != moved);
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed).0, moved);
+
+        // "Put it back where I clicked" returns to the recorded click, and is undone like any change.
+        click_text(&mut ed, &ctx, "Put it back where I clicked");
+        assert_eq!(shown_pulse(&ed), (None, recorded));
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed), (moved.clone(), click));
+
+        // Esc stops the picture taking the pulse; the moved pulse stays.
+        assert_eq!(ed.placing_pulse(), Some(src));
+        tour_frame(&mut ed, &ctx, vec![plain_key(egui::Key::Escape)]);
+        assert_eq!(ed.placing_pulse(), None);
+        assert_eq!(shown_pulse(&ed).0, moved);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+
+        // "Where I clicked" puts it back too, and stops placing.
+        click_text(&mut ed, &ctx, "A spot I pick");
+        click_text(&mut ed, &ctx, "Where I clicked");
+        assert_eq!((shown_pulse(&ed), ed.placing_pulse()), ((None, recorded), None));
+    }
+
+    #[test]
+    fn the_pulse_stays_inside_the_kept_picture_and_the_end_step_has_none_to_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = tour_editor(tmp.path());
+        let ctx = crate::theme::test_context();
+        click_text(&mut ed, &ctx, "A spot I pick");
+        let ring = hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap();
+        // Dragged far past the crop's corner: it stops at the crop's last pixel, so the tour keeps it.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(-2000.0, -2000.0));
+        assert_eq!(shown_pulse(&ed).0, Some(crate::tour::Point { x: 20.0, y: 10.0 }), "the crop starts at 20, 10");
+        assert_eq!(shown_pulse(&ed).1, Some((0.0, 0.0)));
+        let now = hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap();
+        drag(&mut ed, &ctx, now, now + egui::vec2(2000.0, 2000.0));
+        assert_eq!(shown_pulse(&ed).0, Some(crate::tour::Point { x: 179.0, y: 149.0 }), "the crop ends before 180, 150");
+        // Closing Tour settings stops the picture taking the pulse.
+        ed.video.as_mut().unwrap().tour.settings.open = false;
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None);
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None, "and does not take it again by itself");
+        // The end step has no click: its row is there but does nothing.
+        let last = crate::tour_view::planned_steps(ed.video.as_ref().unwrap()).unwrap().len() - 1;
+        for _ in 0..last {
+            tour_frame(&mut ed, &ctx, vec![plain_key(egui::Key::ArrowRight)]);
+        }
+        assert_eq!(shown_pulse(&ed).1, None, "the end step");
+        click_text(&mut ed, &ctx, "A spot I pick");
+        assert_eq!(ed.placing_pulse(), None);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+    }
+
+    #[test]
+    fn a_moved_pulse_is_saved_with_the_project_and_reopens_with_undo_starting_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(tmp.path());
+        let steps = tour::plan_steps(&st.rec, &st.edit, &st.events).unwrap();
+        st.edit.tour_doc.steps.entry(steps[0].src).or_default().pulse = Some(crate::tour::Point { x: 100.0, y: 100.0 });
+        let store = store_in(tmp.path());
+        let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        let snap = Snapshot { rec: &st.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &st.edit, events: &st.events, items: &st.items };
+        store.save(&key, &snap).unwrap();
+        let mut ed = reopened(&store, &key);
+        let at = |ed: &Editor| ed.video.as_ref().unwrap().edit.tour_doc.steps.get(&steps[0].src).and_then(|s| s.pulse.clone());
+        assert_eq!(at(&ed), Some(crate::tour::Point { x: 100.0, y: 100.0 }));
+        // Put back and undone: the saved spot, not the recorded click, is where undo goes back to.
+        assert!(ed.set_pulse(steps[0].src, None, true));
+        assert_eq!(at(&ed), None);
+        ed.doc.undo();
+        ed.pulses_from_history();
+        assert_eq!(at(&ed), Some(crate::tour::Point { x: 100.0, y: 100.0 }));
     }
 
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {
@@ -3512,6 +3845,196 @@ mod tests {
         drop(ed);
         assert_eq!(reopened(&store, &key).doc.items().len(), 2);
         drop(reopened(&store, &other));
+    }
+
+    // ---- Publishing again from the editor that published: replace the chapter it uploaded ----
+
+    fn pending(server: &str) -> Pending {
+        Pending { server: server.into(), chapter_title: "Typed chapter".into() }
+    }
+
+    #[test]
+    fn an_upload_is_remembered_as_the_saved_project_is_keyed() {
+        let done = |kept: Kept, outcome: Outcome| PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 2, outcome }, kept };
+        let saved = Kept::Saved { left_out: vec![], over: None };
+        // The address in the form the address rule writes, as `keep_recording` keys the project.
+        let r = remember_upload(&pending(" https://tours.example.com/ "), TOUR_TITLE, &done(saved.clone(), Outcome::Draft), None).unwrap();
+        assert_eq!(r, Remembered { key: ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() }, chapter_title: "Typed chapter".into(), tour_title: TOUR_TITLE.into(), kept: true });
+        // Published, or uploaded and not published: the chapter is on the site either way.
+        for outcome in [Outcome::Public { url: None }, Outcome::NotPublic { cancelled: true, error: String::new() }] {
+            assert!(remember_upload(&pending("https://tours.example.com"), TOUR_TITLE, &done(Kept::Off, outcome), None).is_some_and(|r| !r.kept));
+        }
+        // A tour taken away again after a restricted publish did not finish: nothing to replace.
+        assert_eq!(remember_upload(&pending("https://tours.example.com"), TOUR_TITLE, &done(saved.clone(), Outcome::Draft), Some(publish_ui::Left::Deleted)), None);
+        let mut no_chapter = done(saved, Outcome::Draft);
+        no_chapter.finished.chapter_id.clear();
+        assert_eq!(remember_upload(&pending("https://tours.example.com"), TOUR_TITLE, &no_chapter, None), None);
+    }
+
+    /// Run `ed`'s frames until its job has ended.
+    fn until_done(ed: &mut Editor) {
+        let ctx = crate::theme::test_context();
+        for _ in 0..500 {
+            tour_frame(ed, &ctx, vec![]);
+            if !ed.exporting() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the job did not end");
+    }
+
+    #[test]
+    fn an_editor_that_published_offers_to_replace_that_chapter_next_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let mut ed = editor_of(&st);
+        let server = "https://tours.example.com";
+        // A new recording: a new tour or a new chapter, nothing to replace.
+        assert_eq!(dialog_for(ed.video.as_ref().unwrap(), server, TITLE.into()), Dialog::New(TITLE.into()));
+        // A publish that failed before uploading remembers nothing.
+        let failing = EncodeJob::spawn(|_| Err::<PublishDone, String>("Could not start the upload: the server could not be reached.".into()));
+        let v = ed.video.as_mut().unwrap();
+        v.job = Some(ExportJob::Publish(failing, Arc::new(Run::default()), TOUR_TITLE.into(), Before::new_tour(), false));
+        v.publishing_to = Some(pending(server));
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!((&v.remembered, &v.publishing_to), (&None, &None));
+        // A publish that uploaded: the next Publish dialog replaces that chapter, under the title it was uploaded with.
+        let (job, go, _run) = waiting_job(|| Kept::Saved { left_out: vec![], over: None });
+        let v = ed.video.as_mut().unwrap();
+        v.job = Some(job);
+        v.publishing_to = Some(pending(server));
+        go.send(()).unwrap();
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        assert_eq!(v.remembered.as_ref().map(|r| &r.key), Some(&key));
+        let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
+        assert_eq!(dialog_for(v, server, TITLE.into()), Dialog::Replace { title: "Typed chapter".into(), target: target.clone(), logo_missing: false });
+        assert_eq!(dialog_for(v, " https://tours.example.com/ ", TITLE.into()), Dialog::Replace { title: "Typed chapter".into(), target: target.clone(), logo_missing: false });
+        // Another site address configured since: no Replace, as for an opened project.
+        assert_eq!(dialog_for(v, "https://other.example.com", TITLE.into()), Dialog::Elsewhere { title: "Typed chapter".into(), target: target.clone() });
+        // An update of it keeps it, under the tour's title as the site had it.
+        let r = replaceable(v).unwrap();
+        assert!(r.keep_always && is_chapter(&target, &r.key));
+        let update = EncodeJob::spawn(|_| Ok(PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 3, outcome: Outcome::Draft }, kept: Kept::Saved { left_out: vec![], over: None } }));
+        ed.video.as_mut().unwrap().job = Some(ExportJob::Publish(update, Arc::new(Run::default()), "Renamed on the site".into(), Before::new_tour(), true));
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(v.remembered.as_ref().map(|r| (&r.key, r.tour_title.as_str(), r.chapter_title.as_str())), Some((&key, "Renamed on the site", "Typed chapter")));
+    }
+
+    #[test]
+    fn a_publish_from_an_opened_project_moves_replace_to_the_new_chapter_and_keeps_the_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, key, _info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(replaceable(v).map(|r| (r.key, r.chapter_title, r.keep_always)), Some((key.clone(), None, true)), "the opened project, under the editor's title");
+        // It is published as a new tour: Replace is that tour's chapter from now on.
+        const OTHER_TOUR: &str = "tour_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let job = EncodeJob::spawn(|_| Ok(PublishDone { finished: Finished { tour_id: OTHER_TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft }, kept: Kept::Off }));
+        let v = ed.video.as_mut().unwrap();
+        v.job = Some(ExportJob::Publish(job, Arc::new(Run::default()), "A second tour".into(), Before::new_tour(), false));
+        v.publishing_to = Some(Pending { server: s.base.clone(), chapter_title: "A second tour".into() });
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        let r = replaceable(v).unwrap();
+        assert_eq!((r.target.tour_id.as_str(), r.target.tour_title.as_str(), r.chapter_title.as_deref()), (OTHER_TOUR, "A second tour", Some("A second tour")));
+        assert!(!r.keep_always, "its recording was not kept: a replace follows the keep setting");
+        assert_eq!(v.origin.as_ref().unwrap().key, key, "the project it was opened from stays its origin");
+    }
+
+    #[test]
+    fn a_chapter_the_site_no_longer_has_is_not_offered_to_replace_again() {
+        const GONE: &str = "Could not start the upload: that chapter is no longer part of the tour.";
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let mut ed = editor_of(&st);
+        let server = "https://tours.example.com";
+        let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: key.clone(), chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
+        // Only the site saying the chapter is gone counts: a gone tour shows in every new
+        // dialog's list, and anything else may work the next time.
+        let r = replaceable(ed.video.as_ref().unwrap());
+        assert_eq!(gone_after(GONE, r.as_ref()), Some(key.clone()));
+        for other in ["Could not start the upload: that tour no longer exists.", "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.", "Could not send step 3: the server could not be reached."] {
+            assert_eq!(gone_after(other, r.as_ref()), None, "{other}");
+        }
+        // An update that ends that way, in the editor. (A screen is open, so no dialog is made
+        // here: making one would ask a site.)
+        let failing = EncodeJob::spawn(|_| Err::<PublishDone, String>(GONE.into()));
+        let v = ed.video.as_mut().unwrap();
+        v.publish_result = Some(ResultDialog::new(TOUR_TITLE.into(), Before::new_tour(), PublishDone { finished: Finished { tour_id: TOUR.into(), chapter_id: CH.into(), steps: 1, outcome: Outcome::Draft }, kept: Kept::Off }));
+        v.job = Some(ExportJob::Publish(failing, Arc::new(Run::default()), TOUR_TITLE.into(), Before::new_tour(), true));
+        until_done(&mut ed);
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(dialog_for(v, server, TITLE.into()), Dialog::ChapterGone { title: TITLE.into(), target: target.clone() }, "a new chapter of its tour, or a new tour");
+        assert!(replaceable(v).is_some_and(|r| r.gone));
+        // Asked to replace it all the same, nothing starts.
+        ed.start_update(TITLE.into(), target.clone(), Before::new_tour());
+        assert!(!ed.exporting());
+        // A new upload from this editor is a chapter the site has: Replace is offered for it.
+        let other = ProjectKey { chapter_id: "ch_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..key };
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: other, chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        assert!(matches!(dialog_for(ed.video.as_ref().unwrap(), server, TITLE.into()), Dialog::Replace { .. }));
+    }
+
+    #[test]
+    fn replacing_what_a_new_recording_published_saves_over_the_same_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("draft");
+        let store = store_in(tmp.path());
+        let first = state(tmp.path());
+        let done = publish_to(&s, &first, false, &Keeping::In(store.clone())).unwrap();
+        let r = remember_upload(&Pending { server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
+        assert_eq!(r.key, key_at(&s), "keyed as the saved project is");
+        let mut ed = editor_of(&first);
+        ed.video.as_mut().unwrap().edit = first.edit.clone();
+        ed.video.as_mut().unwrap().remembered = Some(r.clone());
+        ed.add_item(Shape::Text { at: pt(60.0, 100.0), text: NOTE.into() });
+        let target = replaceable(ed.video.as_ref().unwrap()).unwrap().target;
+        let sent = s.lines().len();
+        let again = update_job(&state_of(&ed), &r.chapter_title, &target, &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap();
+        assert_eq!((again.finished.tour_id.as_str(), again.finished.chapter_id.as_str()), (TOUR, CH));
+        let create: serde_json::Value = serde_json::from_slice(&s.requests()[sent].body).unwrap();
+        assert_eq!(create["target"], serde_json::json!({ "kind": "replace", "tour_id": TOUR, "chapter_id": CH }), "the same chapter, not a second one");
+        let list = store.list();
+        assert_eq!(list.len(), 1, "the same project, saved over");
+        assert_eq!((&list[0].key, list[0].title.as_str()), (&key_at(&s), TITLE));
+        assert!(project_text(&list[0]).contains(NOTE));
+    }
+
+    #[test]
+    fn a_remembered_chapter_removed_on_the_site_fails_the_replace_and_loses_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let how = Arc::new(Mutex::new(Replace::Works("draft")));
+        let s = site(how.clone(), || {}, |_| reply(200, LIVE));
+        let store = store_in(tmp.path());
+        let first = state(tmp.path());
+        let done = publish_to(&s, &first, false, &Keeping::In(store.clone())).unwrap();
+        let r = remember_upload(&Pending { server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
+        let mut ed = editor_of(&first);
+        ed.video.as_mut().unwrap().remembered = Some(r.clone());
+        ed.add_item(Shape::Text { at: pt(60.0, 100.0), text: NOTE.into() });
+        let items = ed.doc.items().to_vec();
+        let before = files_of(&store.list()[0].dir);
+        let target = replaceable(ed.video.as_ref().unwrap()).unwrap().target;
+        for (refusal, sentence, again) in [
+            (Replace::ChapterGone, "Could not start the upload: that chapter is no longer part of the tour.", false),
+            (Replace::TourGone, "Could not start the upload: that tour no longer exists.", false),
+            (Replace::Changed, "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.", true),
+        ] {
+            *how.lock().unwrap() = refusal;
+            let e = update_job(&state_of(&ed), &r.chapter_title, &target, &s.base, || Ok(TOKEN.to_string()), &Keeping::In(store.clone()), &Arc::new(Run::default()), &|_| {}).unwrap_err();
+            assert_eq!((e.as_str(), publish_ui::update_can_be_tried_again(&e)), (sentence, again));
+            // The editor's work and what it remembers are as they were, and so is the saved project.
+            assert_eq!(ed.doc.items(), items.as_slice());
+            assert_eq!(ed.video.as_ref().unwrap().remembered.as_ref(), Some(&r));
+            assert_eq!(files_of(&store.list()[0].dir), before);
+        }
     }
 
     #[test]

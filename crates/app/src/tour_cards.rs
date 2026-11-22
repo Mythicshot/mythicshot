@@ -19,7 +19,7 @@ use crate::tour::{
     self, Advance, Anchor, BUTTON_LABEL_MAX, CARD_BODY_MAX, CARD_TITLE_MAX, COVER_BODY_MAX, COVER_BUTTON_MAX, COVER_TITLE_MAX, Card, CardStyle, Cover, DEFAULT_ACCENT, END_TEXT_MAX, EndCard, HotspotStyle, LINK_MAX, Link, NEXT_LABEL_MAX, Placed, Placement, Point, Side, TourDoc, ZOOM_MAX,
     ZOOM_MIN, AUTOPLAY_MAX, AUTOPLAY_MIN, parse_bold, place_card, safe_url,
 };
-use crate::tour_view::{click_point, planned_steps};
+use crate::tour_view::{PULSE_HINT, PulseAction, click_point, planned_steps};
 use crate::video::crop_px;
 
 /// The card's width on screen, the same as the players draw it.
@@ -434,6 +434,37 @@ fn link_rows(ui: &mut egui::Ui, label_name: &str, link: &mut Link, draft: &mut S
     ui.end_row();
 }
 
+/// The "Pulse" row of the shown step: "Where I clicked" or "A spot I pick", in the style of the
+/// card's "Points at" row; while the picture takes the pulse, the hint in the accent colour; and
+/// once the pulse was moved, "Put it back where I clicked". A step without a click (the end step)
+/// has the row disabled. `moved`: the step's pulse is not where it was clicked; `placing`: the
+/// picture takes it now.
+fn pulse_row(ui: &mut egui::Ui, has_click: bool, moved: bool, placing: bool) -> Option<PulseAction> {
+    let mut action = None;
+    let picked = has_click && (moved || placing);
+    ui.horizontal(|ui| {
+        ui.label("Pulse");
+        ui.add_enabled_ui(has_click, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let recorded = ui.add(egui::Button::selectable(!picked, "Where I clicked"));
+            if recorded.on_hover_text("Where the recording was clicked").on_disabled_hover_text("This step has no click").clicked() {
+                action = Some(PulseAction::Recorded);
+            }
+            let spot = ui.add(egui::Button::selectable(picked, "A spot I pick"));
+            if spot.on_hover_text(PULSE_HINT).on_disabled_hover_text("This step has no click").clicked() {
+                action = Some(PulseAction::Pick);
+            }
+        });
+    });
+    if has_click && placing {
+        ui.label(RichText::new(PULSE_HINT).color(theme::ACCENT));
+    }
+    if has_click && moved && ui.button("Put it back where I clicked").clicked() {
+        action = Some(PulseAction::PutBack);
+    }
+    action
+}
+
 impl Editor {
     /// The shown step's source frame, its index, the step count and whether it has a click.
     fn card_step(&self) -> Option<(usize, usize, usize, bool)> {
@@ -751,6 +782,7 @@ impl Editor {
     /// The Tour settings panel, at the right of the canvas.
     pub(crate) fn tour_settings_panel(&mut self, ui: &mut egui::Ui) {
         let step = self.card_step();
+        let placing = self.placing_pulse();
         let dim = self.prefs.spotlight_dim.clamp(MIN_DIM, MAX_DIM);
         let Some(v) = self.video.as_mut() else { return };
         // A logo being checked lands even while the panel is closed.
@@ -771,6 +803,8 @@ impl Editor {
             }
         }
         if !v.tour.settings.open {
+            // The "Pulse" row is gone with the panel: the picture stops taking the pulse.
+            v.tour.pulse.placing = None;
             return;
         }
         let theme_before = saved_theme(&v.edit.tour_doc);
@@ -778,6 +812,7 @@ impl Editor {
         let mut animate = animate_before;
         let instance = v.tour.instance;
         let mut new_dim: Option<(u8, bool)> = None;
+        let mut pulse: Option<(usize, PulseAction)> = None;
         let mut close = false;
         let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(Margin::symmetric(12, 10));
         egui::Panel::right(("tour-settings", instance)).resizable(false).exact_size(304.0).frame(frame).show(ui, |ui| {
@@ -992,9 +1027,10 @@ impl Editor {
                     None => {
                         ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
                     }
-                    Some((src, i, _, _)) => {
+                    Some((src, i, _, has_click)) => {
                         ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
                         let x = doc.steps.entry(src).or_default();
+                        pulse = pulse_row(ui, has_click, x.pulse.is_some(), placing == Some(src)).map(|a| (src, a));
                         ui.label("Zoom to the spotlight");
                         ui.horizontal(|ui| {
                             for (z, label) in [(None, "Follow the tour"), (Some(true), "On"), (Some(false), "Off")] {
@@ -1026,6 +1062,9 @@ impl Editor {
         }
         if let Some((d, checkpoint)) = new_dim {
             self.apply_spotlight_dim(d, checkpoint);
+        }
+        if let Some((src, action)) = pulse {
+            self.pulse_action(src, action);
         }
         if animate != animate_before {
             self.prefs.tour_animate_hotspot = animate;
