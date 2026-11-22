@@ -3,7 +3,7 @@
 //! is red and the result starts a recording instead of a screenshot; Tab
 //! switches between the two.
 
-use eframe::egui::{self, epaint, Align2, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
+use eframe::egui::{self, Align2, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
 use mythicshot_capture::{Desktop, PxRect};
 
 use crate::theme;
@@ -281,7 +281,7 @@ mod tests {
         let picture = meshes
             .iter()
             .find_map(|c| match &c.primitive {
-                epaint::Primitive::Mesh(m) if m.texture_id != egui::TextureId::default() => Some(m.calc_bounds()),
+                egui::epaint::Primitive::Mesh(m) if m.texture_id != egui::TextureId::default() => Some(m.calc_bounds()),
                 _ => None,
             })
             .expect("the picture is painted");
