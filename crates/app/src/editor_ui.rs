@@ -2580,8 +2580,9 @@ mod tests {
     }
 
     /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and
-    /// with "Publish to…" open on its form. The picture in it is made here: bands and blocks, like
-    /// a screenshot of some app. Nothing is asked of any site.
+    /// with "Publish to…" open on its form, and with a rectangle selected on a white page and on a
+    /// dark one. The pictures in it are made here: bands and blocks, like a screenshot of some
+    /// app. Nothing is asked of any site.
     #[test]
     #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
     fn snapshot_the_editor_and_the_share_dialog() {
@@ -2607,6 +2608,19 @@ mod tests {
             share.show(ui.ctx(), &mut |_| false);
         });
         assert_eq!(crate::snapshot::save(&shot, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
+        // A selected rectangle on a white page and on a dark app, to see the selection on both.
+        for (name, page, ink) in [("editor-selection-white", [255u8, 255, 255], [214u8, 218, 224]), ("editor-selection-dark", [14, 14, 18], [44, 48, 58])] {
+            let shot = RgbaImage::from_fn(960, 600, |x, y| {
+                let line = (60..900).contains(&x) && (y % 36) < 10 && y > 40;
+                let c = if line { ink } else { page };
+                image::Rgba([c[0], c[1], c[2], 255])
+            });
+            let mut ed = Editor::new(shot, "Selection".into(), BTreeMap::new(), s.dest_context("Selection"), EditorPrefs::default());
+            let id = ed.doc.add(Shape::Rect(Bounds { x0: 240.0, y0: 160.0, x1: 620.0, y1: 400.0 }), Style::default());
+            ed.select(Some(id));
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+            assert_eq!(crate::snapshot::save(&shot, name), 0, "{name}: nothing behind the window shows");
+        }
     }
 
     /// Every dialog is made by the one helper that leaves the window undimmed.
