@@ -304,7 +304,7 @@ mod tests {
         egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() }
     }
 
-    /// "Add to site" paints an opaque surface-raised frame.
+    /// "Add to site" paints an opaque surface-raised frame, and no label sticks out of its button or field.
     #[test]
     fn the_dialog_is_opaque() {
         let ctx = crate::theme::test_context();
@@ -319,7 +319,9 @@ mod tests {
             out.textures_delta.clear();
             last = Some(out);
         }
-        crate::theme::checks::assert_dialog_opaque(&last.unwrap(), "add to site");
+        let out = last.unwrap();
+        crate::theme::checks::assert_dialog_opaque(&out, "add to site");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "add to site") >= 2);
     }
 
     /// Run frames until the background look at the folder has finished.

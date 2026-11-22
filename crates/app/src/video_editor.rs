@@ -2476,6 +2476,37 @@ mod tests {
         assert!(fills.iter().any(|(r, c, _)| *c == crate::theme::SURFACE && (r.width() - 304.0).abs() <= 2.0), "the Tour settings panel was drawn: {:?}", fills.iter().filter(|(r, ..)| r.width() > 200.0).collect::<Vec<_>>());
     }
 
+    /// Every label of the video editor fits what holds it: the timeline and its controls row
+    /// (with the caution that no key presses were recorded), and in the Tour view the step strip
+    /// and the Tour settings panel, 304 points wide.
+    #[test]
+    fn the_video_editors_labels_fit_its_timeline_and_tour_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let s = Settings::default();
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("timeline")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.video.as_mut().unwrap().edit.overlays.keys = KeyStyle::Chips;
+        let out = frames(&mut ed);
+        let all: String = out.shapes.iter().map(|c| format!("{:?}", c.shape)).collect();
+        assert!(all.contains("No key presses were recorded"), "the controls row shows its caution");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the video editor's timeline") >= 5);
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("tour")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
+    }
+
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {
         let s = Settings::default();
         Editor::open_project(store.load(key).unwrap(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()

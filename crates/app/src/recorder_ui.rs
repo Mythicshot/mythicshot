@@ -414,6 +414,25 @@ mod tests {
             s.bar_ui(ui, false);
         });
         assert_eq!(shot.uncovered, 0, "pixels at {:?}", shot.uncovered_at);
+        // And everything on it fits its fixed 680 by 46 points: the bar itself holds every label.
+        let ctx = crate::theme::test_context();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            s.bar_ui(ui, false);
+        });
+        out.textures_delta.clear();
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the recording bar") >= 3);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, into: &mut Vec<egui::Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => into.push(t.visual_bounding_rect()),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
+        assert!(texts.iter().all(|t| bar.contains_rect(*t)), "a label leaves the bar: {texts:?}");
     }
 
     #[test]

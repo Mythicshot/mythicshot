@@ -2742,7 +2742,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The tour picker and the result screen paint an opaque surface-raised frame.
+    /// The tour picker and the result screen paint an opaque surface-raised frame, and no label
+    /// sticks out of its button or field.
     #[test]
     fn the_picker_and_the_result_screen_are_opaque_dialogs() {
         let ctx = crate::theme::test_context();
@@ -2757,9 +2758,13 @@ pub(crate) mod tests {
             out.textures_delta.clear();
             last = Some(out);
         }
-        crate::theme::checks::assert_dialog_opaque(&last.unwrap(), "the tour picker");
+        let out = last.unwrap();
+        crate::theme::checks::assert_dialog_opaque(&out, "the tour picker");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the tour picker") >= 2);
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
-        crate::theme::checks::assert_dialog_opaque(&draw_result(&ctx, &mut d), "the result screen");
+        let out = draw_result(&ctx, &mut d);
+        crate::theme::checks::assert_dialog_opaque(&out, "the result screen");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the result screen") >= 1);
     }
 
     /// A few frames of the result screen, a second apart so it has faded in; the last one.

@@ -304,7 +304,8 @@ fn the_page_on_another_host_is_shown_in_full() {
     assert!(v.texts().iter().any(|t| t.ends_with("or go to connections-dashboard.a-rather-long-workspace-host-name.example.com:8443/connections.")));
 }
 
-/// The sign-in window paints an opaque surface-raised frame, while it waits and once it has a code.
+/// The sign-in window paints an opaque surface-raised frame, while it waits and once it has a
+/// code, and no label sticks out of its button or field.
 #[test]
 fn the_window_is_an_opaque_dialog() {
     let (mut d, _sender, ..) = dialog(Some(code(Some("https://example.com/device"), Some("10"))));
@@ -322,7 +323,11 @@ fn the_window_is_an_opaque_dialog() {
         }
         last.unwrap()
     };
-    crate::theme::checks::assert_dialog_opaque(&frames(&mut d), "the sign-in window, waiting");
+    let out = frames(&mut d);
+    crate::theme::checks::assert_dialog_opaque(&out, "the sign-in window, waiting");
+    assert!(crate::theme::checks::assert_texts_fit(&out, "the sign-in window, waiting") >= 1);
     until_code(&mut d);
-    crate::theme::checks::assert_dialog_opaque(&frames(&mut d), "the sign-in window with its code");
+    let out = frames(&mut d);
+    crate::theme::checks::assert_dialog_opaque(&out, "the sign-in window with its code");
+    assert!(crate::theme::checks::assert_texts_fit(&out, "the sign-in window with its code") >= 2);
 }

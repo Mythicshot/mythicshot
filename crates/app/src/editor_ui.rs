@@ -2514,6 +2514,57 @@ mod tests {
         assert!(failed.is_empty(), "lost on the screenshot: {failed:?}");
     }
 
+    /// Every label of the editor fits what holds it: the rail's group titles (Draw, Shapes,
+    /// More) in its 84 points, the toolbar's property row with a shape selected and with the
+    /// typing hint while a text is typed, and the status bar.
+    #[test]
+    fn the_editors_labels_fit_its_rail_toolbar_and_status_bar() {
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let texts = |out: &egui::FullOutput| {
+            let mut all = Vec::new();
+            fn collect(s: &egui::Shape, into: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                    egui::Shape::Text(t) => into.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| collect(&c.shape, &mut all));
+            all
+        };
+        // A shape selected: its properties in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor with a shape selected") >= 3);
+        let shown = texts(&out);
+        for title in ["Draw", "Shapes", "More"] {
+            let (_, r) = shown.iter().find(|(t, _)| t == title).unwrap_or_else(|| panic!("the rail shows {title}: {shown:?}"));
+            assert!(r.left() >= 0.0 && r.right() <= RAIL, "{title} at {r:?} fits the {RAIL}-point rail");
+        }
+        // A text being typed: the hint in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: None });
+        let out = frames(&mut ed);
+        assert!(shown_has(&texts(&out), "Esc cancel"), "the typing hint shows");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor while a text is typed") >= 3);
+        fn shown_has(shown: &[(String, Rect)], part: &str) -> bool {
+            shown.iter().any(|(t, _)| t.contains(part))
+        }
+    }
+
     /// An editor window is told once, on its first frame, to draw its title bar dark.
     #[test]
     fn an_editor_window_is_told_once_to_draw_its_title_bar_dark() {
