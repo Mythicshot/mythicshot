@@ -225,6 +225,9 @@ impl Session {
     /// `keys_on` is whether key presses are being logged right now.
     pub fn bar_ui(&self, ui: &mut egui::Ui, keys_on: bool) -> Option<BarAction> {
         let mut action = None;
+        // Opaque under the bar's edge, where its border and its fill each soften and together
+        // left the desktop a little visible.
+        theme::window_background(ui);
         let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, theme::BORDER_STRONG));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
@@ -384,6 +387,57 @@ impl<T: Send + 'static> EncodeJob<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session counting down to a recording that never starts: the bar as it first shows.
+    /// Nothing is recorded and no screen is asked about.
+    pub(crate) fn counting_down() -> Session {
+        let rect = PxRect { x: 0, y: 0, w: 640, h: 480 };
+        Session {
+            rect,
+            title: "t".into(),
+            target: Target { display: String::new(), origin: (0, 0), x: 0, y: 0, width: 640, height: 480 },
+            monitor: rect,
+            monitor_scale: 1.0,
+            frame_placer: Placer::new(FRAME_TITLE, placement::frame_rect(rect, &[]), Focus::None),
+            frame_guess: placement::guess_points(rect, 1.0),
+            phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(3600) },
+            fps: 15,
+            frame: Default::default(),
+            frame_hidden_from_capture: false,
+            previous_foreground: None,
+            draw: LiveDraw::default(),
+        }
+    }
+
+    /// The recording bar, a window of its own, paints all of itself opaque, pixel by pixel at 125%.
+    #[test]
+    fn the_recording_bar_is_opaque_pixel_by_pixel() {
+        let s = counting_down();
+        let size = vec2(placement::BAR_SIZE[0], placement::BAR_SIZE[1]);
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.25, 3, |ui| {
+            s.bar_ui(ui, false);
+        });
+        assert_eq!(shot.uncovered, 0, "pixels at {:?}", shot.uncovered_at);
+        // And everything on it fits its fixed 680 by 46 points: the bar itself holds every label.
+        let ctx = crate::theme::test_context();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            s.bar_ui(ui, false);
+        });
+        out.textures_delta.clear();
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the recording bar") >= 3);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, into: &mut Vec<egui::Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => into.push(t.visual_bounding_rect()),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
+        assert!(texts.iter().all(|t| bar.contains_rect(*t)), "a label leaves the bar: {texts:?}");
+    }
 
     #[test]
     fn a_file_counts_as_being_exported_until_its_export_ends() {

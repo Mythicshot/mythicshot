@@ -1950,7 +1950,7 @@ impl Editor {
                 overlay_controls(ui, &mut v.edit.overlays);
                 let no_keys = !v.events.iter().any(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_)));
                 if no_keys && v.edit.overlays.keys != KeyStyle::Off {
-                    ui.label(RichText::new("No key presses were recorded").color(theme::CAUTION_TEXT).size(12.0))
+                    theme::caution_line(ui, "No key presses were recorded", theme::SMALL_SIZE, theme::Fit::Truncate)
                         .on_hover_text("Key logging is off by default. Turn on Keys on the recording bar (or Record key presses in Preferences › Output) before recording.");
                 }
                 if v.edit.crop.is_some() && ui.button("Clear crop").clicked() {
@@ -2450,6 +2450,61 @@ mod tests {
         crate::editor_ui::dialog_checks::frame(&mut ed, &ctx, vec![]);
         crate::editor_ui::dialog_checks::click(&mut ed, &ctx, egui::pos2(10.0, 810.0));
         assert!(ed.site_dialog_open());
+    }
+
+    /// Filled in pixel by pixel at 125% scaling, the video editor lets nothing behind its window
+    /// show: with its timeline, and in the Tour view with the Tour settings panel open.
+    #[test]
+    fn the_video_editor_its_timeline_and_tour_settings_are_opaque_pixel_by_pixel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let s = Settings::default();
+            Editor::new_video(recorded(&tmp.path().join(name)), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+        };
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = make("timeline");
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with its timeline");
+        let mut ed = make("tour");
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let ctx = crate::theme::test_context();
+        assert_eq!(crate::snapshot::uncovered(&ctx, size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with Tour settings open");
+        // And the panel was there to be checked: 304 points wide (a point of it the separator), on surface.
+        let mut out = ctx.run_ui(crate::editor_ui::dialog_checks::input(vec![]), |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        let fills = crate::theme::checks::fills(&out);
+        assert!(fills.iter().any(|(r, c, _)| *c == crate::theme::SURFACE && (r.width() - 304.0).abs() <= 2.0), "the Tour settings panel was drawn: {:?}", fills.iter().filter(|(r, ..)| r.width() > 200.0).collect::<Vec<_>>());
+    }
+
+    /// Every label of the video editor fits what holds it: the timeline and its controls row
+    /// (with the caution that no key presses were recorded), and in the Tour view the step strip
+    /// and the Tour settings panel, 304 points wide.
+    #[test]
+    fn the_video_editors_labels_fit_its_timeline_and_tour_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let s = Settings::default();
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("timeline")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.video.as_mut().unwrap().edit.overlays.keys = KeyStyle::Chips;
+        let out = frames(&mut ed);
+        let all: String = out.shapes.iter().map(|c| format!("{:?}", c.shape)).collect();
+        assert!(all.contains("No key presses were recorded"), "the controls row shows its caution");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the video editor's timeline") >= 5);
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("tour")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
     }
 
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {

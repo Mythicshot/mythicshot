@@ -2128,7 +2128,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
 
 fn badge_ui(ui: &mut egui::Ui, t: &RemoteTour) {
     let (fg, bg) = if t.is_public() { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
-    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
         ui.label(RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE));
     });
 }
@@ -2138,7 +2138,7 @@ fn refresh_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if enabled && resp.hovered() {
-        p.rect_filled(rect, CornerRadius::same(theme::RADIUS_MD), theme::RAISED);
+        p.rect_filled(rect, CornerRadius::same(theme::control_radius(rect.height())), theme::RAISED);
     }
     let color = if enabled { theme::TEXT } else { theme::DISABLED };
     let (c, r) = (rect.center(), 7.0);

@@ -365,7 +365,7 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
         (hooks.open_folder)(root);
     }
     if let Some(note) = &saved.note {
-        ui.add(egui::Label::new(RichText::new(note).color(theme::CAUTION_TEXT)).wrap());
+        theme::caution_line(ui, note, theme::BODY_SIZE, theme::Fit::Wrap);
     }
     saved_list(ui, saved, hooks);
     changed
@@ -961,7 +961,7 @@ fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bi
                 if listening {
                     ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(12.0));
                 } else if let Some(e) = error {
-                    ui.label(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0));
+                    theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
                 }
             });
         });

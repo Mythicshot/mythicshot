@@ -107,7 +107,6 @@ impl Overlay {
         if tab {
             self.record = !self.record;
         }
-        let accent = if self.record { theme::RECORD } else { theme::SELECTION_EDGE };
         if arrows != (0, 0) {
             platform::nudge_cursor(arrows.0, arrows.1);
         }
@@ -157,7 +156,12 @@ impl Overlay {
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.max.y), full.max), 0.0, theme::SCRIM);
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.min.y), pos2(h.min.x, h.max.y)), 0.0, theme::SCRIM);
                 painter.rect_filled(Rect::from_min_max(pos2(h.max.x, h.min.y), pos2(full.max.x, h.max.y)), 0.0, theme::SCRIM);
-                painter.rect_stroke(h, 0.0, Stroke::new(if self.record { 3.0 } else { 2.0 }, accent), StrokeKind::Outside);
+                if self.record {
+                    painter.rect_stroke(h, 0.0, Stroke::new(3.0, theme::RECORD), StrokeKind::Outside);
+                } else {
+                    // Over the darkened desktop, which can be light: two-tone, as on a picture.
+                    theme::selection_outline(painter, h, 0.0, 2.0);
+                }
             }
             None => {
                 painter.rect_filled(full, 0.0, theme::SCRIM);
@@ -229,7 +233,7 @@ impl Overlay {
 fn label(painter: &egui::Painter, at: Pos2, align: Align2, text: &str) {
     let galley = painter.layout_no_wrap(text.to_string(), FontId::proportional(13.0), theme::TEXT);
     let rect = align.anchor_size(at, galley.size()).expand2(vec2(8.0, 4.0));
-    painter.rect_filled(rect, f32::from(theme::RADIUS_MD), theme::RAISED);
+    painter.rect_filled(rect, f32::from(theme::control_radius(rect.height())), theme::RAISED);
     painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT);
 }
 

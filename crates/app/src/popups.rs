@@ -245,6 +245,13 @@ mod tests {
             // The card on it: surface-raised with its border and corners.
             assert!(checks::fills(&out).iter().any(|(_, c, r)| *c == theme::RAISED && *r == theme::RADIUS_LG), "the toast's card");
         }
+        // Their labels fit: the picker's rows and the toast's message and buttons, in their small fixed windows.
+        let mut out = ctx.run_ui(window(PICKER_SIZE), |ui| picker.ui(ui));
+        out.textures_delta.clear();
+        assert!(checks::assert_texts_fit(&out, "the destination picker") >= 3);
+        let mut out = ctx.run_ui(window(TOAST_SIZE), |ui| toast.ui(ui));
+        out.textures_delta.clear();
+        assert!(checks::assert_texts_fit(&out, "the toast") >= 1);
         // Filled in pixel by pixel: not one pixel lets the desktop through, not even at the card's rounded corners.
         assert_eq!(crate::snapshot::uncovered(&theme::test_context(), PICKER_SIZE.into(), 1.25, 2, |ui| picker.ui(ui)), 0, "the destination picker");
         assert_eq!(crate::snapshot::uncovered(&theme::test_context(), TOAST_SIZE.into(), 1.25, 2, |ui| toast.ui(ui)), 0, "the toast");

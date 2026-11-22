@@ -13,14 +13,15 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 
 ## 0.2.19 (2026-11-21)
 
-- A new look: deep violet backgrounds, purple main buttons with white labels and gold for links, focus and selected items. Mythicshot is always dark now, whatever Windows is set to.
-- Text is set in Manrope, built into the program; links and shortcuts keep their monospace face. The font's licence is installed beside LICENSE.txt.
-- Warnings are orange boxes with a warning sign and an edge; deleting and errors are red, done and connected are teal, and each still says what it means in words.
-- Buttons and fields have softer corners, cards, dialogs, menus and the small "Send capture to" and saved-capture windows rounder ones with a thin edge.
+- A new look: deep violet backgrounds, purple main buttons with white labels and gold for links, focus and selected items. Mythicshot is always dark now, whatever Windows is set to, title bars included.
+- Text is set in Manrope, built into the program, and headings in its bold; links and shortcuts keep their monospace face. Letters Manrope lacks (much of Cyrillic, Greek Extended) still show, in egui's own font. The licences of every font in the program are installed beside LICENSE.txt.
+- Warnings are orange boxes with a warning sign and an edge, or a line with the warning sign before it; deleting and errors are red, done and connected are teal, and each still says what it means in words.
+- Buttons and fields have slightly rounded corners, cards, dialogs, menus and the small "Send capture to" and saved-capture windows rounder ones with a thin edge.
 - Section names in Preferences and the editor's tool groups are no longer in capitals ("After capture", "Shapes").
 - The keyboard focus is a gold ring.
+- What is selected in the editor, the crop edge, the selected guide card and the area being chosen for a capture are outlined in gold with a dark edge, so they show on light and dark pictures alike.
 - New icon for the program, the taskbar, the notification area and Apps in Windows Settings, and new pictures in the installer.
-- The thin line where the main window's menu meets the page, and where the editor's bars meet, no longer lets the desktop show through.
+- The thin line where the main window's menu meets the page, where the editor's bars meet, and along the edge of the recording bar no longer lets the desktop show through.
 
 ## 0.2.18 (2026-11-21)
 

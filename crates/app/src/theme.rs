@@ -38,7 +38,9 @@ pub struct Palette {
     pub border_strong: Color32,
     pub text: Color32,
     pub muted: Color32,
-    /// Text of a control that cannot be used now, painted opaque.
+    /// Text and icons of a control that cannot be used now, where the app draws the disabled
+    /// state itself, opaque. Never inside a disabled Ui: egui fades that already (see
+    /// [`DISABLED_ALPHA`]), so there the text colour is used and egui's fade makes it disabled.
     pub disabled: Color32,
     /// The one main button of a view, selected tabs and toggles.
     pub primary: Color32,
@@ -143,9 +145,16 @@ pub const SCRIM_FAINT: Color32 = Color32::from_black_alpha(28);
 pub const CARD_SHADOW: Color32 = Color32::from_black_alpha(80);
 /// The shadow the Shadow icon depicts.
 pub const ICON_SHADOW: Color32 = Color32::from_black_alpha(200);
-/// The outline and handles of what is selected on the canvas, and the edge of a crop: the gold of
-/// selection highlights, which reads on most pictures.
+/// What marks a selection on the user's picture is two-tone, so it reads on any picture: a gold
+/// line (which reads on dark pictures) inside a dark band of ground (which reads on light ones).
+/// The gold line of the outline, the handles' ring, the edge of a crop and a selected card's dashes.
 pub const SELECTION_EDGE: Color32 = DARK.accent;
+/// The dark band on each side of [`SELECTION_EDGE`], and the outer edge of a handle.
+pub const SELECTION_HALO: Color32 = DARK.ground;
+/// How wide the dark band is on each side of the gold line.
+pub const SELECTION_HALO_WIDTH: f32 = 1.0;
+/// The light fill of a selection handle.
+pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
 /// The pixel grid lines of the magnifier, over the desktop.
@@ -182,14 +191,29 @@ pub const BODY_WEIGHT: f32 = 500.0;
 /// app-heading and app-strong weight.
 pub const STRONG_WEIGHT: f32 = 700.0;
 
-const MANROPE: &[u8] = include_bytes!("../../../assets/fonts/manrope/Manrope[wght].ttf");
+static MANROPE: &[u8] = include_bytes!("../../../assets/fonts/manrope/Manrope[wght].ttf");
+
+/// The font family headings are set in: the same Manrope bytes (borrowed, not copied) at
+/// app-heading's bold weight, with the interface family's fallbacks.
+pub fn heading_family() -> FontFamily {
+    FontFamily::Name("Heading".into())
+}
 
 // Shape and space.
 
-/// radius-sm: menu rows.
+// Corners. A button is never a pill: a control's corner radius is at most a quarter of its
+// height. egui's own controls and fields are dense (about 21 points high), so they take
+// radius-sm; radius-md is for controls at least 36 points high (the 44-point buttons of the
+// share, publish and sign-in windows, the link row, the close question's buttons, big icon
+// buttons) and for caution and notice boxes; [`control_radius`] picks between them. Chips and
+// badges are fully rounded, so a badge never looks like a button.
+
+/// radius-sm: egui's dense controls and fields, menu rows, small icon buttons.
 pub const RADIUS_SM: u8 = 4;
-/// radius-md: buttons, fields, icon buttons, caution and notice boxes.
+/// radius-md: controls 36 points high or more, caution and notice boxes.
 pub const RADIUS_MD: u8 = 8;
+/// Chips and badges: fully rounded (egui caps a radius at half the height).
+pub const RADIUS_FULL: u8 = u8::MAX;
 /// radius-lg: cards, dialogs, popovers.
 pub const RADIUS_LG: u8 = 12;
 pub const SPACE_1: f32 = 4.0;
@@ -202,11 +226,23 @@ pub const SPACE_12: f32 = 48.0;
 /// The focus ring's width.
 pub const FOCUS_WIDTH: f32 = 2.0;
 
+/// The corner radius of a control `height` points high: radius-md from 36 points up, radius-sm below.
+pub fn control_radius(height: f32) -> u8 {
+    if height >= 36.0 { RADIUS_MD } else { RADIUS_SM }
+}
+
 /// Fix the app to the dark theme, with the brand's look and fonts. Called once, at start-up.
 pub fn apply(ctx: &egui::Context) {
     ctx.set_fonts(fonts());
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style());
+}
+
+/// Tell a window with a native title bar to draw it dark, whatever Windows uses: the app is
+/// always dark, and a light title bar over it would not be. Sent once to each such window when
+/// it is made (the main window and every editor window; the other windows have no title bar).
+pub fn dark_title_bar(ctx: &egui::Context, id: egui::ViewportId) {
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
 }
 
 /// A context set up the way the app sets up its own, for tests that draw frames.
@@ -218,21 +254,28 @@ pub fn test_context() -> egui::Context {
 }
 
 /// egui's built-in fonts with Manrope at the head of the interface family, at medium weight
-/// (the font is variable; [`strong`] asks for bold), and Hack for monospace. The built-in
-/// interface face is no longer in either family; the icon and emoji fonts stay as fallbacks.
+/// (the font is variable; [`strong`] asks for bold), Manrope at bold weight for headings
+/// ([`heading_family`]), and Hack for monospace. The icon and emoji fonts stay as fallbacks.
 pub fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
-    let tweak = egui::FontTweak { coords: egui::epaint::text::VariationCoords::new([("wght", BODY_WEIGHT)]), ..Default::default() };
-    fonts.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).tweak(tweak).into());
-    for (family, head) in [(FontFamily::Proportional, None), (FontFamily::Monospace, Some("Hack"))] {
-        let list = fonts.families.entry(family).or_default();
-        list.retain(|name| name != "Ubuntu-Light" && name != "Manrope" && Some(name.as_str()) != head);
-        // Monospace text falls back to Manrope for what Hack lacks.
-        list.insert(0, "Manrope".into());
-        if let Some(head) = head {
-            list.insert(0, head.into());
-        }
-    }
+    let at = |weight: f32| egui::FontTweak { coords: egui::epaint::text::VariationCoords::new([("wght", weight)]), ..Default::default() };
+    // `from_static` borrows the one copy of the font that is built into the program.
+    fonts.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).tweak(at(BODY_WEIGHT)).into());
+    fonts.font_data.insert("Manrope-Heading".into(), FontData::from_static(MANROPE).tweak(at(STRONG_WEIGHT)).into());
+    // egui's built-in interface face, Ubuntu-Light, stays right after Manrope as a fallback: it
+    // has letters Manrope lacks (much of Cyrillic, Greek Extended), so a title or a file name in
+    // them shows its letters, not boxes.
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    proportional.retain(|name| name != "Manrope" && name != "Ubuntu-Light");
+    proportional.splice(0..0, ["Manrope".to_string(), "Ubuntu-Light".to_string()]);
+    let proportional = proportional.clone();
+    // Monospace text falls back to the interface family for what Hack lacks.
+    let mut monospace = vec!["Hack".to_string()];
+    monospace.extend(proportional.iter().cloned());
+    fonts.families.insert(FontFamily::Monospace, monospace);
+    let mut heading = vec!["Manrope-Heading".to_string()];
+    heading.extend(proportional);
+    fonts.families.insert(heading_family(), heading);
     fonts
 }
 
@@ -255,7 +298,8 @@ impl Strong for RichText {
 /// egui's look from a palette.
 pub fn visuals(p: &Palette) -> Visuals {
     let mut v = Visuals::dark();
-    let md = CornerRadius::same(RADIUS_MD);
+    // egui's controls are dense: radius-sm (see the rule above `RADIUS_SM`).
+    let md = CornerRadius::same(RADIUS_SM);
     let w = &mut v.widgets;
     // Labels, separators and frames that take no input.
     w.noninteractive.bg_fill = p.surface;
@@ -263,7 +307,9 @@ pub fn visuals(p: &Palette) -> Visuals {
     w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     w.noninteractive.corner_radius = md;
-    // Secondary buttons, fields, checkboxes: surface fill, border-strong edge, text label.
+    // Controls at rest: a border-strong edge and a text label. egui fills a button with
+    // `weak_bg_fill` (surface), and a checkbox's box, a slider's handle and the like with
+    // `bg_fill` (surface-raised); a text field takes `text_edit_bg_color` (surface, below).
     w.inactive.bg_fill = p.raised;
     w.inactive.weak_bg_fill = p.surface;
     w.inactive.bg_stroke = Stroke::new(1.0, p.border_strong);
@@ -325,7 +371,7 @@ pub fn style() -> Style {
         (TextStyle::Small, FontId::proportional(SMALL_SIZE)),
         (TextStyle::Body, FontId::proportional(BODY_SIZE)),
         (TextStyle::Button, FontId::proportional(BODY_SIZE)),
-        (TextStyle::Heading, FontId::proportional(HEADING_SIZE)),
+        (TextStyle::Heading, FontId::new(HEADING_SIZE, heading_family())),
         (TextStyle::Monospace, FontId::monospace(MONO_SIZE)),
     ]
     .into();
@@ -356,6 +402,30 @@ pub fn window_card<R>(ui: &mut egui::Ui, margin: f32, add: impl FnOnce(&mut egui
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(margin + 1.0)), add).inner
         })
         .inner
+}
+
+/// The outline of what is selected on the user's picture (and the edge of a crop), just outside
+/// `rect`: a gold line `width` points wide with a dark band on each side (see [`SELECTION_HALO`]).
+pub fn selection_outline(painter: &egui::Painter, rect: egui::Rect, radius: f32, width: f32) {
+    let halo = SELECTION_HALO_WIDTH;
+    painter.rect_stroke(rect, radius, Stroke::new(width + 2.0 * halo, SELECTION_HALO), egui::StrokeKind::Outside);
+    painter.rect_stroke(rect.expand(halo), radius + halo, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
+}
+
+/// A handle of what is selected on the user's picture, `side` points square around `center`: a
+/// light fill, a gold ring and a dark outer edge.
+pub fn selection_handle(painter: &egui::Painter, center: egui::Pos2, side: f32) {
+    let r = egui::Rect::from_center_size(center, egui::vec2(side, side));
+    painter.rect_filled(r, 1.0, HANDLE_FILL);
+    painter.rect_stroke(r, 1.0, Stroke::new(1.0, SELECTION_EDGE), egui::StrokeKind::Outside);
+    painter.rect_stroke(r.expand(1.0), 2.0, Stroke::new(SELECTION_HALO_WIDTH, SELECTION_HALO), egui::StrokeKind::Outside);
+}
+
+/// A dashed outline along the closed path `pts` over the user's picture: gold dashes `width`
+/// points wide over an unbroken dark line, so the gaps read as dark and the dashes as gold.
+pub fn selection_dashes(painter: &egui::Painter, pts: &[egui::Pos2], width: f32) {
+    painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(width + 2.0 * SELECTION_HALO_WIDTH, SELECTION_HALO)));
+    painter.extend(egui::Shape::dashed_line(pts, Stroke::new(width, SELECTION_EDGE), 6.0, 4.0));
 }
 
 /// The box around a caution: caution-tint fill, a 1px caution-border edge, radius-md. The edge
@@ -389,6 +459,44 @@ pub fn caution_box<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -
             .inner
         })
         .inner
+}
+
+/// How an inline caution's text fits its line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Onto more lines.
+    Wrap,
+    /// Cut short with "…".
+    Truncate,
+}
+
+/// A caution on a line of its own, without a box: the small warning icon in caution-border, then
+/// `text` in caution-text at `size`. A caution always carries its icon, never colour alone. The
+/// icon comes first in the reading order, also in a row laid out from the right. The text's response.
+pub fn caution_line(ui: &mut egui::Ui, text: impl Into<String>, size: f32, fit: Fit) -> egui::Response {
+    let text = text.into();
+    let from_right = ui.layout().prefer_right_to_left();
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = SPACE_1;
+        let icon = |ui: &mut egui::Ui| {
+            let side = ui.fonts_mut(|f| f.row_height(&FontId::proportional(size)));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+            crate::icons::paint(ui.painter(), rect.shrink(side * 0.1), crate::icons::Icon::Warning, CAUTION_BORDER);
+        };
+        let label = |ui: &mut egui::Ui| {
+            let label = egui::Label::new(RichText::new(text).color(CAUTION_TEXT).size(size));
+            ui.add(if fit == Fit::Wrap { label.wrap() } else { label.truncate() })
+        };
+        if from_right {
+            let response = label(ui);
+            icon(ui);
+            response
+        } else {
+            icon(ui);
+            label(ui)
+        }
+    })
+    .inner
 }
 
 /// A primary button: primary fill, on-primary label in the strong weight.
@@ -444,20 +552,27 @@ pub mod checks {
     }
 
     /// A window's background: at every point of a 16-point grid over `window`, the first fill
-    /// painted there is fully opaque, so nothing behind the window shows through; and every card
-    /// or dialog (radius-lg) on it is opaque too.
+    /// painted there is fully opaque, so nothing behind the window shows through. A ground
+    /// painted under the whole window first ([`window_background`]) only covers the seams
+    /// between panels, so the check is made again without it: the window's own panels, cards
+    /// and bars cover every point themselves, opaque. And every card or dialog (radius-lg) on it
+    /// is opaque too.
     pub fn assert_window_opaque(out: &egui::FullOutput, window: Rect, what: &str) {
         let fills = fills(out);
-        let mut y = window.top() + 2.0;
-        while y < window.bottom() {
-            let mut x = window.left() + 2.0;
-            while x < window.right() {
-                let p = egui::pos2(x, y);
-                let first = fills.iter().find(|(r, ..)| r.contains(p));
-                assert!(first.is_some_and(|(_, c, _)| c.a() == 255), "{what}: at {p:?} the first fill is {first:?}");
-                x += 16.0;
+        let under_all = fills.first().filter(|(r, ..)| r.contains_rect(window)).is_some();
+        let panels = &fills[usize::from(under_all)..];
+        for (layer, fills) in [("the window", &fills[..]), ("its panels", panels)] {
+            let mut y = window.top() + 2.0;
+            while y < window.bottom() {
+                let mut x = window.left() + 2.0;
+                while x < window.right() {
+                    let p = egui::pos2(x, y);
+                    let first = fills.iter().find(|(r, ..)| r.contains(p));
+                    assert!(first.is_some_and(|(_, c, _)| c.a() == 255), "{what}, {layer}: at {p:?} the first fill is {first:?}");
+                    x += 16.0;
+                }
+                y += 16.0;
             }
-            y += 16.0;
         }
         for (r, c, radius) in &fills {
             if *radius >= RADIUS_LG && r.area() >= 4000.0 {
@@ -507,7 +622,7 @@ pub mod checks {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// One frame of `ctx`, its textures dropped.
@@ -558,6 +673,10 @@ mod tests {
             ("caution-border on surface-raised", CAUTION_BORDER, RAISED, 3.0),
             ("focus around a primary button, on ground", FOCUS, GROUND, 3.0),
             ("gold against caution-border (told apart)", GOLD, CAUTION_BORDER, 2.0),
+            ("selection halo on a white picture", SELECTION_HALO, Color32::WHITE, 3.0),
+            ("selection gold on a black picture", SELECTION_EDGE, Color32::BLACK, 3.0),
+            ("selection gold against its halo", SELECTION_EDGE, SELECTION_HALO, 3.0),
+            ("handle fill against the selection halo", HANDLE_FILL, SELECTION_HALO, 3.0),
         ] {
             all.push((name.to_string(), fg, bg, min));
         }
@@ -602,6 +721,175 @@ mod tests {
         }
     }
 
+    /// Whether some pixel of `image` on the line from `a` to `b` (in points, at `ppp`) has at
+    /// least 3:1 contrast against `bg`.
+    pub(crate) fn reads_against(image: &image::RgbaImage, ppp: f32, a: egui::Pos2, b: egui::Pos2, bg: Color32) -> bool {
+        let steps = ((b - a).length() * ppp * 2.0).ceil().max(1.0) as usize;
+        (0..=steps).any(|i| {
+            let p = a + (b - a) * (i as f32 / steps as f32);
+            let (x, y) = ((p.x * ppp) as u32, (p.y * ppp) as u32);
+            x < image.width() && y < image.height() && {
+                let [r, g, bl, _] = image.get_pixel(x, y).0;
+                contrast(Color32::from_rgb(r, g, bl), bg) >= 3.0
+            }
+        })
+    }
+
+    /// The pictures a selection is tested on: a white page and a near-black one.
+    pub(crate) const PICTURES: [(&str, Color32); 2] = [("white", Color32::WHITE), ("near-black", Color32::from_rgb(12, 12, 14))];
+
+    /// What marks a selection over the user's picture (the outline, a handle, the dashed outline
+    /// of a tour card) reads on a white picture and on a near-black one: across each of them there
+    /// is a pixel with at least 3:1 contrast against the picture.
+    #[test]
+    fn what_marks_a_selection_reads_on_a_white_and_on_a_near_black_picture() {
+        let ppp = 1.25;
+        let size = egui::vec2(120.0, 100.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(30.0, 30.0), egui::vec2(60.0, 40.0));
+        let mut failed = Vec::new();
+        for (name, bg) in PICTURES {
+            let draw = |mark: &dyn Fn(&egui::Painter)| {
+                crate::snapshot::picture(&test_context(), size, ppp, 1, |ui| {
+                    ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, bg);
+                    mark(ui.painter());
+                })
+            };
+            // Cross-sections at a quarter of each side, from the edge outwards.
+            let across = |image: &image::RgbaImage, what: &str, failed: &mut Vec<String>| {
+                let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+                let (qx, qy) = (l + rect.width() / 4.0, t + rect.height() / 4.0);
+                for (side, a, z) in [("top", egui::pos2(qx, t), egui::pos2(qx, t - 6.0)), ("bottom", egui::pos2(qx, b), egui::pos2(qx, b + 6.0)), ("left", egui::pos2(l, qy), egui::pos2(l - 6.0, qy)), ("right", egui::pos2(r, qy), egui::pos2(r + 6.0, qy))] {
+                    if !reads_against(image, ppp, a, z, bg) {
+                        failed.push(format!("{what} on {name}, {side} side"));
+                    }
+                }
+            };
+            across(&draw(&|p| selection_outline(p, rect, 2.0, 1.0)), "the selection outline", &mut failed);
+            across(&draw(&|p| selection_outline(p, rect, 0.0, 2.0)), "the crop edge", &mut failed);
+            // A dashed line has gaps, so along each side, over more than one dash and gap (10
+            // points), some pixel reads; across it, the dark line under the dashes reads on white.
+            let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
+            let image = draw(&|p| selection_dashes(p, &pts, 1.5));
+            for (side, a, z) in [("top", rect.left_top() + egui::vec2(15.0, 0.0), rect.left_top() + egui::vec2(27.0, 0.0)), ("right", rect.right_top() + egui::vec2(0.0, 10.0), rect.right_top() + egui::vec2(0.0, 22.0)), ("bottom", rect.right_bottom() - egui::vec2(15.0, 0.0), rect.right_bottom() - egui::vec2(27.0, 0.0)), ("left", rect.left_bottom() - egui::vec2(0.0, 10.0), rect.left_bottom() - egui::vec2(0.0, 22.0))] {
+                if !reads_against(&image, ppp, a, z, bg) {
+                    failed.push(format!("the dashed card outline on {name}, along the {side} side"));
+                }
+            }
+            if bg == Color32::WHITE {
+                across(&image, "the dashed card outline", &mut failed);
+            }
+            // A handle: across it, from outside one side to its middle.
+            let c = rect.center();
+            let image = draw(&|p| selection_handle(p, c, 8.0));
+            if !reads_against(&image, ppp, c - egui::vec2(8.0, 0.0), c, bg) {
+                failed.push(format!("a handle on {name}"));
+            }
+        }
+        assert!(failed.is_empty(), "lost on the picture: {failed:?}");
+    }
+
+    /// A button is never a pill: egui's buttons, fields and dropdowns have a corner radius of at
+    /// most a quarter of their height, and so do the tall buttons of the share window, at
+    /// radius-md. (A checkbox's 14-point box keeps radius-sm: a rounded square, not a pill.)
+    #[test]
+    fn a_button_is_never_a_pill() {
+        let ctx = test_context();
+        let mut text = String::from("Name");
+        let mut out = None;
+        for _ in 0..2 {
+            let o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = ui.button("Save");
+                ui.text_edit_singleline(&mut text);
+                egui::ComboBox::from_id_salt("pick").selected_text("PNG").show_ui(ui, |_| {});
+                ui.allocate_ui(egui::vec2(520.0, 60.0), |ui| crate::share_ui::action_row(ui, &[crate::share_ui::ActionButton { label: "Done", accent: false }]));
+            });
+            out = Some(o);
+            out.as_mut().unwrap().textures_delta.clear();
+        }
+        let out = out.unwrap();
+        let controls: Vec<_> = checks::fills(&out).into_iter().filter(|(r, ..)| r.height() >= 10.0 && r.width() >= 10.0).collect();
+        assert!(controls.len() >= 4, "{controls:?}");
+        for (r, c, radius) in &controls {
+            assert!(f32::from(*radius) <= r.height() / 4.0, "a control {r:?} filled {c:?} has radius {radius}");
+        }
+        assert!(controls.iter().any(|(r, _, radius)| (r.height() - crate::share_ui::BUTTON_HEIGHT).abs() < 0.5 && *radius == RADIUS_MD), "the tall button keeps radius-md: {controls:?}");
+        assert!(controls.iter().any(|(r, _, radius)| r.height() < 30.0 && *radius == RADIUS_SM), "a dense control takes radius-sm: {controls:?}");
+    }
+
+    /// A disabled icon button (undo with nothing to undo, a tool that cannot be used) is faded
+    /// once, by egui: its icon keeps at least 4.5:1 against the bar it sits on.
+    #[test]
+    fn a_disabled_icon_is_faded_once() {
+        let ppp = 2.0;
+        let size = egui::vec2(60.0, 60.0);
+        let image = crate::snapshot::picture(&test_context(), size, ppp, 2, |ui| {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, SURFACE);
+            ui.add_enabled_ui(false, |ui| crate::icons::button(ui, crate::icons::Icon::Undo, 36.0, false, "Undo"));
+        });
+        let best = image.pixels().map(|p| contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), SURFACE)).fold(0.0, f32::max);
+        assert!(best >= 4.5, "the disabled icon reaches only {best:.2}:1 on surface");
+    }
+
+    /// An inline caution carries the warning icon before its text, in a row laid out from the
+    /// left and in one laid out from the right.
+    #[test]
+    fn an_inline_caution_carries_its_icon_before_the_text() {
+        let ctx = test_context();
+        for layout in [egui::Layout::left_to_right(egui::Align::Center), egui::Layout::right_to_left(egui::Align::Center)] {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.with_layout(layout, |ui| caution_line(ui, "The address is not valid.", SMALL_SIZE, Fit::Wrap));
+            });
+            out.textures_delta.clear();
+            let (mut icon, mut text) = (None::<egui::Rect>, None::<egui::Rect>);
+            fn walk(s: &egui::Shape, icon: &mut Option<egui::Rect>, text: &mut Option<egui::Rect>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, icon, text)),
+                    egui::Shape::Text(t) if t.galley.job.sections.iter().all(|sec| sec.format.color == CAUTION_TEXT) => *text = Some(t.visual_bounding_rect()),
+                    egui::Shape::Text(_) => {}
+                    s if format!("{s:?}").contains(&format!("{CAUTION_BORDER:?}")) => *icon = Some(icon.map_or(s.visual_bounding_rect(), |r| r.union(s.visual_bounding_rect()))),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut icon, &mut text));
+            let (icon, text) = (icon.expect("the warning icon is drawn"), text.expect("the text is drawn"));
+            assert!(icon.right() <= text.left() + 0.5, "{layout:?}: the icon {icon:?} comes before the text {text:?}");
+        }
+    }
+
+    /// Every caution in caution-text outside this module is either in a caution box (which
+    /// carries the icon) or a [`caution_line`]: none is colour alone.
+    #[test]
+    fn no_caution_is_colour_alone() {
+        let mut bare = Vec::new();
+        for (file, lines) in production_sources() {
+            if file == "theme.rs" {
+                continue;
+            }
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if line.split("//").next().unwrap_or("").contains("theme::CAUTION_TEXT") && !lines[i.saturating_sub(8)..i].iter().any(|(_, l)| l.contains("caution_box(")) {
+                    bare.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(bare.is_empty(), "cautions without their icon:
+{}", bare.join("
+"));
+    }
+
+    /// The ground under the whole window alone does not pass for a window's panels.
+    #[test]
+    #[should_panic(expected = "its panels")]
+    fn the_ground_under_a_window_alone_does_not_make_it_opaque() {
+        let ctx = test_context();
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), ..Default::default() }, |ui| {
+            window_background(ui);
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)), 0.0, SURFACE);
+        });
+        out.textures_delta.clear();
+        checks::assert_window_opaque(&out, window, "half a window");
+    }
+
     #[test]
     fn the_app_is_dark_whatever_windows_uses() {
         let ctx = test_context();
@@ -629,10 +917,59 @@ mod tests {
         let fonts = fonts();
         assert_eq!(fonts.families[&FontFamily::Proportional][0], "Manrope");
         assert_eq!(fonts.families[&FontFamily::Monospace][0], "Hack");
-        assert!(fonts.families.values().all(|list| !list.iter().any(|n| n == "Ubuntu-Light")), "{:?}", fonts.families);
+        // Ubuntu-Light is a fallback right after Manrope, never ahead of it.
+        assert_eq!(fonts.families[&FontFamily::Proportional][1], "Ubuntu-Light");
+        assert_eq!(fonts.families[&heading_family()][..2], ["Manrope-Heading", "Manrope"]);
         let axes = fonts.font_data["Manrope"].variation_axes();
         let wght = axes.iter().find(|a| a.tag.to_string() == "wght").expect("Manrope is variable in weight");
         assert!(wght.range.min <= BODY_WEIGHT && STRONG_WEIGHT <= wght.range.max, "{wght:?}");
+    }
+
+    /// Headings are app-heading's bold: set in the heading family, Manrope at weight 700, they
+    /// come out wider than the same words in the body family at the same size. The heading face
+    /// borrows the same bytes as the body face: the font is in the program once.
+    #[test]
+    fn headings_are_bold_manrope_from_the_same_bytes() {
+        let fonts = fonts();
+        let (body, heading) = (&fonts.font_data["Manrope"], &fonts.font_data["Manrope-Heading"]);
+        let bytes = |d: &FontData| (*d.font).as_ref().as_ptr();
+        assert!(bytes(body) == MANROPE.as_ptr() && bytes(heading) == MANROPE.as_ptr(), "both borrow the built-in bytes");
+        assert_eq!(style().text_styles[&TextStyle::Heading], FontId::new(HEADING_SIZE, heading_family()));
+        let ctx = test_context();
+        run(&ctx, egui::RawInput::default(), |_| {});
+        let wide = |family: FontFamily| ctx.fonts_mut(|f| f.layout_no_wrap("Publish tour".into(), FontId::new(HEADING_SIZE, family), TEXT).size().x);
+        let (medium, bold) = (wide(FontFamily::Proportional), wide(heading_family()));
+        assert!(bold > medium * 1.02, "body {medium}, heading {bold}");
+        // `ui.heading` and the share window's heading both take the heading family.
+        let mut families = Vec::new();
+        run(&ctx, egui::RawInput::default(), |ui| {
+            for text in [egui::WidgetText::from(RichText::new("Hotkeys").heading()), egui::WidgetText::from(RichText::new("Publish to").heading().size(crate::share_ui::HEADING_SIZE))] {
+                let galley = text.into_galley(ui, None, f32::INFINITY, TextStyle::Body);
+                families.push(galley.job.sections[0].format.font_id.family.clone());
+            }
+        });
+        assert!(families.iter().all(|f| *f == heading_family()), "{families:?}");
+    }
+
+    /// A title or a file name in letters Manrope lacks (extended Cyrillic, Greek Extended) shows
+    /// them through the Ubuntu-Light fallback, in the body and in a heading, not as boxes.
+    #[test]
+    fn letters_manrope_lacks_come_from_the_fallback() {
+        let ctx = test_context();
+        run(&ctx, egui::RawInput::default(), |_| {});
+        let title = "Ѣѳѵ Ґґ Ӂӂ Ӑӑ Ӧӧ — Ἀθῆναι ᾄδω ὕδωρ";
+        for family in [FontFamily::Proportional, heading_family(), FontFamily::Monospace] {
+            let lacking: Vec<char> = title.chars().filter(|c| !c.is_whitespace()).filter(|c| !ctx.fonts_mut(|f| f.has_glyph(&FontId::new(13.0, family.clone()), *c))).collect();
+            assert!(lacking.is_empty(), "{family:?} shows boxes for {lacking:?}");
+        }
+        // And Manrope alone does lack some of them, so the fallback is what draws them.
+        let only = egui::Context::default();
+        let mut defs = FontDefinitions::default();
+        defs.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).into());
+        defs.families.insert(FontFamily::Proportional, vec!["Manrope".into()]);
+        only.set_fonts(defs);
+        run(&only, egui::RawInput::default(), |_| {});
+        assert!(title.chars().any(|c| !c.is_whitespace() && !only.fonts_mut(|f| f.has_glyph(&FontId::proportional(13.0), c))));
     }
 
     /// Width of `text` in the interface font at `size`, at the weight `bold` asks for.

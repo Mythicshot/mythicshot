@@ -1215,7 +1215,7 @@ impl Editor {
                 if let Some(m) = &more {
                     ui.scope(|ui| {
                         ui.set_max_width(status_width(ui.available_width()));
-                        ui.add(egui::Label::new(egui::RichText::new(m).color(theme::CAUTION_TEXT)).truncate()).on_hover_text(&whole);
+                        theme::caution_line(ui, m, theme::BODY_SIZE, theme::Fit::Truncate).on_hover_text(&whole);
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1644,14 +1644,14 @@ impl Editor {
                 ui.spacing_mut().item_spacing.x = GAP;
                 let row = 3.0 * BUTTON.x + 2.0 * GAP;
                 ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
-                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON);
+                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y));
                 if ui.add(primary).clicked() {
                     choice = Some(0);
                 }
-                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(1);
                 }
-                if ui.add(egui::Button::new("Cancel").min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new("Cancel").min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(2);
                 }
             });
@@ -1754,7 +1754,7 @@ impl Editor {
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.max.y), img_rect.max), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.min.y), pos2(r.min.x, r.max.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(img_rect.max.x, r.max.y)), 0.0, dim);
-            painter.rect_stroke(r, 0.0, Stroke::new(2.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+            theme::selection_outline(&painter, r, 0.0, 2.0);
             if self.crop.is_some() {
                 let mut apply = false;
                 let mut cancel = false;
@@ -1780,11 +1780,9 @@ impl Editor {
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
-            painter.rect_stroke(scr_rect(b).expand(3.0), 2.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+            theme::selection_outline(&painter, scr_rect(b).expand(3.0), 2.0, 1.0);
             for (pos, _) in handles(it) {
-                let c = to_scr(pos);
-                painter.rect_filled(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, theme::ON_PICTURE);
-                painter.rect_stroke(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+                theme::selection_handle(&painter, to_scr(pos), HANDLE);
             }
         }
     }
@@ -1997,6 +1995,7 @@ impl EditorWindow {
         });
         if first_frame {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+            theme::dark_title_bar(ctx, id);
         }
     }
 }
@@ -2470,9 +2469,120 @@ mod tests {
         assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor with a dialog");
     }
 
+    /// An editor on a plain `bg` screenshot with one rectangle selected. The rectangle is drawn in
+    /// the picture's own colour, without a shadow, so only the selection shows on the picture.
+    fn selection_on(bg: egui::Color32) -> Editor {
+        let shot = RgbaImage::from_pixel(320, 200, image::Rgba([bg.r(), bg.g(), bg.b(), 255]));
+        let s = Settings::default();
+        let mut ed = Editor::new(shot, "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs::default());
+        let style = Style { stroke: mythicshot_editor::Rgba([bg.r(), bg.g(), bg.b(), 255]), fill: None, width: 1.0, font_size: 20.0, shadow: false };
+        let id = ed.doc.add(Shape::Rect(Bounds { x0: 80.0, y0: 50.0, x1: 240.0, y1: 150.0 }), style);
+        ed.select(Some(id));
+        ed
+    }
+
+    /// The selection on the canvas reads on any screenshot: on a white one and on a near-black
+    /// one, across each side of the outline and across each handle there is a pixel with at least
+    /// 3:1 contrast against the picture.
+    #[test]
+    fn the_selection_reads_on_a_white_and_on_a_near_black_screenshot() {
+        let ppp = 1.25;
+        let mut failed = Vec::new();
+        for (name, bg) in crate::theme::tests::PICTURES {
+            let mut ed = selection_on(bg);
+            let image = crate::snapshot::picture(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 3, |ui| ed.ui(ui));
+            let geom = ed.last_canvas;
+            let scr = |x: f32, y: f32| geom.min + vec2(x, y) * geom.zoom;
+            let (l, t, r, b) = (80.0, 50.0, 240.0, 150.0);
+            let (qx, qy) = (l + (r - l) / 4.0, t + (b - t) / 4.0);
+            for (side, a, out) in [("top", scr(qx, t), vec2(0.0, -10.0)), ("bottom", scr(qx, b), vec2(0.0, 10.0)), ("left", scr(l, qy), vec2(-10.0, 0.0)), ("right", scr(r, qy), vec2(10.0, 0.0))] {
+                if !crate::theme::tests::reads_against(&image, ppp, a + out * 0.15, a + out, bg) {
+                    failed.push(format!("the outline on {name}, {side} side"));
+                }
+            }
+            // Each handle: from inside the rectangle (where nothing else is drawn) into its middle.
+            let it = ed.doc.item(ed.selected.unwrap()).unwrap().clone();
+            let middle = scr((l + r) / 2.0, (t + b) / 2.0);
+            for (pos, _) in handles(&it) {
+                let c = scr(pos.x, pos.y);
+                let inward = (middle - c).normalized();
+                if !crate::theme::tests::reads_against(&image, ppp, c + inward * (HANDLE / 2.0 + 4.0), c, bg) {
+                    failed.push(format!("the handle at {pos:?} on {name}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "lost on the screenshot: {failed:?}");
+    }
+
+    /// Every label of the editor fits what holds it: the rail's group titles (Draw, Shapes,
+    /// More) in its 84 points, the toolbar's property row with a shape selected and with the
+    /// typing hint while a text is typed, and the status bar.
+    #[test]
+    fn the_editors_labels_fit_its_rail_toolbar_and_status_bar() {
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let texts = |out: &egui::FullOutput| {
+            let mut all = Vec::new();
+            fn collect(s: &egui::Shape, into: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                    egui::Shape::Text(t) => into.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| collect(&c.shape, &mut all));
+            all
+        };
+        // A shape selected: its properties in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor with a shape selected") >= 3);
+        let shown = texts(&out);
+        for title in ["Draw", "Shapes", "More"] {
+            let (_, r) = shown.iter().find(|(t, _)| t == title).unwrap_or_else(|| panic!("the rail shows {title}: {shown:?}"));
+            assert!(r.left() >= 0.0 && r.right() <= RAIL, "{title} at {r:?} fits the {RAIL}-point rail");
+        }
+        // A text being typed: the hint in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: None });
+        let out = frames(&mut ed);
+        assert!(shown_has(&texts(&out), "Esc cancel"), "the typing hint shows");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor while a text is typed") >= 3);
+        fn shown_has(shown: &[(String, Rect)], part: &str) -> bool {
+            shown.iter().any(|(t, _)| t.contains(part))
+        }
+    }
+
+    /// An editor window is told once, on its first frame, to draw its title bar dark.
+    #[test]
+    fn an_editor_window_is_told_once_to_draw_its_title_bar_dark() {
+        let ctx = crate::theme::test_context();
+        ctx.set_embed_viewports(false);
+        let window = EditorWindow::new(editor(EditorPrefs::default()));
+        let icon = Arc::new(egui::IconData::default());
+        for (first, want) in [(true, 1), (false, 0), (false, 0)] {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| window.show(ui.ctx(), icon.clone(), first));
+            out.textures_delta.clear();
+            assert_eq!(crate::main_window::tests::dark_title_commands(&out, window.id), want, "first frame: {first}");
+        }
+    }
+
     /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and
-    /// with "Publish to…" open on its form. The picture in it is made here: bands and blocks, like
-    /// a screenshot of some app. Nothing is asked of any site.
+    /// with "Publish to…" open on its form, and with a rectangle selected on a white page and on a
+    /// dark one. The pictures in it are made here: bands and blocks, like a screenshot of some
+    /// app. Nothing is asked of any site.
     #[test]
     #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
     fn snapshot_the_editor_and_the_share_dialog() {
@@ -2486,18 +2596,31 @@ mod tests {
         let make = || Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
         let size = dialog_checks::WINDOW.size();
         let mut ed = make();
-        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
-        assert_eq!(crate::snapshot::save(&image, "editor"), 0, "the editor: nothing behind the window shows");
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+        assert_eq!(crate::snapshot::save(&shot, "editor"), 0, "the editor: nothing behind the window shows");
         // The dialog's form drawn over the editor in the same frame. Through the editor it would
         // first look for a saved token on this computer; here it is shown as it is once one is found.
         let mut ed = make();
         let details = crate::share_ui::image_details(960, 600, crate::publish::share::MediaType::Png, 412_000);
         let mut share = crate::share_ui::ShareDialog::new(crate::publish::share::Kind::Image, "https://tours.example.com".into(), "Loot window", details, false, None, None);
-        let image = crate::snapshot::picture(&crate::theme::test_context(), size, 1.5, 4, |ui| {
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| {
             ed.ui(ui);
             share.show(ui.ctx(), &mut |_| false);
         });
-        assert_eq!(crate::snapshot::save(&image, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
+        assert_eq!(crate::snapshot::save(&shot, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
+        // A selected rectangle on a white page and on a dark app, to see the selection on both.
+        for (name, page, ink) in [("editor-selection-white", [255u8, 255, 255], [214u8, 218, 224]), ("editor-selection-dark", [14, 14, 18], [44, 48, 58])] {
+            let shot = RgbaImage::from_fn(960, 600, |x, y| {
+                let line = (60..900).contains(&x) && (y % 36) < 10 && y > 40;
+                let c = if line { ink } else { page };
+                image::Rgba([c[0], c[1], c[2], 255])
+            });
+            let mut ed = Editor::new(shot, "Selection".into(), BTreeMap::new(), s.dest_context("Selection"), EditorPrefs::default());
+            let id = ed.doc.add(Shape::Rect(Bounds { x0: 240.0, y0: 160.0, x1: 620.0, y1: 400.0 }), Style::default());
+            ed.select(Some(id));
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+            assert_eq!(crate::snapshot::save(&shot, name), 0, "{name}: nothing behind the window shows");
+        }
     }
 
     /// Every dialog is made by the one helper that leaves the window undimmed.

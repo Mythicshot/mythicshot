@@ -167,11 +167,14 @@ Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to"
 
 GNU Affero General Public License 3.0 or later, because the GIF encoder ([gifski](https://docs.rs/crate/gifski/latest)) is AGPL.
 
-Fonts, both under the SIL Open Font License 1.1, whose text ships with every copy (the installer puts it beside `LICENSE.txt` as `OFL-Manrope.txt` and `OFL-Cinzel.txt`):
+Fonts. Each licence asks for its text to go with every copy, so the installer puts each one beside `LICENSE.txt` under the name given here:
 
 | Font | Used for | Licence |
 |---|---|---|
-| [Manrope](https://github.com/googlefonts/manrope), copyright 2018 The Manrope Project Authors | All interface text, built into the program | [assets/fonts/manrope/OFL.txt](assets/fonts/manrope/OFL.txt) |
-| [Cinzel](https://github.com/NDISCOVER/Cinzel), copyright 2020 The Cinzel Project Authors | The name in the installer's side picture | [assets/fonts/cinzel/OFL.txt](assets/fonts/cinzel/OFL.txt) |
+| [Manrope](https://github.com/googlefonts/manrope), copyright 2018 The Manrope Project Authors | All interface text and headings, built into the program | SIL Open Font License 1.1: [assets/fonts/manrope/OFL.txt](assets/fonts/manrope/OFL.txt), installed as `OFL-Manrope.txt` |
+| [Hack](https://github.com/source-foundry/Hack), copyright 2018 Source Foundry Authors, from Bitstream Vera Sans Mono, copyright 2003 Bitstream, Inc. | Monospace text (links shown for copying), built into the program by egui | MIT and the Bitstream Vera licence: [assets/fonts/egui/Hack-LICENSE.txt](assets/fonts/egui/Hack-LICENSE.txt), installed as `LICENSE-Hack.txt` |
+| [Ubuntu](https://design.ubuntu.com/font) Light, copyright 2011 Canonical Ltd. | Letters Manrope lacks (much of Cyrillic, Greek Extended), built into the program by egui | Ubuntu Font Licence 1.0: [assets/fonts/egui/UFL.txt](assets/fonts/egui/UFL.txt), installed as `UFL-Ubuntu.txt` |
+| egui's five icon glyphs, a subset of [emoji-icon-font](https://github.com/jslegers/emoji-icon-font), copyright 2014 John Slegers | Built into the program by egui (the app draws its own icons) | MIT: [assets/fonts/egui/emoji-icon-font-LICENSE.txt](assets/fonts/egui/emoji-icon-font-LICENSE.txt), installed as `LICENSE-emoji-icon-font.txt` |
+| [Cinzel](https://github.com/NDISCOVER/Cinzel), copyright 2020 The Cinzel Project Authors | The name in the installer's side picture (drawn into the picture; the font itself is not shipped) | SIL Open Font License 1.1: [assets/fonts/cinzel/OFL.txt](assets/fonts/cinzel/OFL.txt), installed as `OFL-Cinzel.txt` |
 
-Monospace text uses Hack, which comes with egui.
+egui's Noto Emoji and full emoji-icon-font are not in the program: egui builds them in only with a feature Mythicshot leaves off.
