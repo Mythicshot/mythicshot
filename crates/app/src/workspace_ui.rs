@@ -583,7 +583,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             if !effective.trim().is_empty()
                 && let Err(e) = publish::check_server(&effective)
             {
-                ui.label(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0));
+                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
             }
         });
         ui.end_row();
@@ -596,7 +596,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 ui.label(RichText::new(label).color(fg));
             });
             if refused && conn.token == TokenStatus::Saved {
-                ui.add(egui::Label::new(RichText::new(publish::REJECTED_TOKEN).color(theme::CAUTION_TEXT).size(12.0)).wrap());
+                theme::caution_line(ui, publish::REJECTED_TOKEN, theme::SMALL_SIZE, theme::Fit::Wrap);
             }
             if let Some(line) = p.account.as_ref().and_then(|(name, _)| signed_in_as(name)) {
                 ui.horizontal_wrapped(|ui| {
@@ -650,7 +650,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     // The token was saved for another address: say so, and send nothing until the user decides.
     if let Some(problem) = &problem {
         ui.add_space(10.0);
-        ui.add(egui::Label::new(RichText::new(problem).color(theme::CAUTION_TEXT)).wrap());
+        theme::caution_line(ui, problem.as_str(), theme::BODY_SIZE, theme::Fit::Wrap);
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy, egui::Button::new(publish_ui::USE_IT_HERE)).clicked() {
                 (p.bind)(publish::check_server(&effective).ok());
@@ -684,7 +684,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         if busy || checking {
             ui.add(egui::Spinner::new());
         } else if let Some((text, ok)) = p.current_message(&effective) {
-            ui.add(egui::Label::new(RichText::new(text).color(if ok { theme::SUCCESS_TEXT } else { theme::CAUTION_TEXT })).wrap());
+            if ok {
+                ui.add(egui::Label::new(RichText::new(text).color(theme::SUCCESS_TEXT)).wrap());
+            } else {
+                theme::caution_line(ui, text, theme::BODY_SIZE, theme::Fit::Wrap);
+            }
         } else if site.is_some() && !asked {
             ui.label(RichText::new(PRESS_TEST).color(theme::MUTED).size(12.0));
         }
@@ -767,7 +771,7 @@ fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, address: &st
             }
         }
         TokenRow::Unavailable(e) => {
-            ui.label(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0));
+            theme::caution_line(ui, e.as_str(), theme::SMALL_SIZE, theme::Fit::Wrap);
             ui.horizontal(|ui| {
                 paste(ui, p, "Paste the token from the site's setup page");
                 // Forget stays available when the store holds something it cannot read, so it can be removed.

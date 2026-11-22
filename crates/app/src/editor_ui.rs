@@ -1215,7 +1215,7 @@ impl Editor {
                 if let Some(m) = &more {
                     ui.scope(|ui| {
                         ui.set_max_width(status_width(ui.available_width()));
-                        ui.add(egui::Label::new(egui::RichText::new(m).color(theme::CAUTION_TEXT)).truncate()).on_hover_text(&whole);
+                        theme::caution_line(ui, m, theme::BODY_SIZE, theme::Fit::Truncate).on_hover_text(&whole);
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

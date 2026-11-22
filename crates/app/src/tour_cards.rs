@@ -412,9 +412,9 @@ fn text_field(ui: &mut egui::Ui, text: &mut String, cap: usize, hint: &str) {
     }
 }
 
-/// A warning in caution-text, under the field it belongs to.
+/// A warning under the field it belongs to: the warning icon and caution-text.
 fn warning(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(theme::CAUTION_TEXT).size(12.0));
+    theme::caution_line(ui, text, theme::SMALL_SIZE, theme::Fit::Wrap);
 }
 
 /// The label and link of a button, the link checked as it is typed. Returns nothing; writes the link only when safe.
@@ -940,7 +940,7 @@ impl Editor {
                                 ui.label(RichText::new(name.to_string_lossy()).color(theme::MUTED).size(12.0));
                             }
                             if let Some(e) = &s.logo_error {
-                                ui.add(egui::Label::new(RichText::new(e).color(theme::CAUTION_TEXT).size(12.0)).wrap());
+                                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                             }
                         });
                         ui.end_row();

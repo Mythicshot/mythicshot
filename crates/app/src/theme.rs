@@ -459,6 +459,44 @@ pub fn caution_box<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -
         .inner
 }
 
+/// How an inline caution's text fits its line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Onto more lines.
+    Wrap,
+    /// Cut short with "…".
+    Truncate,
+}
+
+/// A caution on a line of its own, without a box: the small warning icon in caution-border, then
+/// `text` in caution-text at `size`. A caution always carries its icon, never colour alone. The
+/// icon comes first in the reading order, also in a row laid out from the right. The text's response.
+pub fn caution_line(ui: &mut egui::Ui, text: impl Into<String>, size: f32, fit: Fit) -> egui::Response {
+    let text = text.into();
+    let from_right = ui.layout().prefer_right_to_left();
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = SPACE_1;
+        let icon = |ui: &mut egui::Ui| {
+            let side = ui.fonts_mut(|f| f.row_height(&FontId::proportional(size)));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+            crate::icons::paint(ui.painter(), rect.shrink(side * 0.1), crate::icons::Icon::Warning, CAUTION_BORDER);
+        };
+        let label = |ui: &mut egui::Ui| {
+            let label = egui::Label::new(RichText::new(text).color(CAUTION_TEXT).size(size));
+            ui.add(if fit == Fit::Wrap { label.wrap() } else { label.truncate() })
+        };
+        if from_right {
+            let response = label(ui);
+            icon(ui);
+            response
+        } else {
+            icon(ui);
+            label(ui)
+        }
+    })
+    .inner
+}
+
 /// A primary button: primary fill, on-primary label in the strong weight.
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(strong(RichText::new(text).color(ON_PRIMARY))).fill(PRIMARY)
@@ -781,6 +819,52 @@ pub(crate) mod tests {
         });
         let best = image.pixels().map(|p| contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), SURFACE)).fold(0.0, f32::max);
         assert!(best >= 4.5, "the disabled icon reaches only {best:.2}:1 on surface");
+    }
+
+    /// An inline caution carries the warning icon before its text, in a row laid out from the
+    /// left and in one laid out from the right.
+    #[test]
+    fn an_inline_caution_carries_its_icon_before_the_text() {
+        let ctx = test_context();
+        for layout in [egui::Layout::left_to_right(egui::Align::Center), egui::Layout::right_to_left(egui::Align::Center)] {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.with_layout(layout, |ui| caution_line(ui, "The address is not valid.", SMALL_SIZE, Fit::Wrap));
+            });
+            out.textures_delta.clear();
+            let (mut icon, mut text) = (None::<egui::Rect>, None::<egui::Rect>);
+            fn walk(s: &egui::Shape, icon: &mut Option<egui::Rect>, text: &mut Option<egui::Rect>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, icon, text)),
+                    egui::Shape::Text(t) if t.galley.job.sections.iter().all(|sec| sec.format.color == CAUTION_TEXT) => *text = Some(t.visual_bounding_rect()),
+                    egui::Shape::Text(_) => {}
+                    s if format!("{s:?}").contains(&format!("{CAUTION_BORDER:?}")) => *icon = Some(icon.map_or(s.visual_bounding_rect(), |r| r.union(s.visual_bounding_rect()))),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut icon, &mut text));
+            let (icon, text) = (icon.expect("the warning icon is drawn"), text.expect("the text is drawn"));
+            assert!(icon.right() <= text.left() + 0.5, "{layout:?}: the icon {icon:?} comes before the text {text:?}");
+        }
+    }
+
+    /// Every caution in caution-text outside this module is either in a caution box (which
+    /// carries the icon) or a [`caution_line`]: none is colour alone.
+    #[test]
+    fn no_caution_is_colour_alone() {
+        let mut bare = Vec::new();
+        for (file, lines) in production_sources() {
+            if file == "theme.rs" {
+                continue;
+            }
+            for (i, (n, line)) in lines.iter().enumerate() {
+                if line.split("//").next().unwrap_or("").contains("theme::CAUTION_TEXT") && !lines[i.saturating_sub(8)..i].iter().any(|(_, l)| l.contains("caution_box(")) {
+                    bare.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(bare.is_empty(), "cautions without their icon:
+{}", bare.join("
+"));
     }
 
     #[test]
