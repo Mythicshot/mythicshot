@@ -38,7 +38,9 @@ pub struct Palette {
     pub border_strong: Color32,
     pub text: Color32,
     pub muted: Color32,
-    /// Text of a control that cannot be used now, painted opaque.
+    /// Text and icons of a control that cannot be used now, where the app draws the disabled
+    /// state itself, opaque. Never inside a disabled Ui: egui fades that already (see
+    /// [`DISABLED_ALPHA`]), so there the text colour is used and egui's fade makes it disabled.
     pub disabled: Color32,
     /// The one main button of a view, selected tabs and toggles.
     pub primary: Color32,
@@ -765,6 +767,20 @@ pub(crate) mod tests {
         }
         assert!(controls.iter().any(|(r, _, radius)| (r.height() - crate::share_ui::BUTTON_HEIGHT).abs() < 0.5 && *radius == RADIUS_MD), "the tall button keeps radius-md: {controls:?}");
         assert!(controls.iter().any(|(r, _, radius)| r.height() < 30.0 && *radius == RADIUS_SM), "a dense control takes radius-sm: {controls:?}");
+    }
+
+    /// A disabled icon button (undo with nothing to undo, a tool that cannot be used) is faded
+    /// once, by egui: its icon keeps at least 4.5:1 against the bar it sits on.
+    #[test]
+    fn a_disabled_icon_is_faded_once() {
+        let ppp = 2.0;
+        let size = egui::vec2(60.0, 60.0);
+        let image = crate::snapshot::picture(&test_context(), size, ppp, 2, |ui| {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, SURFACE);
+            ui.add_enabled_ui(false, |ui| crate::icons::button(ui, crate::icons::Icon::Undo, 36.0, false, "Undo"));
+        });
+        let best = image.pixels().map(|p| contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), SURFACE)).fold(0.0, f32::max);
+        assert!(best >= 4.5, "the disabled icon reaches only {best:.2}:1 on surface");
     }
 
     #[test]

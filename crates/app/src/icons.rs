@@ -80,7 +80,10 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, selected: bool, tip: &str) -> 
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, f32::from(theme::control_radius(size)), fill);
-    let color = if !enabled { theme::DISABLED } else if selected { theme::ON_PRIMARY } else { theme::TEXT };
+    // Disabled, the icon stays in text: egui already fades everything in a disabled Ui (to
+    // theme::DISABLED_ALPHA, over the opaque window), and fading theme::DISABLED as well
+    // would leave it at 2.8:1.
+    let color = if selected { theme::ON_PRIMARY } else { theme::TEXT };
     paint(ui.painter(), rect.shrink(size * 0.22), icon, color);
     resp.on_hover_text(tip)
 }
