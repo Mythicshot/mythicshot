@@ -216,6 +216,13 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style());
 }
 
+/// Tell a window with a native title bar to draw it dark, whatever Windows uses: the app is
+/// always dark, and a light title bar over it would not be. Sent once to each such window when
+/// it is made (the main window and every editor window; the other windows have no title bar).
+pub fn dark_title_bar(ctx: &egui::Context, id: egui::ViewportId) {
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+}
+
 /// A context set up the way the app sets up its own, for tests that draw frames.
 #[cfg(test)]
 pub fn test_context() -> egui::Context {

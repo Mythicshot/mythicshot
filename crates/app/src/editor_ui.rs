@@ -1995,6 +1995,7 @@ impl EditorWindow {
         });
         if first_frame {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+            theme::dark_title_bar(ctx, id);
         }
     }
 }
@@ -2511,6 +2512,20 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "lost on the screenshot: {failed:?}");
+    }
+
+    /// An editor window is told once, on its first frame, to draw its title bar dark.
+    #[test]
+    fn an_editor_window_is_told_once_to_draw_its_title_bar_dark() {
+        let ctx = crate::theme::test_context();
+        ctx.set_embed_viewports(false);
+        let window = EditorWindow::new(editor(EditorPrefs::default()));
+        let icon = Arc::new(egui::IconData::default());
+        for (first, want) in [(true, 1), (false, 0), (false, 0)] {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| window.show(ui.ctx(), icon.clone(), first));
+            out.textures_delta.clear();
+            assert_eq!(crate::main_window::tests::dark_title_commands(&out, window.id), want, "first frame: {first}");
+        }
     }
 
     /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and

@@ -195,11 +195,13 @@ pub struct Shared {
     pub edit_project: Option<ProjectKey>,
     /// A capture or recording is going on: the tiles are greyed out.
     pub busy: bool,
+    /// The open window's title bar was told to be dark; a closed window is made anew, so it is told again.
+    title_dark: bool,
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false, title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -323,16 +325,18 @@ pub fn viewport_id() -> egui::ViewportId {
 /// [`Request`] for which page it shows). Without a request, an open window is kept drawn and a
 /// closed one stays closed.
 pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::IconData>, request: Option<Request>) {
-    {
+    let dark_title = {
         let mut s = shared.lock().expect("main window state");
         if let Some(request) = request {
             s.nav.apply(request);
         }
         s.settle(ctx);
         if !s.nav.is_open() {
+            s.title_dark = false;
             return;
         }
-    }
+        !std::mem::replace(&mut s.title_dark, true)
+    };
     let builder = egui::ViewportBuilder::default().with_title(TITLE).with_inner_size(SIZE).with_min_inner_size(MIN_SIZE).with_icon(icon);
     let shared = shared.clone();
     ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
@@ -353,6 +357,9 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
+    if dark_title {
+        theme::dark_title_bar(ctx, viewport_id());
+    }
     ctx.request_repaint_of(viewport_id());
 }
 
@@ -418,7 +425,7 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, out: &mut PageOut) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::settings::Settings;
 
@@ -813,6 +820,36 @@ mod tests {
             let uncovered = crate::snapshot::uncovered(&crate::theme::test_context(), window.size(), 1.25, 3, |ui| window_ui(ui, &mut s));
             assert_eq!(uncovered, 0, "{page:?}: pixels the desktop shows through");
         }
+    }
+
+    /// How many times one frame told `id`'s window to draw its title bar dark.
+    pub(crate) fn dark_title_commands(out: &egui::FullOutput, id: egui::ViewportId) -> usize {
+        out.viewport_output.get(&id).map_or(0, |v| v.commands.iter().filter(|c| **c == egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark)).count())
+    }
+
+    /// On light-mode Windows the title bar followed Windows and sat light over the dark app. The
+    /// window is told once, when it opens, to draw it dark; reopened, it is a new window and is
+    /// told again.
+    #[test]
+    fn the_window_is_told_once_to_draw_its_title_bar_dark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(shared(tmp.path())));
+        let ctx = crate::theme::test_context();
+        // As in the app: each viewport is a window of its own.
+        ctx.set_embed_viewports(false);
+        let icon = Arc::new(egui::IconData::default());
+        let mut frame = |request: Option<Request>| {
+            let mut out = ctx.run_ui(egui::RawInput { system_theme: Some(egui::Theme::Light), ..Default::default() }, |ui| show(ui.ctx(), &shared, icon.clone(), request));
+            out.textures_delta.clear();
+            dark_title_commands(&out, viewport_id())
+        };
+        assert_eq!(frame(None), 0, "a closed window is told nothing");
+        assert_eq!(frame(Some(Request::Open)), 1, "the window opens");
+        assert_eq!(frame(None), 0);
+        assert_eq!(frame(Some(Request::Page(Page::Tours))), 0, "an open window is not told again");
+        shared.lock().unwrap().nav.close();
+        assert_eq!(frame(None), 0);
+        assert_eq!(frame(Some(Request::Open)), 1, "reopened, it is a new window");
     }
 
     /// Pictures of the window's pages for the owner, drawn without a window (see `snapshot`).
