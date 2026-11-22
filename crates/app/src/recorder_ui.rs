@@ -62,6 +62,11 @@ struct CountdownDrawn {
     last: Option<u32>,
 }
 
+/// The bar's words while the countdown runs: the whole seconds left, never below 1.
+fn starting_label(left: Duration) -> String {
+    format!("Starting in {}…", (left.as_secs_f32().ceil() as u32).max(1))
+}
+
 /// The log line for one countdown: whether its numbers reached the screen.
 fn countdown_line(time: &str, secs: u32, times: u32, first_ms: Option<u128>, last: Option<u32>) -> String {
     match (first_ms, last) {
@@ -151,7 +156,11 @@ impl Session {
                 if let Ok(f) = self.frame.lock() {
                     let d = f.drawn;
                     let first_ms = d.first.map(|t| t.saturating_duration_since(self.began).as_millis());
-                    crate::capture_log::append(&[countdown_line(&crate::capture_log::now(), self.countdown_secs, d.times, first_ms, d.last)]);
+                    let mut line = countdown_line(&crate::capture_log::now(), self.countdown_secs, d.times, first_ms, d.last);
+                    if let Some(h) = platform::find_window(FRAME_TITLE) {
+                        line = format!("{line} · frame window: {}", platform::composition_note(h));
+                    }
+                    crate::capture_log::append(&[line]);
                 }
                 self.go_live()?;
             }
@@ -217,6 +226,8 @@ impl Session {
             f.paused = matches!(&self.phase, Phase::Live(r) if r.is_paused());
         }
         // Created hidden, put on its pixels around the area, then shown (see `Placer`).
+        // Click-through only once shown: that style makes the window a layered one, and a
+        // window made layered while hidden stayed blank on screen (no frame, no countdown).
         let builder = egui::ViewportBuilder::default()
             .with_title(FRAME_TITLE)
             .with_position(self.frame_guess.0)
@@ -224,7 +235,7 @@ impl Session {
             .with_visible(false)
             .with_decorations(false)
             .with_transparent(true)
-            .with_mouse_passthrough(true)
+            .with_mouse_passthrough(self.frame_placer.shown())
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
@@ -274,17 +285,21 @@ impl Session {
                     Phase::Live(r) => (true, r.is_paused(), r.stats()),
                     Phase::Countdown { .. } => (false, false, Default::default()),
                 };
+                // The countdown is told here too, in the bar, which is always on screen.
+                let starting = match self.phase {
+                    Phase::Countdown { until } => Some(starting_label(until.saturating_duration_since(Instant::now()))),
+                    Phase::Live(_) => None,
+                };
                 let dot = if paused { theme::RECORD_PAUSED } else { theme::RECORD };
                 let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 6.0, dot);
                 let t = stats.active_ms as f64 / 1000.0;
                 ui.label(RichText::new(format!("{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).monospace().size(theme::STRONG_SIZE).bold().color(theme::TEXT));
-                let status = match (live, paused) {
-                    (false, _) => "Starting…",
-                    (true, true) => "Paused",
-                    (true, false) => "Recording",
+                match (&starting, paused) {
+                    (Some(text), _) => ui.label(RichText::new(text).size(theme::STRONG_SIZE).bold().color(theme::RECORD_PAUSED)),
+                    (None, true) => ui.label(RichText::new("Paused").color(theme::MUTED)),
+                    (None, false) => ui.label(RichText::new("Recording").color(theme::MUTED)),
                 };
-                ui.label(RichText::new(status).color(theme::MUTED));
                 ui.separator();
                 let (icon, tip) = if paused { (Icon::Play, "Resume") } else { (Icon::Pause, "Pause") };
                 if ui.add_enabled_ui(live, |ui| icons::button(ui, icon, 30.0, false, tip)).inner.clicked() {
@@ -308,9 +323,12 @@ impl Session {
                 if ui.add_enabled(live, draw).on_hover_text("Draw on the screen while recording. The drawing goes into the GIF; the toolbar does not.").clicked() {
                     action = Some(BarAction::ToggleDraw);
                 }
-                ui.separator();
-                let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;
-                ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(theme::MUTED));
+                // Nothing is recorded during the countdown, and its words need the room.
+                if live {
+                    ui.separator();
+                    let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;
+                    ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(theme::MUTED));
+                }
             });
         });
         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -450,6 +468,15 @@ mod tests {
     }
 
     /// The recording bar, a window of its own, paints all of itself opaque, pixel by pixel at 125%.
+    #[test]
+    fn the_bar_counts_down_in_whole_seconds_and_never_shows_zero() {
+        assert_eq!(starting_label(Duration::from_millis(3000)), "Starting in 3…");
+        assert_eq!(starting_label(Duration::from_millis(2001)), "Starting in 3…");
+        assert_eq!(starting_label(Duration::from_millis(2000)), "Starting in 2…");
+        assert_eq!(starting_label(Duration::from_millis(40)), "Starting in 1…");
+        assert_eq!(starting_label(Duration::ZERO), "Starting in 1…");
+    }
+
     #[test]
     fn the_log_says_whether_the_countdown_numbers_were_drawn() {
         assert_eq!(countdown_line("T", 3, 28, Some(140), Some(1)), "-- T countdown of 3 s · number drawn 28 times, first 140 ms after it began, last number 1");

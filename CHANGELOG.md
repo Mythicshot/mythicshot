@@ -2,12 +2,23 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
-## 0.2.22 (2026-11-22)
+## 0.2.24 (2026-11-22)
 
 - A tour step's pulse can be moved: in Tour settings, under This step, "Pulse" offers "Where I clicked" or "A spot I pick". With a spot picked, drag the pulse on the picture, or click where it should go; "Put it back where I clicked" returns it to the recorded click, which is never lost. Each drag is one undo step.
 - A moved pulse is used everywhere the step's click was: the pulse in the Tour view, the preview, the exported or published tour, a guide card that points at the hotspot, the zoom, and the spot a viewer clicks to go on. It is saved with the recording for later editing. If a crop leaves the spot outside the picture, the step uses the recorded click again until the crop takes it back in.
 - Publishing again from an editor that has already published or uploaded a draft now offers "Replace this chapter" first, so a fix replaces the chapter over the same link instead of adding a duplicate. The dialog of an editor opened through Edit offers the same three choices: "Replace this chapter", "Add as a new chapter to" (with your tours, the editor's own picked) and "New tour".
 - When the chapter cannot be replaced (the site is too old, the tour is gone, the site is still being asked, or the recording belongs to another site address), the dialog says why as before, and a new chapter or a new tour can still be chosen.
+- Under "Replace this chapter" the dialog says what happens: the public page changes when the update is done, or the tour stays a draft. "Publish now" and the draft choice are for a new chapter or a new tour only, and show nothing chosen while Replace is.
+- If the site says the chapter is no longer part of the tour when you replace it, the editor stops offering to replace it; its tour stays picked for a new chapter.
+
+## 0.2.23 (2026-11-22)
+
+- A likely fix for the red recording frame and its countdown number, missing since 0.2.20: the frame's window becomes click-through only after it is shown. Made click-through while still hidden, Windows kept it blank. Not confirmed on a real screen yet.
+- The line `capture.log` writes for each placed window now also says how Windows composites it (its style, whether it is cloaked), which settles the cause if the frame is still missing.
+
+## 0.2.22 (2026-11-22)
+
+- The countdown before a recording is shown in the recording bar ("Starting in 3…"), which is always on screen. The large number over the recorded area still did not appear for everyone after 0.2.21; it is still drawn when it can be.
 
 ## 0.2.21 (2026-11-22)
 
