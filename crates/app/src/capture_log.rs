@@ -10,6 +10,7 @@ use eframe::egui::Rect;
 use mythicshot_capture::{MonitorInfo, PxRect};
 
 use crate::overlay::FrameNote;
+use crate::overlay::geometry::Show;
 
 /// The most the log holds before it starts again (the previous one is kept as `capture.old.log`).
 pub const CAP: u64 = 256 * 1024;
@@ -88,8 +89,25 @@ pub fn frame_line(n: u32, ms: u128, now: Option<WinState>, placed: Placed, note:
     )
 }
 
+pub fn shown_line(frame: u32, show: Show, cloaked: bool) -> String {
+    let why = match show {
+        Show::Now => "placed and settled",
+        Show::Anyway => "NOT settled, shown anyway",
+        Show::Wait => "waiting",
+    };
+    format!("shown after frame {frame}: {why}{}", if cloaked { " · cloaked until a frame is painted" } else { "" })
+}
+
+pub fn focus_line(plain: bool) -> String {
+    format!("focus: {}", if plain { "taken" } else { "refused, asked through winit (synthetic Alt)" })
+}
+
 pub fn finish_line(outcome: &str, sel_pt: Option<Rect>, sel_px: Option<PxRect>, crop: Option<PxRect>) -> String {
     format!("finish: {outcome} · selection {} pt = {} px · crop {}", opt(sel_pt, pt), opt(sel_px, px), opt(crop, px))
+}
+
+pub fn park_line(time: &str, why: &str, target: PxRect, now: Option<WinState>, tries: u32) -> String {
+    format!("-- {time} hidden window parked ({why}) over {} after {tries} tries: {}", px(target), win(now))
 }
 
 fn yes(b: bool) -> &'static str {
@@ -139,7 +157,7 @@ mod tests {
             request_line(PxRect::new(-3840, 0, 8960, 2160), 1.0, PxRect::new(-3840, 0, 8960, 2160), Some(before)),
             "bounds -3840,0 8960x2160 · ppp before 1.00 · window asked for -3840,0 8960x2160 (pixels) · before: window -32000,-32000 1x1 client -32000,-32000 1x1 dpi 96 hidden"
         );
-        let note = FrameNote { content: (0.0, 0.0, 4480.0, 1080.0), ppp: 2.0, hover_px: Some((10, 12)), texture_new: true };
+        let note = FrameNote { content: (0.0, 0.0, 4480.0, 1080.0), ppp: 2.0, client: Some(PxRect::new(-3840, 0, 8960, 2160)), hover_px: Some((10, 12)), texture_new: true, texture_ready: true };
         let now = WinState { outer: PxRect::new(-3840, 0, 8960, 2160), client: PxRect::new(-3840, 0, 8960, 2160), dpi: Some(192), visible: false };
         assert_eq!(
             frame_line(1, 4, Some(now), Placed { moved: true, tries: 2, on_target: true }, &note, Some((10, 11)), false),
@@ -150,6 +168,7 @@ mod tests {
             "finish: capture · selection 5.0,6.0 50.0x20.0 pt = -3830,12 100x40 px · crop -3830,12 100x40"
         );
         assert_eq!(finish_line("cancel", None, None, None), "finish: cancel · selection - pt = - px · crop -");
+        assert_eq!(shown_line(2, Show::Anyway, false), "shown after frame 2: NOT settled, shown anyway");
         assert_eq!(header("2026-11-21 10:00:00.000", "hotkey", false), "== 2026-11-21 10:00:00.000 region capture · trigger hotkey · screenshot");
     }
 

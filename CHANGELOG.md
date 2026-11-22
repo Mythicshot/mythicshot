@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.20 (2026-11-21)
+
+- The first region capture after Mythicshot starts works like every later one on computers with monitors at different scale settings (for example one at 200% beside two at 100%): before, the frozen desktop could appear zoomed or shifted, the selection and the hint bar could land on another screen than the pointer, and the picture saved did not match what was selected. The same could happen to the first screenshot after a GIF recording.
+- The region selector no longer flashes a black or see-through screen as it opens: it appears only once the frozen desktop is drawn at its final size, each pixel exactly where it was captured, on every monitor.
+- Opening the region selector no longer sends a hidden Alt key press to take the keyboard, which could open the menu bar of the program you were in; it is used only when Windows refuses the plain request.
+- Each region capture adds a few lines to `capture.log` beside `crash.log`: the monitors, their scale settings and where the selector's window really was in its first frames. If a capture looks wrong, send that file; it holds no picture, window titles or file paths, see Troubleshooting in the README.
+
 ## 0.2.19 (2026-11-21)
 
 - A new look: deep violet backgrounds, purple main buttons with white labels and gold for links, focus and selected items. Mythicshot is always dark now, whatever Windows is set to.

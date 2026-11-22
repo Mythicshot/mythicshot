@@ -171,11 +171,48 @@ pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
     (dpi != 0).then_some(dpi)
 }
 
+/// Move and size a window to an outer rectangle in desktop pixels, without showing it,
+/// activating it or changing its place in the stack.
+#[cfg(windows)]
+pub fn place_window(hwnd: WindowId, outer: mythicshot_capture::PxRect) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos};
+    unsafe { SetWindowPos(HWND(hwnd as *mut _), None, outer.x, outer.y, outer.w as i32, outer.h as i32, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER).is_ok() }
+}
+
 #[cfg(windows)]
 pub fn is_window_visible(hwnd: WindowId) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
     unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+}
+
+/// Bring one of our windows to the front with a plain request, without the synthetic Alt key
+/// press winit's focus request sends. False when Windows did not allow it.
+#[cfg(windows)]
+pub fn take_foreground(hwnd: WindowId) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let _ = SetForegroundWindow(h);
+        GetForegroundWindow() == h
+    }
+}
+
+/// Cloak or uncloak a window: a cloaked window is shown but never composited, so it can be
+/// shown and painted once at its final size before anyone sees it.
+#[cfg(windows)]
+pub fn set_cloaked(hwnd: WindowId, cloaked: bool) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    let value = windows::core::BOOL::from(cloaked);
+    unsafe { DwmSetWindowAttribute(HWND(hwnd as *mut _), DWMWA_CLOAK, &value as *const _ as *const _, std::mem::size_of_val(&value) as u32).is_ok() }
+}
+
+#[cfg(not(windows))]
+pub fn set_cloaked(_hwnd: WindowId, _cloaked: bool) -> bool {
+    false
 }
 
 #[cfg(not(windows))]
@@ -189,7 +226,17 @@ pub fn window_dpi(_hwnd: WindowId) -> Option<u32> {
 }
 
 #[cfg(not(windows))]
+pub fn place_window(_hwnd: WindowId, _outer: mythicshot_capture::PxRect) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
 pub fn is_window_visible(_hwnd: WindowId) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn take_foreground(_hwnd: WindowId) -> bool {
     false
 }
 

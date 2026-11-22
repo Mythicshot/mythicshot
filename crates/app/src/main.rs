@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, ViewportBuilder, ViewportCommand, pos2, vec2};
+use eframe::egui::{self, ViewportBuilder, ViewportCommand, vec2};
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use mythicshot_capture::{PxRect, grab_desktop};
 use mythicshot_destinations::{self as dest, DestId, Sent};
@@ -158,8 +158,10 @@ struct App {
     rx: Receiver<AppEvent>,
     tx: Sender<AppEvent>,
     overlay: Option<Overlay>,
-    /// The capture log's lines for the capture on screen.
-    trace: Option<capture_window::Trace>,
+    /// Placing and showing the overlay's window for the capture on screen.
+    presenting: Option<capture_window::Presenting>,
+    /// Keeping the hidden root window over the desktop between captures.
+    parking: capture_window::Parking,
     /// What started the command being run, for the capture log.
     trigger: &'static str,
     /// The main window's state, shared with its viewport.
@@ -291,7 +293,8 @@ impl App {
             rx,
             tx,
             overlay: None,
-            trace: None,
+            presenting: None,
+            parking: capture_window::Parking::start(),
             trigger: "other",
             window,
             window_request: main_window::start_request(std::env::args()),
@@ -467,16 +470,12 @@ impl App {
             Ok(d) => d,
             Err(e) => return self.notify(format!("Capture failed: {e}")),
         };
-        let ppp = ctx.pixels_per_point();
-        let b = desktop.bounds;
+        // The window is placed in pixels and shown once it is right, frame by frame: see `capture_window`.
+        let target = overlay::geometry::window_rect(desktop.bounds, 0);
         let mut lines = vec![capture_log::header(&capture_log::now(), std::mem::replace(&mut self.trigger, "other"), record)];
         lines.extend(desktop.monitors.iter().enumerate().map(|(i, m)| capture_log::monitor_line(i, m)));
-        lines.push(capture_log::request_line(b, ppp, b, self.root.and_then(capture_window::state)));
-        self.trace = Some(capture_window::Trace::new(b, started, lines));
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(b.x as f32 / ppp, b.y as f32 / ppp)));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(b.w as f32 / ppp, b.h as f32 / ppp)));
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        lines.push(capture_log::request_line(desktop.bounds, ctx.pixels_per_point(), target, self.root.and_then(capture_window::state)));
+        self.presenting = Some(capture_window::Presenting::new(target, started, lines));
         self.overlay = Some(Overlay::new(desktop, self.settings.magnifier, record));
     }
 
@@ -495,12 +494,12 @@ impl App {
     fn finish_overlay(&mut self, ctx: &egui::Context, outcome: Outcome) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         let Some(ov) = self.overlay.take() else { return };
-        if let Some(t) = self.trace.take() {
+        if let Some(p) = self.presenting.take() {
             let finish = match outcome {
                 Outcome::Capture(rect) => capture_log::finish_line("capture", ov.selection_pt, Some(rect), rect.intersect(&ov.desktop.bounds)),
                 _ => capture_log::finish_line("cancel", None, None, None),
             };
-            t.end(finish);
+            p.end(finish);
         }
         self.settings.magnifier = ov.magnifier;
         if let Outcome::Capture(rect) = outcome {
@@ -620,6 +619,8 @@ impl App {
     /// it is no longer shown.
     fn end_session(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        // The bar moved the root window onto one monitor: back over the desktop once it is hidden.
+        self.parking.request("after recording");
         self.refocus_at = None;
         if let Ok(mut t) = self.tap.lock() {
             *t = None;
@@ -1271,16 +1272,20 @@ impl eframe::App for App {
         }
 
         if let Some(ov) = self.overlay.as_mut() {
-            match ov.ui(ui) {
+            let client = self.presenting.as_mut().and_then(|p| p.before_frame(&ctx, self.root));
+            match ov.ui(ui, client) {
                 Outcome::Continue => {
-                    if let Some(t) = self.trace.as_mut() {
-                        t.after_frame(self.root, &ov.note);
+                    if let Some(p) = self.presenting.as_mut() {
+                        p.after_frame(&ctx, &ov.note);
                     }
                 }
                 outcome => self.finish_overlay(&ctx, outcome),
             }
         } else if let Some(action) = self.session.as_ref().and_then(|s| s.bar_ui(ui, self.settings.record_keys)) {
             self.recording_action(&ctx, action);
+        }
+        if self.overlay.is_none() && self.session.is_none() {
+            self.parking.tick(self.root);
         }
         self.tick_recording(&ctx);
         self.show_editors(&ctx);
