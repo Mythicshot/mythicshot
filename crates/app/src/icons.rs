@@ -61,6 +61,8 @@ pub enum Icon {
     Record,
     /// A small padlock: who can open something is restricted.
     Lock,
+    /// A triangle with an exclamation mark: the icon of every caution box.
+    Warning,
 }
 
 const FG: Color32 = Color32::from_rgb(214, 218, 226);
@@ -346,6 +348,11 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::Record => {
             p.circle_stroke(r.center(), r.width() * 0.44, s);
             p.circle_filled(r.center(), r.width() * 0.22, c);
+        }
+        Icon::Warning => {
+            p.add(Shape::closed_line(vec![at(0.5, 0.06), at(0.96, 0.9), at(0.04, 0.9)], s));
+            p.add(line(&[(0.5, 0.36), (0.5, 0.6)]));
+            p.circle_filled(at(0.5, 0.75), s.width * 0.7, c);
         }
         Icon::Shadow => {
             p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, Color32::from_black_alpha(200));

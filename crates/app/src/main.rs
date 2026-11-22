@@ -31,6 +31,7 @@ mod sign_in_ui;
 mod share_ui;
 mod site;
 mod site_ui;
+mod theme;
 mod tray;
 mod tour;
 mod tour_cards;
