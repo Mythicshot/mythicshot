@@ -2,6 +2,10 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.22 (2026-11-22)
+
+- The countdown before a recording is shown in the recording bar ("Starting in 3…"), which is always on screen. The large number over the recorded area still did not appear for everyone after 0.2.21; it is still drawn when it can be.
+
 ## 0.2.21 (2026-11-22)
 
 - A likely fix for the countdown before a recording, which stopped appearing in 0.2.20: the red recording frame is now asked to draw at every tick of the countdown, and every window that is shown once in place (the frame, the notification, the "Send capture to" menu, the live-draw layer) is asked to draw as it is shown. The cause is not confirmed yet.
