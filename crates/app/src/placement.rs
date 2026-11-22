@@ -166,9 +166,8 @@ pub fn place_step(stage: PlaceStage, looks: u8, look: Look) -> PlaceStep {
 }
 
 /// The stage after a step.
-/// Whether the window must be asked to paint after this step. It was created hidden, and a hidden
-/// window runs no pass at all, so the repaints its own contents ask for have never been asked:
-/// every step that shows or uncloaks it asks once, and its contents carry on from there.
+/// Whether the window is asked to paint after this step: every step that shows or uncloaks it.
+/// The repaints its own contents ask for are not relied on across those two moments.
 pub fn paints_after(step: PlaceStep) -> bool {
     !matches!(step, PlaceStep::Wait)
 }
@@ -242,8 +241,8 @@ impl Placer {
             }
         }
         if paints_after(step) {
-            // A hidden window runs no pass, so nothing in it has asked for a repaint yet: without
-            // this it could stay unpainted after it is shown (the recording countdown did).
+            // Its contents ask for their own repaints, but a request made around the show or the
+            // uncloak can go unanswered and end that chain: ask once more from here.
             ctx.request_repaint_of(id);
         }
         self.stage = place_advance(self.stage, step, look);

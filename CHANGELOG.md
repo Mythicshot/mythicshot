@@ -4,7 +4,8 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 
 ## 0.2.21 (2026-11-22)
 
-- The countdown before a recording shows again. Since 0.2.20 the red recording frame is made hidden and shown once in place, and nothing asked it to draw after that, so the number never appeared. Every window shown this way (the frame, the notification, the "Send capture to" menu, the live-draw layer) is now asked to draw as it is shown.
+- A likely fix for the countdown before a recording, which stopped appearing in 0.2.20: the red recording frame is now asked to draw at every tick of the countdown, and every window that is shown once in place (the frame, the notification, the "Send capture to" menu, the live-draw layer) is asked to draw as it is shown. The cause is not confirmed yet.
+- Each countdown adds one line to `capture.log`: how many times its number was drawn, and when first. If the countdown is still missing, send that file.
 
 ## 0.2.20 (2026-11-21)
 
