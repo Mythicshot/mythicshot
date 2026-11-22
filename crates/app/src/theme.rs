@@ -307,7 +307,9 @@ pub fn visuals(p: &Palette) -> Visuals {
     w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     w.noninteractive.corner_radius = md;
-    // Secondary buttons, fields, checkboxes: surface fill, border-strong edge, text label.
+    // Controls at rest: a border-strong edge and a text label. egui fills a button with
+    // `weak_bg_fill` (surface), and a checkbox's box, a slider's handle and the like with
+    // `bg_fill` (surface-raised); a text field takes `text_edit_bg_color` (surface, below).
     w.inactive.bg_fill = p.raised;
     w.inactive.weak_bg_fill = p.surface;
     w.inactive.bg_stroke = Stroke::new(1.0, p.border_strong);
