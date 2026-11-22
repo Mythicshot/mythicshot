@@ -1061,6 +1061,7 @@ impl Editor {
             drag: None,
             origin: None,
         });
+        editor.init_pulse_history();
         // Test hook: start with one selected annotation, to check the range bar.
         #[cfg(debug_assertions)]
         if std::env::var_os("MYTHICSHOT_TEST_ANNOTATE").is_some() {
@@ -1107,6 +1108,8 @@ impl Editor {
             let logo_dropped = dropped.iter().any(|d| d == crate::project::COVER_LOGO);
             v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, logo_dropped, open: Arc::new(open) });
         }
+        // The moved pulses it was saved with are where undo starts from.
+        editor.init_pulse_history();
         // Kept in front of whatever the editor reports next, until the user has had the time to read it.
         if let Some(note) = opened_note(&dropped) {
             editor.notify_held(note);
@@ -2505,6 +2508,201 @@ mod tests {
         ed.video.as_mut().unwrap().tour.settings.open = true;
         let out = frames(&mut ed);
         assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
+    }
+
+    // ---- Moving a step's pulse in the Tour view ----
+
+    /// One frame of `ed` with `events`, a second after the last, in the editor's own window size.
+    fn tour_frame(ed: &mut Editor, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(events) };
+        let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// A press and release on the text `label`, as a user clicks it; Tour settings is scrolled to
+    /// its end first, where "This step" is, when the text is not in sight.
+    fn click_text(ed: &mut Editor, ctx: &egui::Context, label: &str) {
+        let mut out = tour_frame(ed, ctx, vec![]);
+        if crate::share_ui::tests::text_rect(&out, label).is_none() {
+            let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -4000.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+            tour_frame(ed, ctx, vec![egui::Event::PointerMoved(egui::pos2(1200.0, 400.0)), wheel]);
+            for _ in 0..3 {
+                out = tour_frame(ed, ctx, vec![]);
+            }
+        }
+        let at = crate::share_ui::tests::text_rect(&out, label).unwrap_or_else(|| panic!("{label} is drawn")).center();
+        crate::editor_ui::dialog_checks::click(ed, ctx, at);
+    }
+
+    /// Where the hotspot ring is drawn on the screen, if it is.
+    fn hotspot_on_screen(out: &egui::FullOutput) -> Option<egui::Pos2> {
+        crate::share_ui::tests::shapes_of(out).into_iter().find_map(|s| match s {
+            egui::Shape::Circle(c) if (c.radius - 15.0).abs() < 0.01 && c.stroke.width > 0.0 => Some(c.center),
+            _ => None,
+        })
+    }
+
+    /// A drag with the primary button from `from` to `to`, over a few frames.
+    fn drag(ed: &mut Editor, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        tour_frame(ed, ctx, vec![egui::Event::PointerMoved(from)]);
+        tour_frame(ed, ctx, vec![button(from, true)]);
+        for i in 1..=4 {
+            tour_frame(ed, ctx, vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 4.0))]);
+        }
+        tour_frame(ed, ctx, vec![button(to, false)]);
+        tour_frame(ed, ctx, vec![]);
+    }
+
+    fn ctrl(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND }
+    }
+
+    fn plain_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// The shown step's moved pulse, and its click as the tour has it.
+    fn shown_pulse(ed: &Editor) -> (Option<crate::tour::Point>, Option<(f32, f32)>) {
+        let v = ed.video.as_ref().unwrap();
+        let steps = crate::tour_view::planned_steps(v).unwrap();
+        let step = steps.iter().find(|s| s.src == v.current).unwrap();
+        (v.edit.tour_doc.steps.get(&step.src).and_then(|s| s.pulse.clone()), step.click)
+    }
+
+    /// An editor of `state(root)` with its edit (the crop, trim and removed step) and no annotations, in the Tour view.
+    fn tour_editor(root: &Path) -> Editor {
+        let mut st = state(root);
+        st.items.clear();
+        let mut ed = editor_of(&st);
+        ed.video.as_mut().unwrap().edit = st.edit.clone();
+        ed.init_pulse_history();
+        ed.set_view(VideoView::Tour);
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        ed
+    }
+
+    #[test]
+    fn the_pulse_is_dragged_on_the_picture_undone_in_one_step_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = tour_editor(tmp.path());
+        ed.keys = crate::hotkeys::EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        ed.use_select_tool();
+        let ctx = crate::theme::test_context();
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        let (none, recorded) = shown_pulse(&ed);
+        assert_eq!(none, None);
+        let ring = hotspot_on_screen(&out).expect("the hotspot is drawn where the step was clicked");
+        // Nothing moves the pulse until "A spot I pick" is chosen: a drag on it is a drag of the tools.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(30.0, 20.0));
+        assert_eq!(shown_pulse(&ed).0, None);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+        assert!(!ed.doc.can_undo(), "a drag on the empty picture with the Select tool changes nothing");
+
+        click_text(&mut ed, &ctx, "A spot I pick");
+        let src = ed.tour_src().unwrap();
+        assert_eq!(ed.placing_pulse(), Some(src));
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "Drag the pulse on the picture").is_some(), "the hint shows");
+        assert!(crate::share_ui::tests::text_rect(&out, "Put it back where I clicked").is_none(), "nothing to put back yet");
+        assert!(!ed.doc.can_undo(), "choosing it changes nothing yet");
+
+        // A drag of the pulse moves it, and the tour's click with it.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(30.0, 20.0));
+        let (moved, click) = shown_pulse(&ed);
+        assert!(moved.is_some());
+        assert_ne!(click, recorded, "the step's click is where the pulse went");
+        let out = tour_frame(&mut ed, &ctx, vec![]);
+        let at = hotspot_on_screen(&out).unwrap();
+        assert!((at - (ring + egui::vec2(30.0, 20.0))).length() < 1.5, "drawn where it was dropped: {at:?} from {ring:?}");
+        assert!(crate::share_ui::tests::text_rect(&out, "Put it back where I clicked").is_some());
+
+        // The whole drag is one undo step, and redo brings it back.
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed), (None, recorded));
+        assert!(!ed.doc.can_undo(), "one step for the drag");
+        assert!((hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap() - ring).length() < 0.5);
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Y)]);
+        assert_eq!(shown_pulse(&ed), (moved.clone(), click));
+
+        // A click on the picture puts it there too: one more undo step.
+        crate::editor_ui::dialog_checks::click(&mut ed, &ctx, ring + egui::vec2(-20.0, 10.0));
+        let (clicked, _) = shown_pulse(&ed);
+        assert!(clicked.is_some() && clicked != moved);
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed).0, moved);
+
+        // "Put it back where I clicked" returns to the recorded click, and is undone like any change.
+        click_text(&mut ed, &ctx, "Put it back where I clicked");
+        assert_eq!(shown_pulse(&ed), (None, recorded));
+        tour_frame(&mut ed, &ctx, vec![ctrl(egui::Key::Z)]);
+        assert_eq!(shown_pulse(&ed), (moved.clone(), click));
+
+        // Esc stops the picture taking the pulse; the moved pulse stays.
+        assert_eq!(ed.placing_pulse(), Some(src));
+        tour_frame(&mut ed, &ctx, vec![plain_key(egui::Key::Escape)]);
+        assert_eq!(ed.placing_pulse(), None);
+        assert_eq!(shown_pulse(&ed).0, moved);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+
+        // "Where I clicked" puts it back too, and stops placing.
+        click_text(&mut ed, &ctx, "A spot I pick");
+        click_text(&mut ed, &ctx, "Where I clicked");
+        assert_eq!((shown_pulse(&ed), ed.placing_pulse()), ((None, recorded), None));
+    }
+
+    #[test]
+    fn the_pulse_stays_inside_the_kept_picture_and_the_end_step_has_none_to_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = tour_editor(tmp.path());
+        let ctx = crate::theme::test_context();
+        click_text(&mut ed, &ctx, "A spot I pick");
+        let ring = hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap();
+        // Dragged far past the crop's corner: it stops at the crop's last pixel, so the tour keeps it.
+        drag(&mut ed, &ctx, ring, ring + egui::vec2(-2000.0, -2000.0));
+        assert_eq!(shown_pulse(&ed).0, Some(crate::tour::Point { x: 20.0, y: 10.0 }), "the crop starts at 20, 10");
+        assert_eq!(shown_pulse(&ed).1, Some((0.0, 0.0)));
+        let now = hotspot_on_screen(&tour_frame(&mut ed, &ctx, vec![])).unwrap();
+        drag(&mut ed, &ctx, now, now + egui::vec2(2000.0, 2000.0));
+        assert_eq!(shown_pulse(&ed).0, Some(crate::tour::Point { x: 179.0, y: 149.0 }), "the crop ends before 180, 150");
+        // Closing Tour settings stops the picture taking the pulse.
+        ed.video.as_mut().unwrap().tour.settings.open = false;
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None);
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None, "and does not take it again by itself");
+        // The end step has no click: its row is there but does nothing.
+        let last = crate::tour_view::planned_steps(ed.video.as_ref().unwrap()).unwrap().len() - 1;
+        for _ in 0..last {
+            tour_frame(&mut ed, &ctx, vec![plain_key(egui::Key::ArrowRight)]);
+        }
+        assert_eq!(shown_pulse(&ed).1, None, "the end step");
+        click_text(&mut ed, &ctx, "A spot I pick");
+        assert_eq!(ed.placing_pulse(), None);
+        assert!(crate::share_ui::tests::text_rect(&tour_frame(&mut ed, &ctx, vec![]), crate::tour_view::PULSE_HINT).is_none());
+    }
+
+    #[test]
+    fn a_moved_pulse_is_saved_with_the_project_and_reopens_with_undo_starting_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(tmp.path());
+        let steps = tour::plan_steps(&st.rec, &st.edit, &st.events).unwrap();
+        st.edit.tour_doc.steps.entry(steps[0].src).or_default().pulse = Some(crate::tour::Point { x: 100.0, y: 100.0 });
+        let store = store_in(tmp.path());
+        let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        let snap = Snapshot { rec: &st.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &st.edit, events: &st.events, items: &st.items };
+        store.save(&key, &snap).unwrap();
+        let mut ed = reopened(&store, &key);
+        let at = |ed: &Editor| ed.video.as_ref().unwrap().edit.tour_doc.steps.get(&steps[0].src).and_then(|s| s.pulse.clone());
+        assert_eq!(at(&ed), Some(crate::tour::Point { x: 100.0, y: 100.0 }));
+        // Put back and undone: the saved spot, not the recorded click, is where undo goes back to.
+        assert!(ed.set_pulse(steps[0].src, None, true));
+        assert_eq!(at(&ed), None);
+        ed.doc.undo();
+        ed.pulses_from_history();
+        assert_eq!(at(&ed), Some(crate::tour::Point { x: 100.0, y: 100.0 }));
     }
 
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {

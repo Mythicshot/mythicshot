@@ -30,7 +30,8 @@ pub const MERGE_MS: u64 = 400;
 pub struct StepPlan {
     /// Source frame index in the recording.
     pub src: usize,
-    /// Hotspot centre as a percentage of the cropped image, or None for the final step.
+    /// Hotspot centre as a percentage of the cropped image, or None for the final step: where the
+    /// step was clicked, or where its hotspot was moved to in the Tour view.
     pub click: Option<(f32, f32)>,
     /// Recording-clock time of the press, or of the frame for the final step.
     pub t_ms: u64,
@@ -78,7 +79,10 @@ pub fn plan_steps(rec: &Recording, edit: &Edit, events: &[InputEvent]) -> Result
         }
         let px = pct((ux - cx) as f32 / cw as f32 * 100.0);
         let py = pct((uy - cy) as f32 / ch as f32 * 100.0);
-        steps.push(StepPlan { src, click: Some((px, py)), t_ms: t });
+        // A hotspot moved in the Tour view takes the click's place while the crop keeps it; the step
+        // is still made by the recorded click, which is never changed.
+        let click = moved_pulse(&edit.tour_doc, src, (cx, cy, cw, ch)).unwrap_or((px, py));
+        steps.push(StepPlan { src, click: Some(click), t_ms: t });
     }
     if steps.is_empty() {
         return Err(NO_CLICKS.to_string());
@@ -816,6 +820,92 @@ mod tests {
         assert!(err.contains("no left clicks"), "{err}");
     }
 
+    fn moved(e: &mut Edit, src: usize, x: f32, y: f32) {
+        e.tour_doc.steps.entry(src).or_default().pulse = Some(Point { x, y });
+    }
+
+    #[test]
+    fn a_moved_pulse_is_the_steps_click_and_the_recorded_one_comes_back_when_it_is_cleared() {
+        let r = rec();
+        let mut e = edit(&r);
+        let ev = [left(750, 50, 40), left(1750, 10, 20)];
+        moved(&mut e, 1, 25.0, 60.0);
+        let s = plan_steps(&r, &e, &ev).unwrap();
+        assert_eq!(shape(&s), vec![(1, Some((25.0, 75.0))), (3, Some((10.0, 25.0))), (4, None)], "only its own step moves");
+        assert_eq!(s[0].t_ms, 750, "the step is still the click's");
+        // The recording's click is untouched: clearing the moved spot brings it back exactly.
+        e.tour_doc.steps.get_mut(&1).unwrap().pulse = None;
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap()), vec![(1, Some((50.0, 50.0))), (3, Some((10.0, 25.0))), (4, None)]);
+        // The end step has no click, and a spot stored for it gives it none.
+        moved(&mut e, 4, 30.0, 30.0);
+        assert_eq!(plan_steps(&r, &e, &ev).unwrap()[2].click, None);
+    }
+
+    #[test]
+    fn a_moved_pulse_the_crop_leaves_outside_falls_back_to_the_recorded_click() {
+        let r = rec();
+        let mut e = edit(&r);
+        let ev = [left(750, 75, 40), left(1750, 80, 20)];
+        e.crop = Some(Bounds { x0: 50.0, y0: 0.0, x1: 100.0, y1: 80.0 });
+        // Inside the crop: in percent of the kept picture.
+        moved(&mut e, 1, 60.0, 20.0);
+        // Left of the crop: the recorded click, until the crop takes the spot in again.
+        moved(&mut e, 3, 20.0, 20.0);
+        let s = plan_steps(&r, &e, &ev).unwrap();
+        assert_eq!(shape(&s), vec![(1, Some((20.0, 25.0))), (3, Some((60.0, 25.0))), (4, None)]);
+        // The edges count as the crop's own: its left and top edges are in, its right and bottom out.
+        moved(&mut e, 1, 50.0, 0.0);
+        moved(&mut e, 3, 100.0, 40.0);
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap()), vec![(1, Some((0.0, 0.0))), (3, Some((60.0, 25.0))), (4, None)]);
+        // Nothing is lost while it is outside: the crop taken off, the spot is the step's again.
+        e.crop = None;
+        moved(&mut e, 3, 20.0, 20.0);
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap())[1], (3, Some((20.0, 25.0))));
+        // A spot that is not a number never reaches a tour.
+        moved(&mut e, 3, f32::NAN, 20.0);
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap())[1], (3, Some((80.0, 25.0))));
+    }
+
+    #[test]
+    fn a_moved_pulse_stays_with_its_step_when_steps_are_removed_restored_or_merged() {
+        let r = rec();
+        let mut e = edit(&r);
+        // A double-click on frame 1 is one step; frame 3 is a step of its own.
+        let ev = [left(750, 50, 40), left(1000, 52, 41), left(1750, 10, 20)];
+        moved(&mut e, 1, 30.0, 30.0);
+        moved(&mut e, 3, 70.0, 70.0);
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap()), vec![(1, Some((30.0, 37.5))), (3, Some((70.0, 87.5))), (4, None)]);
+        e.tour_removed.insert(1);
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap()), vec![(3, Some((70.0, 87.5))), (4, None)], "the next step keeps its own spot");
+        e.tour_removed.clear();
+        assert_eq!(shape(&plan_steps(&r, &e, &ev).unwrap())[0], (1, Some((30.0, 37.5))), "restored with its spot");
+    }
+
+    #[test]
+    fn a_moved_pulse_is_just_other_numbers_in_the_manifest() {
+        let r = rec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (plain, moved_dir) = (tmp.path().join("plain"), tmp.path().join("moved"));
+        let mut e = edit(&r);
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Here", "")), ..Default::default() });
+        write_bundle(&r, &[], &clicks(), &e, "t", &plain, flat, |_| true).unwrap();
+        moved(&mut e, 1, 25.0, 60.0);
+        write_bundle(&r, &[], &clicks(), &e, "t", &moved_dir, flat, |_| true).unwrap();
+        let (a, b) = (read_json(&plain), read_json(&moved_dir));
+        // The click, which the hotspot, the zoom and a click to go on all use, is the moved spot.
+        assert_eq!(b["steps"][0]["click"], serde_json::json!({"x": 25.0, "y": 75.0}));
+        // A card on the hotspot is still on the hotspot: the players place it from the click.
+        assert_eq!(b["steps"][0]["card"]["anchor"], "hotspot");
+        // Nothing else differs, and no field was added: the format is the one the site reads.
+        let mut b2 = b.clone();
+        b2["steps"][0]["click"] = a["steps"][0]["click"].clone();
+        assert_eq!(a, b2);
+        assert_eq!(b["version"], 3);
+        let keys = |v: &serde_json::Value| v["steps"][0].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&a), keys(&b));
+        assert_eq!(std::fs::read(plain.join("step-001.png")).unwrap(), std::fs::read(moved_dir.join("step-001.png")).unwrap(), "the picture is the same");
+    }
+
     fn flat(_: usize) -> Result<RgbaImage, String> { Ok(RgbaImage::from_pixel(100, 80, image::Rgba([200, 200, 200, 255]))) }
     fn read_json(dir: &Path) -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(dir.join("tour.json")).unwrap()).unwrap() }
 
@@ -1194,7 +1284,7 @@ mod tests {
     fn cards_export_per_step_with_their_anchor_resolved() {
         let r = rec();
         let mut e = edit(&r);
-        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Unpaid invoices", "One click away.\n**Try it**")), advance: Advance::Anywhere, zoom: Some(false) });
+        e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Unpaid invoices", "One click away.\n**Try it**")), advance: Advance::Anywhere, zoom: Some(false), pulse: None });
         let mut end = card("Done", "");
         end.next_label = "Finish".into();
         e.tour_doc.steps.insert(4, StepExtras { card: Some(end), ..Default::default() }); // the end step has no click
@@ -1637,7 +1727,7 @@ mod tests {
                 c.anchor = Anchor::Point;
                 c.point = Some(Point { x: if i % 4 == 0 { 99.99 } else { -5.0 }, y: 79.99 });
             }
-            e.tour_doc.steps.insert(s.src, StepExtras { card: Some(c), advance: Advance::Anywhere, zoom: Some(true) });
+            e.tour_doc.steps.insert(s.src, StepExtras { card: Some(c), advance: Advance::Anywhere, zoom: Some(true), pulse: None });
         }
         e.tour_doc.theme.accent = "#GGGGGG".into();
         e.tour_doc.theme.backdrop = "url(x)".into();
@@ -1791,7 +1881,7 @@ mod tests {
         let items = vec![text(40.0, 40.0, "Unpaid invoices", 1), spot(Bounds { x0: 200.0, y0: 100.0, x1: 440.0, y1: 300.0 }, 1)];
         let mut e = edit(&r);
         e.tour_doc.steps.insert(1, StepExtras { card: Some(card("Open invoices", "One click **away**.")), ..Default::default() });
-        e.tour_doc.steps.insert(3, StepExtras { card: Some(card("Then this", "")), advance: Advance::Anywhere, zoom: Some(false) });
+        e.tour_doc.steps.insert(3, StepExtras { card: Some(card("Then this", "")), advance: Advance::Anywhere, zoom: Some(false), pulse: None });
         let logo = tmp.join("logo-src.png");
         RgbaImage::from_pixel(64, 32, image::Rgba([20, 120, 220, 255])).save(&logo).unwrap();
         e.tour_doc.cover = Some(Cover { title: "Billing tour".into(), body: "Three steps.".into(), button: "Start".into(), logo: None });

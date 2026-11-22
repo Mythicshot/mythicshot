@@ -169,6 +169,37 @@ pub struct StepExtras {
     pub card: Option<Card>,
     pub advance: Advance,
     pub zoom: Option<bool>,
+    /// Where the step's hotspot was moved to in the Tour view, in frame pixels like [`Card::point`];
+    /// None keeps it where the recording was clicked. The recorded click itself is never changed.
+    pub pulse: Option<Point>,
+}
+
+/// Every step's moved hotspot, by the step's source frame: what undo and redo bring back.
+pub type Pulses = BTreeMap<usize, Point>;
+
+/// The moved hotspots of `doc`.
+pub fn pulses(doc: &TourDoc) -> Pulses {
+    doc.steps.iter().filter_map(|(src, s)| s.pulse.clone().map(|p| (*src, p))).collect()
+}
+
+/// Give `doc` exactly the moved hotspots in `p`: every other step's hotspot goes back to its click.
+pub fn set_pulses(doc: &mut TourDoc, p: &Pulses) {
+    for (src, s) in doc.steps.iter_mut() {
+        s.pulse = p.get(src).cloned();
+    }
+    for (src, at) in p {
+        doc.steps.entry(*src).or_default().pulse = Some(at.clone());
+    }
+}
+
+/// The moved hotspot of step `src` in percent of the kept picture `crop` (x, y, width, height in
+/// frame pixels), while it lies inside it; None when the step's hotspot was not moved or the crop
+/// has left it outside, and then the step uses its recorded click.
+pub fn moved_pulse(doc: &TourDoc, src: usize, crop: (u32, u32, u32, u32)) -> Option<(f32, f32)> {
+    let p = doc.steps.get(&src)?.pulse.as_ref()?;
+    let (cx, cy, cw, ch) = (crop.0 as f32, crop.1 as f32, crop.2 as f32, crop.3 as f32);
+    let inside = p.x.is_finite() && p.y.is_finite() && p.x >= cx && p.y >= cy && p.x < cx + cw && p.y < cy + ch;
+    inside.then(|| (pct((p.x - cx) / cw * 100.0), pct((p.y - cy) / ch * 100.0)))
 }
 
 /// Everything the Tour view edits that is not an annotation. Lives on `Edit`.
