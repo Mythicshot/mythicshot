@@ -143,10 +143,15 @@ pub const SCRIM_FAINT: Color32 = Color32::from_black_alpha(28);
 pub const CARD_SHADOW: Color32 = Color32::from_black_alpha(80);
 /// The shadow the Shadow icon depicts.
 pub const ICON_SHADOW: Color32 = Color32::from_black_alpha(200);
-/// The outline and handles of what is selected on the canvas, and the edge of a crop: the gold of
-/// selection highlights, which reads on most pictures.
+/// What marks a selection on the user's picture is two-tone, so it reads on any picture: a gold
+/// line (which reads on dark pictures) inside a dark band of ground (which reads on light ones).
+/// The gold line of the outline, the handles' ring, the edge of a crop and a selected card's dashes.
 pub const SELECTION_EDGE: Color32 = DARK.accent;
-/// The fill of a selection handle.
+/// The dark band on each side of [`SELECTION_EDGE`], and the outer edge of a handle.
+pub const SELECTION_HALO: Color32 = DARK.ground;
+/// How wide the dark band is on each side of the gold line.
+pub const SELECTION_HALO_WIDTH: f32 = 1.0;
+/// The light fill of a selection handle.
 pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
@@ -360,21 +365,27 @@ pub fn window_card<R>(ui: &mut egui::Ui, margin: f32, add: impl FnOnce(&mut egui
         .inner
 }
 
-/// The outline of what is selected on the user's picture (and the edge of a crop): a line `width`
-/// points wide just outside `rect`.
+/// The outline of what is selected on the user's picture (and the edge of a crop), just outside
+/// `rect`: a gold line `width` points wide with a dark band on each side (see [`SELECTION_HALO`]).
 pub fn selection_outline(painter: &egui::Painter, rect: egui::Rect, radius: f32, width: f32) {
-    painter.rect_stroke(rect, radius, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
+    let halo = SELECTION_HALO_WIDTH;
+    painter.rect_stroke(rect, radius, Stroke::new(width + 2.0 * halo, SELECTION_HALO), egui::StrokeKind::Outside);
+    painter.rect_stroke(rect.expand(halo), radius + halo, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
 }
 
-/// A handle of what is selected on the user's picture, `side` points square around `center`.
+/// A handle of what is selected on the user's picture, `side` points square around `center`: a
+/// light fill, a gold ring and a dark outer edge.
 pub fn selection_handle(painter: &egui::Painter, center: egui::Pos2, side: f32) {
     let r = egui::Rect::from_center_size(center, egui::vec2(side, side));
     painter.rect_filled(r, 1.0, HANDLE_FILL);
     painter.rect_stroke(r, 1.0, Stroke::new(1.0, SELECTION_EDGE), egui::StrokeKind::Outside);
+    painter.rect_stroke(r.expand(1.0), 2.0, Stroke::new(SELECTION_HALO_WIDTH, SELECTION_HALO), egui::StrokeKind::Outside);
 }
 
-/// A dashed outline along the closed path `pts`, `width` points wide, over the user's picture.
+/// A dashed outline along the closed path `pts` over the user's picture: gold dashes `width`
+/// points wide over an unbroken dark line, so the gaps read as dark and the dashes as gold.
 pub fn selection_dashes(painter: &egui::Painter, pts: &[egui::Pos2], width: f32) {
+    painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(width + 2.0 * SELECTION_HALO_WIDTH, SELECTION_HALO)));
     painter.extend(egui::Shape::dashed_line(pts, Stroke::new(width, SELECTION_EDGE), 6.0, 4.0));
 }
 
@@ -578,6 +589,10 @@ pub(crate) mod tests {
             ("caution-border on surface-raised", CAUTION_BORDER, RAISED, 3.0),
             ("focus around a primary button, on ground", FOCUS, GROUND, 3.0),
             ("gold against caution-border (told apart)", GOLD, CAUTION_BORDER, 2.0),
+            ("selection halo on a white picture", SELECTION_HALO, Color32::WHITE, 3.0),
+            ("selection gold on a black picture", SELECTION_EDGE, Color32::BLACK, 3.0),
+            ("selection gold against its halo", SELECTION_EDGE, SELECTION_HALO, 3.0),
+            ("handle fill against the selection halo", HANDLE_FILL, SELECTION_HALO, 3.0),
         ] {
             all.push((name.to_string(), fg, bg, min));
         }
@@ -667,8 +682,18 @@ pub(crate) mod tests {
             };
             across(&draw(&|p| selection_outline(p, rect, 2.0, 1.0)), "the selection outline", &mut failed);
             across(&draw(&|p| selection_outline(p, rect, 0.0, 2.0)), "the crop edge", &mut failed);
+            // A dashed line has gaps, so along each side, over more than one dash and gap (10
+            // points), some pixel reads; across it, the dark line under the dashes reads on white.
             let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
-            across(&draw(&|p| selection_dashes(p, &pts, 1.5)), "the dashed card outline", &mut failed);
+            let image = draw(&|p| selection_dashes(p, &pts, 1.5));
+            for (side, a, z) in [("top", rect.left_top() + egui::vec2(15.0, 0.0), rect.left_top() + egui::vec2(27.0, 0.0)), ("right", rect.right_top() + egui::vec2(0.0, 10.0), rect.right_top() + egui::vec2(0.0, 22.0)), ("bottom", rect.right_bottom() - egui::vec2(15.0, 0.0), rect.right_bottom() - egui::vec2(27.0, 0.0)), ("left", rect.left_bottom() - egui::vec2(0.0, 10.0), rect.left_bottom() - egui::vec2(0.0, 22.0))] {
+                if !reads_against(&image, ppp, a, z, bg) {
+                    failed.push(format!("the dashed card outline on {name}, along the {side} side"));
+                }
+            }
+            if bg == Color32::WHITE {
+                across(&image, "the dashed card outline", &mut failed);
+            }
             // A handle: across it, from outside one side to its middle.
             let c = rect.center();
             let image = draw(&|p| selection_handle(p, c, 8.0));
