@@ -838,7 +838,7 @@ pub(crate) mod tests {
         // As in the app: each viewport is a window of its own.
         ctx.set_embed_viewports(false);
         let icon = Arc::new(egui::IconData::default());
-        let mut frame = |request: Option<Request>| {
+        let frame = |request: Option<Request>| {
             let mut out = ctx.run_ui(egui::RawInput { system_theme: Some(egui::Theme::Light), ..Default::default() }, |ui| show(ui.ctx(), &shared, icon.clone(), request));
             out.textures_delta.clear();
             dark_title_commands(&out, viewport_id())

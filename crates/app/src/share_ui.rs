@@ -41,7 +41,8 @@ pub const LINK_ROW_HEIGHT: f32 = 46.0;
 pub const BUTTON_HEIGHT: f32 = 44.0;
 /// Between the buttons of the action row.
 pub const BUTTON_GAP: f32 = 12.0;
-pub const HEADING_SIZE: f32 = theme::HEADING_SIZE;
+/// The window's heading: 20 points, as in the owner's mockup (the app's other headings are 18).
+pub const HEADING_SIZE: f32 = 20.0;
 /// What Copy link says for a moment after a copy that worked.
 pub const COPIED_LABEL: &str = "Copied";
 pub const OPEN_IN_BROWSER: &str = "Open in browser";

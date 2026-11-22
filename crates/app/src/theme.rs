@@ -189,7 +189,13 @@ pub const BODY_WEIGHT: f32 = 500.0;
 /// app-heading and app-strong weight.
 pub const STRONG_WEIGHT: f32 = 700.0;
 
-const MANROPE: &[u8] = include_bytes!("../../../assets/fonts/manrope/Manrope[wght].ttf");
+static MANROPE: &[u8] = include_bytes!("../../../assets/fonts/manrope/Manrope[wght].ttf");
+
+/// The font family headings are set in: the same Manrope bytes (borrowed, not copied) at
+/// app-heading's bold weight, with the interface family's fallbacks.
+pub fn heading_family() -> FontFamily {
+    FontFamily::Name("Heading".into())
+}
 
 // Shape and space.
 
@@ -246,21 +252,28 @@ pub fn test_context() -> egui::Context {
 }
 
 /// egui's built-in fonts with Manrope at the head of the interface family, at medium weight
-/// (the font is variable; [`strong`] asks for bold), and Hack for monospace. The built-in
-/// interface face is no longer in either family; the icon and emoji fonts stay as fallbacks.
+/// (the font is variable; [`strong`] asks for bold), Manrope at bold weight for headings
+/// ([`heading_family`]), and Hack for monospace. The icon and emoji fonts stay as fallbacks.
 pub fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
-    let tweak = egui::FontTweak { coords: egui::epaint::text::VariationCoords::new([("wght", BODY_WEIGHT)]), ..Default::default() };
-    fonts.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).tweak(tweak).into());
-    for (family, head) in [(FontFamily::Proportional, None), (FontFamily::Monospace, Some("Hack"))] {
-        let list = fonts.families.entry(family).or_default();
-        list.retain(|name| name != "Ubuntu-Light" && name != "Manrope" && Some(name.as_str()) != head);
-        // Monospace text falls back to Manrope for what Hack lacks.
-        list.insert(0, "Manrope".into());
-        if let Some(head) = head {
-            list.insert(0, head.into());
-        }
-    }
+    let at = |weight: f32| egui::FontTweak { coords: egui::epaint::text::VariationCoords::new([("wght", weight)]), ..Default::default() };
+    // `from_static` borrows the one copy of the font that is built into the program.
+    fonts.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).tweak(at(BODY_WEIGHT)).into());
+    fonts.font_data.insert("Manrope-Heading".into(), FontData::from_static(MANROPE).tweak(at(STRONG_WEIGHT)).into());
+    // egui's built-in interface face, Ubuntu-Light, stays right after Manrope as a fallback: it
+    // has letters Manrope lacks (much of Cyrillic, Greek Extended), so a title or a file name in
+    // them shows its letters, not boxes.
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    proportional.retain(|name| name != "Manrope" && name != "Ubuntu-Light");
+    proportional.splice(0..0, ["Manrope".to_string(), "Ubuntu-Light".to_string()]);
+    let proportional = proportional.clone();
+    // Monospace text falls back to the interface family for what Hack lacks.
+    let mut monospace = vec!["Hack".to_string()];
+    monospace.extend(proportional.iter().cloned());
+    fonts.families.insert(FontFamily::Monospace, monospace);
+    let mut heading = vec!["Manrope-Heading".to_string()];
+    heading.extend(proportional);
+    fonts.families.insert(heading_family(), heading);
     fonts
 }
 
@@ -354,7 +367,7 @@ pub fn style() -> Style {
         (TextStyle::Small, FontId::proportional(SMALL_SIZE)),
         (TextStyle::Body, FontId::proportional(BODY_SIZE)),
         (TextStyle::Button, FontId::proportional(BODY_SIZE)),
-        (TextStyle::Heading, FontId::proportional(HEADING_SIZE)),
+        (TextStyle::Heading, FontId::new(HEADING_SIZE, heading_family())),
         (TextStyle::Monospace, FontId::monospace(MONO_SIZE)),
     ]
     .into();
@@ -736,7 +749,7 @@ pub(crate) mod tests {
         let mut out = None;
         for _ in 0..2 {
             let o = ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.button("Save");
+                let _ = ui.button("Save");
                 ui.text_edit_singleline(&mut text);
                 egui::ComboBox::from_id_salt("pick").selected_text("PNG").show_ui(ui, |_| {});
                 ui.allocate_ui(egui::vec2(520.0, 60.0), |ui| crate::share_ui::action_row(ui, &[crate::share_ui::ActionButton { label: "Done", accent: false }]));
@@ -781,10 +794,59 @@ pub(crate) mod tests {
         let fonts = fonts();
         assert_eq!(fonts.families[&FontFamily::Proportional][0], "Manrope");
         assert_eq!(fonts.families[&FontFamily::Monospace][0], "Hack");
-        assert!(fonts.families.values().all(|list| !list.iter().any(|n| n == "Ubuntu-Light")), "{:?}", fonts.families);
+        // Ubuntu-Light is a fallback right after Manrope, never ahead of it.
+        assert_eq!(fonts.families[&FontFamily::Proportional][1], "Ubuntu-Light");
+        assert_eq!(fonts.families[&heading_family()][..2], ["Manrope-Heading", "Manrope"]);
         let axes = fonts.font_data["Manrope"].variation_axes();
         let wght = axes.iter().find(|a| a.tag.to_string() == "wght").expect("Manrope is variable in weight");
         assert!(wght.range.min <= BODY_WEIGHT && STRONG_WEIGHT <= wght.range.max, "{wght:?}");
+    }
+
+    /// Headings are app-heading's bold: set in the heading family, Manrope at weight 700, they
+    /// come out wider than the same words in the body family at the same size. The heading face
+    /// borrows the same bytes as the body face: the font is in the program once.
+    #[test]
+    fn headings_are_bold_manrope_from_the_same_bytes() {
+        let fonts = fonts();
+        let (body, heading) = (&fonts.font_data["Manrope"], &fonts.font_data["Manrope-Heading"]);
+        let bytes = |d: &FontData| (*d.font).as_ref().as_ptr();
+        assert!(bytes(body) == MANROPE.as_ptr() && bytes(heading) == MANROPE.as_ptr(), "both borrow the built-in bytes");
+        assert_eq!(style().text_styles[&TextStyle::Heading], FontId::new(HEADING_SIZE, heading_family()));
+        let ctx = test_context();
+        run(&ctx, egui::RawInput::default(), |_| {});
+        let wide = |family: FontFamily| ctx.fonts_mut(|f| f.layout_no_wrap("Publish tour".into(), FontId::new(HEADING_SIZE, family), TEXT).size().x);
+        let (medium, bold) = (wide(FontFamily::Proportional), wide(heading_family()));
+        assert!(bold > medium * 1.02, "body {medium}, heading {bold}");
+        // `ui.heading` and the share window's heading both take the heading family.
+        let mut families = Vec::new();
+        run(&ctx, egui::RawInput::default(), |ui| {
+            for text in [egui::WidgetText::from(RichText::new("Hotkeys").heading()), egui::WidgetText::from(RichText::new("Publish to").heading().size(crate::share_ui::HEADING_SIZE))] {
+                let galley = text.into_galley(ui, None, f32::INFINITY, TextStyle::Body);
+                families.push(galley.job.sections[0].format.font_id.family.clone());
+            }
+        });
+        assert!(families.iter().all(|f| *f == heading_family()), "{families:?}");
+    }
+
+    /// A title or a file name in letters Manrope lacks (extended Cyrillic, Greek Extended) shows
+    /// them through the Ubuntu-Light fallback, in the body and in a heading, not as boxes.
+    #[test]
+    fn letters_manrope_lacks_come_from_the_fallback() {
+        let ctx = test_context();
+        run(&ctx, egui::RawInput::default(), |_| {});
+        let title = "Ѣѳѵ Ґґ Ӂӂ Ӑӑ Ӧӧ — Ἀθῆναι ᾄδω ὕδωρ";
+        for family in [FontFamily::Proportional, heading_family(), FontFamily::Monospace] {
+            let lacking: Vec<char> = title.chars().filter(|c| !c.is_whitespace()).filter(|c| !ctx.fonts_mut(|f| f.has_glyph(&FontId::new(13.0, family.clone()), *c))).collect();
+            assert!(lacking.is_empty(), "{family:?} shows boxes for {lacking:?}");
+        }
+        // And Manrope alone does lack some of them, so the fallback is what draws them.
+        let only = egui::Context::default();
+        let mut defs = FontDefinitions::default();
+        defs.font_data.insert("Manrope".into(), FontData::from_static(MANROPE).into());
+        defs.families.insert(FontFamily::Proportional, vec!["Manrope".into()]);
+        only.set_fonts(defs);
+        run(&only, egui::RawInput::default(), |_| {});
+        assert!(title.chars().any(|c| !c.is_whitespace() && !only.fonts_mut(|f| f.has_glyph(&FontId::proportional(13.0), c))));
     }
 
     /// Width of `text` in the interface font at `size`, at the weight `bold` asks for.
