@@ -146,6 +146,8 @@ pub const ICON_SHADOW: Color32 = Color32::from_black_alpha(200);
 /// The outline and handles of what is selected on the canvas, and the edge of a crop: the gold of
 /// selection highlights, which reads on most pictures.
 pub const SELECTION_EDGE: Color32 = DARK.accent;
+/// The fill of a selection handle.
+pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
 /// The pixel grid lines of the magnifier, over the desktop.
@@ -358,6 +360,24 @@ pub fn window_card<R>(ui: &mut egui::Ui, margin: f32, add: impl FnOnce(&mut egui
         .inner
 }
 
+/// The outline of what is selected on the user's picture (and the edge of a crop): a line `width`
+/// points wide just outside `rect`.
+pub fn selection_outline(painter: &egui::Painter, rect: egui::Rect, radius: f32, width: f32) {
+    painter.rect_stroke(rect, radius, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
+}
+
+/// A handle of what is selected on the user's picture, `side` points square around `center`.
+pub fn selection_handle(painter: &egui::Painter, center: egui::Pos2, side: f32) {
+    let r = egui::Rect::from_center_size(center, egui::vec2(side, side));
+    painter.rect_filled(r, 1.0, HANDLE_FILL);
+    painter.rect_stroke(r, 1.0, Stroke::new(1.0, SELECTION_EDGE), egui::StrokeKind::Outside);
+}
+
+/// A dashed outline along the closed path `pts`, `width` points wide, over the user's picture.
+pub fn selection_dashes(painter: &egui::Painter, pts: &[egui::Pos2], width: f32) {
+    painter.extend(egui::Shape::dashed_line(pts, Stroke::new(width, SELECTION_EDGE), 6.0, 4.0));
+}
+
 /// The box around a caution: caution-tint fill, a 1px caution-border edge, radius-md. The edge
 /// takes one point of the 10 the boxes had around their text, so nothing moves.
 pub fn caution_frame() -> egui::Frame {
@@ -507,7 +527,7 @@ pub mod checks {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// One frame of `ctx`, its textures dropped.
@@ -600,6 +620,63 @@ mod tests {
         ] {
             assert!((contrast(fg, bg) - want).abs() < 0.01, "{fg:?} on {bg:?}: {} != {want}", contrast(fg, bg));
         }
+    }
+
+    /// Whether some pixel of `image` on the line from `a` to `b` (in points, at `ppp`) has at
+    /// least 3:1 contrast against `bg`.
+    pub(crate) fn reads_against(image: &image::RgbaImage, ppp: f32, a: egui::Pos2, b: egui::Pos2, bg: Color32) -> bool {
+        let steps = ((b - a).length() * ppp * 2.0).ceil().max(1.0) as usize;
+        (0..=steps).any(|i| {
+            let p = a + (b - a) * (i as f32 / steps as f32);
+            let (x, y) = ((p.x * ppp) as u32, (p.y * ppp) as u32);
+            x < image.width() && y < image.height() && {
+                let [r, g, bl, _] = image.get_pixel(x, y).0;
+                contrast(Color32::from_rgb(r, g, bl), bg) >= 3.0
+            }
+        })
+    }
+
+    /// The pictures a selection is tested on: a white page and a near-black one.
+    pub(crate) const PICTURES: [(&str, Color32); 2] = [("white", Color32::WHITE), ("near-black", Color32::from_rgb(12, 12, 14))];
+
+    /// What marks a selection over the user's picture (the outline, a handle, the dashed outline
+    /// of a tour card) reads on a white picture and on a near-black one: across each of them there
+    /// is a pixel with at least 3:1 contrast against the picture.
+    #[test]
+    fn what_marks_a_selection_reads_on_a_white_and_on_a_near_black_picture() {
+        let ppp = 1.25;
+        let size = egui::vec2(120.0, 100.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(30.0, 30.0), egui::vec2(60.0, 40.0));
+        let mut failed = Vec::new();
+        for (name, bg) in PICTURES {
+            let draw = |mark: &dyn Fn(&egui::Painter)| {
+                crate::snapshot::picture(&test_context(), size, ppp, 1, |ui| {
+                    ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, bg);
+                    mark(ui.painter());
+                })
+            };
+            // Cross-sections at a quarter of each side, from the edge outwards.
+            let across = |image: &image::RgbaImage, what: &str, failed: &mut Vec<String>| {
+                let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+                let (qx, qy) = (l + rect.width() / 4.0, t + rect.height() / 4.0);
+                for (side, a, z) in [("top", egui::pos2(qx, t), egui::pos2(qx, t - 6.0)), ("bottom", egui::pos2(qx, b), egui::pos2(qx, b + 6.0)), ("left", egui::pos2(l, qy), egui::pos2(l - 6.0, qy)), ("right", egui::pos2(r, qy), egui::pos2(r + 6.0, qy))] {
+                    if !reads_against(image, ppp, a, z, bg) {
+                        failed.push(format!("{what} on {name}, {side} side"));
+                    }
+                }
+            };
+            across(&draw(&|p| selection_outline(p, rect, 2.0, 1.0)), "the selection outline", &mut failed);
+            across(&draw(&|p| selection_outline(p, rect, 0.0, 2.0)), "the crop edge", &mut failed);
+            let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
+            across(&draw(&|p| selection_dashes(p, &pts, 1.5)), "the dashed card outline", &mut failed);
+            // A handle: across it, from outside one side to its middle.
+            let c = rect.center();
+            let image = draw(&|p| selection_handle(p, c, 8.0));
+            if !reads_against(&image, ppp, c - egui::vec2(8.0, 0.0), c, bg) {
+                failed.push(format!("a handle on {name}"));
+            }
+        }
+        assert!(failed.is_empty(), "lost on the picture: {failed:?}");
     }
 
     #[test]

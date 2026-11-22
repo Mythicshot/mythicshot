@@ -716,7 +716,7 @@ impl Editor {
             if selected {
                 let r = r.response.rect.expand(4.0);
                 let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-                ui.painter().with_clip_rect(clip).extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, theme::SELECTION_EDGE), 6.0, 4.0));
+                theme::selection_dashes(&ui.painter().with_clip_rect(clip), &pts, 1.5);
             }
         });
         let rect = shown.response.rect;

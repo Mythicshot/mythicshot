@@ -1754,7 +1754,7 @@ impl Editor {
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.max.y), img_rect.max), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.min.y), pos2(r.min.x, r.max.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(img_rect.max.x, r.max.y)), 0.0, dim);
-            painter.rect_stroke(r, 0.0, Stroke::new(2.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+            theme::selection_outline(&painter, r, 0.0, 2.0);
             if self.crop.is_some() {
                 let mut apply = false;
                 let mut cancel = false;
@@ -1780,11 +1780,9 @@ impl Editor {
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
-            painter.rect_stroke(scr_rect(b).expand(3.0), 2.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+            theme::selection_outline(&painter, scr_rect(b).expand(3.0), 2.0, 1.0);
             for (pos, _) in handles(it) {
-                let c = to_scr(pos);
-                painter.rect_filled(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, theme::ON_PICTURE);
-                painter.rect_stroke(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Stroke::new(1.0, theme::SELECTION_EDGE), StrokeKind::Outside);
+                theme::selection_handle(&painter, to_scr(pos), HANDLE);
             }
         }
     }
@@ -2468,6 +2466,51 @@ mod tests {
         assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor");
         ed.share = Some(share_dialog());
         assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor with a dialog");
+    }
+
+    /// An editor on a plain `bg` screenshot with one rectangle selected. The rectangle is drawn in
+    /// the picture's own colour, without a shadow, so only the selection shows on the picture.
+    fn selection_on(bg: egui::Color32) -> Editor {
+        let shot = RgbaImage::from_pixel(320, 200, image::Rgba([bg.r(), bg.g(), bg.b(), 255]));
+        let s = Settings::default();
+        let mut ed = Editor::new(shot, "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs::default());
+        let style = Style { stroke: mythicshot_editor::Rgba([bg.r(), bg.g(), bg.b(), 255]), fill: None, width: 1.0, font_size: 20.0, shadow: false };
+        let id = ed.doc.add(Shape::Rect(Bounds { x0: 80.0, y0: 50.0, x1: 240.0, y1: 150.0 }), style);
+        ed.select(Some(id));
+        ed
+    }
+
+    /// The selection on the canvas reads on any screenshot: on a white one and on a near-black
+    /// one, across each side of the outline and across each handle there is a pixel with at least
+    /// 3:1 contrast against the picture.
+    #[test]
+    fn the_selection_reads_on_a_white_and_on_a_near_black_screenshot() {
+        let ppp = 1.25;
+        let mut failed = Vec::new();
+        for (name, bg) in crate::theme::tests::PICTURES {
+            let mut ed = selection_on(bg);
+            let image = crate::snapshot::picture(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 3, |ui| ed.ui(ui));
+            let geom = ed.last_canvas;
+            let scr = |x: f32, y: f32| geom.min + vec2(x, y) * geom.zoom;
+            let (l, t, r, b) = (80.0, 50.0, 240.0, 150.0);
+            let (qx, qy) = (l + (r - l) / 4.0, t + (b - t) / 4.0);
+            for (side, a, out) in [("top", scr(qx, t), vec2(0.0, -10.0)), ("bottom", scr(qx, b), vec2(0.0, 10.0)), ("left", scr(l, qy), vec2(-10.0, 0.0)), ("right", scr(r, qy), vec2(10.0, 0.0))] {
+                if !crate::theme::tests::reads_against(&image, ppp, a + out * 0.15, a + out, bg) {
+                    failed.push(format!("the outline on {name}, {side} side"));
+                }
+            }
+            // Each handle: from inside the rectangle (where nothing else is drawn) into its middle.
+            let it = ed.doc.item(ed.selected.unwrap()).unwrap().clone();
+            let middle = scr((l + r) / 2.0, (t + b) / 2.0);
+            for (pos, _) in handles(&it) {
+                let c = scr(pos.x, pos.y);
+                let inward = (middle - c).normalized();
+                if !crate::theme::tests::reads_against(&image, ppp, c + inward * (HANDLE / 2.0 + 4.0), c, bg) {
+                    failed.push(format!("the handle at {pos:?} on {name}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "lost on the screenshot: {failed:?}");
     }
 
     /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and
