@@ -136,7 +136,7 @@ wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0
 
 Releases are not built on GitHub: they are signed and checked on the signing machine, see [docs/release.md](docs/release.md). The GitHub workflow `.github/workflows/release.yml` only builds an unsigned MSI for testing, when run by hand from the Actions tab; it keeps it as a workflow artifact named `mythicshot-<version>-unsigned-not-for-release` and never publishes a release.
 
-The wizard's banner images come from `installer/make_images.py`. An MSI built by hand as above is not code-signed, so Windows shows a SmartScreen warning the first time.
+The app icon (`assets/mythicshot.ico`) and the two marks in the wizard's pictures come from the brand's marks in `assets/brand/`: `node scripts/make-brand-art.mjs <folder of an installed sharp package>` (sharp is borrowed, not a dependency). The wizard's banner and side pictures then come from `python installer/make_images.py`. An MSI built by hand as above is not code-signed, so Windows shows a SmartScreen warning the first time.
 
 ### Signed release for the download page
 
@@ -160,3 +160,12 @@ Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to"
 ## Licence
 
 GNU Affero General Public License 3.0 or later, because the GIF encoder ([gifski](https://docs.rs/crate/gifski/latest)) is AGPL.
+
+Fonts, both under the SIL Open Font License 1.1, whose text ships with every copy (the installer puts it beside `LICENSE.txt` as `OFL-Manrope.txt` and `OFL-Cinzel.txt`):
+
+| Font | Used for | Licence |
+|---|---|---|
+| [Manrope](https://github.com/googlefonts/manrope), copyright 2018 The Manrope Project Authors | All interface text, built into the program | [assets/fonts/manrope/OFL.txt](assets/fonts/manrope/OFL.txt) |
+| [Cinzel](https://github.com/NDISCOVER/Cinzel), copyright 2020 The Cinzel Project Authors | The name in the installer's side picture | [assets/fonts/cinzel/OFL.txt](assets/fonts/cinzel/OFL.txt) |
+
+Monospace text uses Hack, which comes with egui.

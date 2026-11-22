@@ -62,6 +62,9 @@
       <Component Id="MainExe" Guid="D6C760D4-E8E1-4502-BB2E-65853E41E6F4">
         <File Id="MythicshotExe" Source="$(Exe)" Name="mythicshot.exe" />
         <File Id="LicenseFile" Source="..\LICENSE" Name="LICENSE.txt" />
+        <!-- The licences of the fonts: Manrope is built into mythicshot.exe, Cinzel sets the name in the wizard's side picture. -->
+        <File Id="ManropeLicense" Source="..\assets\fonts\manrope\OFL.txt" Name="OFL-Manrope.txt" />
+        <File Id="CinzelLicense" Source="..\assets\fonts\cinzel\OFL.txt" Name="OFL-Cinzel.txt" />
         <File Id="ReadmeFile" Source="..\README.md" Name="README.md" />
         <RegistryValue Root="HKCU" Key="Software\Mythicshot" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
