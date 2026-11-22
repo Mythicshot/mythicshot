@@ -8,14 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
+use crate::theme;
 use crate::publish_ui::short_title;
 use crate::site::{self, Folder};
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const ERROR: Color32 = Color32::from_rgb(255, 140, 140);
-const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
 
 /// The approved line under the title.
 pub const INTRO: &str = "Writes this tour into a folder of plain web files. Host that folder anywhere, such as GitHub Pages.";
@@ -181,7 +179,7 @@ impl SiteDialog {
         crate::share_ui::modal(egui::Id::unique("add-to-site-dialog")).frame(frame).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.heading("Add to site");
-            ui.add(egui::Label::new(RichText::new(INTRO).color(MUTED)).wrap());
+            ui.add(egui::Label::new(RichText::new(INTRO).color(theme::MUTED)).wrap());
             ui.add_space(12.0);
             egui::Grid::new("add-to-site-rows").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                 ui.label("Site folder");
@@ -190,7 +188,7 @@ impl SiteDialog {
                     let shown = self.folder.as_ref().map(|f| f.display().to_string()).unwrap_or_else(|| "No folder chosen".to_string());
                     ui.scope(|ui| {
                         ui.set_max_width((ui.available_width() - choose_w).max(60.0));
-                        let color = if self.folder.is_some() { ui.visuals().text_color() } else { MUTED };
+                        let color = if self.folder.is_some() { ui.visuals().text_color() } else { theme::MUTED };
                         let r = ui.add(egui::Label::new(RichText::new(&shown).color(color)).truncate());
                         if self.folder.is_some() {
                             r.on_hover_text(&shown);
@@ -217,21 +215,21 @@ impl SiteDialog {
             });
             ui.add_space(8.0);
             if let Some(name) = &self.gone {
-                ui.add(egui::Label::new(RichText::new(format!("The folder used last time, {name}, is no longer there.")).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(format!("The folder used last time, {name}, is no longer there.")).color(theme::MUTED)).wrap());
             }
             match self.note() {
-                Ok(note) => ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap()),
-                Err(why) if self.folder.is_none() || self.seen.is_none() => ui.add(egui::Label::new(RichText::new(why).color(MUTED)).wrap()),
-                Err(why) => ui.add(egui::Label::new(RichText::new(why).color(ERROR)).wrap()),
+                Ok(note) => ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED)).wrap()),
+                Err(why) if self.folder.is_none() || self.seen.is_none() => ui.add(egui::Label::new(RichText::new(why).color(theme::MUTED)).wrap()),
+                Err(why) => ui.add(egui::Label::new(RichText::new(why).color(theme::DANGER_TEXT)).wrap()),
             };
             if let Some(why) = &self.refused {
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(why).color(ERROR)).wrap());
+                ui.add(egui::Label::new(RichText::new(why).color(theme::DANGER_TEXT)).wrap());
             }
             ui.add_space(16.0);
             let ready = self.outcome();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add = egui::Button::new(RichText::new("Add to site").strong()).fill(PRIMARY);
+                let add = theme::primary_button("Add to site");
                 if ui.add_enabled(ready.is_some(), add).clicked() {
                     outcome = ready.clone();
                 }
@@ -306,6 +304,26 @@ mod tests {
         egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() }
     }
 
+    /// "Add to site" paints an opaque surface-raised frame, and no label sticks out of its button or field.
+    #[test]
+    fn the_dialog_is_opaque() {
+        let ctx = crate::theme::test_context();
+        let mut d = SiteDialog::new("", "", "Raid groups");
+        let mut last = None;
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                d.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        crate::theme::checks::assert_dialog_opaque(&out, "add to site");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "add to site") >= 2);
+    }
+
     /// Run frames until the background look at the folder has finished.
     fn settle(ctx: &egui::Context, d: &mut SiteDialog) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -317,7 +335,7 @@ mod tests {
 
     #[test]
     fn enter_adds_escape_cancels_and_nothing_starts_without_a_folder() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let tmp = tempfile::tempdir().unwrap();
         // No folder: Enter does nothing.
         let mut d = SiteDialog::new("", "", "Raid groups");
@@ -346,7 +364,7 @@ mod tests {
 
     #[test]
     fn a_site_brings_its_title_and_a_free_address() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let tmp = tempfile::tempdir().unwrap();
         let mut l = list(&[("raid-groups", "Raid groups")]);
         l.title = "Raid guides".into();
@@ -368,7 +386,7 @@ mod tests {
 
     #[test]
     fn a_main_folder_is_refused_in_the_dialog() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let Some(user) = directories::UserDirs::new() else { return };
         let mut d = SiteDialog::new("", "", "A");
         d.look_at(user.home_dir().to_path_buf(), false);
@@ -379,7 +397,7 @@ mod tests {
 
     #[test]
     fn a_remembered_folder_that_is_gone_asks_for_another() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("old-site");
         let mut d = SiteDialog::new(&gone.to_string_lossy(), "Guides", "A");

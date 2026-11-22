@@ -4,6 +4,8 @@
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
+use crate::theme;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Select,
@@ -61,25 +63,27 @@ pub enum Icon {
     Record,
     /// A small padlock: who can open something is restricted.
     Lock,
+    /// A triangle with an exclamation mark: the icon of every caution box.
+    Warning,
 }
 
-const FG: Color32 = Color32::from_rgb(214, 218, 226);
-const ACCENT: Color32 = Color32::from_rgb(47, 111, 235);
-const HOVER: Color32 = Color32::from_rgb(44, 50, 62);
 
-/// A square icon button. `selected` fills it with the accent colour.
+/// A square icon button. `selected` fills it with the primary colour, the icon in on-primary.
 pub fn button(ui: &mut Ui, icon: Icon, size: f32, selected: bool, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let enabled = ui.is_enabled();
     let fill = if selected {
-        ACCENT
+        theme::PRIMARY
     } else if resp.hovered() && enabled {
-        HOVER
+        theme::RAISED
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, 5.0, fill);
-    let color = if !enabled { Color32::from_gray(90) } else if selected { Color32::WHITE } else { FG };
+    ui.painter().rect_filled(rect, f32::from(theme::control_radius(size)), fill);
+    // Disabled, the icon stays in text: egui already fades everything in a disabled Ui (to
+    // theme::DISABLED_ALPHA, over the opaque window), and fading theme::DISABLED as well
+    // would leave it at 2.8:1.
+    let color = if selected { theme::ON_PRIMARY } else { theme::TEXT };
     paint(ui.painter(), rect.shrink(size * 0.22), icon, color);
     resp.on_hover_text(tip)
 }
@@ -89,11 +93,11 @@ pub fn menu_row(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, HOVER);
+        ui.painter().rect_filled(rect, f32::from(theme::RADIUS_SM), theme::RAISED);
     }
     let icon_rect = Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
-    paint(ui.painter(), icon_rect, icon, FG);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), FG);
+    paint(ui.painter(), icon_rect, icon, theme::TEXT);
+    ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), theme::TEXT);
     resp
 }
 
@@ -176,7 +180,7 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         }
         Icon::Step => {
             p.circle_filled(r.center(), r.width() * 0.48, c);
-            p.text(r.center(), egui::Align2::CENTER_CENTER, "1", FontId::proportional(r.height() * 0.75), Color32::from_rgb(27, 31, 39));
+            p.text(r.center(), egui::Align2::CENTER_CENTER, "1", FontId::proportional(r.height() * 0.75), theme::SURFACE);
         }
         Icon::Highlight => {
             p.rect_filled(rect(0.0, 0.62, 1.0, 0.95), 1.0, Color32::from_rgba_unmultiplied(255, 220, 0, 170));
@@ -230,7 +234,7 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.rect_filled(rect(0.28, 0.08, 0.72, 0.36), 0.0, c);
             p.rect_stroke(rect(0.25, 0.56, 0.75, 0.92), 0.0, thin, StrokeKind::Middle);
             if icon == Icon::SaveAs {
-                p.add(Shape::line(vec![at(0.62, 1.0), at(1.05, 0.55)], Stroke::new(s.width * 1.3, ACCENT)));
+                p.add(Shape::line(vec![at(0.62, 1.0), at(1.05, 0.55)], Stroke::new(s.width * 1.3, theme::ACCENT)));
             }
         }
         Icon::Copy => {
@@ -347,8 +351,13 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.circle_stroke(r.center(), r.width() * 0.44, s);
             p.circle_filled(r.center(), r.width() * 0.22, c);
         }
+        Icon::Warning => {
+            p.add(Shape::closed_line(vec![at(0.5, 0.06), at(0.96, 0.9), at(0.04, 0.9)], s));
+            p.add(line(&[(0.5, 0.36), (0.5, 0.6)]));
+            p.circle_filled(at(0.5, 0.75), s.width * 0.7, c);
+        }
         Icon::Shadow => {
-            p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, Color32::from_black_alpha(200));
+            p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, theme::ICON_SHADOW);
             p.rect_stroke(rect(0.0, 0.0, 0.75, 0.75), 2.0, s, StrokeKind::Middle);
         }
     }

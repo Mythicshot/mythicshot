@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, Modifiers, RichText};
+use eframe::egui::{self, Key, Modifiers, RichText};
 use image::RgbaImage;
 use mythicshot_destinations::DestId;
 
 use crate::icons::{self, Icon};
 use crate::platform;
+use crate::theme;
 
 const PICKER_SIZE: [f32; 2] = [270.0, 262.0];
 const TOAST_SIZE: [f32; 2] = [380.0, 96.0];
@@ -93,8 +94,7 @@ impl Picker {
             self.pick = Pick::Cancelled;
         }
         // A compact menu like Greenshot's destination menu.
-        let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(6.0).stroke(egui::Stroke::new(1.0, Color32::from_rgb(52, 59, 72)));
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        theme::window_card(ui, 6.0, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(RichText::new(format!("  Send capture ({} × {}) to", self.img.width(), self.img.height())).weak().size(12.0));
             ui.add_space(4.0);
@@ -180,27 +180,71 @@ impl Toast {
         ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("toast"), builder, move |ui, _| {
             let Ok(mut guard) = state.lock() else { return };
             let Some(t) = guard.as_mut() else { return };
-            t.hovered = ui.ctx().input(|i| i.pointer.has_pointer());
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(12.0).stroke(egui::Stroke::new(1.0, Color32::from_rgb(52, 59, 72)))).show(ui, |ui| {
-                ui.label(RichText::new(&t.msg).color(Color32::from_rgb(230, 232, 236)));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if let Some(p) = t.path.clone() {
-                        if ui.button("Open").clicked() {
-                            platform::open_path(&p);
-                            t.dismissed = true;
-                        }
-                        if ui.button("Show in folder").clicked() {
-                            platform::reveal(&p);
-                            t.dismissed = true;
-                        }
-                    }
-                    if ui.button("Dismiss").clicked() {
-                        t.dismissed = true;
-                    }
-                });
-            });
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            t.ui(ui);
         });
+    }
+}
+
+impl ToastState {
+    /// The toast window's contents.
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.hovered = ui.ctx().input(|i| i.pointer.has_pointer());
+        theme::window_card(ui, 12.0, |ui| {
+            ui.label(RichText::new(&self.msg).color(theme::TEXT));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if let Some(p) = self.path.clone() {
+                    if ui.button("Open").clicked() {
+                        platform::open_path(&p);
+                        self.dismissed = true;
+                    }
+                    if ui.button("Show in folder").clicked() {
+                        platform::reveal(&p);
+                        self.dismissed = true;
+                    }
+                }
+                if ui.button("Dismiss").clicked() {
+                    self.dismissed = true;
+                }
+            });
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::checks;
+
+    fn window(size: [f32; 2]) -> egui::RawInput {
+        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())), ..Default::default() }
+    }
+
+    #[test]
+    fn the_destination_picker_and_the_toast_paint_their_whole_window_opaque() {
+        let ctx = theme::test_context();
+        let mut picker = Picker { img: RgbaImage::new(640, 480), title: "Capture".into(), pick: Pick::Waiting, had_focus: false };
+        let mut toast = ToastState { msg: "Saved to Pictures".into(), path: Some(PathBuf::from("shot.png")), at: Instant::now(), hovered: false, dismissed: false };
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(window(PICKER_SIZE), |ui| picker.ui(ui));
+            out.textures_delta.clear();
+            checks::assert_window_opaque(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, PICKER_SIZE.into()), "the destination picker");
+            let mut out = ctx.run_ui(window(TOAST_SIZE), |ui| toast.ui(ui));
+            out.textures_delta.clear();
+            checks::assert_window_opaque(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, TOAST_SIZE.into()), "the toast");
+            // The card on it: surface-raised with its border and corners.
+            assert!(checks::fills(&out).iter().any(|(_, c, r)| *c == theme::RAISED && *r == theme::RADIUS_LG), "the toast's card");
+        }
+        // Their labels fit: the picker's rows and the toast's message and buttons, in their small fixed windows.
+        let mut out = ctx.run_ui(window(PICKER_SIZE), |ui| picker.ui(ui));
+        out.textures_delta.clear();
+        assert!(checks::assert_texts_fit(&out, "the destination picker") >= 3);
+        let mut out = ctx.run_ui(window(TOAST_SIZE), |ui| toast.ui(ui));
+        out.textures_delta.clear();
+        assert!(checks::assert_texts_fit(&out, "the toast") >= 1);
+        // Filled in pixel by pixel: not one pixel lets the desktop through, not even at the card's rounded corners.
+        assert_eq!(crate::snapshot::uncovered(&theme::test_context(), PICKER_SIZE.into(), 1.25, 2, |ui| picker.ui(ui)), 0, "the destination picker");
+        assert_eq!(crate::snapshot::uncovered(&theme::test_context(), TOAST_SIZE.into(), 1.25, 2, |ui| toast.ui(ui)), 0, "the toast");
     }
 }

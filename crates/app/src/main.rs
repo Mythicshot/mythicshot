@@ -31,6 +31,9 @@ mod sign_in_ui;
 mod share_ui;
 mod site;
 mod site_ui;
+#[cfg(test)]
+mod snapshot;
+mod theme;
 mod tray;
 mod tour;
 mod tour_cards;
@@ -202,6 +205,8 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        // Dark, in the brand's colours and fonts, whatever Windows uses.
+        theme::apply(&ctx);
         app_icon::set_for_all_windows(cc);
         let (tx, rx) = mpsc::channel();
 

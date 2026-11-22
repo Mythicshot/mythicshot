@@ -14,13 +14,11 @@ use mythicshot_editor::{Bounds, Document, Item, MAX_DIM, MIN_DIM, ObfuscateMode,
 
 use mythicshot_destinations::{self as dest, Context, DestId, Sent};
 
+use crate::theme::{self, Strong as _};
 use crate::hotkeys::{self, EditorAction};
 use crate::icons::{self, Icon};
 
-const ACCENT: Color32 = Color32::from_rgb(91, 141, 239);
-const CANVAS_BG: Color32 = Color32::from_rgb(16, 18, 22);
 const HANDLE: f32 = 8.0;
-const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
 /// Toolbar icon button size and tool rail width.
 const ICON: f32 = 28.0;
 const RAIL: f32 = 84.0;
@@ -30,9 +28,9 @@ const TOOL_BUTTON: f32 = 36.0;
 /// The Spotlight and Guide card tools show only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
-    (Some("DRAW"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
-    (Some("SHAPES"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
-    (Some("MORE"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
+    (Some("Draw"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
+    (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
+    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,6 +544,7 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        theme::window_background(ui);
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.asks_before_closing() {
@@ -934,7 +933,7 @@ impl Editor {
     /// Two rows like Greenshot's editor: actions on top, then the properties of
     /// the selected item (or of the next one drawn).
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
+        egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if self.video.is_some() {
@@ -1116,13 +1115,13 @@ impl Editor {
 
     /// A narrow column of tool icons, grouped like Greenshot's.
     fn tool_rail(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
+        egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
             egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                 for (title, tools) in RAIL_GROUPS {
                     if let Some(title) = title {
                         ui.add_space(4.0);
-                        ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(10.0).strong().color(ACCENT)));
+                        ui.vertical_centered(|ui| ui.label(egui::RichText::new(title).size(theme::SMALL_SIZE).bold().color(theme::MUTED)));
                     }
                     let tools: Vec<Tool> = tools.iter().copied().filter(|t| !matches!(t, Tool::Spotlight | Tool::Card) || self.video.is_some()).collect();
                     for row in tools.chunks(2) {
@@ -1147,7 +1146,7 @@ impl Editor {
         let key = hotkeys::display(binding);
         if !key.is_empty() && key.chars().count() <= 2 {
             let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
-            let color = if self.tool == tool { Color32::WHITE } else { Color32::from_rgb(140, 148, 164) };
+            let color = if self.tool == tool { theme::ON_PRIMARY } else { theme::MUTED };
             ui.painter().text(corner, egui::Align2::RIGHT_BOTTOM, key, FontId::proportional(9.0), color);
         }
         if resp.clicked() {
@@ -1157,9 +1156,9 @@ impl Editor {
 
     /// Size, last action with its time, and zoom, like Greenshot's status bar.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
+        egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let muted = Color32::from_rgb(163, 170, 184);
+                let muted = theme::MUTED;
                 ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).monospace().color(muted));
                 ui.separator();
                 let dirty = match (&self.saved, self.doc.dirty) {
@@ -1216,7 +1215,7 @@ impl Editor {
                 if let Some(m) = &more {
                     ui.scope(|ui| {
                         ui.set_max_width(status_width(ui.available_width()));
-                        ui.add(egui::Label::new(egui::RichText::new(m).color(Color32::from_rgb(245, 165, 36))).truncate()).on_hover_text(&whole);
+                        theme::caution_line(ui, m, theme::BODY_SIZE, theme::Fit::Truncate).on_hover_text(&whole);
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1293,7 +1292,7 @@ impl Editor {
     // ---- canvas -------------------------------------------------------------
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS_BG)).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::GROUND)).show(ui, |ui| {
             let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
             let avail = ui.available_size();
             let fit = ((avail.x - 32.0) / w).min((avail.y - 32.0) / h).clamp(0.05, 1.0);
@@ -1315,9 +1314,9 @@ impl Editor {
                 let to_scr = |p: Pt| img_rect.min + vec2(p.x * z, p.y * z);
 
                 if let Some(tex) = &self.texture {
-                    ui.painter().image(tex.id(), img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    ui.painter().image(tex.id(), img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), theme::IMAGE_TINT);
                 }
-                ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), StrokeKind::Outside);
+                ui.painter().rect_stroke(img_rect, 0.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Outside);
 
                 self.hover = resp.hover_pos().map(to_img).filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= w && p.y <= h);
                 self.handle_pointer(&resp, z, &to_img);
@@ -1606,7 +1605,7 @@ impl Editor {
                     if ui.button("Done").clicked() {
                         commit = true;
                     }
-                    ui.label(egui::RichText::new("Enter done · Shift+Enter new line · Esc cancel").weak().size(11.0));
+                    ui.label(egui::RichText::new("Enter done · Shift+Enter new line · Esc cancel").weak().size(theme::SMALL_SIZE));
                 });
             });
         });
@@ -1645,14 +1644,14 @@ impl Editor {
                 ui.spacing_mut().item_spacing.x = GAP;
                 let row = 3.0 * BUTTON.x + 2.0 * GAP;
                 ui.add_space(((ui.available_width() - row) / 2.0).max(0.0));
-                let primary = egui::Button::new(egui::RichText::new(if is_video { "Export and close" } else { "Save" }).strong()).fill(Color32::from_rgb(47, 111, 235)).min_size(BUTTON);
+                let primary = theme::primary_button(if is_video { "Export and close" } else { "Save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y));
                 if ui.add(primary).clicked() {
                     choice = Some(0);
                 }
-                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new(if is_video { "Discard" } else { "Don't save" }).min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(1);
                 }
-                if ui.add(egui::Button::new("Cancel").min_size(BUTTON)).clicked() {
+                if ui.add(egui::Button::new("Cancel").min_size(BUTTON).corner_radius(theme::control_radius(BUTTON.y))).clicked() {
                     choice = Some(2);
                 }
             });
@@ -1750,12 +1749,12 @@ impl Editor {
         };
         if let Some(b) = crop {
             let r = scr_rect(b);
-            let dim = Color32::from_black_alpha(150);
+            let dim = theme::SCRIM_STRONG;
             painter.rect_filled(Rect::from_min_max(img_rect.min, pos2(img_rect.max.x, r.min.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.max.y), img_rect.max), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(img_rect.min.x, r.min.y), pos2(r.min.x, r.max.y)), 0.0, dim);
             painter.rect_filled(Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(img_rect.max.x, r.max.y)), 0.0, dim);
-            painter.rect_stroke(r, 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+            theme::selection_outline(&painter, r, 0.0, 2.0);
             if self.crop.is_some() {
                 let mut apply = false;
                 let mut cancel = false;
@@ -1781,11 +1780,9 @@ impl Editor {
         // Selection outline and handles.
         if let Some(it) = self.selected.and_then(|id| self.doc.item(id)) {
             let b = it.bounds();
-            painter.rect_stroke(scr_rect(b).expand(3.0), 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+            theme::selection_outline(&painter, scr_rect(b).expand(3.0), 2.0, 1.0);
             for (pos, _) in handles(it) {
-                let c = to_scr(pos);
-                painter.rect_filled(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Color32::WHITE);
-                painter.rect_stroke(Rect::from_center_size(c, vec2(HANDLE, HANDLE)), 1.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+                theme::selection_handle(&painter, to_scr(pos), HANDLE);
             }
         }
     }
@@ -1998,6 +1995,7 @@ impl EditorWindow {
         });
         if first_frame {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+            theme::dark_title_bar(ctx, id);
         }
     }
 }
@@ -2073,8 +2071,8 @@ pub(crate) mod dialog_checks {
     /// status bar and canvas backgrounds are all there.
     pub(crate) fn assert_solid(with_dialog: &Painted, solid: &Painted) {
         let fills = big_fills(&with_dialog.editor);
-        assert!(fills.iter().filter(|(_, c)| *c == BAR_BG).count() >= 3, "the toolbar, rail and status bar backgrounds: {fills:?}");
-        assert!(fills.iter().any(|(_, c)| *c == CANVAS_BG), "the canvas background: {fills:?}");
+        assert!(fills.iter().filter(|(_, c)| *c == theme::SURFACE).count() >= 3, "the toolbar, rail and status bar backgrounds: {fills:?}");
+        assert!(fills.iter().any(|(_, c)| *c == theme::GROUND), "the canvas background: {fills:?}");
         assert!(fills.iter().all(|(_, c)| c.a() == 255), "nothing of the editor's background is see-through: {fills:?}");
         assert_eq!(fills, big_fills(&solid.editor), "the same backgrounds as with no dialog open");
         // The picture itself is not faded either.
@@ -2108,7 +2106,7 @@ pub(crate) mod dialog_checks {
     pub(crate) fn assert_inert_and_solid(make: impl Fn() -> Editor, open: impl Fn(&mut Editor), is_open: impl Fn(&Editor) -> bool) {
         // Find a tool button on the rail: a point a click on which changes the tool with no dialog open.
         let rail = (0..80).map(|i| pos2(RAIL / 2.0, 40.0 + i as f32 * 8.0)).find(|&at| {
-            let (mut ed, ctx) = (make(), egui::Context::default());
+            let (mut ed, ctx) = (make(), crate::theme::test_context());
             frame(&mut ed, &ctx, vec![]);
             let before = ed.tool;
             click(&mut ed, &ctx, at);
@@ -2116,7 +2114,7 @@ pub(crate) mod dialog_checks {
         });
         let rail = rail.expect("a tool button on the rail");
 
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = make();
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
         frame(&mut ed, &ctx, vec![]);
@@ -2181,7 +2179,7 @@ mod tests {
     fn copy_paste_duplicate_and_cut_annotations() {
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let rect = |x: f32| Shape::Rect(Bounds::new(mythicshot_editor::pt(x, 10.0), mythicshot_editor::pt(x + 20.0, 30.0)));
         ed.style.stroke = Rgba::YELLOW;
         let id = ed.add_item(rect(5.0));
@@ -2267,7 +2265,7 @@ mod tests {
         assert_eq!(shown(&mut ed, 0, true).as_deref(), Some("This recording was opened without the cover logo."));
         assert_eq!(shown(&mut ed, 500, false).as_deref(), Some("This recording was opened without the cover logo."));
         // The status bar draws it, and a key press in the window is the first action.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         ed.notify_held("This recording was opened without the cover logo.");
         ed.notify("Saved");
@@ -2281,7 +2279,7 @@ mod tests {
 
     #[test]
     fn copying_the_picture_means_closing_does_not_ask_to_save() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let rect = Shape::Rect(Bounds::new(mythicshot_editor::pt(5.0, 5.0), mythicshot_editor::pt(20.0, 20.0)));
         // Edited and neither saved nor copied: closing asks.
         let mut ed = editor(EditorPrefs::default());
@@ -2307,7 +2305,7 @@ mod tests {
     fn pasted_pictures_become_image_elements_that_fit() {
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // A small picture keeps its size and lands in the middle of the 64×48 capture.
         let small = egui::ColorImage::new([20, 10], vec![egui::Color32::GREEN; 200]);
         press(&mut ed, &ctx, vec![egui::Event::PasteImage(Arc::new(small))]);
@@ -2444,6 +2442,187 @@ mod tests {
         dialog_checks::assert_inert_and_solid(make, |ed| ed.share = Some(share_dialog()), |ed| ed.share.is_some());
     }
 
+    /// The editor paints its whole window opaque in the theme, alone and with a dialog open,
+    /// and the dialog's own frame is opaque surface-raised.
+    #[test]
+    fn the_editor_window_and_its_dialog_are_opaque() {
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        // Frames a second apart, so a dialog has faded in.
+        let run = |ed: &mut Editor| {
+            let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..dialog_checks::input(vec![]) };
+            let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+            out.textures_delta.clear();
+            out
+        };
+        run(&mut ed);
+        crate::theme::checks::assert_window_opaque(&run(&mut ed), dialog_checks::WINDOW, "the editor");
+        ed.share = Some(share_dialog());
+        run(&mut ed);
+        let out = run(&mut ed);
+        crate::theme::checks::assert_window_opaque(&out, dialog_checks::WINDOW, "the editor with a dialog open");
+        crate::theme::checks::assert_dialog_opaque(&out, "the share dialog over the editor");
+        // Filled in pixel by pixel at 125% scaling: not one pixel lets the desktop through.
+        let mut ed = editor(EditorPrefs::default());
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor");
+        ed.share = Some(share_dialog());
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), dialog_checks::WINDOW.size(), 1.25, 3, |ui| ed.ui(ui)), 0, "the editor with a dialog");
+    }
+
+    /// An editor on a plain `bg` screenshot with one rectangle selected. The rectangle is drawn in
+    /// the picture's own colour, without a shadow, so only the selection shows on the picture.
+    fn selection_on(bg: egui::Color32) -> Editor {
+        let shot = RgbaImage::from_pixel(320, 200, image::Rgba([bg.r(), bg.g(), bg.b(), 255]));
+        let s = Settings::default();
+        let mut ed = Editor::new(shot, "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs::default());
+        let style = Style { stroke: mythicshot_editor::Rgba([bg.r(), bg.g(), bg.b(), 255]), fill: None, width: 1.0, font_size: 20.0, shadow: false };
+        let id = ed.doc.add(Shape::Rect(Bounds { x0: 80.0, y0: 50.0, x1: 240.0, y1: 150.0 }), style);
+        ed.select(Some(id));
+        ed
+    }
+
+    /// The selection on the canvas reads on any screenshot: on a white one and on a near-black
+    /// one, across each side of the outline and across each handle there is a pixel with at least
+    /// 3:1 contrast against the picture.
+    #[test]
+    fn the_selection_reads_on_a_white_and_on_a_near_black_screenshot() {
+        let ppp = 1.25;
+        let mut failed = Vec::new();
+        for (name, bg) in crate::theme::tests::PICTURES {
+            let mut ed = selection_on(bg);
+            let image = crate::snapshot::picture(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 3, |ui| ed.ui(ui));
+            let geom = ed.last_canvas;
+            let scr = |x: f32, y: f32| geom.min + vec2(x, y) * geom.zoom;
+            let (l, t, r, b) = (80.0, 50.0, 240.0, 150.0);
+            let (qx, qy) = (l + (r - l) / 4.0, t + (b - t) / 4.0);
+            for (side, a, out) in [("top", scr(qx, t), vec2(0.0, -10.0)), ("bottom", scr(qx, b), vec2(0.0, 10.0)), ("left", scr(l, qy), vec2(-10.0, 0.0)), ("right", scr(r, qy), vec2(10.0, 0.0))] {
+                if !crate::theme::tests::reads_against(&image, ppp, a + out * 0.15, a + out, bg) {
+                    failed.push(format!("the outline on {name}, {side} side"));
+                }
+            }
+            // Each handle: from inside the rectangle (where nothing else is drawn) into its middle.
+            let it = ed.doc.item(ed.selected.unwrap()).unwrap().clone();
+            let middle = scr((l + r) / 2.0, (t + b) / 2.0);
+            for (pos, _) in handles(&it) {
+                let c = scr(pos.x, pos.y);
+                let inward = (middle - c).normalized();
+                if !crate::theme::tests::reads_against(&image, ppp, c + inward * (HANDLE / 2.0 + 4.0), c, bg) {
+                    failed.push(format!("the handle at {pos:?} on {name}"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "lost on the screenshot: {failed:?}");
+    }
+
+    /// Every label of the editor fits what holds it: the rail's group titles (Draw, Shapes,
+    /// More) in its 84 points, the toolbar's property row with a shape selected and with the
+    /// typing hint while a text is typed, and the status bar.
+    #[test]
+    fn the_editors_labels_fit_its_rail_toolbar_and_status_bar() {
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let texts = |out: &egui::FullOutput| {
+            let mut all = Vec::new();
+            fn collect(s: &egui::Shape, into: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                    egui::Shape::Text(t) => into.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| collect(&c.shape, &mut all));
+            all
+        };
+        // A shape selected: its properties in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor with a shape selected") >= 3);
+        let shown = texts(&out);
+        for title in ["Draw", "Shapes", "More"] {
+            let (_, r) = shown.iter().find(|(t, _)| t == title).unwrap_or_else(|| panic!("the rail shows {title}: {shown:?}"));
+            assert!(r.left() >= 0.0 && r.right() <= RAIL, "{title} at {r:?} fits the {RAIL}-point rail");
+        }
+        // A text being typed: the hint in the toolbar.
+        let mut ed = editor(EditorPrefs::default());
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: None });
+        let out = frames(&mut ed);
+        assert!(shown_has(&texts(&out), "Esc cancel"), "the typing hint shows");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the editor while a text is typed") >= 3);
+        fn shown_has(shown: &[(String, Rect)], part: &str) -> bool {
+            shown.iter().any(|(t, _)| t.contains(part))
+        }
+    }
+
+    /// An editor window is told once, on its first frame, to draw its title bar dark.
+    #[test]
+    fn an_editor_window_is_told_once_to_draw_its_title_bar_dark() {
+        let ctx = crate::theme::test_context();
+        ctx.set_embed_viewports(false);
+        let window = EditorWindow::new(editor(EditorPrefs::default()));
+        let icon = Arc::new(egui::IconData::default());
+        for (first, want) in [(true, 1), (false, 0), (false, 0)] {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| window.show(ui.ctx(), icon.clone(), first));
+            out.textures_delta.clear();
+            assert_eq!(crate::main_window::tests::dark_title_commands(&out, window.id), want, "first frame: {first}");
+        }
+    }
+
+    /// Pictures of the editor for the owner, drawn without a window (see `snapshot`): alone, and
+    /// with "Publish to…" open on its form, and with a rectangle selected on a white page and on a
+    /// dark one. The pictures in it are made here: bands and blocks, like a screenshot of some
+    /// app. Nothing is asked of any site.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn snapshot_the_editor_and_the_share_dialog() {
+        let shot = RgbaImage::from_fn(960, 600, |x, y| {
+            let band = if y < 48 { [40, 44, 52] } else if x < 200 { [235, 237, 240] } else { [250, 250, 251] };
+            let block = (260..900).contains(&x) && ((90..170).contains(&y) || (200..330).contains(&y) || (360..560).contains(&y)) && (x / 4 + y / 4) % 1 == 0;
+            let c = if block { [212, 222, 240] } else { band };
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let s = Settings::default();
+        let make = || Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = make();
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+        assert_eq!(crate::snapshot::save(&shot, "editor"), 0, "the editor: nothing behind the window shows");
+        // The dialog's form drawn over the editor in the same frame. Through the editor it would
+        // first look for a saved token on this computer; here it is shown as it is once one is found.
+        let mut ed = make();
+        let details = crate::share_ui::image_details(960, 600, crate::publish::share::MediaType::Png, 412_000);
+        let mut share = crate::share_ui::ShareDialog::new(crate::publish::share::Kind::Image, "https://tours.example.com".into(), "Loot window", details, false, None, None);
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| {
+            ed.ui(ui);
+            share.show(ui.ctx(), &mut |_| false);
+        });
+        assert_eq!(crate::snapshot::save(&shot, "editor-share"), 0, "the editor with the share dialog: nothing behind the window shows");
+        // A selected rectangle on a white page and on a dark app, to see the selection on both.
+        for (name, page, ink) in [("editor-selection-white", [255u8, 255, 255], [214u8, 218, 224]), ("editor-selection-dark", [14, 14, 18], [44, 48, 58])] {
+            let shot = RgbaImage::from_fn(960, 600, |x, y| {
+                let line = (60..900).contains(&x) && (y % 36) < 10 && y > 40;
+                let c = if line { ink } else { page };
+                image::Rgba([c[0], c[1], c[2], 255])
+            });
+            let mut ed = Editor::new(shot, "Selection".into(), BTreeMap::new(), s.dest_context("Selection"), EditorPrefs::default());
+            let id = ed.doc.add(Shape::Rect(Bounds { x0: 240.0, y0: 160.0, x1: 620.0, y1: 400.0 }), Style::default());
+            ed.select(Some(id));
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+            assert_eq!(crate::snapshot::save(&shot, name), 0, "{name}: nothing behind the window shows");
+        }
+    }
+
     /// Every dialog is made by the one helper that leaves the window undimmed.
     #[test]
     fn every_dialog_is_made_without_dimming() {
@@ -2467,7 +2646,7 @@ mod tests {
     /// A click outside "Publish to…" closes nothing, as before the dimming went.
     #[test]
     fn a_click_outside_publish_to_does_not_close_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         ed.share = Some(share_dialog());
         dialog_checks::frame(&mut ed, &ctx, vec![]);
@@ -2479,7 +2658,7 @@ mod tests {
     /// outside it still dismisses it without closing the window, as it did with the dimming.
     #[test]
     fn the_close_question_is_undimmed_and_a_click_outside_still_dismisses_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = editor(EditorPrefs::default());
         dialog_checks::frame(&mut ed, &ctx, vec![]);
         let solid = dialog_checks::frame(&mut ed, &ctx, vec![]);
@@ -2501,7 +2680,7 @@ mod tests {
     /// nothing, as before.
     #[test]
     fn the_close_question_takes_the_keys_and_escape_dismisses_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let key = |k: Key, modifiers: Modifiers| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers };
         let mut ed = editor(EditorPrefs::default());
         ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();

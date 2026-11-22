@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, FontId, RichText, Stroke, StrokeKind, vec2};
+use eframe::egui::{self, FontId, RichText, Stroke, StrokeKind, vec2};
 use mythicshot_capture::PxRect;
 use mythicshot_editor::Item;
 use mythicshot_editor::overlays::InputEvent;
 use mythicshot_recording::export::{self, Format, Job};
 use mythicshot_recording::{Recorder, Recording, Target};
 
+use crate::theme::{self, Strong as _};
 use crate::icons::{self, Icon};
 use crate::live_draw::LiveDraw;
 use crate::platform::{self, WindowId};
@@ -23,10 +24,6 @@ use crate::video::{self, Edit};
 pub const FRAME_TITLE: &str = "Mythicshot recording frame";
 pub const BAR_SIZE: [f32; 2] = [680.0, 46.0];
 const BORDER: f32 = 4.0;
-const RED: Color32 = Color32::from_rgb(229, 72, 77);
-const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
-const BAR_BG: Color32 = Color32::from_rgb(27, 31, 39);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 /// GIF size relative to the compressed frames on disk, measured on game
 /// footage (94 MB of frames became a 13.4 MB GIF). Only an estimate.
 const GIF_RATIO: f64 = 0.14;
@@ -208,11 +205,11 @@ impl Session {
             let Ok(f) = state.lock() else { return };
             let full = ui.ctx().content_rect();
             let painter = ui.painter();
-            let color = if f.paused { AMBER } else { RED };
+            let color = if f.paused { theme::RECORD_PAUSED } else { theme::RECORD };
             painter.rect_stroke(full.shrink(BORDER / 2.0), 0.0, Stroke::new(BORDER - 1.0, color), StrokeKind::Middle);
             if let Some(n) = f.countdown.filter(|n| *n > 0) {
-                painter.circle_filled(full.center(), 64.0, Color32::from_black_alpha(170));
-                painter.text(full.center(), egui::Align2::CENTER_CENTER, n.to_string(), FontId::proportional(80.0), Color32::WHITE);
+                painter.circle_filled(full.center(), 64.0, theme::SCRIM_COUNTDOWN);
+                painter.text(full.center(), egui::Align2::CENTER_CENTER, n.to_string(), FontId::proportional(80.0), theme::ON_PICTURE);
             }
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         });
@@ -227,7 +224,10 @@ impl Session {
     /// `keys_on` is whether key presses are being logged right now.
     pub fn bar_ui(&self, ui: &mut egui::Ui, keys_on: bool) -> Option<BarAction> {
         let mut action = None;
-        let frame = egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, Color32::from_rgb(52, 59, 72)));
+        // Opaque under the bar's edge, where its border and its fill each soften and together
+        // left the desktop a little visible.
+        theme::window_background(ui);
+        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(10, 7)).stroke(Stroke::new(1.0, theme::BORDER_STRONG));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -235,17 +235,17 @@ impl Session {
                     Phase::Live(r) => (true, r.is_paused(), r.stats()),
                     Phase::Countdown { .. } => (false, false, Default::default()),
                 };
-                let dot = if paused { AMBER } else { RED };
+                let dot = if paused { theme::RECORD_PAUSED } else { theme::RECORD };
                 let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 6.0, dot);
                 let t = stats.active_ms as f64 / 1000.0;
-                ui.label(RichText::new(format!("{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).monospace().size(15.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(format!("{:02}:{:04.1}", (t / 60.0) as u32, t % 60.0)).monospace().size(theme::STRONG_SIZE).bold().color(theme::TEXT));
                 let status = match (live, paused) {
                     (false, _) => "Starting…",
                     (true, true) => "Paused",
                     (true, false) => "Recording",
                 };
-                ui.label(RichText::new(status).color(MUTED));
+                ui.label(RichText::new(status).color(theme::MUTED));
                 ui.separator();
                 let (icon, tip) = if paused { (Icon::Play, "Resume") } else { (Icon::Pause, "Pause") };
                 if ui.add_enabled_ui(live, |ui| icons::button(ui, icon, 30.0, false, tip)).inner.clicked() {
@@ -271,7 +271,7 @@ impl Session {
                 }
                 ui.separator();
                 let est = stats.compressed_bytes as f64 * GIF_RATIO / 1_048_576.0;
-                ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(MUTED));
+                ui.label(RichText::new(format!("{} frames · {} fps · ≈{est:.1} MB", stats.frames, self.fps)).monospace().size(12.0).color(theme::MUTED));
             });
         });
         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -386,6 +386,54 @@ impl<T: Send + 'static> EncodeJob<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session counting down to a recording that never starts: the bar as it first shows.
+    /// Nothing is recorded and no screen is asked about.
+    pub(crate) fn counting_down() -> Session {
+        let rect = PxRect { x: 0, y: 0, w: 640, h: 480 };
+        Session {
+            rect,
+            title: "t".into(),
+            target: Target { display: String::new(), origin: (0, 0), x: 0, y: 0, width: 640, height: 480 },
+            monitor: rect,
+            phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(3600) },
+            fps: 15,
+            frame: Default::default(),
+            frame_hidden_from_capture: false,
+            previous_foreground: None,
+            draw: LiveDraw::default(),
+        }
+    }
+
+    /// The recording bar, a window of its own, paints all of itself opaque, pixel by pixel at 125%.
+    #[test]
+    fn the_recording_bar_is_opaque_pixel_by_pixel() {
+        let s = counting_down();
+        let size = vec2(BAR_SIZE[0], BAR_SIZE[1]);
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.25, 3, |ui| {
+            s.bar_ui(ui, false);
+        });
+        assert_eq!(shot.uncovered, 0, "pixels at {:?}", shot.uncovered_at);
+        // And everything on it fits its fixed 680 by 46 points: the bar itself holds every label.
+        let ctx = crate::theme::test_context();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            s.bar_ui(ui, false);
+        });
+        out.textures_delta.clear();
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the recording bar") >= 3);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, into: &mut Vec<egui::Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => into.push(t.visual_bounding_rect()),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
+        assert!(texts.iter().all(|t| bar.contains_rect(*t)), "a label leaves the bar: {texts:?}");
+    }
 
     #[test]
     fn a_file_counts_as_being_exported_until_its_export_ends() {

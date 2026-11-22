@@ -11,16 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
+use crate::theme::{self, Strong as _};
 use crate::project::{self, Store};
 use crate::publish::access::{Access, Granted};
 use crate::publish::{self, Finished, Images, Outcome, RemoteTour, Target};
 use crate::share_ui::{self, who};
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const ERROR: Color32 = Color32::from_rgb(255, 140, 140);
-const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
 /// The result screen's copy button, beside the tour's link.
 const COPY: &str = "Copy";
 
@@ -1125,26 +1123,26 @@ impl ResultDialog {
         share_ui::modal(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(share_ui::WINDOW_WIDTH);
             share_ui::heading_label(ui, self.heading());
-            ui.label(RichText::new(self.line()).color(MUTED)).on_hover_text(&self.title);
+            ui.label(RichText::new(self.line()).color(theme::MUTED)).on_hover_text(&self.title);
             if let Some((note, is_error)) = self.note() {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(note).color(if is_error { ERROR } else { MUTED })).wrap());
+                ui.add(egui::Label::new(RichText::new(note).color(if is_error { theme::DANGER_TEXT } else { theme::MUTED })).wrap());
             }
             // Not an error of the upload: the tour is on the site either way.
             if let Some(note) = self.kept_line() {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED)).wrap());
             }
             // A line of its own under it: the recording was kept, and nothing is removed.
             if let Some(note) = self.over_line() {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(note).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED)).wrap());
             }
             let url = self.url().map(str::to_string);
             if let Some(url) = &url {
                 share_ui::gap(ui, share_ui::BLOCK_GAP);
                 if self.link_is_older() {
-                    ui.label(RichText::new("The public version's link:").color(MUTED).size(12.0));
+                    ui.label(RichText::new("The public version's link:").color(theme::MUTED).size(12.0));
                 }
                 if share_ui::link_row(ui, url, COPY, copied).clicked() {
                     ctx.copy_text(url.clone());
@@ -1155,7 +1153,7 @@ impl ResultDialog {
             }
             if let Some(lock) = self.lock() {
                 ui.add_space(8.0);
-                who::lock_line(ui, &lock, MUTED);
+                who::lock_line(ui, &lock, theme::MUTED);
             }
             share_ui::gap(ui, share_ui::BLOCK_GAP);
             // With a link the accent belongs to Copy; without one it stays on Done, as before.
@@ -1303,13 +1301,13 @@ fn show_refusal(ui: &mut egui::Ui, why: &str) {
     let r = refusal_parts(why);
     ui.add_space(8.0);
     if let Some(heading) = r.heading {
-        ui.add(egui::Label::new(RichText::new(heading).color(ERROR).strong()).wrap());
+        ui.add(egui::Label::new(RichText::new(heading).color(theme::DANGER_TEXT).bold()).wrap());
         ui.add_space(2.0);
     }
-    ui.add(egui::Label::new(RichText::new(r.body).color(ERROR)).wrap());
+    ui.add(egui::Label::new(RichText::new(r.body).color(theme::DANGER_TEXT)).wrap());
     if let Some(note) = r.note {
         ui.add_space(2.0);
-        ui.add(egui::Label::new(RichText::new(note).color(MUTED).size(12.0)).wrap());
+        ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED).size(12.0)).wrap());
     }
 }
 
@@ -1617,25 +1615,25 @@ impl Picker {
             let hint = |ui: &mut egui::Ui, text: &str| {
                 ui.horizontal(|ui| {
                     ui.add_space(24.0);
-                    ui.add(egui::Label::new(RichText::new(text).color(MUTED).size(12.0)).wrap());
+                    ui.add(egui::Label::new(RichText::new(text).color(theme::MUTED).size(12.0)).wrap());
                 });
             };
             match &shown {
                 Shown::Asking => {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
-                        ui.label(RichText::new("Loading tours…").color(MUTED));
+                        ui.label(RichText::new("Loading tours…").color(theme::MUTED));
                     });
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 Shown::Failed(e) => {
-                    ui.add(egui::Label::new(RichText::new(e).color(ERROR)).wrap());
+                    ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT)).wrap());
                     if ui.button("Retry").clicked() {
                         retry = true;
                     }
                 }
                 Shown::OnlyNew(Some(why)) => {
-                    ui.add(egui::Label::new(RichText::new(*why).color(MUTED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(*why).color(theme::MUTED)).wrap());
                 }
                 Shown::OnlyNew(None) | Shown::Update { .. } => {}
             }
@@ -1667,7 +1665,7 @@ impl Picker {
                     let width = ui.available_width() - if count.is_some() { 70.0 } else { 0.0 };
                     ui.add(egui::TextEdit::singleline(&mut self.title).char_limit(TITLE_MAX).hint_text("Tour title").desired_width(width));
                     if let Some(count) = count {
-                        ui.label(RichText::new(count).color(MUTED).size(12.0));
+                        ui.label(RichText::new(count).color(theme::MUTED).size(12.0));
                     }
                 });
                 let restricted = who_shown == WhoShown::Choice && self.who.chosen() != who::Choice::Anyone;
@@ -1681,7 +1679,7 @@ impl Picker {
                     if let Some(hint) = mode_hint(mode, Goes::NewTour, restricted) {
                         ui.horizontal(|ui| {
                             ui.add_space(48.0);
-                            ui.add(egui::Label::new(RichText::new(hint).color(MUTED).size(12.0)).wrap());
+                            ui.add(egui::Label::new(RichText::new(hint).color(theme::MUTED).size(12.0)).wrap());
                         });
                     }
                 }
@@ -1693,7 +1691,7 @@ impl Picker {
             ui.add_space(16.0);
             let can = self.edit_outcome(&shown).is_some();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let main = egui::Button::new(RichText::new(edit_button(&shown, choice, self.mode)).strong()).fill(PRIMARY);
+                let main = theme::primary_button(edit_button(&shown, choice, self.mode));
                 if ui.add_enabled(can, main).clicked() {
                     outcome = self.edit_outcome(&shown);
                 }
@@ -1847,13 +1845,13 @@ impl Picker {
             WhoShown::Nothing => {}
             WhoShown::Dashboard => {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(self.dashboard_line()).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(self.dashboard_line()).color(theme::MUTED)).wrap());
             }
             WhoShown::Choice => {
                 ui.add_space(8.0);
                 for part in self.who.parts() {
                     ui.add_space(4.0);
-                    who::draw_part(ui, &part, &mut self.who, MUTED);
+                    who::draw_part(ui, &part, &mut self.who, theme::MUTED);
                 }
             }
         }
@@ -1932,7 +1930,7 @@ impl Picker {
                 if let Some(hint) = self.hint_line(mode, into, restricted) {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
-                        ui.add(egui::Label::new(RichText::new(hint).color(MUTED).size(12.0)).wrap());
+                        ui.add(egui::Label::new(RichText::new(hint).color(theme::MUTED).size(12.0)).wrap());
                     });
                 }
             }
@@ -1951,11 +1949,11 @@ impl Picker {
                     self.choice = Choice::New;
                 }
                 if let Some(count) = count {
-                    ui.label(RichText::new(count).color(MUTED).size(12.0));
+                    ui.label(RichText::new(count).color(theme::MUTED).size(12.0));
                 }
             });
             ui.add_space(12.0);
-            ui.label(RichText::new("Or add as a new chapter to").color(MUTED));
+            ui.label(RichText::new("Or add as a new chapter to").color(theme::MUTED));
             ui.add_space(4.0);
             // Before the list is locked: what it says is read from the list.
             let who_shown = self.who_shown(&Shown::OnlyNew(None));
@@ -1966,18 +1964,18 @@ impl Picker {
                 ListState::Loading => {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
-                        ui.label(RichText::new("Loading tours…").color(MUTED));
+                        ui.label(RichText::new("Loading tours…").color(theme::MUTED));
                     });
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 ListState::Failed(e) => {
-                    ui.add(egui::Label::new(RichText::new(e).color(ERROR)).wrap());
+                    ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT)).wrap());
                     if ui.button("Retry").clicked() {
                         retry = true;
                     }
                 }
                 ListState::Loaded(tours) if tours.is_empty() => {
-                    ui.label(RichText::new("This workspace has no tours yet.").color(MUTED));
+                    ui.label(RichText::new("This workspace has no tours yet.").color(theme::MUTED));
                 }
                 ListState::Loaded(tours) => {
                     egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
@@ -1988,7 +1986,7 @@ impl Picker {
                                     self.choice = Choice::Tour(t.id.clone());
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(tour_row_detail(t)).color(MUTED).size(12.0));
+                                    ui.label(RichText::new(tour_row_detail(t)).color(theme::MUTED).size(12.0));
                                 });
                             });
                         }
@@ -2003,7 +2001,7 @@ impl Picker {
             ui.add_space(16.0);
             let can_upload = self.can_upload();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let upload = egui::Button::new(RichText::new(self.main_label()).strong()).fill(PRIMARY);
+                let upload = theme::primary_button(self.main_label());
                 if ui.add_enabled(can_upload, upload).clicked() {
                     outcome = self.try_upload();
                 }
@@ -2521,7 +2519,7 @@ pub(crate) mod tests {
         assert_eq!(without.kept_line().as_deref(), Some("The recording was saved for later editing, but without the cover logo and 2 pasted pictures."));
         assert_eq!(screen(Kept::Saved { left_out: vec!["a pasted picture".into()], over: None }).kept_line().as_deref(), Some("The recording was saved for later editing, but without a pasted picture."));
         // Every case draws, with and without a link, and after a publish that failed.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         for kept in [Kept::Off, Kept::Saved { left_out: vec!["the cover logo".into()], over: None }, Kept::Failed("the disk is full.".into())] {
             for outcome in [Outcome::Public { url: Some(LINK.into()) }, Outcome::Draft, failed()] {
                 let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), PublishDone { finished: finished(2, outcome), kept: kept.clone() });
@@ -2607,7 +2605,7 @@ pub(crate) mod tests {
         assert_eq!(both.over_line().as_deref(), Some(OVER_5));
         // Whatever became of the publish step, the recording was saved all the same; the upload
         // is reported as it went, and the screen draws with the line on it.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         for outcome in [public(), Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled()] {
             let mut d = screen(kept_past_the_limit(), outcome.clone());
             assert_eq!(d.over_line().as_deref(), Some(OVER_5), "{outcome:?}");
@@ -2728,7 +2726,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_result_screen_draws_and_enter_or_escape_is_done() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
         let was = Before { public: true, link: Some(LINK.into()), steps: Some(14) };
         let cases = [Outcome::Public { url: Some("https://x.dev/t/a".into()) }, Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled()];
@@ -2742,6 +2740,31 @@ pub(crate) mod tests {
             ctx.run_ui(key(egui::Key::Escape), |ui| out = d.show(ui.ctx())).textures_delta.clear();
             assert_eq!(out, Some(ResultAction::Done));
         }
+    }
+
+    /// The tour picker and the result screen paint an opaque surface-raised frame, and no label
+    /// sticks out of its button or field.
+    #[test]
+    fn the_picker_and_the_result_screen_are_opaque_dialogs() {
+        let ctx = crate::theme::test_context();
+        let mut p = Picker::new(String::new(), "Demo");
+        let mut last = None;
+        for _ in 0..3 {
+            let time = ctx.input(|i| i.time) + 1.0;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0))), time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                p.show(ui.ctx());
+            });
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        crate::theme::checks::assert_dialog_opaque(&out, "the tour picker");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the tour picker") >= 2);
+        let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
+        let out = draw_result(&ctx, &mut d);
+        crate::theme::checks::assert_dialog_opaque(&out, "the result screen");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the result screen") >= 1);
     }
 
     /// A few frames of the result screen, a second apart so it has faded in; the last one.
@@ -2767,7 +2790,7 @@ pub(crate) mod tests {
         const LINK_ROW_HEIGHT: f32 = 46.0;
         const BUTTON_HEIGHT: f32 = 44.0;
         const BUTTON_GAP: f32 = 12.0;
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         // Published: the link with Copy on its row, then Open in browser and Done, as wide as each other.
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
         let out = draw_result(&ctx, &mut d);
@@ -2775,11 +2798,11 @@ pub(crate) mod tests {
         assert!(near(window.width(), WINDOW_WIDTH), "{window:?}");
         let (link, copy) = (text_rect(&out, LINK).expect("the link is drawn"), button_rect(&out, COPY));
         assert!(near(link.center().y, copy.center().y) && link.right() < copy.left() && near(copy.right(), window.right()));
-        assert!(near(copy.height(), LINK_ROW_HEIGHT) && fills_on(&out, copy).contains(&PRIMARY));
+        assert!(near(copy.height(), LINK_ROW_HEIGHT) && fills_on(&out, copy).contains(&theme::PRIMARY));
         let (open, done_button) = (button_rect(&out, "Open in browser"), button_rect(&out, "Done"));
         assert!(near(open.top(), done_button.top()) && open.top() > copy.bottom());
         assert!(near(open.width(), done_button.width()) && near(open.height(), BUTTON_HEIGHT) && near(done_button.left() - open.right(), BUTTON_GAP));
-        assert!(!fills_on(&out, done_button).contains(&PRIMARY), "the accent belongs to Copy");
+        assert!(!fills_on(&out, done_button).contains(&theme::PRIMARY), "the accent belongs to Copy");
         for line in ["Tour published", "Demo · 2 steps · public"] {
             assert!(text_rect(&out, line).is_some(), "{line}");
         }
@@ -2794,14 +2817,14 @@ pub(crate) mod tests {
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Draft));
         let out = draw_result(&ctx, &mut d);
         let only = button_rect(&out, "Done");
-        assert!(near(only.width(), WINDOW_WIDTH) && near(only.height(), BUTTON_HEIGHT) && fills_on(&out, only).contains(&PRIMARY));
+        assert!(near(only.width(), WINDOW_WIDTH) && near(only.height(), BUTTON_HEIGHT) && fills_on(&out, only).contains(&theme::PRIMARY));
         assert!(text_rect(&out, COPY).is_none() && text_rect(&out, "Open in browser").is_none());
     }
 
     #[test]
     fn copy_on_the_result_screen_says_copied_for_two_seconds_on_its_clock_and_asks_for_the_frames() {
         use crate::share_ui::tests::{button_rect, click_events, copied_texts, field_rect, frame_with, repaint_delay, text_rect};
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let now = Arc::new(Mutex::new(Instant::now()));
         let shared = now.clone();
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) })).with_clock(move || *shared.lock().unwrap());
@@ -2845,7 +2868,7 @@ pub(crate) mod tests {
     #[test]
     fn clicks_on_open_in_browser_and_done_on_the_result_screen_reach_the_editor() {
         use crate::share_ui::tests::{button_rect, click_events, frame_with};
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut d = ResultDialog::new("Demo".into(), Before::new_tour(), done(2, Outcome::Public { url: Some(LINK.into()) }));
         let out = draw_result(&ctx, &mut d);
         for (button, expected) in [("Open in browser", ResultAction::Open(LINK.into())), ("Done", ResultAction::Done)] {
@@ -2860,7 +2883,7 @@ pub(crate) mod tests {
 
     #[test]
     fn enter_uploads_and_escape_cancels_the_picker() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let key = |k: egui::Key| egui::RawInput { events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], ..Default::default() };
         let mut p = Picker::new(String::new(), "Demo");
         let mut out = None;
@@ -2906,7 +2929,7 @@ pub(crate) mod tests {
     }
 
     fn draw(p: &mut Picker, input: egui::RawInput) -> Option<PickerOutcome> {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut out = None;
         ctx.run_ui(input, |ui| out = p.show(ui.ctx())).textures_delta.clear();
         out
@@ -3316,7 +3339,7 @@ pub(crate) mod tests {
         assert_eq!(result_line("T", &finished(3, Outcome::Draft), &was_public(), true), "T · this chapter: 3 steps · not public");
 
         // Every case draws, and the words of a new upload are untouched.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         for outcome in [public.clone(), Outcome::Public { url: None }, Outcome::Draft, failed(), cancelled(), Outcome::Held] {
             for before in [was_public(), draft.clone()] {
                 let mut d = ResultDialog::after_update("Demo".into(), before, done(2, outcome.clone()));
@@ -3512,7 +3535,7 @@ pub(crate) mod tests {
         let mut p = restricted_picker();
         p.who.choose(who::Choice::People);
         p.who.addresses = "a@example.com".into();
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut out = None;
         ctx.run_ui(egui::RawInput::default(), |ui| out = p.show(ui.ctx())).textures_delta.clear();
         ctx.memory_mut(|m| m.request_focus(p.who.addresses_id()));

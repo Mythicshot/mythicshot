@@ -136,7 +136,7 @@ wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0
 
 Releases are not built on GitHub: they are signed and checked on the signing machine, see [docs/release.md](docs/release.md). The GitHub workflow `.github/workflows/release.yml` only builds an unsigned MSI for testing, when run by hand from the Actions tab; it keeps it as a workflow artifact named `mythicshot-<version>-unsigned-not-for-release` and never publishes a release.
 
-The wizard's banner images come from `installer/make_images.py`. An MSI built by hand as above is not code-signed, so Windows shows a SmartScreen warning the first time.
+The app icon (`assets/mythicshot.ico`) and the two marks in the wizard's pictures come from the brand's marks in `assets/brand/`: `node scripts/make-brand-art.mjs <folder of an installed sharp package>` (sharp is borrowed, not a dependency). The wizard's banner and side pictures then come from `python installer/make_images.py`. An MSI built by hand as above is not code-signed, so Windows shows a SmartScreen warning the first time.
 
 ### Signed release for the download page
 
@@ -160,3 +160,15 @@ Mythicshot sends nothing anywhere, unless you publish a tour or use "Publish to"
 ## Licence
 
 GNU Affero General Public License 3.0 or later, because the GIF encoder ([gifski](https://docs.rs/crate/gifski/latest)) is AGPL.
+
+Fonts. Each licence asks for its text to go with every copy, so the installer puts each one beside `LICENSE.txt` under the name given here:
+
+| Font | Used for | Licence |
+|---|---|---|
+| [Manrope](https://github.com/googlefonts/manrope), copyright 2018 The Manrope Project Authors | All interface text and headings, built into the program | SIL Open Font License 1.1: [assets/fonts/manrope/OFL.txt](assets/fonts/manrope/OFL.txt), installed as `OFL-Manrope.txt` |
+| [Hack](https://github.com/source-foundry/Hack), copyright 2018 Source Foundry Authors, from Bitstream Vera Sans Mono, copyright 2003 Bitstream, Inc. | Monospace text (links shown for copying), built into the program by egui | MIT and the Bitstream Vera licence: [assets/fonts/egui/Hack-LICENSE.txt](assets/fonts/egui/Hack-LICENSE.txt), installed as `LICENSE-Hack.txt` |
+| [Ubuntu](https://design.ubuntu.com/font) Light, copyright 2011 Canonical Ltd. | Letters Manrope lacks (much of Cyrillic, Greek Extended), built into the program by egui | Ubuntu Font Licence 1.0: [assets/fonts/egui/UFL.txt](assets/fonts/egui/UFL.txt), installed as `UFL-Ubuntu.txt` |
+| egui's five icon glyphs, a subset of [emoji-icon-font](https://github.com/jslegers/emoji-icon-font), copyright 2014 John Slegers | Built into the program by egui (the app draws its own icons) | MIT: [assets/fonts/egui/emoji-icon-font-LICENSE.txt](assets/fonts/egui/emoji-icon-font-LICENSE.txt), installed as `LICENSE-emoji-icon-font.txt` |
+| [Cinzel](https://github.com/NDISCOVER/Cinzel), copyright 2020 The Cinzel Project Authors | The name in the installer's side picture (drawn into the picture; the font itself is not shipped) | SIL Open Font License 1.1: [assets/fonts/cinzel/OFL.txt](assets/fonts/cinzel/OFL.txt), installed as `OFL-Cinzel.txt` |
+
+egui's Noto Emoji and full emoji-icon-font are not in the program: egui builds them in only with a feature Mythicshot leaves off.

@@ -11,6 +11,7 @@ use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 use mythicshot_editor::{Bounds, MAX_DIM, MIN_DIM, Pt, Shape, pt};
 
+use crate::theme::{self, Strong as _};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::settings::SavedTheme;
@@ -18,7 +19,7 @@ use crate::tour::{
     self, Advance, Anchor, BUTTON_LABEL_MAX, CARD_BODY_MAX, CARD_TITLE_MAX, COVER_BODY_MAX, COVER_BUTTON_MAX, COVER_TITLE_MAX, Card, CardStyle, Cover, DEFAULT_ACCENT, END_TEXT_MAX, EndCard, HotspotStyle, LINK_MAX, Link, NEXT_LABEL_MAX, Placed, Placement, Point, Side, TourDoc, ZOOM_MAX,
     ZOOM_MIN, AUTOPLAY_MAX, AUTOPLAY_MIN, parse_bold, place_card, safe_url,
 };
-use crate::tour_view::{AMBER, click_point, planned_steps};
+use crate::tour_view::{click_point, planned_steps};
 use crate::video::crop_px;
 
 /// The card's width on screen, the same as the players draw it.
@@ -30,11 +31,6 @@ const ANCHOR_BOX: f32 = 44.0;
 const DEFAULT_GREEN: Color32 = Color32::from_rgb(0x5d, 0xca, 0xa5);
 const INK_DARK: Color32 = Color32::from_rgb(0x10, 0x14, 0x1a);
 const INK_LIGHT: Color32 = Color32::from_rgb(0xf4, 0xf6, 0xf9);
-/// The editor's selection colour, for the dashed outline.
-const SELECT: Color32 = Color32::from_rgb(91, 141, 239);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const FG: Color32 = Color32::from_rgb(214, 218, 226);
-const PANEL_BG: Color32 = Color32::from_rgb(27, 31, 39);
 /// Five calm accents; the first is the default. None of them is red.
 const ACCENTS: [(&str, &str); 5] = [("Calm green", "#5dcaa5"), ("Sky", "#6aa8f0"), ("Lavender", "#a593f2"), ("Honey", "#e8b04b"), ("Slate", "#8fa3b8")];
 /// A backdrop colour to start from when "Pick a colour" is chosen.
@@ -390,13 +386,13 @@ fn heading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
-    ui.label(RichText::new(title).strong().color(FG));
+    ui.label(RichText::new(title).bold().color(theme::TEXT));
     ui.add_space(2.0);
 }
 
 /// A muted label in the first column of a settings grid.
 fn grid_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(MUTED));
+    ui.label(RichText::new(text).color(theme::MUTED));
 }
 
 /// A one-line text field capped at `cap`.
@@ -416,9 +412,9 @@ fn text_field(ui: &mut egui::Ui, text: &mut String, cap: usize, hint: &str) {
     }
 }
 
-/// A warning in the warning colour, under the field it belongs to.
+/// A warning under the field it belongs to: the warning icon and caution-text.
 fn warning(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).color(AMBER).size(12.0));
+    theme::caution_line(ui, text, theme::SMALL_SIZE, theme::Fit::Wrap);
 }
 
 /// The label and link of a button, the link checked as it is typed. Returns nothing; writes the link only when safe.
@@ -570,7 +566,7 @@ impl Editor {
         if !can_undo_removal(&v.edit.tour_doc, &v.tour.card, src) {
             return;
         }
-        ui.label(RichText::new("Card removed ·").color(MUTED));
+        ui.label(RichText::new("Card removed ·").color(theme::MUTED));
         if ui.link("Undo").on_hover_text("Bring the guide card back").clicked() {
             undo_removal(&mut v.edit.tour_doc, &mut v.tour.card, src);
         }
@@ -580,16 +576,16 @@ impl Editor {
     /// The properties row while the Guide card tool is active or the card is selected: "Points at" and "Remove card".
     pub(crate) fn card_properties(&mut self, ui: &mut egui::Ui) {
         let Some((_, _, _, has_click)) = self.card_step() else {
-            ui.label(RichText::new("Show a step to add its guide card").color(MUTED));
+            ui.label(RichText::new("Show a step to add its guide card").color(theme::MUTED));
             return;
         };
         let picking = self.video.as_ref().is_some_and(|v| v.tour.card.picking.is_some());
         let Some(anchor) = self.shown_card().map(|c| shown_anchor(c, picking)) else {
-            ui.label(RichText::new("Click the picture to add this step's guide card").color(MUTED));
+            ui.label(RichText::new("Click the picture to add this step's guide card").color(theme::MUTED));
             return;
         };
         if !self.card_selected() {
-            ui.label(RichText::new("Click the card to edit it").color(MUTED));
+            ui.label(RichText::new("Click the card to edit it").color(theme::MUTED));
             return;
         }
         ui.label("Points at");
@@ -608,7 +604,7 @@ impl Editor {
             }
         });
         if picking {
-            ui.label(RichText::new("Click the picture to set the spot").color(AMBER));
+            ui.label(RichText::new("Click the picture to set the spot").color(theme::ACCENT));
         }
         ui.separator();
         if ui.button("Remove card").on_hover_text("Take this step's guide card away; Undo in the status bar brings it back").clicked() {
@@ -659,7 +655,7 @@ impl Editor {
         if card.anchor == Anchor::Point
             && let Some(p) = anchor
         {
-            painter.circle(to_scr(p), 5.0, accent, Stroke::new(1.5, Color32::WHITE));
+            painter.circle(to_scr(p), 5.0, accent, Stroke::new(1.5, theme::ON_PICTURE));
         }
         let compact = theme.card_style == CardStyle::Compact;
         let (bg, ink, muted) = card_colors(theme.card_style);
@@ -688,7 +684,7 @@ impl Editor {
                 // The compact bar is a pill: fully rounded ends, whatever its height.
                 .corner_radius(CornerRadius::same(if compact { pill_radius(h) } else { CARD_RADIUS }))
                 .inner_margin(if compact { Margin::symmetric(12, 8) } else { Margin::same(CARD_PAD as i8) })
-                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(80) });
+                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: theme::CARD_SHADOW });
             let inner = width - if compact { 24.0 } else { 2.0 * CARD_PAD };
             let r = frame.show(ui, |ui| {
                 ui.set_width(inner);
@@ -720,7 +716,7 @@ impl Editor {
             if selected {
                 let r = r.response.rect.expand(4.0);
                 let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-                ui.painter().with_clip_rect(clip).extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, SELECT), 6.0, 4.0));
+                theme::selection_dashes(&ui.painter().with_clip_rect(clip), &pts, 1.5);
             }
         });
         let rect = shown.response.rect;
@@ -783,7 +779,7 @@ impl Editor {
         let instance = v.tour.instance;
         let mut new_dim: Option<(u8, bool)> = None;
         let mut close = false;
-        let frame = egui::Frame::new().fill(PANEL_BG).inner_margin(Margin::symmetric(12, 10));
+        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(Margin::symmetric(12, 10));
         egui::Panel::right(("tour-settings", instance)).resizable(false).exact_size(304.0).frame(frame).show(ui, |ui| {
             let (doc, s) = (&mut v.edit.tour_doc, &mut v.tour.settings);
             if !s.loaded {
@@ -794,14 +790,14 @@ impl Editor {
                 s.secondary_url = doc.end.as_ref().and_then(|e| e.secondary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Tour settings").strong().size(15.0).color(FG));
+                ui.label(RichText::new("Tour settings").bold().size(theme::STRONG_SIZE).color(theme::TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icons::button(ui, Icon::Close, 22.0, false, "Close Tour settings").clicked() {
                         close = true;
                     }
                 });
             });
-            ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(MUTED).size(12.0));
+            ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(theme::MUTED).size(12.0));
             egui::ScrollArea::vertical().id_salt("tour-settings-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 let t = &mut doc.theme;
@@ -827,13 +823,13 @@ impl Editor {
                         let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
                         ui.painter().circle_filled(r.center(), 9.0, c);
                         if t.accent.eq_ignore_ascii_case(hex) {
-                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, Color32::WHITE));
+                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, theme::TEXT));
                         } else if resp.hovered() {
-                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, MUTED));
+                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, theme::MUTED));
                         }
-                        // Reached with Tab: a ring in the selection colour, outside the others.
+                        // Reached with Tab: the focus ring, outside the others.
                         if resp.has_focus() {
-                            ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(2.0, SELECT));
+                            ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(theme::FOCUS_WIDTH, theme::FOCUS));
                         }
                         if resp.on_hover_text(name).clicked() {
                             t.accent = hex.to_string();
@@ -938,13 +934,13 @@ impl Editor {
                                 }
                             });
                             if loading {
-                                ui.label(RichText::new("Loading logo…").color(MUTED).size(12.0));
+                                ui.label(RichText::new("Loading logo…").color(theme::MUTED).size(12.0));
                             }
                             if let Some(name) = doc.logo_path.as_ref().and_then(|p| p.file_name()) {
-                                ui.label(RichText::new(name.to_string_lossy()).color(MUTED).size(12.0));
+                                ui.label(RichText::new(name.to_string_lossy()).color(theme::MUTED).size(12.0));
                             }
                             if let Some(e) = &s.logo_error {
-                                ui.add(egui::Label::new(RichText::new(e).color(AMBER).size(12.0)).wrap());
+                                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                             }
                         });
                         ui.end_row();
@@ -994,10 +990,10 @@ impl Editor {
                 heading(ui, "This step");
                 match step {
                     None => {
-                        ui.label(RichText::new("Show a step to set these").color(MUTED));
+                        ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
                     }
                     Some((src, i, _, _)) => {
-                        ui.label(RichText::new(format!("Step {}", i + 1)).color(MUTED).size(12.0));
+                        ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
                         let x = doc.steps.entry(src).or_default();
                         ui.label("Zoom to the spotlight");
                         ui.horizontal(|ui| {

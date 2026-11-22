@@ -12,15 +12,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
+use crate::theme;
 use crate::publish::connect::{self, ConnectError, Started};
 use crate::publish_ui::Run;
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
-const WARNING_BG: Color32 = Color32::from_rgb(74, 58, 22);
-const WARNING_TEXT: Color32 = Color32::from_rgb(245, 214, 150);
 
 pub const CAPTION: &str = "Sign in";
 pub const HEADING: &str = "Type this code in your browser";
@@ -379,7 +376,7 @@ impl SignInDialog {
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         crate::share_ui::modal(egui::Id::unique("sign-in-window")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.label(RichText::new(CAPTION).color(MUTED).size(12.0));
+            ui.label(RichText::new(CAPTION).color(theme::MUTED).size(12.0));
             ui.add_space(4.0);
             ui.heading(&view.heading);
             for (i, line) in view.lines.iter().enumerate() {
@@ -389,22 +386,21 @@ impl SignInDialog {
                         ui.add(egui::Label::new(t.as_str()).wrap());
                     }
                     Line::Muted(t) => {
-                        ui.add(egui::Label::new(RichText::new(t).color(MUTED)).wrap());
+                        ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED)).wrap());
                     }
                     Line::Warning(t) => {
-                        egui::Frame::new().fill(WARNING_BG).corner_radius(8.0).inner_margin(10.0).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(egui::Label::new(RichText::new(t).color(WARNING_TEXT)).wrap());
+                        theme::caution_box(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(t).color(theme::CAUTION_TEXT)).wrap());
                         });
                     }
                     Line::Help { address } => {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(HELP_BEFORE).color(MUTED));
+                            ui.label(RichText::new(HELP_BEFORE).color(theme::MUTED));
                             if ui.link(OPEN_THE_PAGE).clicked() {
                                 open_page = true;
                             }
                             // The address in full, never shortened, and selectable so it can be copied.
-                            ui.add(egui::Label::new(RichText::new(go_to(address)).color(MUTED)).selectable(true).wrap());
+                            ui.add(egui::Label::new(RichText::new(go_to(address)).color(theme::MUTED)).selectable(true).wrap());
                         });
                     }
                 }
@@ -422,7 +418,7 @@ impl SignInDialog {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 for (i, button) in view.buttons.iter().enumerate().rev() {
                     let main = i + 1 == view.buttons.len() && view.buttons.len() > 1;
-                    let b = if main { egui::Button::new(RichText::new(button.label()).strong()).fill(PRIMARY) } else { egui::Button::new(button.label()) };
+                    let b = if main { theme::primary_button(button.label()) } else { egui::Button::new(button.label()) };
                     if ui.add(b).clicked() {
                         pressed = Some(*button);
                     }

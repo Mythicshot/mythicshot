@@ -1,8 +1,8 @@
 //! The app's own icon, for the tray and the windows. Every size is read from
 //! `assets/mythicshot.ico`, the same file the build puts in the exe: under 48
-//! pixels it holds the simplified picture, from 48 up the full one (see
-//! `assets/make_icons.py`). The size shown is picked to match the screen's
-//! scaling, so Windows does not have to stretch it.
+//! pixels it holds the brand's small mark, at 48 and 64 the standard mark, and at
+//! 128 and 256 the rich one (see `scripts/make-brand-art.mjs`). The size shown is
+//! picked to match the screen's scaling, so Windows does not have to stretch it.
 
 use std::sync::Arc;
 
@@ -94,15 +94,16 @@ pub fn set_for_all_windows(_window: &impl raw_window_handle::HasWindowHandle) {}
 mod tests {
     use super::*;
 
-    /// Sizes drawn from the simplified picture, then from the full one.
-    const SIMPLE: [u32; 5] = [16, 20, 24, 32, 40];
-    const FULL: [u32; 4] = [48, 64, 128, 256];
+    /// Sizes drawn from the small mark, the standard mark and the rich mark.
+    const SMALL: [u32; 5] = [16, 20, 24, 32, 40];
+    const STANDARD: [u32; 2] = [48, 64];
+    const RICH: [u32; 2] = [128, 256];
 
     #[test]
     fn the_icon_file_holds_every_size_as_a_square_picture_of_that_size() {
         assert_eq!(&ICO[..4], [0, 0, 1, 0], "an .ico header");
         let all = pictures();
-        assert_eq!(all.iter().map(|(side, _)| *side).collect::<Vec<_>>(), SIMPLE.into_iter().chain(FULL).collect::<Vec<_>>());
+        assert_eq!(all.iter().map(|(side, _)| *side).collect::<Vec<_>>(), SMALL.into_iter().chain(STANDARD).chain(RICH).collect::<Vec<_>>());
         for (side, png) in all {
             let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).unwrap().to_rgba8();
             assert_eq!((image.width(), image.height()), (side, side));
@@ -113,15 +114,26 @@ mod tests {
     }
 
     #[test]
-    fn small_sizes_are_the_simplified_picture_and_large_ones_the_full_one() {
-        // The simplified picture is mostly flat colour; the full one is shaded all over. Counted as
-        // distinct colours per pixel, at the two sizes where the picture changes.
-        let colours = |side: u32| {
+    fn each_size_is_drawn_from_the_mark_the_brand_names_for_it() {
+        // The small mark's lens is plain; the standard and rich marks have a gold ring at its centre.
+        // The standard mark's facets are one purple; the rich mark's each have their own.
+        let (gold, dark, purple, rich_top) = ([0xf5, 0xb8, 0x41], [0x16, 0x12, 0x1c], [0x6d, 0x4a, 0xe8], [0x92, 0x7e, 0xe0]);
+        for side in SMALL.into_iter().chain(STANDARD).chain(RICH) {
             let (rgba, _) = rgba(side);
-            let seen: std::collections::HashSet<[u8; 3]> = rgba.chunks_exact(4).filter(|p| p[3] == 255).map(|p| [p[0] / 8, p[1] / 8, p[2] / 8]).collect();
-            seen.len() as f32 / (side * side) as f32
-        };
-        assert!(colours(48) > colours(40) * 1.5, "40: {}, 48: {}", colours(40), colours(48));
+            let px = |x: u32, y: u32| -> [u8; 3] {
+                let at = ((y * side + x) * 4) as usize;
+                [rgba[at], rgba[at + 1], rgba[at + 2]]
+            };
+            let centre = px(side / 2, (side as f32 * 0.508) as u32);
+            let colours: std::collections::HashSet<[u8; 3]> = rgba.chunks_exact(4).filter(|p| p[3] == 255).map(|p| [p[0], p[1], p[2]]).collect();
+            if SMALL.contains(&side) {
+                assert_eq!(centre, dark, "{side}: the small mark's plain lens");
+            } else {
+                assert_eq!(centre, gold, "{side}: the ring in the lens");
+            }
+            assert_eq!(colours.contains(&purple), !RICH.contains(&side), "{side}: one purple for the facets");
+            assert_eq!(colours.contains(&rich_top), RICH.contains(&side), "{side}: the rich mark's lit facet");
+        }
     }
 
     #[test]

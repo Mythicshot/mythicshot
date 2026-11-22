@@ -15,6 +15,7 @@ use eframe::egui::{self, Color32, ColorImage, FontId, Key, Modifiers, Rect, Resp
 use image::RgbaImage;
 use mythicshot_editor::{Bounds, Item, Pt, Shape, pt};
 
+use crate::theme;
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::tour::{self, HotspotStyle, StepPlan, TourDoc};
@@ -22,8 +23,6 @@ use crate::tour_cards::{CardUi, SettingsUi, card_has_text, parse_hex};
 use crate::video::{Edit, crop_px};
 use crate::video_editor::{VideoState, VideoView};
 
-pub const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 /// What the status bar says while the Tour view is open.
 pub const STATUS: &str = "Text and spotlight stay editable after export";
 /// Thumbnail width in the step strip.
@@ -234,44 +233,44 @@ fn load_thumbs(v: &mut VideoState, steps: &[StepPlan], ctx: &egui::Context) {
     }
 }
 
-/// One step in the strip: its thumbnail, badges and label; amber outline when shown.
+/// One step in the strip: its thumbnail, badges and label; a gold outline when shown.
 fn step_thumb(ui: &mut egui::Ui, tex: Option<&TextureHandle>, size: Vec2, label: &str, marks: StepMarks, selected: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size.x, size.y + 16.0), Sense::click());
     let img = Rect::from_min_size(rect.min, size);
     let p = ui.painter();
-    p.rect_filled(img, 3.0, Color32::from_rgb(17, 20, 26));
+    p.rect_filled(img, 3.0, theme::GROUND);
     if let Some(t) = tex {
-        p.image(t.id(), img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        p.image(t.id(), img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), theme::IMAGE_TINT);
     }
     let outline = if selected {
-        Stroke::new(2.0, AMBER)
+        Stroke::new(2.0, theme::ACCENT)
     } else if resp.hovered() {
-        Stroke::new(1.0, Color32::from_rgb(140, 148, 164))
+        Stroke::new(1.0, theme::MUTED)
     } else {
-        Stroke::new(1.0, Color32::from_rgb(52, 59, 72))
+        Stroke::new(1.0, theme::BORDER)
     };
     p.rect_stroke(img, 3.0, outline, StrokeKind::Outside);
     // Badges in the top-right corner: the card icon for a guide card, "T" for text or a bubble, the spotlight icon for a spotlight.
-    let badge_bg = Color32::from_black_alpha(180);
+    let badge_bg = theme::SCRIM_BADGE;
     let mut right = img.right() - 3.0;
     if marks.card {
         let r = Rect::from_min_size(pos2(right - 16.0, img.top() + 3.0), Vec2::splat(16.0));
         p.rect_filled(r, 3.0, badge_bg);
-        icons::paint(p, r.shrink(3.0), Icon::Card, Color32::WHITE);
+        icons::paint(p, r.shrink(3.0), Icon::Card, theme::ON_PICTURE);
         right -= 18.0;
     }
     if marks.spotlight {
         let r = Rect::from_min_size(pos2(right - 16.0, img.top() + 3.0), Vec2::splat(16.0));
         p.rect_filled(r, 3.0, badge_bg);
-        icons::paint(p, r.shrink(3.0), Icon::Spotlight, Color32::WHITE);
+        icons::paint(p, r.shrink(3.0), Icon::Spotlight, theme::ON_PICTURE);
         right -= 18.0;
     }
     if marks.text {
         let r = Rect::from_min_size(pos2(right - 16.0, img.top() + 3.0), Vec2::splat(16.0));
         p.rect_filled(r, 3.0, badge_bg);
-        p.text(r.center(), egui::Align2::CENTER_CENTER, "T", FontId::proportional(11.0), Color32::WHITE);
+        p.text(r.center(), egui::Align2::CENTER_CENTER, "T", FontId::proportional(11.0), theme::ON_PICTURE);
     }
-    p.text(pos2(img.center().x, img.bottom() + 8.0), egui::Align2::CENTER_CENTER, label, FontId::proportional(11.0), if selected { AMBER } else { MUTED });
+    p.text(pos2(img.center().x, img.bottom() + 8.0), egui::Align2::CENTER_CENTER, label, FontId::proportional(theme::SMALL_SIZE), if selected { theme::ACCENT } else { theme::MUTED });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -307,7 +306,7 @@ impl Editor {
         if theme.hotspot == HotspotStyle::None {
             return;
         }
-        let accent = parse_hex(&theme.accent).or_else(|| parse_hex(tour::DEFAULT_ACCENT)).unwrap_or(AMBER);
+        let accent = parse_hex(&theme.accent).or_else(|| parse_hex(tour::DEFAULT_ACCENT)).unwrap_or(theme::ACCENT);
         let at = to_scr(c);
         if theme.hotspot == HotspotStyle::Pulse && self.prefs.tour_animate_hotspot {
             let (scale, alpha) = pulse_ring(ctx.input(|i| i.time));
@@ -485,7 +484,7 @@ impl Editor {
         let marks: Vec<StepMarks> = steps.as_ref().map(|s| s.iter().map(|st| step_marks(self.doc.items(), doc, st.src)).collect()).unwrap_or_default();
         let can_copy = self.selected.and_then(|id| self.doc.item(id)).is_some_and(|it| it.pin.is_some());
         let mut action = None;
-        let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8, 6));
+        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(8, 6));
         egui::Panel::bottom("editor-timeline").frame(frame).show(ui, |ui| {
             let v = self.video.as_ref().expect("video");
             let count = steps.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -496,7 +495,7 @@ impl Editor {
                     action = Some(TourAction::View(view));
                 }
                 if count > 0 {
-                    ui.label(RichText::new(format!("Step {} of {count}", v.tour_step + 1)).color(MUTED));
+                    ui.label(RichText::new(format!("Step {} of {count}", v.tour_step + 1)).color(theme::MUTED));
                 }
                 if ui.add(egui::Button::selectable(v.tour.settings.open, "Tour settings")).on_hover_text("Card style, accent colour, zoom, cover, buttons, end card and autoplay").clicked() {
                     action = Some(TourAction::Settings);
@@ -517,7 +516,7 @@ impl Editor {
             ui.add_space(4.0);
             match &steps {
                 Err(e) => {
-                    ui.add(egui::Label::new(RichText::new(e).color(MUTED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(e).color(theme::MUTED)).wrap());
                 }
                 Ok(steps) => {
                     let h = (THUMB_W as f32 * v.rec.height as f32 / v.rec.width.max(1) as f32).clamp(24.0, 96.0);

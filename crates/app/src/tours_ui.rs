@@ -38,24 +38,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, vec2};
+use eframe::egui::{self, Align, CornerRadius, Layout, RichText, Sense, Stroke, vec2};
 use mythicshot_recording::VideoCodec;
 
+use crate::theme::{self, Strong as _};
 use crate::main_window::{Page, PageOut};
 use crate::project::{self, Expand, FfmpegState, Form, LoadError, Loaded, Problem, ProjectInfo, ProjectKey, Store};
 use crate::publish::{self, Images, RemoteTour};
 use crate::publish_ui::{self, TITLE_MAX, TokenStatus};
 use crate::settings::UnfinishedDelete;
 
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-const ERROR: Color32 = Color32::from_rgb(255, 140, 140);
-const PRIMARY: Color32 = Color32::from_rgb(47, 111, 235);
-const CARD: Color32 = Color32::from_rgb(27, 31, 39);
-const DANGER: Color32 = Color32::from_rgb(240, 110, 110);
-const DANGER_TINT: Color32 = Color32::from_rgb(58, 26, 28);
-const PUBLIC_TEXT: Color32 = Color32::from_rgb(125, 211, 140);
-const PUBLIC_BG: Color32 = Color32::from_rgb(24, 52, 34);
-const DRAFT_BG: Color32 = Color32::from_rgb(44, 50, 62);
 
 pub const NOT_CONNECTED: &str = "Mythicshot is not connected to a tour site yet.";
 pub const OPEN_WORKSPACE: &str = "Open Workspace";
@@ -1835,7 +1827,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     ui.horizontal(|ui| {
         ui.heading("Tours");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new(RECORD_A_TOUR).strong()).fill(PRIMARY)).on_hover_text("Go to Home, where a recording starts").clicked() {
+            if ui.add(theme::primary_button(RECORD_A_TOUR)).on_hover_text("Go to Home, where a recording starts").clicked() {
                 clicks.push(Click::RecordTour);
             }
             let can_refresh = m.site.is_some() && !m.is_loading();
@@ -1861,30 +1853,30 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 
     match view {
         View::NotConnected(why) => {
-            ui.add(egui::Label::new(RichText::new(why).color(MUTED)).wrap());
+            ui.add(egui::Label::new(RichText::new(why).color(theme::MUTED)).wrap());
             ui.add_space(8.0);
             if ui.button(OPEN_WORKSPACE).clicked() {
                 clicks.push(Click::Workspace);
             }
         }
         View::Checking => {
-            ui.label(RichText::new(CHECKING).color(MUTED));
+            ui.label(RichText::new(CHECKING).color(theme::MUTED));
         }
         View::Loading => {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0));
-                ui.label(RichText::new(LOADING).color(MUTED));
+                ui.label(RichText::new(LOADING).color(theme::MUTED));
             });
         }
         View::Failed(e) => {
-            ui.add(egui::Label::new(RichText::new(e).color(ERROR)).wrap());
+            ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT)).wrap());
             ui.add_space(8.0);
             if ui.add_enabled(!m.is_loading(), egui::Button::new("Retry")).clicked() {
                 clicks.push(Click::Refresh);
             }
         }
         View::Empty => {
-            ui.add(egui::Label::new(RichText::new(EMPTY).color(MUTED)).wrap());
+            ui.add(egui::Label::new(RichText::new(EMPTY).color(theme::MUTED)).wrap());
         }
         View::List => {
             let today = Local::now();
@@ -1896,7 +1888,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                     row_ui(ui, &m, t, &mut edit, &today, now, &mut clicks);
                 }
                 ui.add_space(4.0);
-                ui.label(RichText::new(footer_text).color(MUTED).size(12.0));
+                ui.label(RichText::new(footer_text).color(theme::MUTED).size(12.0));
             });
             m.edit = edit;
         }
@@ -1985,9 +1977,9 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 }
 
 fn notice_ui(ui: &mut egui::Ui, notice: &Notice, clicks: &mut Vec<Click>) {
-    egui::Frame::new().fill(if notice.error { DANGER_TINT } else { CARD }).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+    if notice.error { theme::danger_frame() } else { theme::card_frame().stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(9.0) }.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(RichText::new(&notice.text).color(if notice.error { ERROR } else { MUTED })).wrap());
+        ui.add(egui::Label::new(RichText::new(&notice.text).color(if notice.error { theme::DANGER_TEXT } else { theme::MUTED })).wrap());
         if ui.button("Dismiss").clicked() {
             clicks.push(Click::DismissNotice);
         }
@@ -1997,14 +1989,14 @@ fn notice_ui(ui: &mut egui::Ui, notice: &Notice, clicks: &mut Vec<Click>) {
 
 /// The block of one unfinished delete: what is left, and the button that carries on, or its progress.
 fn unfinished_ui(ui: &mut egui::Ui, entry: &UnfinishedDelete, work: Option<Work>, clicks: &mut Vec<Click>) {
-    egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+    theme::danger_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(RichText::new(unfinished_sentence(&entry.title)).color(ERROR)).wrap());
+        ui.add(egui::Label::new(RichText::new(unfinished_sentence(&entry.title)).color(theme::DANGER_TEXT)).wrap());
         match work {
             Some(work) => {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(14.0));
-                    ui.label(RichText::new(work_message(work)).color(MUTED));
+                    ui.label(RichText::new(work_message(work)).color(theme::MUTED));
                 });
             }
             None => {
@@ -2024,7 +2016,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
     let choosing = matches!(edit, Edit::ChoosingChapter { id } if *id == t.id);
     let asking_publish = matches!(edit, Edit::ConfirmPublish { id } if *id == t.id);
     let saved = m.saved(&t.id);
-    egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+    theme::card_frame().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         if renaming {
             if let Edit::Renaming { text, .. } = edit {
@@ -2036,61 +2028,61 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                         field.request_focus();
                     }
                     let can_save = !text.trim().is_empty();
-                    if (ui.add_enabled(can_save, egui::Button::new(RichText::new("Save").strong()).fill(PRIMARY)).clicked() || enter) && can_save {
+                    if (ui.add_enabled(can_save, theme::primary_button("Save")).clicked() || enter) && can_save {
                         clicks.push(Click::SaveRename);
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         clicks.push(Click::CancelEdit);
                     }
                 });
-                ui.label(RichText::new(RENAME_NOTE).color(MUTED).size(12.0));
+                ui.label(RichText::new(RENAME_NOTE).color(theme::MUTED).size(12.0));
             }
         } else {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     badge_ui(ui, t);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(&t.title).size(15.0).strong()).truncate()).on_hover_text(&t.title);
+                        ui.add(egui::Label::new(RichText::new(&t.title).size(theme::STRONG_SIZE).bold()).truncate()).on_hover_text(&t.title);
                     });
                 });
             });
         }
-        ui.add(egui::Label::new(RichText::new(detail_line(t, saved, m.converting(), today)).color(MUTED).size(12.0)).wrap());
+        ui.add(egui::Label::new(RichText::new(detail_line(t, saved, m.converting(), today)).color(theme::MUTED).size(12.0)).wrap());
         ui.add_space(4.0);
         if let Some(work) = m.work(&t.id) {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0));
-                ui.label(RichText::new(work_message(work)).color(MUTED));
+                ui.label(RichText::new(work_message(work)).color(theme::MUTED));
                 // Expanding a long recording takes minutes: it can be stopped.
                 if matches!(work, Work::Opening(_)) && ui.button("Cancel").clicked() {
                     clicks.push(Click::CancelOpen(t.id.clone()));
                 }
             });
         } else if confirming {
-            egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+            theme::danger_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(delete_question(t, saved.len())).color(ERROR)).wrap());
+                ui.add(egui::Label::new(RichText::new(delete_question(t, saved.len())).color(theme::DANGER_TEXT)).wrap());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Keep it").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         clicks.push(Click::CancelEdit);
                     }
-                    if ui.add(egui::Button::new(RichText::new("Delete tour").color(Color32::WHITE)).fill(Color32::from_rgb(170, 48, 48))).clicked() {
+                    if ui.add(theme::danger_button("Delete tour")).clicked() {
                         clicks.push(Click::DeleteTour(t.id.clone()));
                     }
                 });
             });
         } else if asking_publish {
             // Cancel is the default: Enter and Escape both choose it.
-            egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+            theme::danger_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_HEADING).strong()).wrap());
-                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_TEXT).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_HEADING).bold()).wrap());
+                ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_TEXT).color(theme::MUTED)).wrap());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let keys = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter));
                     for (label, default) in confirm_publish_buttons() {
-                        let button = if default { egui::Button::new(RichText::new(label).strong()).fill(PRIMARY) } else { egui::Button::new(label) };
+                        let button = if default { theme::primary_button(label) } else { egui::Button::new(label) };
                         let clicked = ui.add(button).clicked();
                         if (clicked || (default && keys)) && default {
                             clicks.push(Click::CancelEdit);
@@ -2101,7 +2093,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                 });
             });
         } else if choosing {
-            ui.label(RichText::new(WHICH_CHAPTER).color(MUTED));
+            ui.label(RichText::new(WHICH_CHAPTER).color(theme::MUTED));
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 for p in usable(saved) {
@@ -2117,27 +2109,27 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
             // Wrapped: with Publish changes a public row has seven buttons, more than a narrow window holds on one line.
             ui.horizontal_wrapped(|ui| {
                 for b in row_buttons(t) {
-                    let text = if b == RowButton::Delete { RichText::new(b.label()).color(DANGER) } else { RichText::new(b.label()) };
+                    let text = if b == RowButton::Delete { RichText::new(b.label()).color(theme::DANGER_TEXT) } else { RichText::new(b.label()) };
                     if ui.button(text).clicked() {
                         clicks.push(Click::Button(t.id.clone(), b, t.link.clone()));
                     }
                 }
                 if m.shows_copied(&t.id, now) {
-                    ui.label(RichText::new(LINK_COPIED).color(MUTED));
+                    ui.label(RichText::new(LINK_COPIED).color(theme::MUTED));
                 }
             });
         }
         if let Some(e) = m.error(&t.id) {
-            ui.add(egui::Label::new(RichText::new(e).color(ERROR).size(12.0)).wrap());
+            ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT).size(12.0)).wrap());
         }
     });
     ui.add_space(6.0);
 }
 
 fn badge_ui(ui: &mut egui::Ui, t: &RemoteTour) {
-    let (fg, bg) = if t.is_public() { (PUBLIC_TEXT, PUBLIC_BG) } else { (MUTED, DRAFT_BG) };
-    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
-        ui.label(RichText::new(badge(t)).color(fg).size(11.0));
+    let (fg, bg) = if t.is_public() { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
+    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+        ui.label(RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE));
     });
 }
 
@@ -2146,9 +2138,9 @@ fn refresh_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if enabled && resp.hovered() {
-        p.rect_filled(rect, CornerRadius::same(6), DRAFT_BG);
+        p.rect_filled(rect, CornerRadius::same(theme::control_radius(rect.height())), theme::RAISED);
     }
-    let color = if enabled { Color32::from_rgb(214, 218, 226) } else { Color32::from_gray(100) };
+    let color = if enabled { theme::TEXT } else { theme::DISABLED };
     let (c, r) = (rect.center(), 7.0);
     let at = |deg: f32| c + vec2(deg.to_radians().cos(), deg.to_radians().sin()) * r;
     // Three quarters of a circle, with an arrow head where it ends.
@@ -2187,7 +2179,7 @@ pub(crate) mod tests {
         Site { server: "https://tours.example.com".into(), epoch: 1 }
     }
 
-    fn conn(token: TokenStatus) -> Conn {
+    pub(crate) fn conn(token: TokenStatus) -> Conn {
         Conn { server: "https://tours.example.com".into(), token, epoch: 1, bound: Some("https://tours.example.com".into()) }
     }
 
@@ -2904,7 +2896,7 @@ pub(crate) mod tests {
     #[test]
     fn the_page_draws_the_tours_with_their_badges_buttons_and_the_footer() {
         let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(404, r#"{"error":"not_found"}"#) });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let (first, _) = drawn(&ctx, &mut state, &conn);
         // The list is being read, unless the stub already answered.
         assert!(has_line(&first, "Tours") && has_line(&first, RECORD_A_TOUR) && (has_line(&first, LOADING) || has_line(&first, "Testing")), "{first}");
@@ -2940,7 +2932,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_page_that_is_not_connected_empty_or_failing_says_so_in_a_sentence() {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut state = page();
         let (text, _) = drawn(&ctx, &mut state, &conn(TokenStatus::Missing));
         assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, OPEN_WORKSPACE) && !text.contains("Retry"), "{text}");
@@ -2976,7 +2968,7 @@ pub(crate) mod tests {
             }
             _ => reply(500, r#"{"error":"unexpected"}"#),
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         let job = {
             let mut m = lock(&state.model);
@@ -3001,7 +2993,7 @@ pub(crate) mod tests {
             "GET /api/v1/tours" => reply(200, if seen == 0 { LIST } else { ONLY_A }),
             _ => reply(404, NO_TOUR),
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         let job = lock(&state.model).start_publish(B).unwrap();
         state.spawn_job(job);
@@ -3020,7 +3012,7 @@ pub(crate) mod tests {
             }
             _ => Answer::Drop,
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         let job = {
             let mut m = lock(&state.model);
@@ -3053,7 +3045,7 @@ pub(crate) mod tests {
             }
             _ => reply(500, r#"{"error":"unexpected"}"#),
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let store = state.unfinished();
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         let job = {
@@ -3109,7 +3101,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unfinished_delete_whose_tour_is_gone_by_now_is_simply_forgotten() {
         let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, ONLY_A) } else { reply(404, NO_TOUR) });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let store = state.unfinished();
         store.load(vec![
             UnfinishedDelete { server: s.base.clone(), tour_id: B.into(), title: "Testing".into() },
@@ -3175,7 +3167,7 @@ pub(crate) mod tests {
     #[test]
     fn a_delete_whose_first_answer_is_lost_is_on_disk_before_the_request_and_is_finished_after_a_restart() {
         // The site removes the tour, but its answer never arrives. Its files are still being cleared.
-        let (ctx, mut state) = (egui::Context::default(), page());
+        let (ctx, mut state) = (crate::theme::test_context(), page());
         let store = state.unfinished();
         let file = written_to(&store);
         let (s, at_request) = delete_stub(&file, 1, || Answer::Drop, |n| if n < 3 { reply(202, r#"{"status":"in_progress","done":5,"total":10}"#) } else { reply(200, DELETED) });
@@ -3220,7 +3212,7 @@ pub(crate) mod tests {
             || reply(405, ""),
         ];
         for (i, refusal) in refusals.into_iter().enumerate() {
-            let (ctx, mut state) = (egui::Context::default(), page());
+            let (ctx, mut state) = (crate::theme::test_context(), page());
             let store = state.unfinished();
             let file = written_to(&store);
             let (s, at_request) = delete_stub(&file, usize::MAX, refusal, |_| reply(500, r#"{"error":"unexpected"}"#));
@@ -3241,7 +3233,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_delete_that_succeeds_at_once_was_noted_first_and_leaves_no_note() {
-        let (ctx, mut state) = (egui::Context::default(), page());
+        let (ctx, mut state) = (crate::theme::test_context(), page());
         let store = state.unfinished();
         let file = written_to(&store);
         let (s, at_request) = delete_stub(&file, 1, || reply(200, DELETED), |_| reply(404, NO_TOUR));
@@ -3265,7 +3257,7 @@ pub(crate) mod tests {
         ];
         for (i, answer) in unclear.into_iter().enumerate() {
             // The site in fact never began: the tour is still there, whole.
-            let (ctx, mut state) = (egui::Context::default(), page());
+            let (ctx, mut state) = (crate::theme::test_context(), page());
             let store = state.unfinished();
             let file = written_to(&store);
             let (s, _) = delete_stub(&file, 2, answer, |_| reply(200, DELETED));
@@ -3292,7 +3284,7 @@ pub(crate) mod tests {
     fn a_delete_whose_note_cannot_be_saved_is_not_sent_and_the_row_says_why() {
         // The settings file cannot be written (false), or is not to be written this session (no way to write).
         for can_try in [true, false] {
-            let (ctx, mut state) = (egui::Context::default(), unsaved_page());
+            let (ctx, mut state) = (crate::theme::test_context(), unsaved_page());
             let store = state.unfinished();
             if can_try {
                 store.save_with(|_| false);
@@ -3320,7 +3312,7 @@ pub(crate) mod tests {
     #[test]
     fn finish_deleting_needs_no_new_note_so_a_file_that_cannot_be_written_does_not_stop_it() {
         for can_try in [true, false] {
-            let (ctx, mut state) = (egui::Context::default(), unsaved_page());
+            let (ctx, mut state) = (crate::theme::test_context(), unsaved_page());
             let store = state.unfinished();
             if can_try {
                 store.save_with(|_| false);
@@ -3345,7 +3337,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_refusal_of_finish_deleting_keeps_the_earlier_note() {
-        let (ctx, mut state) = (egui::Context::default(), page());
+        let (ctx, mut state) = (crate::theme::test_context(), page());
         let store = state.unfinished();
         let file = written_to(&store);
         let (s, _) = delete_stub(&file, 0, || reply(401, r#"{"error":"unauthorized"}"#), |_| reply(409, r#"{"error":"publish_busy"}"#));
@@ -3374,7 +3366,7 @@ pub(crate) mod tests {
             assert!(!flag.load(Ordering::SeqCst), "a job thread panics (this message is part of the test)");
             Ok(TOKEN.to_string())
         });
-        let (ctx, conn) = (egui::Context::default(), stub_conn(&s));
+        let (ctx, conn) = (crate::theme::test_context(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         broken.store(true, Ordering::SeqCst);
         let job = lock(&state.model).start_publish(B).unwrap();
@@ -3395,7 +3387,7 @@ pub(crate) mod tests {
     #[test]
     fn a_page_whose_token_belongs_to_another_address_sends_nothing() {
         let s = stub(|_, _| reply(200, LIST));
-        let (ctx, mut state) = (egui::Context::default(), page());
+        let (ctx, mut state) = (crate::theme::test_context(), page());
         let conn = Conn { bound: Some("https://tours.example.com".into()), ..stub_conn(&s) };
         let text = drawn(&ctx, &mut state, &conn).0.replace('\n', " ");
         assert!(text.contains("The saved token belongs to tours.example.com, so it is not sent to this address.") && text.contains(OPEN_WORKSPACE), "{text}");
@@ -3407,7 +3399,7 @@ pub(crate) mod tests {
     #[test]
     fn the_header_buttons_ask_for_the_right_page() {
         // "Record a tour" is the right-most thing in the header.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut state = page();
         let c = conn(TokenStatus::Missing);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0));
@@ -3798,7 +3790,7 @@ pub(crate) mod tests {
         // A (two chapters) has one chapter saved, B (one chapter) its only one.
         save_project(&store, &s.base, A, CH1, "Getting started");
         let saved_b = save_project(&store, &s.base, B, CH1, "Testing");
-        let (ctx, mut state, conn) = (egui::Context::default(), page().with_store(store.clone()), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page().with_store(store.clone()), stub_conn(&s));
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         assert_eq!(text.lines().filter(|l| *l == "Edit").count(), 2, "every row has Edit:\n{text}");
         let flat = text.replace('\n', " ");
@@ -3839,7 +3831,7 @@ pub(crate) mod tests {
     fn a_computer_with_no_folder_for_saved_recordings_says_the_recording_is_not_saved() {
         let s = stub(|_, _| reply(200, LIST));
         // `page()` has no folder, as when the user's folder cannot be found.
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         assert!(!text.contains("saved on this computer"), "{text}");
         let edits = places(&ctx, &mut state, &conn, "Edit");
@@ -3873,7 +3865,7 @@ pub(crate) mod tests {
             let saved = save_project(&store, &s.base, B, CH1, "Testing");
             spoil(&saved.dir);
             let before = files(&saved.dir);
-            let (ctx, mut state, conn) = (egui::Context::default(), page().with_store(store.clone()), stub_conn(&s));
+            let (ctx, mut state, conn) = (crate::theme::test_context(), page().with_store(store.clone()), stub_conn(&s));
             let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
             assert!(!text.contains("saved on this computer"), "case {i}: the row claims no recording:\n{text}");
             assert_eq!(text.lines().filter(|l| *l == "Edit").count(), 2, "case {i}: Edit is there all the same");
@@ -3928,7 +3920,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_confirmed_delete_removes_the_saved_recordings_of_that_tour_only() {
-        let (ctx, state) = (egui::Context::default(), page());
+        let (ctx, state) = (crate::theme::test_context(), page());
         let file = written_to(&state.unfinished());
         // The site takes two calls: the saved recordings are still there while it is asked.
         let (s, _) = delete_stub(&file, 1, || reply(202, r#"{"status":"in_progress","done":5,"total":10}"#), |_| reply(200, DELETED));
@@ -3959,7 +3951,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tour_deleted_while_its_recording_is_open_loses_it_when_the_editor_closes() {
-        let (ctx, state) = (egui::Context::default(), page());
+        let (ctx, state) = (crate::theme::test_context(), page());
         let file = written_to(&state.unfinished());
         let (s, _) = delete_stub(&file, 1, || reply(200, DELETED), |_| reply(404, NO_TOUR));
         let (_tmp, store) = temp_store();
@@ -3994,7 +3986,7 @@ pub(crate) mod tests {
             || reply(200, "<html>Sign in</html>"),
         ];
         for (i, answer) in answers.into_iter().enumerate() {
-            let (ctx, state) = (egui::Context::default(), page());
+            let (ctx, state) = (crate::theme::test_context(), page());
             let file = written_to(&state.unfinished());
             let (s, at_request) = delete_stub(&file, usize::MAX, answer, |_| reply(500, r#"{"error":"unexpected"}"#));
             let (_tmp, store) = temp_store();
@@ -4029,7 +4021,7 @@ pub(crate) mod tests {
         let (_tmp, store) = temp_store();
         saved_for_delete(&store, &s);
         let before = files(store.root());
-        let (ctx, mut state, conn) = (egui::Context::default(), unsaved_page().with_store(store.clone()), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), unsaved_page().with_store(store.clone()), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| m.tours().len() == 2);
         delete_b(&ctx, &mut state, &conn);
         assert_eq!(lock(&state.model).error(B), Some(NOTE_NOT_SAVED));
@@ -4040,7 +4032,7 @@ pub(crate) mod tests {
     #[test]
     fn a_delete_that_left_files_on_the_site_still_removes_the_saved_recording() {
         // The site has removed the tour and stops making progress on its files.
-        let (ctx, state) = (egui::Context::default(), page());
+        let (ctx, state) = (crate::theme::test_context(), page());
         let file = written_to(&state.unfinished());
         let (s, _) = delete_stub(&file, 1, || reply(202, r#"{"status":"in_progress","done":5,"total":10}"#), |_| reply(202, r#"{"status":"in_progress","done":5,"total":10}"#));
         let (_tmp, store) = temp_store();
@@ -4072,7 +4064,7 @@ pub(crate) mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         // Once for a delete that finishes, once for one that leaves files on the site.
         for unfinished in [false, true] {
-            let (ctx, state) = (egui::Context::default(), page());
+            let (ctx, state) = (crate::theme::test_context(), page());
             let file = written_to(&state.unfinished());
             let in_progress = || reply(202, r#"{"status":"in_progress","done":5,"total":10}"#);
             let (s, _) = if unfinished { delete_stub(&file, 1, in_progress, |_| reply(202, r#"{"status":"in_progress","done":5,"total":10}"#)) } else { delete_stub(&file, 1, || reply(200, DELETED), |_| reply(404, NO_TOUR)) };
@@ -4107,7 +4099,7 @@ pub(crate) mod tests {
     fn a_recording_saved_after_the_list_was_read_shows_without_asking_the_site_again() {
         let s = stub(|_, _| reply(200, LIST));
         let (_tmp, store) = temp_store();
-        let (ctx, mut state, conn) = (egui::Context::default(), page().with_store(store.clone()), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page().with_store(store.clone()), stub_conn(&s));
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         assert!(!text.contains("saved on this computer"), "{text}");
         // A publish in an editor keeps its recording: the store counts the change, the page reads it.
@@ -4125,7 +4117,7 @@ pub(crate) mod tests {
     #[test]
     fn a_recording_saved_while_its_tour_was_being_deleted_is_removed_when_it_shows_up() {
         // An upload to B is still saving its recording when B is deleted on the Tours page.
-        let (ctx, state) = (egui::Context::default(), page());
+        let (ctx, state) = (crate::theme::test_context(), page());
         let file = written_to(&state.unfinished());
         let (s, _) = delete_stub(&file, 1, || reply(200, DELETED), |_| reply(404, NO_TOUR));
         let (_tmp, store) = temp_store();
@@ -4531,7 +4523,7 @@ pub(crate) mod tests {
             }
             _ => reply(500, r#"{"error":"unexpected"}"#),
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         // The button and the note on the public tour only; the flagged draft is a plain draft.
         assert_eq!(text.lines().filter(|l| *l == "Publish changes").count(), 1, "{text}");
@@ -4590,7 +4582,7 @@ pub(crate) mod tests {
         // The row of a draft being published offers its progress and nothing to press (there is
         // no Cancel on a Tours row); publishing changes is the same job and shows the same.
         let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST_WAITING) } else { reply(500, r#"{"error":"unexpected"}"#) });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         {
             // Both jobs are held as running, without their threads: the page draws what the model says.
@@ -4615,7 +4607,7 @@ pub(crate) mod tests {
             "GET /api/v1/tours" => reply(200, LIST_WAITING),
             _ => reply(500, r#"{"error":"server_error"}"#),
         });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         let button = places(&ctx, &mut state, &conn, "Publish changes");
         assert_eq!(button.len(), 1);
@@ -4633,7 +4625,7 @@ pub(crate) mod tests {
     fn a_site_that_does_not_say_whether_changes_wait_shows_no_publish_changes() {
         // The list of a site of 0.1.5: no such field on any row.
         let s = stub(|req, _| if req.line == "GET /api/v1/tours" { reply(200, LIST) } else { reply(500, r#"{"error":"unexpected"}"#) });
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 2);
         assert!(!text.contains("Publish changes") && !text.contains("changes waiting"), "{text}");
         for (word, times) in [("Copy link", 1), ("Open", 1), ("Unpublish", 1), ("Publish", 1), ("Edit", 2), ("Rename", 2), ("Delete", 2)] {
@@ -4721,7 +4713,40 @@ pub(crate) mod tests {
 
     /// A page that lists the three tours and holds these saved recordings, with no site and no
     /// folder behind it.
-    fn page_with(saved: Vec<ProjectInfo>) -> ToursState {
+    /// The rows were fitted to the old interface font: in Manrope every row's buttons, title,
+    /// badge and details still fit inside the row's card and the page, and no two buttons overlap.
+    #[test]
+    fn every_row_fits_the_page_in_the_interface_font() {
+        let saved: Vec<ProjectInfo> = [A, B, C].iter().map(|id| info(id, CH1, "Chapter one", mb(12.0), None)).collect();
+        let mut state = page_with(saved);
+        let (ctx, conn) = (crate::theme::test_context(), conn(TokenStatus::Saved));
+        let (text, _) = drawn(&ctx, &mut state, &conn);
+        for word in ["Copy link", "Open", "Edit", "Rename", "Unpublish", "Delete", "Publish"] {
+            assert!(text.lines().any(|l| l == word), "{word:?} in:\n{text}");
+        }
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(590.0, 520.0))), ..Default::default() };
+        let mut page_out = PageOut::default();
+        let mut out = ctx.run_ui(input, |ui| super::ui(ui, &mut state, &conn, &mut page_out));
+        out.textures_delta.clear();
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the Tours page") >= 10);
+        // The row buttons: inside the page, and apart.
+        let mut buttons = Vec::new();
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape
+                && ["Copy link", "Open", "Edit", "Rename", "Unpublish", "Delete", "Publish"].contains(&t.galley.text())
+            {
+                buttons.push(t.visual_bounding_rect());
+            }
+        }
+        for (i, a) in buttons.iter().enumerate() {
+            assert!(a.right() <= 590.0, "{a:?} past the page");
+            for b in &buttons[i + 1..] {
+                assert!(!a.intersects(*b), "{a:?} and {b:?} overlap");
+            }
+        }
+    }
+
+    pub(crate) fn page_with(saved: Vec<ProjectInfo>) -> ToursState {
         let state = page();
         *lock(&state.model) = loaded_with(three(), saved);
         state
@@ -4891,7 +4916,7 @@ pub(crate) mod tests {
         let shown = |id: &str| lock(&state.model).work(id);
         assert_eq!((shown(B), shown(C)), (Some(Work::Opening(Some((100, 250)))), None));
 
-        let (ctx, conn) = (egui::Context::default(), conn(TokenStatus::Saved));
+        let (ctx, conn) = (crate::theme::test_context(), conn(TokenStatus::Saved));
         let (text, _) = drawn(&ctx, &mut state, &conn);
         assert!(has_line(&text, "Opening the recording… 40%"), "{text}");
         assert_eq!(text.lines().filter(|l| *l == "Cancel").count(), 1, "{text}");
@@ -5473,7 +5498,7 @@ pub(crate) mod tests {
         let publish_line = format!("POST /api/v1/tours/{ID}/publish");
         let s = stub(move |req, _| if req.line == "GET /api/v1/tours" { reply(200, &list) } else { reply(200, r#"{"slug":"x1","url":"/t/x1","steps":3,"access":"public","viewers":0}"#) });
         crate::publish_ui::note_unfinished_restriction(ID);
-        let (ctx, mut state, conn) = (egui::Context::default(), page(), stub_conn(&s));
+        let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
         let sent = || s.lines().iter().filter(|l| **l == publish_line).count();
         let asking = |state: &ToursState| lock(&state.model).edit() == &Edit::ConfirmPublish { id: ID.into() };

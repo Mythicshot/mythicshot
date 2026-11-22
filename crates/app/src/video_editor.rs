@@ -15,6 +15,7 @@ use mythicshot_recording::export::{Format, ffmpeg_available};
 use mythicshot_recording::ffmpeg::Found;
 use mythicshot_recording::{FrameReader, Recording};
 
+use crate::theme::{self, Strong as _};
 use crate::editor_ui::Editor;
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
@@ -27,8 +28,6 @@ use crate::settings_ui::{click_style_label, key_style_label};
 use crate::tour::{self, StepPlan, TourSummary};
 use crate::video::{self, Edit};
 
-const AMBER: Color32 = Color32::from_rgb(245, 165, 36);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
 /// Width of the grips at each end of an annotation's range bar.
 const GRIP: f32 = 12.0;
 /// Height of one row of annotation bars.
@@ -892,7 +891,7 @@ fn tour_more(file_bytes: Option<u64>, squeezed: Option<String>) -> Option<String
 fn menu_item(ui: &mut egui::Ui, label: &str, hint: &str) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     RichText::new(label).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Min);
-    RichText::new(format!("\n{hint}")).color(MUTED).size(12.0).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Min);
+    RichText::new(format!("\n{hint}")).color(theme::MUTED).size(12.0).append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Min);
     ui.add(egui::Button::new(job))
 }
 
@@ -1743,7 +1742,7 @@ impl Editor {
         let exporting = self.exporting();
         let Some(v) = self.video.as_mut() else { return };
         ui.set_min_width(260.0);
-        ui.label(RichText::new("Format").strong());
+        ui.label(RichText::new("Format").bold());
         // Read when the menu is drawn, not when the editor opened: the search for ffmpeg may
         // have ended since. Both are answers kept in memory; no program is started here.
         let ffmpeg = ffmpeg_available();
@@ -1781,14 +1780,14 @@ impl Editor {
         }
         let (w, h) = video::output_size(&v.rec, &v.edit);
         let (frames, end) = video::plan(&v.rec, &v.edit);
-        ui.label(RichText::new(format!("{w} × {h} · {} frames · {:.1} s", frames.len(), end as f64 / 1000.0)).color(MUTED).size(12.0));
+        ui.label(RichText::new(format!("{w} × {h} · {} frames · {:.1} s", frames.len(), end as f64 / 1000.0)).color(theme::MUTED).size(12.0));
         let (tour_line, tour_ok) = match tour::plan_steps(&v.rec, &v.edit, &v.events) {
             Ok(steps) => (tour_steps_label(&steps), true),
             Err(e) => (e, false),
         };
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.add_enabled(!exporting, egui::Button::new(RichText::new("Export").strong()).fill(Color32::from_rgb(47, 111, 235))).clicked() {
+            if ui.add_enabled(!exporting, theme::primary_button("Export")).clicked() {
                 self.start_export(None);
                 ui.close();
             }
@@ -1798,14 +1797,14 @@ impl Editor {
             }
         });
         ui.separator();
-        ui.label(RichText::new(crate::share_ui::EXPORT_HEADING).strong());
+        ui.label(RichText::new(crate::share_ui::EXPORT_HEADING).bold());
         if ui.add_enabled(!exporting, egui::Button::new(crate::share_ui::MENU_ENTRY)).clicked() {
             self.open_share_clip();
             ui.close();
         }
         ui.separator();
-        ui.label(RichText::new("Tour").strong());
-        ui.add(egui::Label::new(RichText::new(tour_line).color(MUTED).size(12.0)).wrap());
+        ui.label(RichText::new("Tour").bold());
+        ui.add(egui::Label::new(RichText::new(tour_line).color(theme::MUTED).size(12.0)).wrap());
         let publishing = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.cancelling());
         let tour_running = self.video.as_ref().and_then(|v| v.job.as_ref()).and_then(|j| j.tour_cancelling());
         let blocked = publish_ui::publish_blocked(exporting, tour_ok, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref());
@@ -1830,7 +1829,7 @@ impl Editor {
                 add_to_site = true;
                 ui.close();
             }
-            let publish = egui::Button::new(RichText::new("Publish tour…").strong()).fill(Color32::from_rgb(47, 111, 235));
+            let publish = theme::primary_button("Publish tour…");
             if ui.add_enabled(blocked.is_none(), publish).on_hover_text("Upload this tour to your server, as a public link or as a private draft").clicked() {
                 self.open_publish_picker();
                 ui.close();
@@ -1847,7 +1846,7 @@ impl Editor {
             }
         }
         if let Some(reason) = blocked.and_then(|b| b.reason()) {
-            ui.add(egui::Label::new(RichText::new(reason).color(MUTED).size(12.0)).wrap());
+            ui.add(egui::Label::new(RichText::new(reason).color(theme::MUTED).size(12.0)).wrap());
         }
         match publishing {
             Some(false) => {
@@ -1901,7 +1900,7 @@ impl Editor {
         let mut switched = None;
         let selected = self.selected;
         let (bars, lanes) = lay_out_bars(self.doc.items());
-        let frame = egui::Frame::new().fill(Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8, 6));
+        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(8, 6));
         let mut new_range: Option<(u64, (u32, u32))> = None;
         let mut range_drag_started = false;
         let mut select: Option<u64> = None;
@@ -1924,7 +1923,7 @@ impl Editor {
                     v.current = (v.current + 1).min(v.rec.frames.len() - 1);
                 }
                 let t = v.rec.frames[v.current].t_ms as f64 / 1000.0;
-                ui.label(RichText::new(format!("Frame {} / {} · {t:05.2} s", v.current + 1, v.rec.frames.len())).monospace().color(MUTED));
+                ui.label(RichText::new(format!("Frame {} / {} · {t:05.2} s", v.current + 1, v.rec.frames.len())).monospace().color(theme::MUTED));
                 ui.separator();
                 if ui.button("Start here").on_hover_text("Trim: keep from this frame").clicked() {
                     v.edit.trim.0 = v.current.min(v.edit.trim.1);
@@ -1951,7 +1950,7 @@ impl Editor {
                 overlay_controls(ui, &mut v.edit.overlays);
                 let no_keys = !v.events.iter().any(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_)));
                 if no_keys && v.edit.overlays.keys != KeyStyle::Off {
-                    ui.label(RichText::new("No key presses were recorded").color(AMBER).size(12.0))
+                    theme::caution_line(ui, "No key presses were recorded", theme::SMALL_SIZE, theme::Fit::Truncate)
                         .on_hover_text("Key logging is off by default. Turn on Keys on the recording bar (or Record key presses in Preferences › Output) before recording.");
                 }
                 if v.edit.crop.is_some() && ui.button("Clear crop").clicked() {
@@ -1978,17 +1977,17 @@ impl Editor {
                 let y = band_top + bar.lane as f32 * LANE;
                 Rect::from_min_max(pos2(x_of(v.rec.frames[bar.range.0 as usize].t_ms), y), pos2(x_of(frame_end(bar.range.1 as usize)).max(x_of(v.rec.frames[bar.range.0 as usize].t_ms) + GRIP * 2.0 + 4.0), y + LANE - 3.0))
             };
-            painter.rect_filled(strip, CornerRadius::same(4), Color32::from_rgb(17, 20, 26));
+            painter.rect_filled(strip, CornerRadius::same(theme::RADIUS_SM), theme::GROUND);
             let kept = Rect::from_min_max(pos2(x_of(v.rec.frames[v.edit.trim.0].t_ms), strip.top()), pos2(x_of(frame_end(v.edit.trim.1)), strip.bottom()));
-            painter.rect_filled(kept, 0.0, Color32::from_rgb(52, 59, 72));
+            painter.rect_filled(kept, 0.0, theme::BORDER);
             for (i, f) in v.rec.frames.iter().enumerate() {
                 let x = x_of(f.t_ms);
-                let color = if v.edit.deleted.contains(&i) { Color32::from_rgb(229, 72, 77) } else { Color32::from_rgb(90, 99, 117) };
+                let color = if v.edit.deleted.contains(&i) { theme::RECORD } else { theme::BORDER_STRONG };
                 painter.vline(x, strip.top() + 20.0..=strip.bottom() - 2.0, Stroke::new(1.0, color));
             }
             for x in [kept.left(), kept.right()] {
                 let g = Rect::from_center_size(pos2(x, strip.center().y), vec2(6.0, strip.height() + 4.0));
-                painter.rect_filled(g, 2.0, AMBER);
+                painter.rect_filled(g, 2.0, theme::ACCENT);
                 if resp.hover_pos().is_some_and(|p| g.expand(4.0).contains(p)) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -1996,22 +1995,22 @@ impl Editor {
 
             // Annotation bars, in their own colour, with grips at both ends.
             if bars.is_empty() {
-                painter.text(pos2(rect.left() + 4.0, band_top + LANE / 2.0), egui::Align2::LEFT_CENTER, "Annotations you add show here; drag their ends to set when they appear", egui::FontId::proportional(11.0), MUTED);
+                painter.text(pos2(rect.left() + 4.0, band_top + LANE / 2.0), egui::Align2::LEFT_CENTER, "Annotations you add show here; drag their ends to set when they appear", egui::FontId::proportional(theme::SMALL_SIZE), theme::MUTED);
             }
             let hover = resp.hover_pos();
             for bar in &bars {
                 let r = bar_rect(bar);
                 let is_sel = selected == Some(bar.id);
                 painter.rect_filled(r, 3.0, bar.color.gamma_multiply(if is_sel { 0.75 } else { 0.4 }));
-                painter.rect_stroke(r, 3.0, Stroke::new(if is_sel { 2.0 } else { 1.0 }, if is_sel { Color32::WHITE } else { bar.color }), StrokeKind::Inside);
+                painter.rect_stroke(r, 3.0, Stroke::new(if is_sel { 2.0 } else { 1.0 }, if is_sel { theme::TEXT } else { bar.color }), StrokeKind::Inside);
                 let label_clip = Rect::from_min_max(pos2(r.left() + GRIP + 3.0, r.top()), pos2(r.right() - GRIP - 3.0, r.bottom()));
-                ui.painter_at(label_clip.intersect(rect)).text(pos2(label_clip.left(), r.center().y), egui::Align2::LEFT_CENTER, &bar.label, egui::FontId::proportional(11.0), Color32::WHITE);
+                ui.painter_at(label_clip.intersect(rect)).text(pos2(label_clip.left(), r.center().y), egui::Align2::LEFT_CENTER, &bar.label, egui::FontId::proportional(theme::SMALL_SIZE), theme::TEXT);
                 for x in [r.left() + GRIP / 2.0, r.right() - GRIP / 2.0] {
                     let g = Rect::from_center_size(pos2(x, r.center().y), vec2(GRIP, r.height()));
                     let hot = hover.is_some_and(|p| g.expand(2.0).contains(p));
-                    painter.rect_filled(g, 3.0, if hot { Color32::WHITE } else { Color32::from_rgb(200, 210, 230) });
+                    painter.rect_filled(g, 3.0, if hot { theme::TEXT } else { theme::MUTED });
                     for dx in [-2.0, 2.0] {
-                        painter.vline(g.center().x + dx, g.center().y - 4.0..=g.center().y + 4.0, Stroke::new(1.5, Color32::from_rgb(27, 31, 39)));
+                        painter.vline(g.center().x + dx, g.center().y - 4.0..=g.center().y + 4.0, Stroke::new(1.5, theme::SURFACE));
                     }
                     if hot {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -2022,7 +2021,7 @@ impl Editor {
                 }
             }
             let head = x_of(v.rec.frames[v.current].t_ms);
-            painter.vline(head, rect.y_range(), Stroke::new(2.0, Color32::WHITE));
+            painter.vline(head, rect.y_range(), Stroke::new(2.0, theme::TEXT));
 
             if resp.drag_started() || resp.clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
@@ -2426,13 +2425,86 @@ mod tests {
             Editor::new_video(rec, Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
         };
         crate::editor_ui::dialog_checks::assert_inert_and_solid(make, |ed| ed.open_site_dialog(), |ed| ed.site_dialog_open());
+        // The video editor paints its whole window opaque, alone and with the dialog open, which is opaque too.
+        {
+            let ctx = crate::theme::test_context();
+            let mut ed = make();
+            let run = |ed: &mut Editor| {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                out
+            };
+            run(&mut ed);
+            crate::theme::checks::assert_window_opaque(&run(&mut ed), crate::editor_ui::dialog_checks::WINDOW, "the video editor");
+            ed.open_site_dialog();
+            run(&mut ed);
+            let out = run(&mut ed);
+            crate::theme::checks::assert_window_opaque(&out, crate::editor_ui::dialog_checks::WINDOW, "the video editor with add to site open");
+            crate::theme::checks::assert_dialog_opaque(&out, "add to site over the video editor");
+        }
         // A click outside it closes nothing.
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut ed = make();
         ed.open_site_dialog();
         crate::editor_ui::dialog_checks::frame(&mut ed, &ctx, vec![]);
         crate::editor_ui::dialog_checks::click(&mut ed, &ctx, egui::pos2(10.0, 810.0));
         assert!(ed.site_dialog_open());
+    }
+
+    /// Filled in pixel by pixel at 125% scaling, the video editor lets nothing behind its window
+    /// show: with its timeline, and in the Tour view with the Tour settings panel open.
+    #[test]
+    fn the_video_editor_its_timeline_and_tour_settings_are_opaque_pixel_by_pixel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let s = Settings::default();
+            Editor::new_video(recorded(&tmp.path().join(name)), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap()
+        };
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = make("timeline");
+        assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with its timeline");
+        let mut ed = make("tour");
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let ctx = crate::theme::test_context();
+        assert_eq!(crate::snapshot::uncovered(&ctx, size, 1.25, 3, |ui| ed.ui(ui)), 0, "the video editor with Tour settings open");
+        // And the panel was there to be checked: 304 points wide (a point of it the separator), on surface.
+        let mut out = ctx.run_ui(crate::editor_ui::dialog_checks::input(vec![]), |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        let fills = crate::theme::checks::fills(&out);
+        assert!(fills.iter().any(|(r, c, _)| *c == crate::theme::SURFACE && (r.width() - 304.0).abs() <= 2.0), "the Tour settings panel was drawn: {:?}", fills.iter().filter(|(r, ..)| r.width() > 200.0).collect::<Vec<_>>());
+    }
+
+    /// Every label of the video editor fits what holds it: the timeline and its controls row
+    /// (with the caution that no key presses were recorded), and in the Tour view the step strip
+    /// and the Tour settings panel, 304 points wide.
+    #[test]
+    fn the_video_editors_labels_fit_its_timeline_and_tour_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let frames = |ed: &mut Editor| {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { time: Some(ctx.input(|i| i.time) + 1.0), ..crate::editor_ui::dialog_checks::input(vec![]) };
+                let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        };
+        let s = Settings::default();
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("timeline")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.video.as_mut().unwrap().edit.overlays.keys = KeyStyle::Chips;
+        let out = frames(&mut ed);
+        let all: String = out.shapes.iter().map(|c| format!("{:?}", c.shape)).collect();
+        assert!(all.contains("No key presses were recorded"), "the controls row shows its caution");
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the video editor's timeline") >= 5);
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("tour")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.test_tour_view();
+        ed.video.as_mut().unwrap().tour.settings.open = true;
+        let out = frames(&mut ed);
+        assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
     }
 
     fn reopened(store: &Store, key: &ProjectKey) -> Editor {
@@ -2442,7 +2514,7 @@ mod tests {
 
     /// Ask the editor's window to close, as the window's own close button does.
     fn request_close(ed: &mut Editor) {
-        let ctx = egui::Context::default();
+        let ctx = crate::theme::test_context();
         let mut input = egui::RawInput::default();
         input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
         ctx.run_ui(input, |ui| ed.ui(ui)).textures_delta.clear();

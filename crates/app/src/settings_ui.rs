@@ -9,25 +9,13 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke,
 
 use mythicshot_destinations::{DEFAULT_PATTERN, DestId, ImageFormat, expand_pattern};
 
+use crate::theme::{self, Strong as _};
 use crate::hotkeys::{self, Action, EditorAction};
 use crate::project::{self, ConvertState, FfmpegState, Form, ProjectInfo, Removed, Store, Totals, form_text, over_limit, over_limit_sentence, parse_limit, problem_text, remove_question, row_title, usage_fraction, usage_line};
 use crate::publish_ui::size_text;
 use crate::settings::{Settings, TrayLeftClick};
 
-const WARN_BG: Color32 = Color32::from_rgb(58, 42, 16);
-const WARN_TEXT: Color32 = Color32::from_rgb(255, 196, 107);
-const MUTED: Color32 = Color32::from_rgb(163, 170, 184);
-/// The question before a recording is removed, in the colours of the Tours page's own question.
-const DANGER_TINT: Color32 = Color32::from_rgb(58, 26, 28);
-const DANGER_TEXT: Color32 = Color32::from_rgb(255, 140, 140);
-const DANGER_BUTTON: Color32 = Color32::from_rgb(170, 48, 48);
-/// The usage bar: its track, what is used, and what is used past the limit.
-const BAR_TRACK: Color32 = Color32::from_rgb(40, 46, 58);
-const BAR_USED: Color32 = Color32::from_rgb(138, 180, 255);
-const BAR_OVER: Color32 = Color32::from_rgb(201, 138, 30);
 const BAR_HEIGHT: f32 = 8.0;
-/// The background of the list of saved recordings.
-const LIST_BG: Color32 = Color32::from_rgb(27, 31, 39);
 /// How long until the page looks again whether ffmpeg was found, while it is being looked for.
 const FFMPEG_LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
 /// The room a row's title keeps before the row's details go under it.
@@ -153,9 +141,8 @@ fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hoo
     ui.add_space(6.0);
     // The settings file could not be used as it was at start-up.
     if let Some(problem) = &view.settings.load_problem {
-        egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(problem.sentence()).color(WARN_TEXT)).wrap());
+        theme::caution_box(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(problem.sentence()).color(theme::CAUTION_TEXT)).wrap());
         });
         ui.add_space(8.0);
     }
@@ -198,7 +185,7 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     }
     // Which build this is.
     ui.add_space(16.0);
-    ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(Color32::from_rgb(140, 148, 164)));
+    ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(theme::MUTED));
 }
 
 fn output_tab(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, hooks: &mut Hooks<'_>, out: &mut Vec<UiAction>) {
@@ -223,8 +210,8 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     ui.heading("Output");
     ui.add_space(10.0);
 
-    ui.label(RichText::new("AFTER CAPTURE").size(11.0).color(MUTED));
-    ui.label(RichText::new("Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.").color(MUTED).size(12.0));
+    section_label(ui, "After capture");
+    ui.label(RichText::new("Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.").color(theme::MUTED).size(12.0));
     ui.add_space(4.0);
     for d in DestId::ALL {
         let mut on = s.has_destination(*d);
@@ -235,7 +222,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     }
 
     ui.add_space(14.0);
-    ui.label(RichText::new("SAVING").size(11.0).color(MUTED));
+    section_label(ui, "Saving");
     ui.add_space(4.0);
     ui.label("Captures folder");
     ui.horizontal(|ui| {
@@ -263,8 +250,8 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
         }
     });
     let example = expand_pattern(&s.filename_pattern, "Window title", chrono::Local::now());
-    ui.label(RichText::new(format!("Example: {example}.{}", s.image_format.extension())).color(MUTED).size(12.0));
-    ui.label(RichText::new("Tokens: ${YYYY} ${MM} ${DD} ${hh} ${mm} ${ss} ${title} ${user}. Use / for subfolders.").color(MUTED).size(12.0));
+    ui.label(RichText::new(format!("Example: {example}.{}", s.image_format.extension())).color(theme::MUTED).size(12.0));
+    ui.label(RichText::new("Tokens: ${YYYY} ${MM} ${DD} ${hh} ${mm} ${ss} ${title} ${user}. Use / for subfolders.").color(theme::MUTED).size(12.0));
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("Format");
@@ -276,7 +263,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     });
 
     ui.add_space(14.0);
-    ui.label(RichText::new("RECORDING").size(11.0).color(MUTED));
+    section_label(ui, "Recording");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("Frame rate");
@@ -318,10 +305,10 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
         ui.label("GIF quality");
         changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
     });
-    ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(MUTED).size(12.0));
+    ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(theme::MUTED).size(12.0));
 
     ui.add_space(14.0);
-    ui.label(RichText::new("TOUR PUBLISHING").size(11.0).color(MUTED));
+    section_label(ui, "Tour publishing");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(TOUR_SITE_MOVED);
@@ -351,7 +338,7 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
     if s.store_recordings_as_video {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
-            ui.add(egui::Label::new(RichText::new(ffmpeg_line(hooks.ffmpeg)).color(MUTED).size(12.0)).wrap());
+            ui.add(egui::Label::new(RichText::new(ffmpeg_line(hooks.ffmpeg)).color(theme::MUTED).size(12.0)).wrap());
         });
     }
     ui.add_space(6.0);
@@ -364,11 +351,11 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
         if let Some(fraction) = usage_fraction(t.bytes, limit) {
             usage_bar(ui, fraction, over);
         }
-        ui.add(egui::Label::new(RichText::new(usage_line(t.count, t.bytes, limit)).color(MUTED)).extend()).on_hover_text(RECORDINGS_STAY);
+        ui.add(egui::Label::new(RichText::new(usage_line(t.count, t.bytes, limit)).color(theme::MUTED)).extend()).on_hover_text(RECORDINGS_STAY);
         if over {
-            egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+            theme::caution_box(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(over_limit_sentence(t.bytes, limit)).color(WARN_TEXT)).wrap());
+                ui.add(egui::Label::new(RichText::new(over_limit_sentence(t.bytes, limit)).color(theme::CAUTION_TEXT)).wrap());
             });
         }
     }
@@ -378,7 +365,7 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
         (hooks.open_folder)(root);
     }
     if let Some(note) = &saved.note {
-        ui.add(egui::Label::new(RichText::new(note).color(WARN_TEXT)).wrap());
+        theme::caution_line(ui, note, theme::BODY_SIZE, theme::Fit::Wrap);
     }
     saved_list(ui, saved, hooks);
     changed
@@ -425,10 +412,10 @@ fn usage_bar(ui: &mut egui::Ui, fraction: f32, over: bool) {
         return;
     }
     let round = CornerRadius::same(4);
-    ui.painter().rect_filled(track, round, BAR_TRACK);
+    ui.painter().rect_filled(track, round, theme::METER_TRACK);
     if fraction > 0.0 {
         let used = egui::Rect::from_min_size(track.min, vec2(track.width() * fraction.clamp(0.0, 1.0), track.height()));
-        ui.painter().rect_filled(used, round, if over { BAR_OVER } else { BAR_USED });
+        ui.painter().rect_filled(used, round, if over { theme::METER_OVER } else { theme::METER_USED });
     }
 }
 
@@ -446,7 +433,7 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
         let reveal = std::mem::take(&mut saved.reveal);
         let Some(listing) = saved.shown.as_ref().filter(|l| !l.rows.is_empty()) else { return };
         let (asking, busy) = (saved.asking.as_deref(), saved.removing.is_some());
-        egui::Frame::new().fill(LIST_BG).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+        theme::card_frame().inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("saved-recordings").max_height(LIST_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
                 for row in &listing.rows {
                     // A row and its question are widgets of their own, so the keyboard focus
@@ -481,7 +468,7 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
 /// would leave the title too little room, the details go under the title instead. True when
 /// the button was clicked.
 fn list_row(ui: &mut egui::Ui, row: &Row, enabled: bool) -> bool {
-    let detail = RichText::new(row.detail()).color(MUTED).size(12.0);
+    let detail = RichText::new(row.detail()).color(theme::MUTED).size(12.0);
     let button_width = text_width(ui, REMOVE_RECORDING, egui::TextStyle::Button.resolve(ui.style())) + 2.0 * ui.spacing().button_padding.x;
     let detail_width = text_width(ui, &row.detail(), egui::FontId::proportional(12.0));
     let one_line = ui.available_width() - button_width - detail_width - 2.0 * ui.spacing().item_spacing.x >= TITLE_MIN_WIDTH;
@@ -513,12 +500,12 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
 /// Some(true) for "Remove recording", Some(false) for "Keep it" or Escape.
 fn question(ui: &mut egui::Ui, row: &Row, reveal: bool) -> Option<bool> {
     let mut answer = None;
-    let frame = egui::Frame::new().fill(DANGER_TINT).corner_radius(CornerRadius::same(6)).inner_margin(10.0).show(ui, |ui| {
+    let frame = theme::danger_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(RichText::new(remove_question(&row.title)).color(DANGER_TEXT)).wrap());
+        ui.add(egui::Label::new(RichText::new(remove_question(&row.title)).color(theme::DANGER_TEXT)).wrap());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(RichText::new(REMOVE_RECORDING).color(Color32::WHITE)).fill(DANGER_BUTTON)).clicked() {
+            if ui.add(theme::danger_button(REMOVE_RECORDING)).clicked() {
                 answer = Some(true);
             }
             if ui.button(KEEP_IT).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -892,14 +879,14 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
         .any(|a| view.errors.contains_key(&Bind::Global(*a)) && view.settings.binding(*a).to_ascii_lowercase().contains("printscreen"));
     let snipping = view.snipping_tool == Some(true) && !(cfg!(windows) && view.settings.take_print_screen);
     if snipping || prtsc_failed {
-        egui::Frame::new().fill(WARN_BG).corner_radius(CornerRadius::same(8)).inner_margin(10.0).show(ui, |ui| {
+        theme::caution_box(ui, |ui| {
             ui.set_width(ui.available_width());
             if snipping {
-                ui.label(RichText::new("Windows is using the Print Screen key for Snipping Tool").color(WARN_TEXT).strong());
-                ui.label(RichText::new("Turn off Settings › Accessibility › Keyboard › \"Use the Print screen key to open screen capture\", then restart Mythicshot, or pick other keys below.").color(WARN_TEXT));
+                ui.label(RichText::new("Windows is using the Print Screen key for Snipping Tool").color(theme::CAUTION_TEXT).bold());
+                ui.label(RichText::new("Turn off Settings › Accessibility › Keyboard › \"Use the Print screen key to open screen capture\", then restart Mythicshot, or pick other keys below.").color(theme::CAUTION_TEXT));
             } else {
-                ui.label(RichText::new("Another app is holding the Print Screen shortcuts").color(WARN_TEXT).strong());
-                ui.label(RichText::new("Another screenshot tool is probably running. Close it or turn off its shortcuts, then restart Mythicshot, or pick other keys below.").color(WARN_TEXT));
+                ui.label(RichText::new("Another app is holding the Print Screen shortcuts").color(theme::CAUTION_TEXT).bold());
+                ui.label(RichText::new("Another screenshot tool is probably running. Close it or turn off its shortcuts, then restart Mythicshot, or pick other keys below.").color(theme::CAUTION_TEXT));
             }
         });
         ui.add_space(8.0);
@@ -915,7 +902,7 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
             row(ui, state, &view, Bind::Global(action), view.settings.binding(action), out);
         }
         group_title(ui, "Editor");
-        ui.label(RichText::new("These work inside the editor window only.").color(MUTED).size(12.0));
+        ui.label(RichText::new("These work inside the editor window only.").color(theme::MUTED).size(12.0));
         ui.add_space(4.0);
         for &action in EditorAction::ALL {
             row(ui, state, &view, Bind::Editor(action), view.settings.editor_binding(action), out);
@@ -925,21 +912,26 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
 
 fn group_title(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
-    ui.label(RichText::new(title.to_uppercase()).size(11.0).color(MUTED));
+    section_label(ui, title);
     ui.add_space(4.0);
+}
+
+/// The label over a section of the page, in sentence case.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(theme::SMALL_SIZE).color(theme::MUTED).bold());
 }
 
 fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bind, binding: &str, out: &mut Vec<UiAction>) {
     let listening = state.listening == Some(action);
     let error = view.errors.get(&action);
     let fill = if listening {
-        Color32::from_rgb(30, 42, 64)
+        theme::SELECTION
     } else if error.is_some() {
-        Color32::from_rgb(36, 30, 20)
+        theme::CAUTION_TINT
     } else {
-        Color32::from_rgb(27, 31, 39)
+        theme::SURFACE
     };
-    egui::Frame::new().fill(fill).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+    egui::Frame::new().fill(fill).corner_radius(CornerRadius::same(theme::RADIUS_MD)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
@@ -956,20 +948,20 @@ fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bi
                     hotkeys::display(binding)
                 };
                 let stroke = if listening {
-                    Stroke::new(1.0, Color32::from_rgb(138, 180, 255))
+                    Stroke::new(1.0, theme::ACCENT)
                 } else if error.is_some() {
-                    Stroke::new(1.0, Color32::from_rgb(201, 138, 30))
+                    Stroke::new(1.0, theme::CAUTION_BORDER)
                 } else {
-                    Stroke::new(1.0, Color32::from_rgb(52, 59, 72))
+                    Stroke::new(1.0, theme::BORDER_STRONG)
                 };
                 let button = egui::Button::new(RichText::new(text).monospace()).stroke(stroke).min_size(vec2(170.0, 32.0));
                 if ui.add(button).on_hover_text("Click, then press the new shortcut").clicked() {
                     out.push(if listening { UiAction::StopListening } else { UiAction::Listen(action) });
                 }
                 if listening {
-                    ui.label(RichText::new("Esc cancels · Backspace clears").color(MUTED).size(12.0));
+                    ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(12.0));
                 } else if let Some(e) = error {
-                    ui.label(RichText::new(e).color(WARN_TEXT).size(12.0));
+                    theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
                 }
             });
         });
@@ -1108,8 +1100,8 @@ mod tests {
                 _ => None,
             })
         };
-        let (track, _) = rect(&[BAR_TRACK])?;
-        let (used, fill) = rect(&[BAR_USED, BAR_OVER]).unwrap_or((egui::Rect::from_min_size(track.min, vec2(0.0, track.height())), BAR_USED));
+        let (track, _) = rect(&[theme::METER_TRACK])?;
+        let (used, fill) = rect(&[theme::METER_USED, theme::METER_OVER]).unwrap_or((egui::Rect::from_min_size(track.min, vec2(0.0, track.height())), theme::METER_USED));
         Some((track, used, fill))
     }
 
@@ -1139,7 +1131,7 @@ mod tests {
         fn new(root: Option<PathBuf>) -> Page {
             let state = SettingsState { tab: Tab::Output, listening: None, saved: SavedRecordings::at(root) };
             Page {
-                ctx: egui::Context::default(),
+                ctx: crate::theme::test_context(),
                 settings: Settings::default(),
                 state,
                 actions: Vec::new(),
@@ -1497,21 +1489,21 @@ mod tests {
         let out = page.settled();
         let texts = texts_of(&out);
         let (track, used, fill) = bar_of(&out).expect("a limit, a bar");
-        assert!((used.width() / track.width() - 0.25).abs() < 0.01 && fill == BAR_USED, "{track:?} {used:?}");
+        assert!((used.width() / track.width() - 0.25).abs() < 0.01 && fill == theme::METER_USED, "{track:?} {used:?}");
         assert!((used.left() - track.left()).abs() < 0.5 && track.width() > 200.0 && track.right() <= page.screen.x, "{track:?} {used:?}");
         assert!(texts.iter().any(|t| t == "1 saved recording · 1.0 GB of 4 GB") && !texts.iter().any(|t| t.starts_with("Saved recordings take")), "{texts:?}");
         // Exactly the limit: full, and still no warning.
         page.settings.saved_recordings_warn_gb = 1;
         let out = page.settled();
         let (track, used, fill) = bar_of(&out).unwrap();
-        assert!((used.width() - track.width()).abs() < 0.5 && fill == BAR_USED, "{track:?} {used:?}");
+        assert!((used.width() - track.width()).abs() < 0.5 && fill == theme::METER_USED, "{track:?} {used:?}");
         assert!(!texts_of(&out).iter().any(|t| t.starts_with("Saved recordings take")));
         // Past it: full and no fuller, in the warning's colour, with the planned sentence under the line.
         let projects = vec![info(SITE, "tour_a", "chap_a", "Customer onboarding", "Invite your team", 2, 5 * GB), info(SITE, "tour_a", "chap_b", "Customer onboarding", "Add a domain", 1, 429_496_730)];
         let mut page = Page::showing(listed(projects));
         let out = page.settled();
         let (track, used, fill) = bar_of(&out).unwrap();
-        assert!((used.width() - track.width()).abs() < 0.5 && fill == BAR_OVER, "{track:?} {used:?}");
+        assert!((used.width() - track.width()).abs() < 0.5 && fill == theme::METER_OVER, "{track:?} {used:?}");
         let sentence = "Saved recordings take 5.4 GB, more than the 5 GB you set. Nothing is removed automatically: remove recordings you no longer need in Preferences.";
         let (line, warning, button) = (rect_of(&out, "2 saved recordings · 5.4 GB of 5 GB").unwrap(), rect_of(&out, sentence).unwrap_or_else(|| panic!("{:?}", texts_of(&out))), rect_of(&out, OPEN_FOLDER).unwrap());
         assert!(track.bottom() <= line.top() && line.bottom() <= warning.top() && warning.bottom() <= button.top(), "{track:?} {line:?} {warning:?} {button:?}");
@@ -2005,7 +1997,7 @@ mod tests {
             let texts = texts_of(&out);
             let rect = |text: &str| rect_of(&out, text).unwrap_or_else(|| panic!("{text} is drawn at {width}: {texts:?}"));
             let (track, _, _) = bar_of(&out).unwrap_or_else(|| panic!("the bar is drawn at {width}"));
-            let heading = rect("TOUR PUBLISHING");
+            let heading = rect("Tour publishing");
             let (keep, video, ffmpeg, limit, unit) = (rect(KEEP_RECORDING), rect(STORE_AS_VIDEO), rect(FFMPEG_FOUND), rect(WARN_WHEN), rect(WARN_UNIT));
             let (line, warning, button) = (rect(&usage_line(3, total, 5)), rect(&over_limit_sentence(total, 5)), rect(OPEN_FOLDER));
             let title = rect("Customer onboarding for the whole support team · Invite your team and give everybody a role");
@@ -2156,9 +2148,10 @@ mod tests {
         let out = page.settled();
         // Ask about the last row the list shows without scrolling: the question is taller
         // than the row it replaces, so where the row stood its buttons would be cut off.
-        let buttons = rects_of(&out, REMOVE_RECORDING);
-        let (last, nth) = (*buttons.last().unwrap(), buttons.len() - 1);
         let list_bottom = out.shapes.iter().find(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == "Recording 00")).unwrap().clip_rect.bottom();
+        // The list may also paint the top of a row it cuts off; that row is not one it shows.
+        let buttons: Vec<egui::Rect> = rects_of(&out, REMOVE_RECORDING).into_iter().filter(|r| r.bottom() <= list_bottom).collect();
+        let (last, nth) = (*buttons.last().unwrap(), buttons.len() - 1);
         assert!((5..12).contains(&nth) && list_bottom - last.bottom() < 30.0, "{nth}: {last:?} in a list that ends at {list_bottom}");
         page.click_at(last.center());
         assert_eq!(page.state.saved.asking.as_deref(), Some(projects[nth].dir.as_path()));

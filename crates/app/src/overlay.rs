@@ -3,16 +3,12 @@
 //! is red and the result starts a recording instead of a screenshot; Tab
 //! switches between the two.
 
-use eframe::egui::{self, Align2, Color32, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
+use eframe::egui::{self, Align2, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
 use mythicshot_capture::{Desktop, PxRect};
 
+use crate::theme;
 use crate::platform;
 
-const DIM: Color32 = Color32::from_black_alpha(130);
-const ACCENT: Color32 = Color32::from_rgb(91, 141, 239);
-const RECORD: Color32 = Color32::from_rgb(229, 72, 77);
-const PANEL: Color32 = Color32::from_rgba_premultiplied(17, 20, 26, 235);
-const TEXT: Color32 = Color32::from_rgb(230, 232, 236);
 const MAGNIFIER: f32 = 128.0;
 const ZOOM: f32 = 8.0;
 
@@ -87,7 +83,6 @@ impl Overlay {
         if tab {
             self.record = !self.record;
         }
-        let accent = if self.record { RECORD } else { ACCENT };
         if arrows != (0, 0) {
             platform::nudge_cursor(arrows.0, arrows.1);
         }
@@ -124,19 +119,24 @@ impl Overlay {
         }
 
         let painter = ui.painter();
-        painter.image(tex.id(), full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        painter.image(tex.id(), full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), theme::IMAGE_TINT);
 
         let hole = selection.or(if self.window_mode || self.drag_from.is_none() { hovered_window.filter(|_| self.window_mode) } else { None });
         match hole.map(to_pt) {
             Some(h) => {
-                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, h.min.y)), 0.0, DIM);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.max.y), full.max), 0.0, DIM);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.min.y), pos2(h.min.x, h.max.y)), 0.0, DIM);
-                painter.rect_filled(Rect::from_min_max(pos2(h.max.x, h.min.y), pos2(full.max.x, h.max.y)), 0.0, DIM);
-                painter.rect_stroke(h, 0.0, Stroke::new(if self.record { 3.0 } else { 2.0 }, accent), StrokeKind::Outside);
+                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, h.min.y)), 0.0, theme::SCRIM);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.max.y), full.max), 0.0, theme::SCRIM);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.min.y), pos2(h.min.x, h.max.y)), 0.0, theme::SCRIM);
+                painter.rect_filled(Rect::from_min_max(pos2(h.max.x, h.min.y), pos2(full.max.x, h.max.y)), 0.0, theme::SCRIM);
+                if self.record {
+                    painter.rect_stroke(h, 0.0, Stroke::new(3.0, theme::RECORD), StrokeKind::Outside);
+                } else {
+                    // Over the darkened desktop, which can be light: two-tone, as on a picture.
+                    theme::selection_outline(painter, h, 0.0, 2.0);
+                }
             }
             None => {
-                painter.rect_filled(full, 0.0, DIM);
+                painter.rect_filled(full, 0.0, theme::SCRIM);
             }
         }
 
@@ -149,7 +149,7 @@ impl Overlay {
 
         if let Some(p) = hover {
             if selection.is_none() && !self.window_mode {
-                let line = Stroke::new(1.0, Color32::from_rgba_unmultiplied(138, 180, 255, 120));
+                let line = Stroke::new(1.0, theme::PICTURE_GUIDE);
                 painter.hline(full.x_range(), p.y, line);
                 painter.vline(p.x, full.y_range(), line);
             }
@@ -190,20 +190,20 @@ impl Overlay {
         let half = MAGNIFIER / ZOOM / 2.0;
         let (cx, cy) = (p.x * ppp, p.y * ppp);
         let uv = Rect::from_min_max(pos2((cx - half) / w, (cy - half) / h), pos2((cx + half) / w, (cy + half) / h));
-        painter.rect_filled(rect, 4.0, Color32::BLACK);
-        painter.image(tex.id(), rect, uv, Color32::WHITE);
-        let red = Stroke::new(1.0, Color32::from_rgb(229, 72, 77));
+        painter.rect_filled(rect, 4.0, theme::PICTURE_BACKDROP);
+        painter.image(tex.id(), rect, uv, theme::IMAGE_TINT);
+        let red = Stroke::new(1.0, theme::RECORD);
         painter.hline(rect.x_range(), rect.center().y, red);
         painter.vline(rect.center().x, rect.y_range(), red);
-        painter.rect_stroke(rect, 4.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+        painter.rect_stroke(rect, 4.0, Stroke::new(2.0, theme::ON_PICTURE), StrokeKind::Outside);
         let (x, y) = (self.desktop.bounds.x + cx.round() as i32, self.desktop.bounds.y + cy.round() as i32);
         label(painter, rect.center_bottom() + vec2(0.0, 20.0), Align2::CENTER_BOTTOM, &format!("x {x} · y {y}"));
     }
 }
 
 fn label(painter: &egui::Painter, at: Pos2, align: Align2, text: &str) {
-    let galley = painter.layout_no_wrap(text.to_string(), FontId::proportional(13.0), TEXT);
+    let galley = painter.layout_no_wrap(text.to_string(), FontId::proportional(13.0), theme::TEXT);
     let rect = align.anchor_size(at, galley.size()).expand2(vec2(8.0, 4.0));
-    painter.rect_filled(rect, 5.0, PANEL);
-    painter.galley(rect.min + vec2(8.0, 4.0), galley, TEXT);
+    painter.rect_filled(rect, f32::from(theme::control_radius(rect.height())), theme::RAISED);
+    painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT);
 }
