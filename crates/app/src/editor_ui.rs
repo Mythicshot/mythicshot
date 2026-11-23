@@ -382,6 +382,8 @@ struct ToolbarRow {
     view_w: f32,
     offset: f32,
     cues: [Option<Rect>; 2],
+    /// The room kept at each end for a chevron (left, right), drawn or not: only while the row overflows.
+    areas: [Option<Rect>; 2],
     scroll_to: Option<f32>,
 }
 
@@ -1152,7 +1154,10 @@ impl Editor {
                 let gap = ui.spacing().item_spacing.x;
                 let view = if overflow { (room - 2.0 * (cue_w + gap)).max(0.0) } else { room };
                 let height = ICON;
-                let left = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::click()));
+                // The room is laid out taking nothing; a side with buttons hidden takes clicks once that
+                // is known (below), never the keyboard focus: Tab would land on it, and the editor's
+                // keys wait while something has the focus.
+                let left = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::hover()).0);
                 let mut area = egui::ScrollArea::horizontal().id_salt("editor-toolbar-row").max_width(view).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
                 if let Some(x) = self.toolbar_scroll.scroll_to.take() {
                     area = area.horizontal_scroll_offset(x);
@@ -1160,16 +1165,23 @@ impl Editor {
                 let out = area.show(ui, |ui| {
                     ui.horizontal(|ui| self.toolbar_row(ui));
                 });
-                let right = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::click()));
+                let right = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::hover()).0);
                 let (content_w, view_w, offset) = (out.content_size.x, out.inner_rect.width(), out.state.clamped_offset().x);
                 let hidden = [overflow && offset > 0.5, overflow && offset + view_w < content_w - 0.5];
                 let step = (view_w * 0.75).max(ICON);
+                // The row's width this frame against the room decided from the last: when the answer
+                // changed, the cue (or the room kept for it) is wrong this frame, so draw another now.
+                if (content_w > room + 0.5) != overflow {
+                    ui.ctx().request_repaint();
+                }
+                let areas = [left, right];
                 let mut cues = [None, None];
-                for (i, cue) in [left, right].into_iter().enumerate() {
-                    let Some((rect, resp)) = cue else { continue };
+                for (i, area) in areas.into_iter().enumerate() {
+                    let Some(rect) = area else { continue };
                     if !hidden[i] {
                         continue;
                     }
+                    let resp = ui.interact(rect, ui.scope_id().with(("editor-toolbar-cue", i)), egui::Sense::click() - egui::Sense::FOCUSABLE);
                     paint_chevron(ui.painter(), rect, i == 1, if resp.hovered() { theme::TEXT } else { theme::MUTED });
                     cues[i] = Some(rect);
                     if resp.clicked() {
@@ -1179,7 +1191,7 @@ impl Editor {
                     }
                 }
                 let scroll_to = self.toolbar_scroll.scroll_to;
-                self.toolbar_scroll = ToolbarRow { content_w, view_w, offset, cues, scroll_to };
+                self.toolbar_scroll = ToolbarRow { content_w, view_w, offset, cues, areas, scroll_to };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.properties_button(ui));
             });
         });
@@ -3288,6 +3300,103 @@ pub(crate) mod tests {
         }
         assert!(ed.toolbar_scroll.cues[1].is_none() && ed.toolbar_scroll.cues[0].is_some(), "scrolled to the end, only the left cue: {:?}", ed.toolbar_scroll);
         assert!((ed.toolbar_scroll.offset + ed.toolbar_scroll.view_w - ed.toolbar_scroll.content_w).abs() <= 1.0, "the last button is reachable: {:?}", ed.toolbar_scroll);
+    }
+
+    /// Whether the frame asked to be drawn again at once.
+    fn repaint_asked(out: &egui::FullOutput) -> bool {
+        out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.repaint_delay == std::time::Duration::ZERO)
+    }
+
+    /// The row's cue state is decided from the width it had the frame before; when the row grows
+    /// or shrinks past its room, that frame asks for another, so the cue is right without waiting
+    /// for the next input. On a steady row nothing asks for one. (When it grows because buttons
+    /// appear, egui asks for a frame of its own as well; the shrink is the case only this covers.)
+    #[test]
+    fn a_toolbar_row_that_grows_or_shrinks_past_its_room_asks_for_another_frame() {
+        let rect = || Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 });
+        let settle = |ed: &mut Editor, ctx: &egui::Context, size: egui::Vec2| {
+            for _ in 0..3 {
+                sized_frame(ed, ctx, size, vec![]);
+            }
+            sized_frame(ed, ctx, size, vec![])
+        };
+        // A window wide enough for the row with nothing selected, too narrow with a shape selected.
+        let size = (500..=1200)
+            .step_by(10)
+            .map(|w| egui::vec2(w as f32, EDITOR_MIN_SIZE[1]))
+            .find(|&size| {
+                let mut plain = editor(EditorPrefs::default());
+                settle(&mut plain, &crate::theme::test_context(), size);
+                let mut sel = editor(EditorPrefs::default());
+                let id = sel.add_item(rect());
+                sel.select(Some(id));
+                settle(&mut sel, &crate::theme::test_context(), size);
+                plain.toolbar_scroll.cues == [None, None] && plain.toolbar_scroll.areas == [None, None] && sel.toolbar_scroll.cues[1].is_some()
+            })
+            .expect("a width between the two rows");
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        let steady = settle(&mut ed, &ctx, size);
+        assert!(!repaint_asked(&steady), "a steady row asks for nothing");
+        let id = ed.add_item(rect());
+        ed.select(Some(id));
+        let grew = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(repaint_asked(&grew), "the row grew past its room: another frame is asked for");
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(ed.toolbar_scroll.cues[1].is_some(), "the frame it asked for shows the cue");
+        // egui asks for a frame or two of its own after new widgets appear; then the row is steady.
+        assert!((0..5).any(|_| !repaint_asked(&sized_frame(&mut ed, &ctx, size, vec![]))), "the row with the cue settles");
+        // Removing the selection's buttons adds no widget, so egui asks for nothing of its own here.
+        ed.select(None);
+        let shrank = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(repaint_asked(&shrank), "the row shrank back into its room: another frame is asked for");
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert_eq!((ed.toolbar_scroll.cues, ed.toolbar_scroll.areas), ([None, None], [None, None]), "no cue and no room kept for one");
+        // The editor's first frame knows no width yet: an overflowing row asks for a second at once.
+        let mut first = editor(EditorPrefs::default());
+        let id = first.add_item(rect());
+        first.select(Some(id));
+        assert!(repaint_asked(&sized_frame(&mut first, &crate::theme::test_context(), size, vec![])));
+    }
+
+    /// The widgets registered over `r` in the frame just drawn.
+    fn senses_at(ctx: &egui::Context, r: Rect) -> Vec<egui::Sense> {
+        ctx.viewport(|v| v.this_pass.widgets.layers().flat_map(|(_, ws)| ws.iter()).filter(|w| w.rect == r).map(|w| w.sense).collect())
+    }
+
+    /// The cue areas never take the keyboard focus (Tab would land on a blank area, and the editor's
+    /// keys wait while something has the focus); a side with nothing hidden takes no click at all.
+    #[test]
+    fn the_toolbar_cue_areas_take_no_focus_and_a_blank_one_no_click() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(480.0, EDITOR_MIN_SIZE[1]);
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        for _ in 0..4 {
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        let [left, right] = ed.toolbar_scroll.areas.map(|a| a.expect("both areas kept while the row overflows"));
+        assert!(ed.toolbar_scroll.cues[0].is_none() && ed.toolbar_scroll.cues[1] == Some(right), "nothing hidden on the left yet");
+        let (l, r) = (senses_at(&ctx, left), senses_at(&ctx, right));
+        assert!(!l.is_empty() && !r.is_empty(), "both areas are laid out: {l:?} {r:?}");
+        assert!(l.iter().chain(&r).all(|s| !s.is_focusable()), "no cue area is focusable: {l:?} {r:?}");
+        assert!(l.iter().all(|s| !s.senses_click()), "the blank left area takes no click: {l:?}");
+        assert!(r.iter().any(|s| s.senses_click()), "the right chevron does: {r:?}");
+        // Tab around the window: the focus never lands on a cue area.
+        let tab = egui::Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        for _ in 0..40 {
+            sized_frame(&mut ed, &ctx, size, vec![tab.clone()]);
+            if let Some(f) = ctx.memory(|m| m.focused()) {
+                let at = ctx.viewport(|v| v.this_pass.widgets.get(f).map(|w| w.rect));
+                assert!(at.is_none_or(|a| a != left && a != right), "Tab focused a cue area at {at:?}");
+            }
+        }
+        // A click on the blank left area scrolls nothing.
+        let offset = ed.toolbar_scroll.offset;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), left.center());
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert_eq!((ed.toolbar_scroll.offset, ed.toolbar_scroll.scroll_to), (offset, None));
     }
 
     /// The toolbar of a frame `size` points big: the band of surface just under the menu bar.
