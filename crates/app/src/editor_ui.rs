@@ -25,6 +25,8 @@ const ICON: f32 = 28.0;
 const RAIL: f32 = 84.0;
 /// A tool button on the rail.
 const TOOL_BUTTON: f32 = 36.0;
+/// The width each of the toolbar's overflow chevrons keeps for itself.
+const CUE_W: f32 = 14.0;
 /// The toolbar's button for the settings panel, and the panel's heading. Approved wording.
 pub(crate) const PROPERTIES: &str = "Properties";
 /// The rail's sections, like a mockup palette; `None` has no heading.
@@ -368,6 +370,21 @@ pub struct Editor {
     pub busy: bool,
     /// Quitting asked this editor its close question: its answer, until the quit goes on or stops.
     pub(crate) quit: Option<QuitAnswer>,
+    /// The toolbar row as it was last drawn, for its overflow chevrons.
+    toolbar_scroll: ToolbarRow,
+}
+
+/// The toolbar row's scrolling as of the last frame: how wide its content and its view are, how far
+/// it is scrolled, where its chevrons were drawn (left, right), and a scroll a chevron asked for.
+#[derive(Debug, Clone, Copy, Default)]
+struct ToolbarRow {
+    content_w: f32,
+    view_w: f32,
+    offset: f32,
+    cues: [Option<Rect>; 2],
+    /// The room kept at each end for a chevron (left, right), drawn or not: only while the row overflows.
+    areas: [Option<Rect>; 2],
+    scroll_to: Option<f32>,
 }
 
 /// An editor's answer to its close question when Quit asked it.
@@ -483,6 +500,7 @@ impl Editor {
             menu_hold: false,
             busy: false,
             quit: None,
+            toolbar_scroll: ToolbarRow::default(),
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -1129,9 +1147,51 @@ impl Editor {
                 let font = egui::TextStyle::Button.resolve(ui.style());
                 let button = ui.fonts_mut(|f| f.layout_no_wrap(PROPERTIES.into(), font, theme::TEXT).size().x) + 2.0 * ui.spacing().button_padding.x;
                 let room = (ui.available_width() - button - 2.0 * ui.spacing().item_spacing.x - 8.0).max(0.0);
-                egui::ScrollArea::horizontal().id_salt("editor-toolbar-row").max_width(room).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                // When the row is wider than its room, a chevron at each end shows that buttons are hidden
+                // that way and scrolls there; both keep their room, so they never cover a button.
+                let overflow = self.toolbar_scroll.content_w > room + 0.5;
+                let cue_w = if overflow { CUE_W } else { 0.0 };
+                let gap = ui.spacing().item_spacing.x;
+                let view = if overflow { (room - 2.0 * (cue_w + gap)).max(0.0) } else { room };
+                let height = ICON;
+                // The room is laid out taking nothing; a side with buttons hidden takes clicks once that
+                // is known (below), never the keyboard focus: Tab would land on it, and the editor's
+                // keys wait while something has the focus.
+                let left = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::hover()).0);
+                let mut area = egui::ScrollArea::horizontal().id_salt("editor-toolbar-row").max_width(view).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                if let Some(x) = self.toolbar_scroll.scroll_to.take() {
+                    area = area.horizontal_scroll_offset(x);
+                }
+                let out = area.show(ui, |ui| {
                     ui.horizontal(|ui| self.toolbar_row(ui));
                 });
+                let right = overflow.then(|| ui.allocate_exact_size(vec2(cue_w, height), egui::Sense::hover()).0);
+                let (content_w, view_w, offset) = (out.content_size.x, out.inner_rect.width(), out.state.clamped_offset().x);
+                let hidden = [overflow && offset > 0.5, overflow && offset + view_w < content_w - 0.5];
+                let step = (view_w * 0.75).max(ICON);
+                // The row's width this frame against the room decided from the last: when the answer
+                // changed, the cue (or the room kept for it) is wrong this frame, so draw another now.
+                if (content_w > room + 0.5) != overflow {
+                    ui.ctx().request_repaint();
+                }
+                let areas = [left, right];
+                let mut cues = [None, None];
+                for (i, area) in areas.into_iter().enumerate() {
+                    let Some(rect) = area else { continue };
+                    if !hidden[i] {
+                        continue;
+                    }
+                    let resp = ui.interact(rect, ui.scope_id().with(("editor-toolbar-cue", i)), egui::Sense::click() - egui::Sense::FOCUSABLE);
+                    paint_chevron(ui.painter(), rect, i == 1, if resp.hovered() { theme::TEXT } else { theme::MUTED });
+                    cues[i] = Some(rect);
+                    if resp.clicked() {
+                        let to = if i == 0 { offset - step } else { offset + step };
+                        self.toolbar_scroll.scroll_to = Some(to.clamp(0.0, (content_w - view_w).max(0.0)));
+                        ui.ctx().request_repaint();
+                    }
+                }
+                let scroll_to = self.toolbar_scroll.scroll_to;
+                self.toolbar_scroll = ToolbarRow { content_w, view_w, offset, cues, areas, scroll_to };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.properties_button(ui));
             });
         });
@@ -2199,6 +2259,14 @@ fn status_width(available: f32) -> f32 {
     (available - STATUS_ZOOM_W).max(0.0)
 }
 
+/// A chevron pointing right (or left) in the middle of `r`: the toolbar's sign that buttons are hidden that way.
+fn paint_chevron(p: &egui::Painter, r: Rect, right: bool, c: Color32) {
+    let (h, w) = (r.height().min(16.0) / 2.0, 3.5);
+    let (tip, back) = if right { (r.center().x + w, r.center().x - w) } else { (r.center().x - w, r.center().x + w) };
+    let y = r.center().y;
+    p.add(egui::Shape::line(vec![pos2(back, y - h / 1.5), pos2(tip, y), pos2(back, y + h / 1.5)], egui::Stroke::new(2.0, c)));
+}
+
 fn to_color32(c: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(c.0[0], c.0[1], c.0[2], c.0[3])
 }
@@ -3157,6 +3225,178 @@ pub(crate) mod tests {
                 assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| ed2.ui(ui)), 0, "{what}");
             }
         }
+    }
+
+    /// The painted lines (paths and segments) of a frame that lie inside `r`.
+    fn lines_in(out: &egui::FullOutput, r: Rect) -> usize {
+        fn walk(s: &egui::Shape, r: Rect, n: &mut usize) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, r, n)),
+                egui::Shape::Path(p) if !p.points.is_empty() && p.points.iter().all(|q| r.expand(0.5).contains(*q)) => *n += 1,
+                egui::Shape::LineSegment { points, .. } if points.iter().all(|q| r.expand(0.5).contains(*q)) => *n += 1,
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        out.shapes.iter().for_each(|c| walk(&c.shape, r, &mut n));
+        n
+    }
+
+    /// An editor with a shape selected (the longest toolbar row), drawn a few frames at `size`.
+    fn overflowing(ctx: &egui::Context, size: egui::Vec2) -> (Editor, egui::FullOutput) {
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        for _ in 0..3 {
+            sized_frame(&mut ed, ctx, size, vec![]);
+        }
+        let out = sized_frame(&mut ed, ctx, size, vec![]);
+        (ed, out)
+    }
+
+    /// With room for the whole toolbar row, no chevron is drawn on either side.
+    #[test]
+    fn the_toolbar_shows_no_overflow_cue_when_everything_fits() {
+        let ctx = crate::theme::test_context();
+        let (ed, _) = overflowing(&ctx, dialog_checks::WINDOW.size());
+        assert!(ed.toolbar_scroll.content_w > 0.0 && ed.toolbar_scroll.content_w <= ed.toolbar_scroll.view_w + 0.5, "the row fits: {:?}", ed.toolbar_scroll);
+        assert_eq!(ed.toolbar_scroll.cues, [None, None], "no cue when everything fits");
+    }
+
+    /// On a window narrower than the row (smaller than the editor allows, so the test does not hang on
+    /// the row's exact width) the row overflows: a chevron at the right edge, none at the left, both
+    /// left of the Properties button; a click on it scrolls right and brings the left chevron; a
+    /// click on that scrolls back. Scrolled to the end, the right chevron goes.
+    #[test]
+    fn the_toolbar_shows_a_chevron_where_buttons_are_hidden_and_a_click_scrolls() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(480.0, EDITOR_MIN_SIZE[1]);
+        let (mut ed, out) = overflowing(&ctx, size);
+        assert!(ed.toolbar_scroll.content_w > ed.toolbar_scroll.view_w + 0.5, "the row overflows: {:?}", ed.toolbar_scroll);
+        let [left, right] = ed.toolbar_scroll.cues;
+        assert!(left.is_none(), "nothing is hidden to the left at first");
+        let right = right.expect("a cue at the right edge");
+        assert!(lines_in(&out, right) >= 1, "the chevron is painted in {right:?}");
+        let props = crate::share_ui::tests::text_rect(&out, PROPERTIES).expect("the Properties button");
+        assert!(right.right() <= props.left() && right.top() < props.bottom() && right.bottom() > props.top(), "the cue {right:?} sits in the toolbar, left of Properties {props:?}");
+
+        let before = ed.toolbar_scroll.offset;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), right.center());
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(ed.toolbar_scroll.offset > before + 1.0, "a click on the right chevron scrolls right: {before} -> {:?}", ed.toolbar_scroll);
+        let left = ed.toolbar_scroll.cues[0].expect("a cue at the left edge once scrolled");
+        assert!(lines_in(&out, left) >= 1, "the left chevron is painted in {left:?}");
+        assert!(left.right() <= right.left(), "the left cue is at the left edge");
+
+        let scrolled = ed.toolbar_scroll.offset;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), left.center());
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(ed.toolbar_scroll.offset < scrolled - 1.0, "a click on the left chevron scrolls back: {scrolled} -> {:?}", ed.toolbar_scroll);
+
+        for _ in 0..20 {
+            let Some(r) = ed.toolbar_scroll.cues[1] else { break };
+            crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), r.center());
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        assert!(ed.toolbar_scroll.cues[1].is_none() && ed.toolbar_scroll.cues[0].is_some(), "scrolled to the end, only the left cue: {:?}", ed.toolbar_scroll);
+        assert!((ed.toolbar_scroll.offset + ed.toolbar_scroll.view_w - ed.toolbar_scroll.content_w).abs() <= 1.0, "the last button is reachable: {:?}", ed.toolbar_scroll);
+    }
+
+    /// Whether the frame asked to be drawn again at once.
+    fn repaint_asked(out: &egui::FullOutput) -> bool {
+        out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.repaint_delay == std::time::Duration::ZERO)
+    }
+
+    /// The row's cue state is decided from the width it had the frame before; when the row grows
+    /// or shrinks past its room, that frame asks for another, so the cue is right without waiting
+    /// for the next input. On a steady row nothing asks for one. (When it grows because buttons
+    /// appear, egui asks for a frame of its own as well; the shrink is the case only this covers.)
+    #[test]
+    fn a_toolbar_row_that_grows_or_shrinks_past_its_room_asks_for_another_frame() {
+        let rect = || Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 });
+        let settle = |ed: &mut Editor, ctx: &egui::Context, size: egui::Vec2| {
+            for _ in 0..3 {
+                sized_frame(ed, ctx, size, vec![]);
+            }
+            sized_frame(ed, ctx, size, vec![])
+        };
+        // A window wide enough for the row with nothing selected, too narrow with a shape selected.
+        let size = (500..=1200)
+            .step_by(10)
+            .map(|w| egui::vec2(w as f32, EDITOR_MIN_SIZE[1]))
+            .find(|&size| {
+                let mut plain = editor(EditorPrefs::default());
+                settle(&mut plain, &crate::theme::test_context(), size);
+                let mut sel = editor(EditorPrefs::default());
+                let id = sel.add_item(rect());
+                sel.select(Some(id));
+                settle(&mut sel, &crate::theme::test_context(), size);
+                plain.toolbar_scroll.cues == [None, None] && plain.toolbar_scroll.areas == [None, None] && sel.toolbar_scroll.cues[1].is_some()
+            })
+            .expect("a width between the two rows");
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        let steady = settle(&mut ed, &ctx, size);
+        assert!(!repaint_asked(&steady), "a steady row asks for nothing");
+        let id = ed.add_item(rect());
+        ed.select(Some(id));
+        let grew = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(repaint_asked(&grew), "the row grew past its room: another frame is asked for");
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(ed.toolbar_scroll.cues[1].is_some(), "the frame it asked for shows the cue");
+        // egui asks for a frame or two of its own after new widgets appear; then the row is steady.
+        assert!((0..5).any(|_| !repaint_asked(&sized_frame(&mut ed, &ctx, size, vec![]))), "the row with the cue settles");
+        // Removing the selection's buttons adds no widget, so egui asks for nothing of its own here.
+        ed.select(None);
+        let shrank = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(repaint_asked(&shrank), "the row shrank back into its room: another frame is asked for");
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert_eq!((ed.toolbar_scroll.cues, ed.toolbar_scroll.areas), ([None, None], [None, None]), "no cue and no room kept for one");
+        // The editor's first frame knows no width yet: an overflowing row asks for a second at once.
+        let mut first = editor(EditorPrefs::default());
+        let id = first.add_item(rect());
+        first.select(Some(id));
+        assert!(repaint_asked(&sized_frame(&mut first, &crate::theme::test_context(), size, vec![])));
+    }
+
+    /// The widgets registered over `r` in the frame just drawn.
+    fn senses_at(ctx: &egui::Context, r: Rect) -> Vec<egui::Sense> {
+        ctx.viewport(|v| v.this_pass.widgets.layers().flat_map(|(_, ws)| ws.iter()).filter(|w| w.rect == r).map(|w| w.sense).collect())
+    }
+
+    /// The cue areas never take the keyboard focus (Tab would land on a blank area, and the editor's
+    /// keys wait while something has the focus); a side with nothing hidden takes no click at all.
+    #[test]
+    fn the_toolbar_cue_areas_take_no_focus_and_a_blank_one_no_click() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(480.0, EDITOR_MIN_SIZE[1]);
+        let mut ed = editor(EditorPrefs::default());
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        for _ in 0..4 {
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        let [left, right] = ed.toolbar_scroll.areas.map(|a| a.expect("both areas kept while the row overflows"));
+        assert!(ed.toolbar_scroll.cues[0].is_none() && ed.toolbar_scroll.cues[1] == Some(right), "nothing hidden on the left yet");
+        let (l, r) = (senses_at(&ctx, left), senses_at(&ctx, right));
+        assert!(!l.is_empty() && !r.is_empty(), "both areas are laid out: {l:?} {r:?}");
+        assert!(l.iter().chain(&r).all(|s| !s.is_focusable()), "no cue area is focusable: {l:?} {r:?}");
+        assert!(l.iter().all(|s| !s.senses_click()), "the blank left area takes no click: {l:?}");
+        assert!(r.iter().any(|s| s.senses_click()), "the right chevron does: {r:?}");
+        // Tab around the window: the focus never lands on a cue area.
+        let tab = egui::Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        for _ in 0..40 {
+            sized_frame(&mut ed, &ctx, size, vec![tab.clone()]);
+            if let Some(f) = ctx.memory(|m| m.focused()) {
+                let at = ctx.viewport(|v| v.this_pass.widgets.get(f).map(|w| w.rect));
+                assert!(at.is_none_or(|a| a != left && a != right), "Tab focused a cue area at {at:?}");
+            }
+        }
+        // A click on the blank left area scrolls nothing.
+        let offset = ed.toolbar_scroll.offset;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), left.center());
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert_eq!((ed.toolbar_scroll.offset, ed.toolbar_scroll.scroll_to), (offset, None));
     }
 
     /// The toolbar of a frame `size` points big: the band of surface just under the menu bar.

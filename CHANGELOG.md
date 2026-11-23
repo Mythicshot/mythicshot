@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.29 (2026-11-23)
+
+- When the editor's toolbar is too wide for the window, a small arrow at its right end shows that more buttons are hidden that way, and one at its left end once it is scrolled. Clicking an arrow scrolls the toolbar that way. When everything fits, no arrow is shown.
+- In the region selector, the crosshair and the starting point of a drag stay on the right pixel in the moment the selector is put back over the desktop, also when the mouse moves or is pressed in that very moment.
+- Updating a chapter that another upload changed just before the update started now says "the chapter was changed by another upload meanwhile. Update again." and offers Update again, as it already did when the change happened during the update.
+
 ## 0.2.28 (2026-11-23)
 
 - The region selector covers the whole desktop for as long as it is open. If Windows changes its scale after it is shown (which made it shrink to a part of the desktop, with the live screen moving beside it), it is put back over every monitor, hidden from view until it is drawn at the right size, and a drag already started keeps its starting point. It is put back at most three times per capture.

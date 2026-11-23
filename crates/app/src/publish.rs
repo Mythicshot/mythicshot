@@ -95,6 +95,9 @@ const NEEDS_UPDATE: &str = "the site needs an update to version 0.1.1 or newer."
 const NO_SUCH_CHAPTER: &str = "no such chapter";
 /// What an update says when the chapter it would replace is not there.
 const CHAPTER_GONE: &str = "that chapter is no longer part of the tour.";
+/// What an update says when another upload changed the chapter first (`409 chapter_changed`,
+/// at the create or at the commit): pressing Update again can work.
+const CHAPTER_CHANGED: &str = "the chapter was changed by another upload meanwhile. Update again.";
 /// What an update says to a site that cannot replace a chapter yet.
 const UPDATE_NEEDS_UPDATE: &str = "the site needs an update to version 0.1.4 or newer.";
 /// The first site version that can replace a chapter.
@@ -979,6 +982,10 @@ impl Client {
         if replace && reply.status == 400 && reply.error_code().as_deref() == Some("bad_target") {
             return Err(format!("{what}: {UPDATE_NEEDS_UPDATE}"));
         }
+        // Another upload changed the chapter between the check and this create (platform 0.1.55 and newer).
+        if replace && Self::says_chapter_changed(&reply) {
+            return Err(format!("{what}: {CHAPTER_CHANGED}"));
+        }
         // No room in the workspace: said with the site's numbers, never with its text. Only the
         // create is refused this way; an answer without all three numbers (another site) keeps
         // the site's own sentence, like any other refusal.
@@ -1040,6 +1047,11 @@ impl Client {
         self.commit(id, target)
     }
 
+    /// A `409 chapter_changed`: another upload replaced the chapter first.
+    fn says_chapter_changed(reply: &Reply) -> bool {
+        reply.status == 409 && reply.error_code().as_deref() == Some("chapter_changed")
+    }
+
     /// PUTs an image. Sent a second time only when the first got no answer at all; a 409
     /// `already_sent` then means the first copy arrived.
     fn send_image(&self, what: &str, path: &str, content_type: &str, data: &[u8]) -> Result<(), String> {
@@ -1063,8 +1075,8 @@ impl Client {
             Ok(r) => r,
             Err(_) => self.send(Method::Post, &path, None).map_err(|t| format!("{what}: {}. Check the tour list before uploading again.", t.0))?,
         };
-        if matches!(target, Target::Replace { .. }) && reply.status == 409 && reply.error_code().as_deref() == Some("chapter_changed") {
-            return Err(format!("{what}: the chapter was changed by another upload meanwhile. Update again."));
+        if matches!(target, Target::Replace { .. }) && Self::says_chapter_changed(&reply) {
+            return Err(format!("{what}: {CHAPTER_CHANGED}"));
         }
         let reply = self.check(what, reply)?;
         let v = reply.json().ok_or_else(|| not_understood(what))?;
@@ -3006,6 +3018,36 @@ pub(crate) mod tests {
         assert_eq!(count(&lines, |l| l.ends_with("/commit")), 1, "{lines:?}");
         assert_eq!(count(&lines, |l| l.starts_with("DELETE ")), 1, "{lines:?}");
         assert_eq!(count(&lines, |l| l == PUBLISH), 0);
+    }
+
+    /// Since platform 0.1.55 the site can say the chapter changed already when the upload is created
+    /// (another upload committed in between): the same sentence, after this call's own words. No
+    /// upload exists then, so nothing is aborted, sent or published.
+    #[test]
+    fn a_chapter_changed_before_the_upload_starts_is_the_same_sentence() {
+        let s = publish_stub_over(
+            |req, seen| {
+                if req.line == CREATE {
+                    reply(409, r#"{"error":"chapter_changed","detail":"the chapter was changed by another upload; start again"}"#)
+                } else {
+                    platform(req, seen)
+                }
+            },
+            |_| reply(200, LIVE),
+        );
+        let dir = distinct_bundle(3, false);
+        let e = update(&s, dir.path()).unwrap_err();
+        assert_eq!(e, "Could not start the upload: the chapter was changed by another upload meanwhile. Update again.");
+        assert!(!e.contains(TOKEN) && !format!("{e:?}").contains(TOKEN));
+        let lines = s.lines();
+        assert_eq!(count(&lines, |l| l == CREATE), 1, "{lines:?}");
+        assert_eq!(count(&lines, |l| l.starts_with("DELETE ") || l.starts_with("PUT ") || l.ends_with("/commit") || l == PUBLISH), 0, "{lines:?}");
+        // A new tour or a new chapter has no chapter to have changed: that answer is not read as this one.
+        for target in [Target::New, Target::Chapter(TOUR.into())] {
+            let e = upload_bundle(&s.base, TOKEN, dir.path(), &target, |_| true).unwrap_err();
+            assert!(!e.contains("Update again"), "{target:?}: {e}");
+            assert!(e.starts_with("Could not start the upload: ") && !e.contains(TOKEN), "{target:?}: {e}");
+        }
     }
 
     #[test]

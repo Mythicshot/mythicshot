@@ -3329,9 +3329,17 @@ pub(crate) mod tests {
             assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Upload { target: Target::New, .. })), "{error}");
         }
         // Anything else may work the next time: Update stays, once the site has answered.
-        for error in ["Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.", "Could not send step 3: the server could not be reached."] {
+        for error in [
+            "Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.",
+            "Could not start the upload: the chapter was changed by another upload meanwhile. Update again.",
+            "Could not send step 3: the server could not be reached.",
+        ] {
             assert!(update_can_be_tried_again(error), "{error}");
         }
+        // Changed before the upload started: Update is offered again, as for a change before the commit.
+        let mut p = edit_picker(Some(Some("0.1.55")), Some(vec![listed_tour("published")]));
+        p.refuse("Could not start the upload: the chapter was changed by another upload meanwhile. Update again.".into());
+        assert!(matches!(draw(&mut p, key_press(egui::Key::Enter)), Some(PickerOutcome::Update { .. })));
         // (What that dialog shows is `edit_picker`'s: opening it for real would ask a site.)
         let mut p = edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("published")]));
         p.refuse("Could not finish the upload: the chapter was changed by another upload meanwhile. Update again.".into());
