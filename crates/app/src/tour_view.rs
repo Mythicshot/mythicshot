@@ -3,8 +3,8 @@
 //!
 //! Items added here are pinned to the step's source frame (`Item::pin`), so
 //! they show only on that step and are written to `tour.json` as the layer.
-//! The canvas, tools and undo are the editor's own. Guide cards and Tour settings
-//! are tour data, not items; see `tour_cards`.
+//! The canvas, tools and undo are the editor's own. Guide cards and the Properties panel's
+//! settings are tour data, not items; see `tour_cards`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -57,8 +57,8 @@ impl PlanKey {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PulseUi {
     /// While Some, a press on the picture puts that step's pulse there and a drag moves it; the
-    /// tools wait. Ends on Esc, on another step or view, with "Where I clicked", and when the Tour
-    /// settings panel closes.
+    /// tools wait. Ends on Esc, on another step or view, with "Where I clicked", and when the
+    /// Properties panel closes.
     pub(crate) placing: Option<usize>,
     /// A drag is under way.
     dragging: bool,
@@ -106,7 +106,7 @@ pub struct TourState {
     pub dim_dragging: bool,
     /// The shown step's guide card: selection, typing, the spot being picked, the last removal.
     pub(crate) card: CardUi,
-    /// The Tour settings panel.
+    /// The Properties panel.
     pub(crate) settings: SettingsUi,
     /// Moving the shown step's pulse.
     pub(crate) pulse: PulseUi,
@@ -232,18 +232,47 @@ fn faded(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// The "Timeline | Tour" switch at the left of the bottom panel. Returns the view picked, if it changed.
+/// The two parts of the view switch, left to right: the view, its label and its hover text.
+pub(crate) const VIEW_PARTS: [(VideoView, &str, &str); 2] = [(VideoView::Timeline, "Timeline", "Trim, time and play the recording"), (VideoView::Tour, "Tour", "Give each tour step text, bubbles and a spotlight")];
+
+/// The "Timeline | Tour" switch at the left of the bottom panel: one control in two joined parts,
+/// the picked part filled in the primary colour. Returns the view picked, if it changed.
 pub(crate) fn view_switch(ui: &mut egui::Ui, view: VideoView) -> Option<VideoView> {
     let mut picked = None;
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        if ui.add(egui::Button::selectable(view == VideoView::Timeline, "Timeline")).on_hover_text("Trim, time and play the recording").clicked() {
-            picked = Some(VideoView::Timeline);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding;
+    let h = ui.spacing().interact_size.y;
+    let widths: Vec<f32> = VIEW_PARTS.iter().map(|(_, label, _)| ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), theme::TEXT).size().x) + 2.0 * pad.x + 8.0).collect();
+    let (whole, _) = ui.allocate_exact_size(vec2(widths.iter().sum(), h), Sense::hover());
+    let radius = theme::control_radius(h);
+    let mut x = whole.left();
+    for (i, ((part, label, tip), w)) in VIEW_PARTS.iter().zip(&widths).enumerate() {
+        let rect = Rect::from_min_size(pos2(x, whole.top()), vec2(*w, h));
+        x += w;
+        let resp = ui.interact(rect, ui.scope_id().with(("view-switch", i)), Sense::click());
+        let on = view == *part;
+        // Rounded only on the switch's own outer corners, so the two parts read as one control.
+        let corners = if i == 0 { egui::CornerRadius { nw: radius, sw: radius, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: radius, se: radius } };
+        let fill = if on {
+            theme::PRIMARY
+        } else if resp.hovered() {
+            theme::RAISED
+        } else {
+            theme::SURFACE
+        };
+        ui.painter().rect_filled(rect, corners, fill);
+        let color = if on { theme::ON_PRIMARY } else { theme::TEXT };
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, *label, font.clone(), color);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect, corners, Stroke::new(theme::FOCUS_WIDTH, theme::FOCUS), StrokeKind::Inside);
         }
-        if ui.add(egui::Button::selectable(view == VideoView::Tour, "Tour")).on_hover_text("Give each tour step text, bubbles and a spotlight").clicked() {
-            picked = Some(VideoView::Tour);
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), on, *label));
+        if resp.on_hover_text(*tip).clicked() {
+            picked = Some(*part);
         }
-    });
+    }
+    ui.painter().rect_stroke(whole, radius, Stroke::new(1.0, theme::BORDER_STRONG), StrokeKind::Inside);
+    ui.painter().vline(whole.left() + widths[0], whole.y_range(), Stroke::new(1.0, theme::BORDER_STRONG));
     picked.filter(|p| *p != view)
 }
 
@@ -325,7 +354,6 @@ enum TourAction {
     CopyToAll,
     Remove,
     Restore,
-    Settings,
 }
 
 /// `current` when it is the source frame of a planned step, else None
@@ -363,7 +391,7 @@ impl Editor {
     }
 
     /// The step whose pulse the picture takes now: only while the Tour view shows that very step
-    /// and the Tour settings panel, where its "Pulse" row is, is open.
+    /// and the Properties panel, where its "Pulse" row is, is open.
     pub(crate) fn placing_pulse(&self) -> Option<usize> {
         let v = self.video.as_ref()?;
         let src = v.tour.pulse.placing?;
@@ -532,7 +560,12 @@ impl Editor {
                 self.use_select_tool();
             }
         }
+        let open = self.prefs.tour_properties_open;
         let Some(v) = self.video.as_mut() else { return };
+        if view == VideoView::Tour {
+            // The Properties panel opens with the Tour view, unless it was closed last time.
+            v.tour.settings.open = open;
+        }
         if view == VideoView::Tour
             && let Ok(steps) = planned_steps(v)
         {
@@ -607,7 +640,8 @@ impl Editor {
         }
     }
 
-    /// The Tour view's bottom panel: the switch, "Step N of M", the chips and the step strip.
+    /// The Tour view's bottom panel: the switch and "Step N of M" at the left, the step's
+    /// actions at the right, and the step strip.
     pub(crate) fn tour_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(v) = self.video.as_mut() else { return };
@@ -644,23 +678,24 @@ impl Editor {
                     action = Some(TourAction::View(view));
                 }
                 if count > 0 {
+                    ui.add_space(4.0);
                     ui.label(RichText::new(format!("Step {} of {count}", v.tour_step + 1)).color(theme::MUTED));
                 }
-                if ui.add(egui::Button::selectable(v.tour.settings.open, "Tour settings")).on_hover_text("Card style, accent colour, zoom, cover, buttons, end card and autoplay").clicked() {
-                    action = Some(TourAction::Settings);
-                }
-                ui.separator();
-                let copy = ui.add_enabled(can_copy, egui::Button::new("Copy to all steps"));
-                if copy.on_hover_text("Put a copy of the selected text, bubble or spotlight on every step").on_disabled_hover_text("Select something on this step first").clicked() {
-                    action = Some(TourAction::CopyToAll);
-                }
-                let remove = ui.add_enabled(count > 1, egui::Button::new("Remove step"));
-                if remove.on_hover_text("Leave this step out of the tour").on_disabled_hover_text("A tour needs at least one step").clicked() {
-                    action = Some(TourAction::Remove);
-                }
-                if removed > 0 && ui.button(format!("Restore {removed} removed")).on_hover_text("Bring back every removed step").clicked() {
-                    action = Some(TourAction::Restore);
-                }
+                // The step's own actions at the right end; laid out from the right, so they read
+                // left to right as "Restore N removed", "Copy to all steps", "Remove step".
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let remove = ui.add_enabled(count > 1, egui::Button::new("Remove step"));
+                    if remove.on_hover_text("Leave this step out of the tour").on_disabled_hover_text("A tour needs at least one step").clicked() {
+                        action = Some(TourAction::Remove);
+                    }
+                    let copy = ui.add_enabled(can_copy, egui::Button::new("Copy to all steps"));
+                    if copy.on_hover_text("Put a copy of the selected text, bubble or spotlight on every step").on_disabled_hover_text("Select something on this step first").clicked() {
+                        action = Some(TourAction::CopyToAll);
+                    }
+                    if removed > 0 && ui.button(format!("Restore {removed} removed")).on_hover_text("Bring back every removed step").clicked() {
+                        action = Some(TourAction::Restore);
+                    }
+                });
             });
             ui.add_space(4.0);
             match &steps {
@@ -713,11 +748,6 @@ impl Editor {
                     v.edit.tour_removed.clear();
                 }
                 ctx.request_repaint();
-            }
-            Some(TourAction::Settings) => {
-                if let Some(v) = self.video.as_mut() {
-                    v.tour.settings.open = !v.tour.settings.open;
-                }
             }
         }
         self.tour_settings_panel(ui);

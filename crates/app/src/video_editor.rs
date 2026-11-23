@@ -1677,7 +1677,14 @@ impl Editor {
         self.video.as_ref().is_some_and(|v| v.picker.is_some() || v.publish_result.is_some())
     }
 
-    fn open_publish_picker(&mut self) {
+    /// "Publish tour…" can be used now: what makes the export panel's button usable.
+    pub(crate) fn can_publish_tour(&self) -> bool {
+        let Some(v) = self.video.as_ref() else { return false };
+        let tour_ok = crate::tour_view::planned_steps(v).is_ok();
+        publish_ui::publish_blocked(self.exporting(), tour_ok, &publish_ui::server(), &publish_ui::token_status(), publish_ui::token_site().as_deref()).is_none()
+    }
+
+    pub(crate) fn open_publish_picker(&mut self) {
         let title = self.title().to_string();
         let Some(v) = self.video.as_mut() else { return };
         if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
@@ -2645,6 +2652,310 @@ mod tests {
         assert!(crate::theme::checks::assert_texts_fit(&out, "the Tour view with Tour settings open") >= 5);
     }
 
+    // ---- The menu bar, the Properties panel and the Tour view's strip ----
+    use crate::menu_bar::Entry;
+
+    /// A recording editor with `prefs`, its keys the default ones: three clicks, so its tour has
+    /// three steps and the last frame.
+    fn video_editor_with(dir: &Path, prefs: crate::settings::EditorPrefs) -> Editor {
+        let s = Settings::default();
+        let events = vec![left(750, 40, 30), left(1250, 60, 50), left(2250, 120, 90)];
+        let mut ed = Editor::new_video(recorded(dir), events, Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), prefs).unwrap();
+        ed.keys = crate::hotkeys::EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        ed
+    }
+
+    /// One frame of `ed` in a window `size` points big.
+    fn sized(ed: &mut Editor, ctx: &egui::Context, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+        crate::editor_ui::tests::sized_frame(ed, ctx, size, events)
+    }
+
+    /// The Properties panel as drawn: the 304-point column of surface at the right, if it is there.
+    fn properties_panel(out: &egui::FullOutput) -> Option<egui::Rect> {
+        crate::theme::checks::fills(out).into_iter().find(|(r, c, _)| *c == crate::theme::SURFACE && (r.width() - 304.0).abs() <= 2.0 && r.height() > 200.0).map(|(r, ..)| r)
+    }
+
+    /// Where `text` is drawn inside `area`, if it is.
+    fn text_in(out: &egui::FullOutput, text: &str, area: egui::Rect) -> Option<egui::Rect> {
+        crate::share_ui::tests::shapes_of(out).into_iter().find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text && area.contains(t.pos + t.galley.rect.center().to_vec2()) => Some(t.galley.rect.translate(t.pos.to_vec2())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_recording_editors_menus_export_and_publish_and_offer_properties_only_in_the_tour_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
+        let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&crate::menu_bar::menus(&ed.menu_state()), e);
+        // It exports from its export panel, and has no save of its own.
+        assert!(!find(&ed, Entry::Save).enabled && find(&ed, Entry::Export).enabled);
+        // "Publish tour…" is usable exactly when the export panel's button is: never without a site and token, as in a test run.
+        assert_eq!(find(&ed, Entry::PublishTour).enabled, ed.can_publish_tour());
+        assert!(!ed.can_publish_tour());
+        // The Timeline view has no panel yet: the entry is there, disabled, as is the toolbar's button.
+        assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (false, Some(false)));
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let at = crate::share_ui::tests::text_rect(&out, crate::editor_ui::PROPERTIES).expect("the button");
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at.center());
+        assert!(!ed.properties_open() && !ed.prefs_changed);
+        // In the Tour view it is usable, and checked while the panel is open.
+        ed.set_view(VideoView::Tour);
+        assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (true, Some(true)));
+        assert!(find(&ed, Entry::Export).enabled && !find(&ed, Entry::Save).enabled);
+    }
+
+    #[test]
+    fn export_in_the_file_menu_opens_the_export_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        for tour in [false, true] {
+            let ctx = crate::theme::test_context();
+            let mut ed = video_editor_with(&tmp.path().join(format!("rec{tour}")), Default::default());
+            if tour {
+                ed.set_view(VideoView::Tour);
+            }
+            let closed = sized(&mut ed, &ctx, size, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&closed, "Export as…").is_none());
+            crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "File", "Export…");
+            sized(&mut ed, &ctx, size, vec![]);
+            let open = sized(&mut ed, &ctx, size, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&open, "Export as…").is_some() && crate::share_ui::tests::text_rect(&open, "Publish tour…").is_some(), "the export panel is open, tour {tour}");
+            assert!(ed.doc.items().is_empty() && !ed.exporting(), "nothing was exported by it");
+        }
+    }
+
+    #[test]
+    fn the_properties_panel_opens_with_the_tour_view_and_closing_or_opening_it_is_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = video_editor_with(&tmp.path().join("a"), Default::default());
+        assert!(ed.prefs.tour_properties_open, "open by default");
+        ed.set_view(VideoView::Tour);
+        assert!(ed.properties_open());
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = properties_panel(&out).expect("the panel is open, docked at the right");
+        assert!((panel.right() - size.x).abs() <= 1.0, "docked at the right edge: {panel:?}");
+        // The panel sits beside the picture, never over it: the canvas ends where the panel starts.
+        let canvas = crate::theme::checks::fills(&out).into_iter().filter(|(r, c, _)| *c == crate::theme::GROUND && r.height() > 200.0 && r.width() < size.x - 10.0).map(|(r, ..)| r).max_by(|a, b| a.area().total_cmp(&b.area())).expect("the canvas");
+        assert!(canvas.right() <= panel.left() + 1.0, "{canvas:?} and {panel:?}");
+        assert!(text_in(&out, crate::editor_ui::PROPERTIES, panel).is_some(), "the panel's heading");
+        // The toolbar's button is lit: the selection fill behind its label.
+        let label = crate::share_ui::tests::text_rect(&out, crate::editor_ui::PROPERTIES).unwrap();
+        assert!(label.right() > size.x - 120.0 && label.top() < 80.0, "the toolbar's button comes first, at the right: {label:?}");
+        assert!(crate::theme::checks::fills(&out).iter().any(|(r, c, _)| *c == crate::theme::SELECTION && r.contains(label.center()) && r.area() < 20_000.0), "the button is lit while the panel is open");
+
+        // Closed with the toolbar's button: gone, and remembered.
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), label.center());
+        assert!(!ed.properties_open() && !ed.prefs.tour_properties_open && ed.prefs_changed);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        assert!(properties_panel(&out).is_none(), "the panel is closed");
+        assert!(!crate::theme::checks::fills(&out).iter().any(|(r, c, _)| *c == crate::theme::SELECTION && r.contains(label.center()) && r.area() < 20_000.0), "and the button is not lit");
+        // Back to the Tour view later: still closed.
+        ed.set_view(VideoView::Timeline);
+        ed.set_view(VideoView::Tour);
+        assert!(!ed.properties_open());
+        // After a restart: the preference went through the settings file, and the next recording's Tour view opens without the panel.
+        let restarted = |prefs: &crate::settings::EditorPrefs| {
+            let mut settings = Settings::default();
+            settings.editor = prefs.clone();
+            let back: Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+            back.editor
+        };
+        let mut next = video_editor_with(&tmp.path().join("b"), restarted(&ed.prefs));
+        next.set_view(VideoView::Tour);
+        assert!(!next.properties_open(), "closed after a restart");
+
+        // Opened from the Edit menu: open, and remembered as open.
+        ed.prefs_changed = false;
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(ed.properties_open() && ed.prefs.tour_properties_open && ed.prefs_changed);
+        assert!(properties_panel(&sized(&mut ed, &ctx, size, vec![])).is_some());
+        let mut next = video_editor_with(&tmp.path().join("c"), restarted(&ed.prefs));
+        next.set_view(VideoView::Tour);
+        assert!(next.properties_open(), "open after a restart");
+
+        // Closed with the panel's own close button, at the right of its heading: remembered too.
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = properties_panel(&out).unwrap();
+        let heading = text_in(&out, crate::editor_ui::PROPERTIES, panel).unwrap();
+        let close = egui::pos2(panel.right() - 12.0 - 11.0, heading.center().y);
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), close);
+        assert!(!ed.properties_open() && !ed.prefs.tour_properties_open);
+        // And with the menu again, then closed again with the menu.
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(ed.properties_open());
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(!ed.properties_open() && !ed.prefs.tour_properties_open);
+    }
+
+    #[test]
+    fn closing_properties_with_its_button_ends_placing_the_pulse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = tour_editor(tmp.path());
+        let ctx = crate::theme::test_context();
+        click_text(&mut ed, &ctx, "A spot I pick");
+        assert!(ed.placing_pulse().is_some());
+        ed.toggle_properties();
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None, "the Pulse row went with the panel");
+        ed.toggle_properties();
+        tour_frame(&mut ed, &ctx, vec![]);
+        assert_eq!(ed.placing_pulse(), None, "and does not take it again by itself");
+    }
+
+    #[test]
+    fn the_properties_panel_shows_this_step_first_then_the_tour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        // Tall enough that the whole panel is in sight.
+        let size = egui::vec2(1280.0, 2400.0);
+        let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
+        ed.test_tour_view();
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = properties_panel(&out).expect("open");
+        let order = ["Properties", "This step", "Step 1", "Pulse", "Zoom to the spotlight", "Continue on a click anywhere", "Tour", "How the tour looks and plays. None of it is drawn into the step images.", "Card style", "Accent colour", "Zoom", "Spotlight", "Hotspot", "Backdrop", "Progress bar", "Cover card", "Always-on button", "End card", "Autoplay", "In this editor", "Animate hotspot"];
+        let ys: Vec<f32> = order.iter().map(|t| text_in(&out, t, panel).unwrap_or_else(|| panic!("the panel shows {t}")).top()).collect();
+        for (w, t) in ys.windows(2).zip(order.windows(2)) {
+            assert!(w[0] < w[1], "{} comes before {}: {ys:?}", t[0], t[1]);
+        }
+        // The two sections' titles are a size up from the headings inside them.
+        let height = |t: &str| text_in(&out, t, panel).unwrap().height();
+        assert!(height("This step") > height("Card style") && height("Tour") > height("Card style"));
+        assert!((height("This step") - height("Tour")).abs() < 0.5);
+        // The old name is gone from the window.
+        assert!(crate::share_ui::tests::text_rect(&out, "Tour settings").is_none());
+    }
+
+    #[test]
+    fn the_tour_strip_has_the_switch_and_the_step_count_at_the_left_and_the_steps_actions_at_the_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
+        ed.set_view(VideoView::Tour);
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let count = crate::tour_view::planned_steps(ed.video.as_ref().unwrap()).unwrap().len();
+        let step = format!("Step 1 of {count}");
+        let row: Vec<egui::Rect> = ["Timeline", "Tour", step.as_str(), "Copy to all steps", "Remove step"].iter().map(|t| {
+            crate::share_ui::tests::shapes_of(&out).into_iter().rev().find_map(|s| match s {
+                egui::Shape::Text(x) if x.galley.text() == *t && x.pos.y > size.y / 2.0 => Some(x.galley.rect.translate(x.pos.to_vec2())),
+                _ => None,
+            }).unwrap_or_else(|| panic!("the strip shows {t}"))
+        }).collect();
+        assert!(row.windows(2).all(|w| w[0].right() < w[1].left() && (w[0].center().y - w[1].center().y).abs() < 2.0), "one row, in this order: {row:?}");
+        assert!(row[0].left() < 40.0, "the switch at the left: {row:?}");
+        assert!(row[4].right() > size.x - 30.0, "Remove step at the right end: {row:?}");
+        assert!(row[3].left() - row[2].right() > 200.0, "the step's actions apart from the count: {row:?}");
+        assert!(crate::share_ui::tests::text_rect(&out, "Tour settings").is_none(), "no Tour settings button");
+        // One switch: the picked part filled in the primary colour, the other not, joined edge to edge.
+        let fills = crate::theme::checks::fills(&out);
+        let part = |r: egui::Rect| fills.iter().filter(|(f, ..)| f.contains(r.center()) && f.area() < 5_000.0).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).copied().unwrap();
+        let (timeline, tour) = (part(row[0]), part(row[1]));
+        assert_eq!((tour.1, timeline.1 == crate::theme::PRIMARY), (crate::theme::PRIMARY, false), "{timeline:?} {tour:?}");
+        assert!((timeline.0.right() - tour.0.left()).abs() < 0.5 && (timeline.0.height() - tour.0.height()).abs() < 0.5, "joined: {timeline:?} {tour:?}");
+        // Its parts switch the view, as the two buttons did.
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), row[0].center());
+        assert!(!ed.in_tour_view());
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let timeline_now = crate::share_ui::tests::shapes_of(&out).into_iter().rev().find_map(|s| match s {
+            egui::Shape::Text(x) if x.galley.text() == "Timeline" && x.pos.y > size.y / 2.0 => Some(x.galley.rect.translate(x.pos.to_vec2())),
+            _ => None,
+        }).unwrap();
+        assert!(crate::theme::checks::fills(&out).iter().any(|(f, c, _)| *c == crate::theme::PRIMARY && f.contains(timeline_now.center()) && f.area() < 5_000.0), "Timeline is the filled part now");
+        let tour_now = crate::share_ui::tests::shapes_of(&out).into_iter().rev().find_map(|s| match s {
+            egui::Shape::Text(x) if x.galley.text() == "Tour" && x.pos.y > size.y / 2.0 => Some(x.galley.rect.translate(x.pos.to_vec2())),
+            _ => None,
+        }).unwrap();
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), tour_now.center());
+        assert!(ed.in_tour_view());
+        // The same hover texts as the buttons had.
+        assert_eq!(crate::tour_view::VIEW_PARTS.map(|(_, label, tip)| (label, tip)), [("Timeline", "Trim, time and play the recording"), ("Tour", "Give each tour step text, bubbles and a spotlight")]);
+    }
+
+    /// Nothing sticks out of the toolbar or the Tour view's strip at the narrowest window the
+    /// editor allows, at 100%, 125% and 200%: the Timeline view, and the Tour view with the panel
+    /// open, with a guide card selected (the card's controls in the toolbar) and with a removed
+    /// step to restore (the strip's longest row). Nothing of the window lets the desktop through.
+    #[test]
+    fn nothing_sticks_out_of_the_toolbar_or_the_strip_at_the_narrowest_window_and_every_scale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let size = egui::vec2(crate::editor_ui::EDITOR_MIN_SIZE[0], crate::editor_ui::EDITOR_MIN_SIZE[1]);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for ppp in [1.0, 1.25, 2.0] {
+            for case in ["timeline", "tour", "card", "removed"] {
+                let ctx = crate::theme::test_context();
+                ctx.set_pixels_per_point(ppp);
+                let mut ed = video_editor_with(&tmp.path().join(format!("{case}{ppp}")), Default::default());
+                if case != "timeline" {
+                    ed.test_tour_view();
+                }
+                if case == "card" {
+                    ed.select(None);
+                    ed.select_card(true);
+                }
+                if case == "removed" {
+                    let steps = crate::tour_view::planned_steps(ed.video.as_ref().unwrap()).unwrap();
+                    let last = steps.last().unwrap().src;
+                    ed.video.as_mut().unwrap().edit.tour_removed.insert(last);
+                }
+                for _ in 0..2 {
+                    sized(&mut ed, &ctx, size, vec![]);
+                }
+                let out = sized(&mut ed, &ctx, size, vec![]);
+                let what = format!("{case} at {ppp}");
+                crate::editor_ui::tests::assert_toolbar_fits(&out, size, &what);
+                if case != "timeline" {
+                    // The strip's first row: every text inside the window, none on top of another.
+                    let row: Vec<(String, egui::Rect)> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| match s {
+                        egui::Shape::Text(x) => Some((x.galley.text().to_string(), x.visual_bounding_rect())),
+                        _ => None,
+                    }).filter(|(t, r)| r.center().y > size.y * 0.5 && (["Timeline", "Tour", "Copy to all steps", "Remove step"].contains(&t.as_str()) || t.starts_with("Step ") || t.starts_with("Restore "))).collect();
+                    assert!(row.len() >= 5, "{what}: {row:?}");
+                    for (i, (t, r)) in row.iter().enumerate() {
+                        assert!(window.contains_rect(*r), "{what}: {t:?} at {r:?} leaves the window");
+                        for (u, q) in &row[i + 1..] {
+                            assert!(!r.intersects(*q), "{what}: {t:?} at {r:?} is on top of {u:?} at {q:?}");
+                        }
+                    }
+                }
+                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 5);
+                assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| ed.ui(ui)), 0, "{what}");
+            }
+        }
+    }
+
+    /// Pictures for the owner, drawn without a window (see `snapshot`): the Tour view with the
+    /// Properties panel open, the same at the narrowest window, and the File and Edit menus open.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn snapshot_the_menus_and_the_properties_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, size) in [("tour-properties", crate::editor_ui::dialog_checks::WINDOW.size()), ("tour-properties-narrow", egui::vec2(crate::editor_ui::EDITOR_MIN_SIZE[0], crate::editor_ui::EDITOR_MIN_SIZE[1]))] {
+            let mut ed = video_editor_with(&tmp.path().join(name), Default::default());
+            ed.test_tour_view();
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), size, 1.5, 4, |ui| ed.ui(ui));
+            assert_eq!(crate::snapshot::save(&shot, name), 0, "{name}");
+        }
+        for menu in ["File", "Edit"] {
+            let ctx = crate::theme::test_context();
+            let size = crate::editor_ui::dialog_checks::WINDOW.size();
+            let mut ed = video_editor_with(&tmp.path().join(menu), Default::default());
+            ed.test_tour_view();
+            crate::menu_bar::tests::open_menu(&mut |events| sized(&mut ed, &ctx, size, events), menu);
+            let shot = crate::snapshot::shot(&ctx, size, 1.5, 2, |ui| ed.ui(ui));
+            let name = format!("menu-{}", menu.to_lowercase());
+            assert_eq!(crate::snapshot::save(&shot, &name), 0, "{name}");
+        }
+    }
+
     // ---- Moving a step's pulse in the Tour view ----
 
     /// One frame of `ed` with `events`, a second after the last, in the editor's own window size.
@@ -2655,8 +2966,8 @@ mod tests {
         out
     }
 
-    /// A press and release on the text `label`, as a user clicks it; Tour settings is scrolled to
-    /// its end first, where "This step" is, when the text is not in sight.
+    /// A press and release on the text `label`, as a user clicks it; the Properties panel is
+    /// scrolled to its end first when the text is not in sight.
     fn click_text(ed: &mut Editor, ctx: &egui::Context, label: &str) {
         let mut out = tour_frame(ed, ctx, vec![]);
         if crate::share_ui::tests::text_rect(&out, label).is_none() {

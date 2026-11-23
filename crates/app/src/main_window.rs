@@ -14,6 +14,7 @@ use eframe::egui::{self, RichText};
 
 use crate::theme;
 use crate::home_ui::{self, HomeState};
+use crate::menu_bar::{self, AppRequest, Entry};
 use crate::platform::{WindowId, WindowKind};
 use crate::project::ProjectKey;
 use crate::publish_ui::{self, TokenStatus};
@@ -195,13 +196,15 @@ pub struct Shared {
     pub edit_project: Option<ProjectKey>,
     /// A capture or recording is going on: the tiles are greyed out.
     pub busy: bool,
+    /// What the menu bar asked of the app, in order; the app takes them on its next frame.
+    pub app_requests: Vec<AppRequest>,
     /// The open window's title bar was told to be dark; a closed window is made anew, so it is told again.
     title_dark: bool,
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false, title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -215,6 +218,44 @@ impl Shared {
         }
         if out.edit_project.is_some() {
             self.edit_project = out.edit_project;
+        }
+    }
+
+    /// Show Preferences at `tab`, as the Preferences menu does: the page's own tab row would.
+    /// A shortcut waiting for its keys on another tab stops waiting, as a click on the tab stops it.
+    pub fn open_preferences(&mut self, tab: settings_ui::Tab) {
+        if self.nav.page() == Page::Preferences && self.prefs.state.tab != tab {
+            self.prefs.actions.push(UiAction::StopListening);
+        }
+        self.prefs.state.tab = tab;
+        self.nav.go(Page::Preferences);
+    }
+
+    /// What the menu bar shows in this window: no editor, so nothing to save, undo or copy, and
+    /// no Properties panel. Capture and record are greyed out like the Home tiles while busy.
+    fn menu_state(&self) -> menu_bar::State {
+        let settings = &self.prefs.settings;
+        let keys = menu_bar::Keys::from(|a| settings.binding(a).to_string(), |a| settings.editor_binding(a).to_string());
+        menu_bar::State { busy: self.busy, keys, ..Default::default() }
+    }
+
+    /// Run a menu entry clicked in this window.
+    fn menu_entry(&mut self, entry: Entry, out: &mut PageOut) {
+        match entry {
+            // As the Home tiles do: the window goes, then the capture starts.
+            Entry::CaptureRegion | Entry::RecordRegion if self.busy => {}
+            Entry::CaptureRegion => out.capture = Some(Command::Region),
+            Entry::RecordRegion => out.capture = Some(Command::Record),
+            Entry::OpenTours => out.go_to = Some(Page::Tours),
+            Entry::Workspace => out.go_to = Some(Page::Workspace),
+            Entry::Preferences(tab) => self.open_preferences(tab),
+            Entry::About => self.open_preferences(settings_ui::Tab::General),
+            Entry::CloseWindow => self.nav.close(),
+            entry => {
+                if let Some(request) = entry.app_request() {
+                    self.app_requests.push(request);
+                }
+            }
         }
     }
 
@@ -353,7 +394,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -372,6 +413,10 @@ pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
 fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn) {
     theme::window_background(ui);
     let mut out = PageOut::default();
+    let menu = s.menu_state();
+    if let Some(entry) = menu_bar::bar(ui, "main-menu-bar", &menu).picked {
+        s.menu_entry(entry, &mut out);
+    }
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
     egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, tours_conn, &mut out));
     s.take(out);
@@ -715,6 +760,151 @@ pub(crate) mod tests {
         }
     }
 
+    /// One frame of the window at `size` with `events`, its textures dropped.
+    fn window_frame(ctx: &egui::Context, s: &mut Shared, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(ctx.input(|i| i.time) + 0.5), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| window_ui(ui, s));
+        out.textures_delta.clear();
+        out
+    }
+
+    #[test]
+    fn the_menu_bar_runs_along_the_top_with_file_edit_preferences_and_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Home);
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        window_frame(&ctx, &mut s, size, vec![]);
+        let out = window_frame(&ctx, &mut s, size, vec![]);
+        let at: Vec<egui::Rect> = menu_bar::TITLES.iter().map(|t| crate::share_ui::tests::text_rect(&out, t).unwrap_or_else(|| panic!("{t}"))).collect();
+        assert!(at.windows(2).all(|w| w[0].right() < w[1].left() && (w[0].center().y - w[1].center().y).abs() < 0.5), "left to right on one line: {at:?}");
+        assert!(at[0].left() < NAV_WIDTH / 2.0, "from the left edge, above the left menu: {at:?}");
+        // Above everything else: the left menu's first page is below it.
+        let home = crate::share_ui::tests::text_rect(&out, "Home").unwrap();
+        assert!(at.iter().all(|r| r.bottom() < home.top()), "{at:?} above {home:?}");
+    }
+
+    #[test]
+    fn the_main_windows_menus_offer_no_editing_and_no_properties() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        let menus = menu_bar::menus(&s.menu_state());
+        assert_eq!(crate::menu_bar::tests::labels(&menus[1]), vec![vec!["Undo", "Redo"], vec!["Copy", "Delete"]], "no Properties panel here");
+        for e in [Entry::Save, Entry::Export, Entry::PublishTour, Entry::Undo, Entry::Redo, Entry::Copy, Entry::Delete] {
+            assert!(!crate::menu_bar::tests::find(&menus, e).enabled, "{e:?} is disabled in the main window");
+        }
+        for e in [Entry::CaptureRegion, Entry::RecordRegion, Entry::OpenTours, Entry::CloseWindow, Entry::Quit] {
+            assert!(crate::menu_bar::tests::find(&menus, e).enabled, "{e:?}");
+        }
+        // The shortcuts are the ones Preferences > Hotkeys shows.
+        assert_eq!(crate::menu_bar::tests::find(&menus, Entry::CaptureRegion).shortcut, "PrtSc");
+        assert_eq!(crate::menu_bar::tests::find(&menus, Entry::RecordRegion).shortcut, "Shift+PrtSc");
+        s.prefs.settings.hotkeys.insert(crate::hotkeys::Action::CaptureRegion, "control+shift+KeyA".into());
+        assert_eq!(crate::menu_bar::tests::find(&menu_bar::menus(&s.menu_state()), Entry::CaptureRegion).shortcut, "Ctrl+Shift+A");
+        // While something is being captured, capture and record are greyed out like the Home tiles.
+        s.busy = true;
+        let busy = menu_bar::menus(&s.menu_state());
+        assert!(!crate::menu_bar::tests::find(&busy, Entry::CaptureRegion).enabled && !crate::menu_bar::tests::find(&busy, Entry::RecordRegion).enabled);
+    }
+
+    #[test]
+    fn each_menu_entry_does_what_the_windows_own_controls_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let fresh = |page: Page| {
+            let mut s = shared(tmp.path());
+            s.nav.request(page);
+            s.nav.take_focus();
+            s
+        };
+        let choose = |s: &mut Shared, menu: &str, entry: &str| crate::menu_bar::tests::choose(&mut |events| window_frame(&ctx, s, size, events), menu, entry);
+
+        // Preferences: the page, at the section chosen; a section is a tab of the page.
+        for tab in settings_ui::Tab::ALL {
+            let mut s = fresh(Page::Home);
+            choose(&mut s, "Preferences", tab.label());
+            assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, tab));
+            assert!(s.nav.is_open() && !s.nav.take_focus(), "the same window, no focus change");
+        }
+        // From one tab to another stops a shortcut being recorded, as a click on the tab does.
+        let mut s = fresh(Page::Preferences);
+        s.prefs.state.tab = settings_ui::Tab::Hotkeys;
+        choose(&mut s, "Preferences", "General");
+        assert!(matches!(s.prefs.actions.as_slice(), [UiAction::StopListening]), "a shortcut being recorded stops");
+        // The Workspace page, Tours, and About on Preferences > General, where the version is.
+        let mut s = fresh(Page::Home);
+        choose(&mut s, "Preferences", "Workspace");
+        assert_eq!(s.nav.page(), Page::Workspace);
+        choose(&mut s, "File", "Open tours");
+        assert_eq!(s.nav.page(), Page::Tours);
+        s.prefs.state.tab = settings_ui::Tab::Output;
+        choose(&mut s, "Help", "About Mythicshot");
+        assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, settings_ui::Tab::General));
+        let version = window_frame(&ctx, &mut s, size, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&version, concat!("Version ", env!("CARGO_PKG_VERSION"))).is_some(), "the version is on the page");
+
+        // Capture region and Record region: the window goes, then the capture, as from the Home tiles.
+        for (entry, cmd) in [("Capture region", Command::Region), ("Record region", Command::Record)] {
+            let mut s = fresh(Page::Tours);
+            choose(&mut s, "File", entry);
+            assert_eq!(s.capture, Some(cmd), "{entry}");
+            assert!(s.app_requests.is_empty());
+            // Not while something is being captured.
+            let mut s = fresh(Page::Home);
+            s.busy = true;
+            choose(&mut s, "File", entry);
+            assert_eq!(s.capture, None, "{entry} while busy");
+        }
+        // Close window closes only the window; Quit and the help go to the app, in order.
+        let mut s = fresh(Page::Home);
+        for (menu, entry) in [("File", "Quit Mythicshot"), ("Help", "Troubleshooting"), ("Help", "Open the log folder"), ("Help", "Download page")] {
+            choose(&mut s, menu, entry);
+        }
+        assert_eq!(s.app_requests, vec![AppRequest::Run(Command::Exit), AppRequest::Troubleshooting, AppRequest::LogFolder, AppRequest::DownloadPage]);
+        assert!(s.nav.is_open());
+        choose(&mut s, "File", "Close window");
+        assert!(!s.nav.is_open());
+        // The editing entries do nothing here.
+        let mut s = fresh(Page::Home);
+        for entry in ["Undo", "Redo", "Copy", "Delete"] {
+            choose(&mut s, "Edit", entry);
+        }
+        assert!(s.app_requests.is_empty() && s.capture.is_none() && s.nav.is_open() && s.nav.page() == Page::Home);
+    }
+
+    /// The menu bar and every open menu fit the window at its smallest size, at 100%, 125% and
+    /// 200%: no label sticks out of its button or row or leaves the window, and nothing of the
+    /// window lets the desktop through.
+    #[test]
+    fn the_menus_fit_the_smallest_window_at_every_scale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let size = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
+        for ppp in [1.0, 1.25, 2.0] {
+            for menu in menu_bar::TITLES {
+                let ctx = crate::theme::test_context();
+                ctx.set_pixels_per_point(ppp);
+                let mut s = shared(tmp.path());
+                s.nav.request(Page::Home);
+                let out = crate::menu_bar::tests::open_menu(&mut |events| window_frame(&ctx, &mut s, size, events), menu);
+                let what = format!("{menu} at {ppp}");
+                let shown = menu_bar::menus(&s.menu_state()).into_iter().find(|m| m.title == menu).unwrap();
+                crate::menu_bar::tests::assert_menu_fits(&out, &shown, egui::Rect::from_min_size(egui::Pos2::ZERO, size), &what);
+            }
+            // With the menus closed, every label of the window fits, the bar's titles too.
+            let ctx = crate::theme::test_context();
+            ctx.set_pixels_per_point(ppp);
+            let mut s = shared(tmp.path());
+            s.nav.request(Page::Home);
+            window_frame(&ctx, &mut s, size, vec![]);
+            let out = window_frame(&ctx, &mut s, size, vec![]);
+            assert!(crate::theme::checks::assert_texts_fit(&out, &format!("the window at {ppp}")) >= 4);
+            crate::menu_bar::tests::assert_inside(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, size), &format!("the window at {ppp}"));
+            assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| window_ui(ui, &mut s)), 0, "at {ppp}");
+        }
+    }
+
     #[test]
     fn the_menu_names_the_four_pages_in_order() {
         assert_eq!(Page::ALL.map(Page::label), ["Home", "Tours", "Workspace", "Preferences"]);
@@ -792,7 +982,7 @@ pub(crate) mod tests {
     }
 
     /// Every page, and every tab of Preferences, paints the whole window opaque in the theme's
-    /// colours: the menu on surface, the page on ground.
+    /// colours: the menu bar and the menu on surface, the page on ground.
     #[test]
     fn every_page_paints_the_whole_window_opaque() {
         let tmp = tempfile::tempdir().unwrap();
@@ -815,8 +1005,12 @@ pub(crate) mod tests {
             crate::theme::checks::assert_window_opaque(&out, window, &format!("{page:?} {tab:?}"));
             crate::theme::checks::assert_texts_fit(&out, &format!("{page:?} {tab:?}"));
             let fills = crate::theme::checks::fills(&out);
-            assert!(fills.iter().any(|(r, c, _)| *c == theme::SURFACE && r.height() >= window.height() - 1.0), "{page:?}: the menu on surface");
-            assert!(fills.iter().any(|(r, c, _)| *c == theme::GROUND && r.height() >= window.height() - 1.0), "{page:?}: the page on ground");
+            // The menu bar across the top on surface; under it, from there to the bottom, the
+            // left menu on surface and the page on ground.
+            let bar = fills.iter().find(|(r, c, _)| *c == theme::SURFACE && r.top() <= window.top() + 0.5 && r.width() >= window.width() - 1.0 && r.height() < 40.0).unwrap_or_else(|| panic!("{page:?}: the menu bar on surface"));
+            let below = window.height() - bar.0.height();
+            assert!(fills.iter().any(|(r, c, _)| *c == theme::SURFACE && r.height() >= below - 1.0 && r.bottom() >= window.bottom() - 0.5 && r.width() < window.width() / 2.0), "{page:?}: the menu on surface");
+            assert!(fills.iter().any(|(r, c, _)| *c == theme::GROUND && r.height() >= below - 1.0 && r.bottom() >= window.bottom() - 0.5), "{page:?}: the page on ground");
         }
         // Filled in pixel by pixel at 125% scaling: not one pixel lets the desktop through, not
         // even at the seam where the menu meets the page.

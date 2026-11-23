@@ -304,6 +304,9 @@ pub struct EditorPrefs {
     pub tour_theme: SavedTheme,
     /// The Tour view pulses the hotspot as the tour does; off draws it still.
     pub tour_animate_hotspot: bool,
+    /// The Tour view's Properties panel is open: it opens with the Tour view until it is closed,
+    /// and stays closed (in every recording) until it is opened again.
+    pub tour_properties_open: bool,
     /// "Add to site": the site folder and the site's title used last, empty until a tour is added.
     pub site_folder: String,
     pub site_title: String,
@@ -335,7 +338,7 @@ impl Default for SavedTheme {
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true, site_folder: String::new(), site_title: String::new() }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true, tour_properties_open: true, site_folder: String::new(), site_title: String::new() }
     }
 }
 
@@ -853,6 +856,25 @@ crop = \"KeyX\"
         s.editor.tour_animate_hotspot = false;
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert!(!back.editor.tour_animate_hotspot);
+    }
+
+    #[test]
+    fn the_properties_panel_is_open_by_default_and_closing_or_opening_it_is_remembered() {
+        let old: Settings = toml::from_str("[editor]
+tool = \"text\"
+").unwrap();
+        assert!(old.editor.tour_properties_open, "a file from before the panel was remembered: open");
+        assert!(Settings::default().editor.tour_properties_open);
+        // Closed, saved, read back as at the next start: closed. Opened again: open.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        for open in [false, true] {
+            let mut s = Settings::default();
+            s.editor.tour_properties_open = open;
+            std::fs::write(&path, toml::to_string_pretty(&s).unwrap()).unwrap();
+            let back: Settings = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(back.editor.tour_properties_open, open);
+        }
     }
 
     #[test]

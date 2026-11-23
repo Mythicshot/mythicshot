@@ -19,6 +19,7 @@ mod icons;
 mod input;
 mod live_draw;
 mod main_window;
+mod menu_bar;
 mod overlay;
 mod placement;
 mod password;
@@ -794,16 +795,22 @@ impl App {
         }
     }
 
+    /// Show a new editor window. Its menu bar shows the global shortcuts beside Capture region and Record region.
+    fn add_editor(&mut self, mut editor: editor_ui::Editor) {
+        editor.global_keys = self.settings.hotkeys.clone();
+        self.editors.push((editor_ui::EditorWindow::new(editor), true));
+    }
+
     fn open_editor(&mut self, img: image::RgbaImage, title: String) {
         let editor = editor_ui::Editor::new(img, title.clone(), self.settings.editor_keys.clone(), self.settings.dest_context(&title), self.settings.editor.clone());
-        self.editors.push((editor_ui::EditorWindow::new(editor), true));
+        self.add_editor(editor);
     }
 
     /// Open a recording in the editor's video mode (the GIF editor).
     fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, items: Vec<mythicshot_editor::Item>, title: String) {
         let s = &self.settings;
         match editor_ui::Editor::new_video(rec.clone(), events, items, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.editor.clone()) {
-            Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Ok(editor) => self.add_editor(editor),
             Err(e) => {
                 rec.delete_files();
                 self.notify(format!("Could not open the recording: {e}"));
@@ -820,7 +827,7 @@ impl App {
         let store = project::Store::default_root().map(project::Store::at);
         if let Some(opened) = open_at_once(store.as_ref(), &key, &self.settings) {
             match opened {
-                Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+                Ok(editor) => self.add_editor(editor),
                 Err(sentence) => self.edit_failed(&key, sentence),
             }
             return;
@@ -851,7 +858,7 @@ impl App {
             s.tours.open_ended(&key);
         }
         match after_open(cancelled, result).map(|ready| ready.and_then(|loaded| open_loaded(loaded, &self.settings))) {
-            Some(Ok(editor)) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Some(Ok(editor)) => self.add_editor(editor),
             Some(Err(sentence)) => self.edit_failed(&key, sentence),
             None => {}
         }
@@ -877,6 +884,11 @@ impl App {
 
     fn show_editors(&mut self, ctx: &egui::Context) {
         self.collect_editor_prefs();
+        // What the editors' menu bars asked for since the last frame, in the order they asked.
+        let requests: Vec<menu_bar::AppRequest> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok().map(|mut e| std::mem::take(&mut e.app_requests))).flatten().collect();
+        for request in requests {
+            self.menu_request(ctx, request);
+        }
         self.editors.retain(|(w, _)| !w.is_closed());
         for (w, first) in &mut self.editors {
             w.show(ctx, self.icon.clone(), std::mem::take(first));
@@ -914,6 +926,49 @@ impl App {
         if self.prefs_save_at.is_some_and(|t| Instant::now() >= t) {
             self.prefs_save_at = None;
             self.save_settings();
+        }
+    }
+
+    /// Do what a window's menu bar asked of the app. Showing the main window is held back while
+    /// something is being captured, as from the tray menu.
+    fn menu_request(&mut self, ctx: &egui::Context, request: menu_bar::AppRequest) {
+        use menu_bar::AppRequest;
+        match request {
+            AppRequest::Run(cmd) => {
+                self.trigger = "menu bar";
+                self.run(ctx, cmd);
+            }
+            AppRequest::Page(page) => {
+                if tray::allowed(Command::OpenApp, self.activity()) {
+                    self.window_request = Some(main_window::Request::Page(page));
+                }
+            }
+            AppRequest::Preferences(tab) => {
+                if tray::allowed(Command::Preferences, self.activity()) {
+                    if let Ok(mut s) = self.window.lock() {
+                        s.open_preferences(tab);
+                    }
+                    self.window_request = Some(main_window::Request::Page(main_window::Page::Preferences));
+                }
+            }
+            AppRequest::LogFolder => {
+                // `crash.log` and `capture.log` are beside the settings file.
+                if let Some(dir) = Settings::path().parent() {
+                    platform::open_folder(dir);
+                }
+            }
+            AppRequest::Troubleshooting => {
+                // The app points nowhere else for help: the README the installer puts beside the program.
+                match std::env::current_exe().map(|exe| menu_bar::readme_beside(&exe)) {
+                    Ok(readme) if readme.is_file() => platform::open_path(&readme),
+                    _ => self.notify(menu_bar::NO_README.into()),
+                }
+            }
+            AppRequest::DownloadPage => {
+                if let Err(e) = dest::open_url(menu_bar::DOWNLOAD_PAGE) {
+                    self.notify(e);
+                }
+            }
         }
     }
 
@@ -983,6 +1038,7 @@ impl App {
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
                 e.keys = self.settings.editor_keys.clone();
+                e.global_keys = self.settings.hotkeys.clone();
                 e.set_output(self.settings.dest_context(""));
             }
         }
@@ -1125,13 +1181,16 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture, edit_project) = {
+        let (actions, edited, tab, capture, edit_project, requests) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take())
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests))
         };
+        for request in requests {
+            self.menu_request(ctx, request);
+        }
         self.settings_state.tab = tab;
         let edited = edited.unwrap_or_else(|| self.settings.clone());
         // Which app the user is in, for a capture started from the main window.

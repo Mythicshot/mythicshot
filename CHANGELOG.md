@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.26 (2026-11-22)
+
+- The main window and every editor window have a menu bar at the top: File, Edit, Preferences and Help. Its entries are what the app already does (capture and record a region, open the Tours page, save, export, publish a tour, undo, redo, copy, delete, each Preferences section, the Workspace page, the README's troubleshooting help, the log folder, the download page), with their shortcuts beside them; an entry that does not apply is greyed out. About Mythicshot opens Preferences › General, where the version is.
+- "Properties", at the right end of the editor's toolbar, opens and closes the Tour view's settings panel, which is now called Properties. It opens with the Tour view, and once closed it stays closed, also after a restart, until it is opened again. In the Timeline view and the image editor the button is greyed out for now.
+- The Properties panel shows the shown step's settings first, under "This step", then the tour's, under "Tour". Every setting does what it did.
+- The Tour view's strip: "Timeline | Tour" is one switch in two parts, the picked part filled; "Step N of M" follows it, and "Copy to all steps" and "Remove step" are at the right end. The "Tour settings" button is gone from the strip.
+- On a narrow editor window, the toolbar's row scrolls under the Properties button instead of pushing it off the window.
+
 ## 0.2.25 (2026-11-22)
 
 - The countdown before a recording is a large number in the recording bar, where the timer then runs. It is no longer drawn over the recorded area.

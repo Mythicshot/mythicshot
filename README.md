@@ -14,6 +14,17 @@ Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Li
 - **GIF editor:** trim, delete frames, speed, reverse, crop, annotations with frame ranges on a timeline, export to GIF, APNG, MP4 or WebM (the last two need ffmpeg on the PATH).
 - **Settings:** every global and editor shortcut can be rebound; settings live in one `settings.toml` you can copy to another PC.
 
+## Menus
+
+The main window and every editor window have a menu bar at the top: File, Edit, Preferences and Help. The menus are another way to reach what the app already does, with each entry's shortcut beside it; an entry that does not apply in that window, or not now, is shown greyed out.
+
+- **File:** Capture region and Record region (as their hotkeys; from the main window, the window closes first, as with its tiles), Open tours (the main window's Tours page), Save (the image editor), Export… (opens the recording editor's export panel), Publish tour… (when the export panel's button can be used), Close window and Quit Mythicshot.
+- **Edit:** Undo, Redo, Copy and Delete, as the editor's own keys and buttons do, and Properties, which opens or closes the Properties panel (see below).
+- **Preferences:** General, Output and Hotkeys open the main window's Preferences page at that section; Workspace opens the Workspace page, where the site and its sign-in are.
+- **Help:** Troubleshooting opens this README (installed beside the program), Open the log folder opens the folder with `crash.log` and `capture.log`, Download page opens [mythicshot.com/download](https://mythicshot.com/download/) in your browser, and About Mythicshot opens Preferences › General, where the version is shown.
+
+The menus open with a click, or with Tab to reach them and Enter or Space; the arrow keys move inside an open menu and Esc closes it. There are no Alt+letter keys. The menus never take an editor's own shortcuts.
+
 ## Tour export
 
 A tour bundle turns a recording into a click-through walkthrough: one image per left click, with the place you clicked marked as a hotspot, plus the last frame as a closing step.
@@ -42,7 +53,7 @@ A tour is written into a temporary folder and swapped in only once complete, so 
 
 ## Tour view
 
-The Tour view is the second mode of the recording editor's bottom panel ("Timeline | Tour"): it shows the tour's steps as a strip of thumbnails, and anything you draw there belongs to the selected step only.
+The Tour view is the second mode of the recording editor's bottom panel, picked with the two-part "Timeline | Tour" switch at its left: it shows the tour's steps as a strip of thumbnails, and anything you draw there belongs to the selected step only. Above the thumbnails, "Step N of M" follows the switch, and the step's actions are at the right end.
 
 Text, speech bubbles and a spotlight (everything outside its box is darkened; one strength, 10 to 90 percent, for the whole tour) are saved in `tour.json` as a layer, so they stay editable after export.
 
@@ -52,13 +63,13 @@ Blur, pixelate and every other shape you draw on a step is saved into that step'
 
 Items drawn in the Tour view are not part of GIF, APNG, MP4 or WebM exports and never show in Timeline mode.
 
-## Guide cards and tour settings
+## Guide cards and the Properties panel
 
 A guide card is the small panel a tour shows on a step: a title, a body (line breaks and `**bold**` work) and a button, with "‹ 2 of 6" filled in for you. Pick the Guide card tool in the Tour view and click the picture to give the shown step its card (one per step), then type straight onto the card.
 
 The card places itself beside the hotspot, the step's spotlight or a spot you pick ("Points at": Hotspot, A spot I pick or Nothing), by the same rule the preview uses, so it never covers the bright box; it is not dragged. "Remove card" takes it away and "Card removed · Undo" in the status bar brings it back.
 
-"Tour settings", beside "Step N of M", holds the card style (Dark, Light, Compact bar, or Match viewer, which follows the viewer's light or dark system setting), the accent colour, zoom, the spotlight's soft edge and strength, the hotspot style, the backdrop, the progress bar, a cover card with an optional logo, an always-on button, an end card, autoplay, and for the shown step "Zoom to the spotlight", "Continue on a click anywhere" and "Pulse": "Where I clicked" keeps the step's pulse where the recording was clicked, and with "A spot I pick" you drag the pulse on the picture (or click where it should go) and "Put it back where I clicked" returns it. The moved pulse is the step's click in the preview and the tour: the hotspot, a card on the hotspot, the zoom and the spot a viewer clicks to go on. The style, accent and zoom you used last are where the next recording's tour starts.
+"Properties", at the right end of the editor's toolbar (or Edit › Properties), opens and closes the Properties panel, docked at the right of the picture. It opens with the Tour view; once you close it, it stays closed in every recording until you open it again. In the Timeline view and the image editor the button is there but greyed out, for now. The panel holds first "This step", for the shown step: "Pulse", "Zoom to the spotlight" and "Continue on a click anywhere" ("Where I clicked" keeps the step's pulse where the recording was clicked, and with "A spot I pick" you drag the pulse on the picture, or click where it should go, while the panel is open; "Put it back where I clicked" returns it). Then "Tour", for the whole tour: the card style (Dark, Light, Compact bar, or Match viewer, which follows the viewer's light or dark system setting), the accent colour, zoom, the spotlight's soft edge and strength, the hotspot style, the backdrop, the progress bar, a cover card with an optional logo, an always-on button, an end card and autoplay. The moved pulse is the step's click in the preview and the tour: the hotspot, a card on the hotspot, the zoom and the spot a viewer clicks to go on. The style, accent and zoom you used last are where the next recording's tour starts.
 
 Button links must be plain `https://` addresses; anything else shows a warning beside the field and is not saved into the tour.
 
@@ -157,7 +168,7 @@ The app icon (`assets/mythicshot.ico`) and the two marks in the wizard's picture
 
 Panics are written to `crash.log` beside the settings file (`%AppData%\Mythicshot\config\` on Windows; Preferences › "Open settings folder" opens it).
 
-Every region capture (Region, Record GIF › Region, and Last region when there is none yet) adds a few lines to `capture.log` in the same folder: when it started and what started it (hotkey, hotkey (hook) for Print Screen taken by the keyboard hook, tray menu, tray click, app window), every monitor's rectangle in pixels, its scale factor and which is primary, the desktop's bounds, the scale the selector had before the capture and where its window was asked to go, then for its first three frames where the window really was (rectangle, client area, DPI, shown or hidden), the scale and content area it drew with, the pointer as Windows reports it next to the pixel the selector took to be under it, and whether the picture was uploaded in that frame; the frame after which the window was shown, and whether that was because it was in place or because it did not settle in time ("NOT settled, shown anyway"); whether it got the keyboard focus with a plain request; and at the end the selection in points and in pixels and the rectangle cropped. Lines also say when the window was uncloaked (or that it could not be, in which case it is hidden and the capture cancelled) and when placement stopped with the window not where it was asked to go. A line starting with `--` says where the hidden selector window was put over the desktop at start-up and after a recording: it covers the desktop from start-up so its scale is settled before the first capture, which means Mythicshot holds a drawing surface the size of the desktop all the time. If a capture looks wrong, especially the first one after Mythicshot starts, send that file. It holds no picture, window titles or file paths, and stays under 256 KB: a full file becomes `capture.old.log` and a new one starts.
+Every region capture (Region, Record GIF › Region, and Last region when there is none yet) adds a few lines to `capture.log` in the same folder: when it started and what started it (hotkey, hotkey (hook) for Print Screen taken by the keyboard hook, tray menu, tray click, app window, menu bar for an editor's File menu), every monitor's rectangle in pixels, its scale factor and which is primary, the desktop's bounds, the scale the selector had before the capture and where its window was asked to go, then for its first three frames where the window really was (rectangle, client area, DPI, shown or hidden), the scale and content area it drew with, the pointer as Windows reports it next to the pixel the selector took to be under it, and whether the picture was uploaded in that frame; the frame after which the window was shown, and whether that was because it was in place or because it did not settle in time ("NOT settled, shown anyway"); whether it got the keyboard focus with a plain request; and at the end the selection in points and in pixels and the rectangle cropped. Lines also say when the window was uncloaked (or that it could not be, in which case it is hidden and the capture cancelled) and when placement stopped with the window not where it was asked to go. A line starting with `--` says where the hidden selector window was put over the desktop at start-up and after a recording: it covers the desktop from start-up so its scale is settled before the first capture, which means Mythicshot holds a drawing surface the size of the desktop all the time. If a capture looks wrong, especially the first one after Mythicshot starts, send that file. It holds no picture, window titles or file paths, and stays under 256 KB: a full file becomes `capture.old.log` and a new one starts.
 
 ## Privacy
 
