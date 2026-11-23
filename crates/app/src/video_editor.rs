@@ -16,7 +16,7 @@ use mythicshot_recording::ffmpeg::Found;
 use mythicshot_recording::{FrameReader, Recording};
 
 use crate::theme::{self, Strong as _};
-use crate::editor_ui::{Editor, Place, in_row, row_label, switch};
+use crate::editor_ui::{Editor, Place, applied, in_row, row_label, switch};
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
 use crate::publish::{Published, Target, access::Access, share};
@@ -1905,7 +1905,8 @@ impl Editor {
             }
         });
         ui.add_space(6.0);
-        output_controls(ui, v);
+        let format = v.format;
+        output_controls(ui, v, format);
         let (tour_line, tour_ok) = match tour::plan_steps(&v.rec, &v.edit, &v.events) {
             Ok(steps) => (tour_steps_label(&steps), true),
             Err(e) => (e, false),
@@ -2050,7 +2051,7 @@ impl Editor {
                 let t = v.rec.frames[v.current].t_ms as f64 / 1000.0;
                 ui.label(RichText::new(format!("Frame {} / {} · {t:05.2} s", v.current + 1, v.rec.frames.len())).monospace().color(theme::MUTED));
                 ui.separator();
-                frame_buttons(ui, v);
+                frame_buttons(ui, v, Place::Toolbar);
                 ui.separator();
                 speed_choice(ui, "speed", &mut v.edit.speed);
                 switch(ui, Place::Toolbar, &mut v.edit.reverse, "Reverse");
@@ -2196,12 +2197,13 @@ impl Editor {
     /// each control the very one of the controls row or the export panel. True when something changed.
     pub(crate) fn timeline_properties(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(v) = self.video.as_mut() else { return false };
-        // As the export panel does: a format that needs ffmpeg gives way when there is none.
-        v.format = usable_format(v.format, mythicshot_recording::ffmpeg::found());
-        let before = timeline_settings(v);
+        // A format that needs ffmpeg shows as GIF while there is none, as on export; the choice
+        // itself is left as it is, and nothing is remembered by looking.
+        let shown = usable_format(v.format, ffmpeg_found());
+        let (before, output_before) = (timeline_settings(v), output_settings(v));
         crate::tour_cards::section(ui, "This frame");
         ui.label(RichText::new(format!("Frame {} of {}", v.current + 1, v.rec.frames.len())).color(theme::MUTED));
-        ui.horizontal_wrapped(|ui| frame_buttons(ui, v));
+        ui.horizontal_wrapped(|ui| frame_buttons(ui, v, Place::Panel));
         crate::tour_cards::section(ui, "Playback");
         ui.horizontal(|ui| {
             row_label(ui, "Speed");
@@ -2211,9 +2213,13 @@ impl Editor {
         crate::tour_cards::section(ui, "Shown on the recording");
         overlay_controls(ui, &mut v.edit.overlays, Place::Panel);
         crate::tour_cards::section(ui, "Output");
-        output_controls(ui, v);
-        let changed = timeline_settings(v) != before;
-        self.remember_export();
+        output_controls(ui, v, shown);
+        let output_changed = output_settings(v) != output_before;
+        let changed = output_changed || timeline_settings(v) != before;
+        // Only a change to the output is the export panel's to remember, and only when it is made.
+        if output_changed {
+            self.remember_export();
+        }
         changed
     }
 
@@ -2275,15 +2281,15 @@ fn overlay_controls(ui: &mut egui::Ui, o: &mut OverlayStyle, place: Place) {
 
 /// Trim to the shown frame from either end, and delete or restore it: the Timeline view's
 /// controls row and the panel's "This frame".
-fn frame_buttons(ui: &mut egui::Ui, v: &mut VideoState) {
-    if ui.button("Start here").on_hover_text("Trim: keep from this frame").clicked() {
+fn frame_buttons(ui: &mut egui::Ui, v: &mut VideoState, place: Place) {
+    if applied(ui.button("Start here").on_hover_text("Trim: keep from this frame"), place) {
         v.edit.trim.0 = v.current.min(v.edit.trim.1);
     }
-    if ui.button("End here").on_hover_text("Trim: keep up to this frame").clicked() {
+    if applied(ui.button("End here").on_hover_text("Trim: keep up to this frame"), place) {
         v.edit.trim.1 = v.current.max(v.edit.trim.0);
     }
     let deleted = v.edit.deleted.contains(&v.current);
-    if ui.button(if deleted { "Restore frame" } else { "Delete frame" }).clicked() {
+    if applied(ui.button(if deleted { "Restore frame" } else { "Delete frame" }), place) {
         if deleted {
             v.edit.deleted.remove(&v.current);
         } else {
@@ -2301,9 +2307,9 @@ fn speed_choice(ui: &mut egui::Ui, salt: &str, speed: &mut f32) {
     });
 }
 
-/// The output's scale, the quality or fps of the chosen format, looping where the format loops, and
-/// what comes out: the export panel's and the panel's "Output".
-fn output_controls(ui: &mut egui::Ui, v: &mut VideoState) {
+/// The output's scale, the quality or fps of `format`, looping where it loops, and what comes out:
+/// the export panel's and the panel's "Output".
+fn output_controls(ui: &mut egui::Ui, v: &mut VideoState, format: Format) {
     ui.horizontal(|ui| {
         ui.label("Scale");
         for s in [100, 75, 50, 25] {
@@ -2312,7 +2318,7 @@ fn output_controls(ui: &mut egui::Ui, v: &mut VideoState) {
             }
         }
     });
-    match v.format {
+    match format {
         Format::Gif => {
             ui.add(egui::Slider::new(&mut v.quality, 50..=100).text("quality"));
         }
@@ -2321,7 +2327,7 @@ fn output_controls(ui: &mut egui::Ui, v: &mut VideoState) {
         }
         Format::Apng => {}
     }
-    if matches!(v.format, Format::Gif | Format::Apng) {
+    if matches!(format, Format::Gif | Format::Apng) {
         ui.checkbox(&mut v.loop_forever, "Loop forever");
     }
     let (w, h) = video::output_size(&v.rec, &v.edit);
@@ -2330,11 +2336,31 @@ fn output_controls(ui: &mut egui::Ui, v: &mut VideoState) {
 }
 
 /// What the Timeline view's panel sets, to tell whether a frame of it changed something.
-type TimelineSettings = ((usize, usize), std::collections::BTreeSet<usize>, f32, bool, OverlayStyle, u32, Format, u8, u32, bool);
+type TimelineSettings = ((usize, usize), std::collections::BTreeSet<usize>, f32, bool, OverlayStyle);
 
 fn timeline_settings(v: &VideoState) -> TimelineSettings {
     let e = &v.edit;
-    (e.trim, e.deleted.clone(), e.speed, e.reverse, e.overlays, e.scale, v.format, v.quality, v.fps, v.loop_forever)
+    (e.trim, e.deleted.clone(), e.speed, e.reverse, e.overlays)
+}
+
+/// What the panel's "Output" sets: the export choices that are remembered for the next recording.
+fn output_settings(v: &VideoState) -> (u32, u8, u32, bool) {
+    (v.edit.scale, v.quality, v.fps, v.loop_forever)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test says the search for ffmpeg found, in place of the real answer.
+    static FFMPEG_FOR_TEST: std::cell::Cell<Option<Found>> = const { std::cell::Cell::new(None) };
+}
+
+/// What the search for ffmpeg found, as the Timeline view's panel reads it.
+fn ffmpeg_found() -> Found {
+    #[cfg(test)]
+    if let Some(found) = FFMPEG_FOR_TEST.with(|f| f.get()) {
+        return found;
+    }
+    mythicshot_recording::ffmpeg::found()
 }
 
 #[cfg(test)]
@@ -2940,6 +2966,79 @@ mod tests {
         sized(&mut ed, &ctx, size, vec![egui::Event::PointerMoved(p), button(true)]);
         let released = sized(&mut ed, &ctx, size, vec![button(false)]);
         assert!(v(&ed).reverse && released.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|o| o.repaint_delay == std::time::Duration::ZERO));
+    }
+
+    /// An open panel only shows the export choices: a recording whose scale, format, quality, fps and
+    /// looping differ from the saved ones leaves the saved ones as they are, frame after frame, also
+    /// with a video format saved while ffmpeg is reported missing (shown as GIF, kept as MP4). A
+    /// change to an output control in the panel is saved, once.
+    #[test]
+    fn an_open_timeline_panel_saves_the_export_choices_only_when_one_is_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let prefs = crate::settings::EditorPrefs { timeline_properties_open: true, ..Default::default() };
+        let mut ed = video_editor_with(&tmp.path().join("own"), prefs.clone());
+        let v = ed.video.as_mut().unwrap();
+        (v.edit.scale, v.format, v.quality, v.fps, v.loop_forever) = (50, Format::Apng, 60, 15, false);
+        ed.prefs_changed = false;
+        for _ in 0..6 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        assert!(properties_panel(&sized(&mut ed, &ctx, size, vec![])).is_some(), "the panel is open");
+        assert_eq!(ed.prefs, prefs, "the saved export choices are untouched");
+        assert!(!ed.prefs_changed);
+
+        // MP4 saved, ffmpeg reported missing: shown as GIF, kept as MP4, nothing saved.
+        FFMPEG_FOR_TEST.with(|f| f.set(Some(Found::None)));
+        let saved = crate::settings::EditorPrefs { export_format: "mp4".into(), ..prefs.clone() };
+        let mut ed = video_editor_with(&tmp.path().join("mp4"), saved.clone());
+        ed.video.as_mut().unwrap().format = Format::Mp4;
+        ed.prefs_changed = false;
+        for _ in 0..6 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = panel_of(&out).unwrap();
+        assert!(in_panel(&out, panel, "quality").is_some() && in_panel(&out, panel, "fps").is_none(), "shown as GIF");
+        assert_eq!(ed.video.as_ref().unwrap().format, Format::Mp4, "the recording's choice is kept");
+        assert_eq!((ed.prefs.export_format.as_str(), ed.prefs_changed), ("mp4", false), "and the saved one");
+        // A click on an output control saves the choices, once, with the format as chosen.
+        let at = in_panel(&out, panel, "50%").unwrap().center();
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at);
+        assert!(ed.prefs_changed && ed.prefs.export_scale == 50 && ed.prefs.export_format == "mp4", "saved: {:?}", ed.prefs);
+        ed.prefs_changed = false;
+        for _ in 0..6 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        assert!(!ed.prefs_changed, "once");
+        FFMPEG_FOR_TEST.with(|f| f.set(None));
+    }
+
+    /// "Delete frame" in the panel, clicked once, deletes the frame once: a later Space or Enter does
+    /// not click it again.
+    #[test]
+    fn a_frame_deleted_in_the_panel_stays_deleted_whatever_keys_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let prefs = crate::settings::EditorPrefs { timeline_properties_open: true, ..Default::default() };
+        let mut ed = video_editor_with(&tmp.path().join("rec"), prefs);
+        ed.video.as_mut().unwrap().current = 2;
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let at = in_panel(&out, panel_of(&out).unwrap(), "Delete frame").unwrap().center();
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at);
+        assert!(ed.video.as_ref().unwrap().edit.deleted.contains(&2));
+        assert_eq!(ctx.memory(|m| m.focused()), None, "the button let go of the keyboard");
+        for key in [egui::Key::Space, egui::Key::Enter] {
+            for pressed in [true, false] {
+                sized(&mut ed, &ctx, size, vec![egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE }]);
+            }
+        }
+        let v = ed.video.as_mut().unwrap();
+        v.playing = None;
+        assert_eq!(v.edit.deleted.iter().copied().collect::<Vec<_>>(), [2], "deleted once, not restored by a key");
     }
 
     /// Every label of the Timeline view's panel fits it at 100%, in the editor's own window and at
