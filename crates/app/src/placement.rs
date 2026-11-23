@@ -20,8 +20,6 @@ pub const TOAST_SIZE: [f32; 2] = [380.0, 96.0];
 pub const PICKER_SIZE: [f32; 2] = [270.0, 262.0];
 /// The recording control bar's size in points.
 pub const BAR_SIZE: [f32; 2] = [680.0, 46.0];
-/// The red frame's width outside the recorded area, in points.
-pub const FRAME_BORDER: f32 = 4.0;
 
 fn px(points: f32, scale: f32) -> i32 {
     (points * scale).round() as i32
@@ -86,13 +84,6 @@ pub fn bar_rect(rect: PxRect, monitor: PxRect, scale: f32) -> PxRect {
         rect.y + gap
     };
     PxRect::new(x, y, bw as u32, bh as u32)
-}
-
-/// The red frame's window around a recorded area: the area plus the border, in the scale of
-/// the monitor the window belongs to (the area's own monitor, since the area is on one).
-pub fn frame_rect(rect: PxRect, monitors: &[MonitorInfo]) -> PxRect {
-    let b = px(FRAME_BORDER, scale_for(rect, monitors));
-    PxRect::new(rect.x - b, rect.y - b, rect.w + 2 * b as u32, rect.h + 2 * b as u32)
 }
 
 /// A rectangle in points for a viewport builder, from pixels at `scale`. Only a first guess:
@@ -201,12 +192,6 @@ pub struct Placer {
 impl Placer {
     pub fn new(title: &'static str, target: PxRect, focus: Focus) -> Self {
         Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus }
-    }
-
-    /// Whether the window has been shown (cloaked or not). A click-through window takes that
-    /// style only from here on: Windows does not draw a window that became layered while hidden.
-    pub fn shown(&self) -> bool {
-        self.stage != PlaceStage::Seeking
     }
 
     /// Each frame after the viewport `id` was asked for. Its window appears at the end of the
@@ -353,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_and_the_frame_go_around_a_region_in_its_monitors_scale() {
+    fn the_bar_goes_around_a_region_in_its_monitors_scale() {
         for (name, mons) in layouts() {
             for m in &mons {
                 let s = m.scale;
@@ -362,25 +347,19 @@ mod tests {
                 assert_eq!((bar.w, bar.h), (rnd(680.0 * s) as u32, rnd(46.0 * s) as u32), "{name}: the bar's size in its monitor's scale");
                 assert_eq!(bar.bottom(), region.y - rnd(10.0 * s), "{name}: above the area");
                 assert!(inside(bar, m.rect) && scale_for(bar, &mons) == s, "{name}: on the area's monitor {bar:?}");
-                let f = frame_rect(region, &mons);
-                let b = rnd(4.0 * s);
-                assert_eq!(f, PxRect::new(region.x - b, region.y - b, region.w + 2 * b as u32, region.h + 2 * b as u32), "{name}");
-                assert_eq!(scale_for(f, &mons), s);
-                // A whole monitor: the bar goes inside its top edge, the frame just outside it.
+                // A whole monitor: the bar goes inside its top edge.
                 let bar = bar_rect(m.rect, m.rect, s);
                 assert_eq!(bar.y, m.rect.y + rnd(10.0 * s), "{name}");
                 assert!(inside(bar, m.rect));
-                assert_eq!(scale_for(frame_rect(m.rect, &mons), &mons), s, "{name}: the frame over a whole monitor keeps its scale");
             }
             // A region dragged across two monitors is clipped to the one holding its centre
-            // (the recorder's rule); its frame and bar follow that monitor's scale.
+            // (the recorder's rule); its bar follows that monitor's scale.
             let (a, b) = (&mons[1], &mons[2]);
             if a.rect.right() == b.rect.x {
                 let across = PxRect::new(a.rect.right() - 300, a.rect.y + 100, 400, 300);
                 let centre = (across.x + 200, across.y + 150);
                 let on = mons.iter().find(|m| m.rect.contains(centre.0, centre.1)).unwrap();
                 let clipped = across.intersect(&on.rect).unwrap();
-                assert_eq!(scale_for(frame_rect(clipped, &mons), &mons), on.scale, "{name}");
                 assert!(inside(bar_rect(clipped, on.rect, on.scale), on.rect), "{name}");
             }
         }

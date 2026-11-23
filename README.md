@@ -9,7 +9,7 @@ Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Li
 - **Screenshots:** region (with magnifier and window snapping), window, full screen or one display, last region, and from the clipboard. Default keys: PrtSc, Alt+PrtSc, Ctrl+PrtSc.
 - **Editor:** rectangle, ellipse, line, arrow, freehand, text, speech bubble, numbered steps, highlight, pixelate or blur, and crop, all editable until you save. Effects: drop shadow, torn edge, border, greyscale, invert, resize, rotate. Each tool remembers its own colours and sizes.
 - **Destinations:** save with a file name pattern, save as, clipboard, print, email, or a menu every time.
-- **GIF recording:** Shift+PrtSc, then select a region or window. A countdown, a red frame and a control bar that never appear in the recording. Pause, restart, discard.
+- **GIF recording:** Shift+PrtSc, then select a region or window. A control bar with a countdown that never appears in the recording. Pause, restart, discard.
 - **Overlays:** key chips or an on-screen keyboard, click ripples or an on-screen mouse, pointer and halo, drawn at export so you can change them afterwards. Key logging is off by default.
 - **GIF editor:** trim, delete frames, speed, reverse, crop, annotations with frame ranges on a timeline, export to GIF, APNG, MP4 or WebM (the last two need ffmpeg on the PATH).
 - **Settings:** every global and editor shortcut can be rebound; settings live in one `settings.toml` you can copy to another PC.

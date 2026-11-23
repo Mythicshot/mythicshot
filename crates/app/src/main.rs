@@ -521,7 +521,7 @@ impl App {
         }
     }
 
-    /// Show the red frame and control bar, count down, then record `rect`.
+    /// Show the control bar, count down, then record `rect`.
     fn start_recording(&mut self, _ctx: &egui::Context, rect: PxRect, title: String) {
         if self.session.is_some() {
             return;
@@ -701,7 +701,6 @@ impl App {
                 self.notify(e);
                 return;
             }
-            s.show_frame(ctx);
             let rect = s.rect;
             s.draw.show(ctx, rect);
         }

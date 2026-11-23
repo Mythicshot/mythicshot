@@ -2,6 +2,10 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.26 (2026-11-22)
+
+- The red frame around a recorded region is gone. The recording bar shows that a recording is on, with its countdown and its timer.
+
 ## 0.2.25 (2026-11-22)
 
 - The countdown before a recording is a large number in the recording bar, where the timer then runs. It is no longer drawn over the recorded area.
