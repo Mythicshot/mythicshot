@@ -394,14 +394,41 @@ pub(crate) const CLOSE_PROPERTIES: &str = "Close Properties";
 pub(crate) const THIS_STEP: &str = "This step";
 pub(crate) const TOUR: &str = "Tour";
 
-/// One of the Properties panel's two sections ([`THIS_STEP`], [`TOUR`]): a line, then its title,
-/// a size up from the headings inside it.
-fn section(ui: &mut egui::Ui, title: &str) {
+/// One of the Properties panel's sections ([`THIS_STEP`], [`TOUR`], and those of the image
+/// editor's and the Timeline view's panels): a line, then its title, a size up from the headings
+/// inside it.
+pub(crate) fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
     ui.label(RichText::new(title).bold().size(theme::STRONG_SIZE).color(theme::TEXT));
     ui.add_space(2.0);
+}
+
+/// The width of the Properties panel, in points.
+pub(crate) const PANEL_W: f32 = 304.0;
+
+/// The Properties panel's frame, the same in every view: docked at the right of the canvas,
+/// [`PANEL_W`] wide, on surface, with its heading and close button at the top and `body` in a
+/// scroll area below. True when its close button was clicked.
+pub(crate) fn properties_shell(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug + Copy, body: impl FnOnce(&mut egui::Ui)) -> bool {
+    let mut close = false;
+    let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(Margin::symmetric(12, 10));
+    egui::Panel::right(id).resizable(false).exact_size(PANEL_W).frame(frame).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(PROPERTIES).bold().size(theme::STRONG_SIZE).color(theme::TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button(ui, Icon::Close, 22.0, false, CLOSE_PROPERTIES).clicked() {
+                    close = true;
+                }
+            });
+        });
+        egui::ScrollArea::vertical().id_salt((id, "scroll")).auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            body(ui);
+        });
+    });
+    close
 }
 
 /// A heading inside a section of the Properties panel.
@@ -837,245 +864,231 @@ impl Editor {
         let instance = v.tour.instance;
         let mut new_dim: Option<(u8, bool)> = None;
         let mut pulse: Option<(usize, PulseAction)> = None;
-        let mut close = false;
-        let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(Margin::symmetric(12, 10));
-        egui::Panel::right(("tour-settings", instance)).resizable(false).exact_size(304.0).frame(frame).show(ui, |ui| {
-            let (doc, s) = (&mut v.edit.tour_doc, &mut v.tour.settings);
-            if !s.loaded {
-                s.loaded = true;
-                s.accent = doc.theme.accent.clone();
-                s.cta_url = doc.cta.as_ref().map(|l| l.url.clone()).unwrap_or_default();
-                s.primary_url = doc.end.as_ref().and_then(|e| e.primary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
-                s.secondary_url = doc.end.as_ref().and_then(|e| e.secondary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
+        let (doc, s) = (&mut v.edit.tour_doc, &mut v.tour.settings);
+        if !s.loaded {
+            s.loaded = true;
+            s.accent = doc.theme.accent.clone();
+            s.cta_url = doc.cta.as_ref().map(|l| l.url.clone()).unwrap_or_default();
+            s.primary_url = doc.end.as_ref().and_then(|e| e.primary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
+            s.secondary_url = doc.end.as_ref().and_then(|e| e.secondary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
+        }
+        let close = properties_shell(ui, ("tour-settings", instance), |ui| {
+            section(ui, THIS_STEP);
+            match step {
+                None => {
+                    ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
+                }
+                Some((src, i, _, has_click)) => {
+                    ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
+                    let x = doc.steps.entry(src).or_default();
+                    pulse = pulse_row(ui, has_click, x.pulse.is_some(), placing == Some(src)).map(|a| (src, a));
+                    ui.label("Zoom to the spotlight");
+                    ui.horizontal(|ui| {
+                        for (z, label) in [(None, "Follow the tour"), (Some(true), "On"), (Some(false), "Off")] {
+                            if ui.add(egui::Button::selectable(x.zoom == z, label)).clicked() {
+                                x.zoom = z;
+                            }
+                        }
+                    });
+                    let mut anywhere = x.advance == Advance::Anywhere;
+                    if ui.checkbox(&mut anywhere, "Continue on a click anywhere").on_hover_text("A click anywhere on the picture moves on, not only on the hotspot").changed() {
+                        x.advance = if anywhere { Advance::Anywhere } else { Advance::Hotspot };
+                    }
+                }
             }
+
+            section(ui, TOUR);
+            ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(theme::MUTED).size(12.0));
+            let t = &mut doc.theme;
+
+            heading(ui, "Card style");
+            ui.horizontal_wrapped(|ui| {
+                for (style, label, tip) in [
+                    (CardStyle::Dark, "Dark", "A dark card beside the spot"),
+                    (CardStyle::Light, "Light", "A light card beside the spot"),
+                    (CardStyle::Compact, "Compact bar", "A light pill along the bottom of the picture: the count, the text and the button on one line"),
+                    (CardStyle::Auto, "Match viewer", "Dark or light, following the viewer's system setting"),
+                ] {
+                    if ui.add(egui::Button::selectable(t.card_style == style, label)).on_hover_text(tip).clicked() {
+                        t.card_style = style;
+                    }
+                }
+            });
+
+            heading(ui, "Accent colour");
             ui.horizontal(|ui| {
-                ui.label(RichText::new(PROPERTIES).bold().size(theme::STRONG_SIZE).color(theme::TEXT));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::button(ui, Icon::Close, 22.0, false, CLOSE_PROPERTIES).clicked() {
-                        close = true;
+                for (name, hex) in ACCENTS {
+                    let c = parse_hex(hex).unwrap_or(DEFAULT_GREEN);
+                    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                    ui.painter().circle_filled(r.center(), 9.0, c);
+                    if t.accent.eq_ignore_ascii_case(hex) {
+                        ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, theme::TEXT));
+                    } else if resp.hovered() {
+                        ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, theme::MUTED));
                     }
+                    // Reached with Tab: the focus ring, outside the others.
+                    if resp.has_focus() {
+                        ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(theme::FOCUS_WIDTH, theme::FOCUS));
+                    }
+                    if resp.on_hover_text(name).clicked() {
+                        t.accent = hex.to_string();
+                        s.accent = hex.to_string();
+                    }
+                }
+                ui.add_space(4.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut s.accent).char_limit(7).desired_width(70.0).hint_text("#rrggbb"));
+                if r.on_hover_text("Any colour as #rrggbb").changed()
+                    && let Some(c) = parse_hex(&s.accent)
+                {
+                    t.accent = hex_of(c);
+                }
+            });
+            if parse_hex(&s.accent).is_none() {
+                warning(ui, HEX_WARNING);
+            }
+
+            heading(ui, "Zoom");
+            ui.checkbox(&mut doc.zoom.enabled, "Zoom toward each step's spot");
+            ui.add_enabled_ui(doc.zoom.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    grid_label(ui, "Amount");
+                    ui.add(egui::Slider::new(&mut doc.zoom.percent, ZOOM_MIN..=ZOOM_MAX).suffix("%"));
                 });
             });
-            egui::ScrollArea::vertical().id_salt("tour-settings-scroll").auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
 
-                section(ui, THIS_STEP);
-                match step {
-                    None => {
-                        ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
+            let t = &mut doc.theme;
+            heading(ui, "Spotlight");
+            ui.checkbox(&mut t.spotlight_soft, "Soft edge").on_hover_text("Round the bright box's corners and feather its edge");
+            ui.horizontal(|ui| {
+                grid_label(ui, "Darken");
+                let mut d = dim;
+                let r = ui.add(egui::Slider::new(&mut d, MIN_DIM..=MAX_DIM).suffix("%")).on_hover_text("How dark everything outside a spotlight gets. One strength for every spotlight.");
+                if r.changed() {
+                    // One undo step per drag.
+                    new_dim = Some((d, r.drag_started() || !r.dragged()));
+                }
+            });
+
+            heading(ui, "Hotspot");
+            ui.horizontal(|ui| {
+                for (h, label, tip) in [(HotspotStyle::Pulse, "Pulse", "A soft pulsing ring where to click"), (HotspotStyle::Dot, "Dot", "A still dot where to click"), (HotspotStyle::None, "None", "No mark; the card does the pointing")] {
+                    if ui.add(egui::Button::selectable(t.hotspot == h, label)).on_hover_text(tip).clicked() {
+                        t.hotspot = h;
                     }
-                    Some((src, i, _, has_click)) => {
-                        ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
-                        let x = doc.steps.entry(src).or_default();
-                        pulse = pulse_row(ui, has_click, x.pulse.is_some(), placing == Some(src)).map(|a| (src, a));
-                        ui.label("Zoom to the spotlight");
+                }
+            });
+
+            heading(ui, "Backdrop");
+            ui.horizontal(|ui| {
+                let auto = t.backdrop == "auto";
+                if ui.add(egui::Button::selectable(auto, "Auto")).on_hover_text("A calm tint from the accent colour").clicked() {
+                    t.backdrop = "auto".into();
+                }
+                if ui.add(egui::Button::selectable(!auto, "Pick a colour")).clicked() && auto {
+                    t.backdrop = BACKDROP_START.into();
+                }
+                if let Some(mut c) = (!auto).then(|| parse_hex(&t.backdrop)).flatten()
+                    && egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).on_hover_text("Backdrop colour").changed()
+                {
+                    t.backdrop = hex_of(c);
+                }
+            });
+
+            heading(ui, "Progress bar");
+            ui.checkbox(&mut t.progress_bar, "Show a thin progress bar in the accent colour");
+
+            heading(ui, "Cover card");
+            let mut cover_on = doc.cover.is_some();
+            if ui.checkbox(&mut cover_on, "Open the tour on a cover card").changed() {
+                if cover_on {
+                    doc.cover = Some(s.stash_cover.take().unwrap_or(Cover { title: String::new(), body: String::new(), button: String::new(), logo: None }));
+                } else {
+                    s.stash_cover = doc.cover.take();
+                }
+            }
+            if let Some(c) = doc.cover.as_mut() {
+                egui::Grid::new("tour-cover").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    grid_label(ui, "Title");
+                    line_field(ui, &mut c.title, COVER_TITLE_MAX, "Needed for the cover to show");
+                    ui.end_row();
+                    grid_label(ui, "Body");
+                    text_field(ui, &mut c.body, COVER_BODY_MAX, "A line about what the tour shows");
+                    ui.end_row();
+                    grid_label(ui, "Button");
+                    line_field(ui, &mut c.button, COVER_BUTTON_MAX, "Start");
+                    ui.end_row();
+                    grid_label(ui, "Logo");
+                    ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            for (z, label) in [(None, "Follow the tour"), (Some(true), "On"), (Some(false), "Off")] {
-                                if ui.add(egui::Button::selectable(x.zoom == z, label)).clicked() {
-                                    x.zoom = z;
-                                }
+                            if ui.add_enabled(!loading, egui::Button::new("Add logo…")).on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
+                                && let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]), "cover logo")
+                            {
+                                // Checked first, so a file that is not a usable logo never reaches the tour.
+                                s.logo_job = Some(start_logo_check(path));
+                                s.logo_error = None;
+                            }
+                            if doc.logo_path.is_some() && !loading && ui.button("Remove logo").clicked() {
+                                doc.logo_path = None;
+                                s.logo_error = None;
                             }
                         });
-                        let mut anywhere = x.advance == Advance::Anywhere;
-                        if ui.checkbox(&mut anywhere, "Continue on a click anywhere").on_hover_text("A click anywhere on the picture moves on, not only on the hotspot").changed() {
-                            x.advance = if anywhere { Advance::Anywhere } else { Advance::Hotspot };
+                        if loading {
+                            ui.label(RichText::new("Loading logo…").color(theme::MUTED).size(12.0));
                         }
-                    }
-                }
-
-                section(ui, TOUR);
-                ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(theme::MUTED).size(12.0));
-                let t = &mut doc.theme;
-
-                heading(ui, "Card style");
-                ui.horizontal_wrapped(|ui| {
-                    for (style, label, tip) in [
-                        (CardStyle::Dark, "Dark", "A dark card beside the spot"),
-                        (CardStyle::Light, "Light", "A light card beside the spot"),
-                        (CardStyle::Compact, "Compact bar", "A light pill along the bottom of the picture: the count, the text and the button on one line"),
-                        (CardStyle::Auto, "Match viewer", "Dark or light, following the viewer's system setting"),
-                    ] {
-                        if ui.add(egui::Button::selectable(t.card_style == style, label)).on_hover_text(tip).clicked() {
-                            t.card_style = style;
+                        if let Some(name) = doc.logo_path.as_ref().and_then(|p| p.file_name()) {
+                            ui.label(RichText::new(name.to_string_lossy()).color(theme::MUTED).size(12.0));
                         }
-                    }
-                });
-
-                heading(ui, "Accent colour");
-                ui.horizontal(|ui| {
-                    for (name, hex) in ACCENTS {
-                        let c = parse_hex(hex).unwrap_or(DEFAULT_GREEN);
-                        let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-                        ui.painter().circle_filled(r.center(), 9.0, c);
-                        if t.accent.eq_ignore_ascii_case(hex) {
-                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, theme::TEXT));
-                        } else if resp.hovered() {
-                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.0, theme::MUTED));
+                        if let Some(e) = &s.logo_error {
+                            theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                         }
-                        // Reached with Tab: the focus ring, outside the others.
-                        if resp.has_focus() {
-                            ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(theme::FOCUS_WIDTH, theme::FOCUS));
-                        }
-                        if resp.on_hover_text(name).clicked() {
-                            t.accent = hex.to_string();
-                            s.accent = hex.to_string();
-                        }
-                    }
-                    ui.add_space(4.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut s.accent).char_limit(7).desired_width(70.0).hint_text("#rrggbb"));
-                    if r.on_hover_text("Any colour as #rrggbb").changed()
-                        && let Some(c) = parse_hex(&s.accent)
-                    {
-                        t.accent = hex_of(c);
-                    }
-                });
-                if parse_hex(&s.accent).is_none() {
-                    warning(ui, HEX_WARNING);
-                }
-
-                heading(ui, "Zoom");
-                ui.checkbox(&mut doc.zoom.enabled, "Zoom toward each step's spot");
-                ui.add_enabled_ui(doc.zoom.enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        grid_label(ui, "Amount");
-                        ui.add(egui::Slider::new(&mut doc.zoom.percent, ZOOM_MIN..=ZOOM_MAX).suffix("%"));
                     });
+                    ui.end_row();
                 });
+            }
 
-                let t = &mut doc.theme;
-                heading(ui, "Spotlight");
-                ui.checkbox(&mut t.spotlight_soft, "Soft edge").on_hover_text("Round the bright box's corners and feather its edge");
+            heading(ui, "Always-on button");
+            let mut cta_on = doc.cta.is_some();
+            if ui.checkbox(&mut cta_on, "Show a button on every step").changed() {
+                if cta_on {
+                    doc.cta = Some(s.stash_cta.take().unwrap_or(Link { label: String::new(), url: link_from_draft(&s.cta_url) }));
+                } else {
+                    s.stash_cta = doc.cta.take();
+                }
+            }
+            if let Some(l) = doc.cta.as_mut() {
+                egui::Grid::new("tour-cta").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Label", l, &mut s.cta_url, "Book a demo"));
+            }
+
+            heading(ui, "End card");
+            let mut end_on = doc.end.is_some();
+            if ui.checkbox(&mut end_on, "Finish on an end card").changed() {
+                if end_on {
+                    doc.end = Some(s.stash_end.take().unwrap_or(EndCard { text: String::new(), primary: None, secondary: None, replay: true }));
+                } else {
+                    s.stash_end = doc.end.take();
+                }
+            }
+            if let Some(e) = doc.end.as_mut() {
+                text_field(ui, &mut e.text, END_TEXT_MAX, "What to do next");
+                let primary = e.primary.get_or_insert_with(|| Link { label: String::new(), url: String::new() });
+                egui::Grid::new("tour-end-1").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Main button", primary, &mut s.primary_url, "Get started"));
+                let secondary = e.secondary.get_or_insert_with(|| Link { label: String::new(), url: String::new() });
+                egui::Grid::new("tour-end-2").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Second button", secondary, &mut s.secondary_url, "Learn more"));
+                ui.checkbox(&mut e.replay, "Show Replay");
+            }
+
+            heading(ui, "Autoplay");
+            ui.checkbox(&mut doc.autoplay.enabled, "Move on by itself");
+            ui.add_enabled_ui(doc.autoplay.enabled, |ui| {
                 ui.horizontal(|ui| {
-                    grid_label(ui, "Darken");
-                    let mut d = dim;
-                    let r = ui.add(egui::Slider::new(&mut d, MIN_DIM..=MAX_DIM).suffix("%")).on_hover_text("How dark everything outside a spotlight gets. One strength for every spotlight.");
-                    if r.changed() {
-                        // One undo step per drag.
-                        new_dim = Some((d, r.drag_started() || !r.dragged()));
-                    }
+                    grid_label(ui, "Seconds per step");
+                    ui.add(egui::Slider::new(&mut doc.autoplay.seconds, AUTOPLAY_MIN..=AUTOPLAY_MAX).suffix(" s"));
                 });
-
-                heading(ui, "Hotspot");
-                ui.horizontal(|ui| {
-                    for (h, label, tip) in [(HotspotStyle::Pulse, "Pulse", "A soft pulsing ring where to click"), (HotspotStyle::Dot, "Dot", "A still dot where to click"), (HotspotStyle::None, "None", "No mark; the card does the pointing")] {
-                        if ui.add(egui::Button::selectable(t.hotspot == h, label)).on_hover_text(tip).clicked() {
-                            t.hotspot = h;
-                        }
-                    }
-                });
-
-                heading(ui, "Backdrop");
-                ui.horizontal(|ui| {
-                    let auto = t.backdrop == "auto";
-                    if ui.add(egui::Button::selectable(auto, "Auto")).on_hover_text("A calm tint from the accent colour").clicked() {
-                        t.backdrop = "auto".into();
-                    }
-                    if ui.add(egui::Button::selectable(!auto, "Pick a colour")).clicked() && auto {
-                        t.backdrop = BACKDROP_START.into();
-                    }
-                    if let Some(mut c) = (!auto).then(|| parse_hex(&t.backdrop)).flatten()
-                        && egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).on_hover_text("Backdrop colour").changed()
-                    {
-                        t.backdrop = hex_of(c);
-                    }
-                });
-
-                heading(ui, "Progress bar");
-                ui.checkbox(&mut t.progress_bar, "Show a thin progress bar in the accent colour");
-
-                heading(ui, "Cover card");
-                let mut cover_on = doc.cover.is_some();
-                if ui.checkbox(&mut cover_on, "Open the tour on a cover card").changed() {
-                    if cover_on {
-                        doc.cover = Some(s.stash_cover.take().unwrap_or(Cover { title: String::new(), body: String::new(), button: String::new(), logo: None }));
-                    } else {
-                        s.stash_cover = doc.cover.take();
-                    }
-                }
-                if let Some(c) = doc.cover.as_mut() {
-                    egui::Grid::new("tour-cover").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                        grid_label(ui, "Title");
-                        line_field(ui, &mut c.title, COVER_TITLE_MAX, "Needed for the cover to show");
-                        ui.end_row();
-                        grid_label(ui, "Body");
-                        text_field(ui, &mut c.body, COVER_BODY_MAX, "A line about what the tour shows");
-                        ui.end_row();
-                        grid_label(ui, "Button");
-                        line_field(ui, &mut c.button, COVER_BUTTON_MAX, "Start");
-                        ui.end_row();
-                        grid_label(ui, "Logo");
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                if ui.add_enabled(!loading, egui::Button::new("Add logo…")).on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
-                                    && let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]), "cover logo")
-                                {
-                                    // Checked first, so a file that is not a usable logo never reaches the tour.
-                                    s.logo_job = Some(start_logo_check(path));
-                                    s.logo_error = None;
-                                }
-                                if doc.logo_path.is_some() && !loading && ui.button("Remove logo").clicked() {
-                                    doc.logo_path = None;
-                                    s.logo_error = None;
-                                }
-                            });
-                            if loading {
-                                ui.label(RichText::new("Loading logo…").color(theme::MUTED).size(12.0));
-                            }
-                            if let Some(name) = doc.logo_path.as_ref().and_then(|p| p.file_name()) {
-                                ui.label(RichText::new(name.to_string_lossy()).color(theme::MUTED).size(12.0));
-                            }
-                            if let Some(e) = &s.logo_error {
-                                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
-                            }
-                        });
-                        ui.end_row();
-                    });
-                }
-
-                heading(ui, "Always-on button");
-                let mut cta_on = doc.cta.is_some();
-                if ui.checkbox(&mut cta_on, "Show a button on every step").changed() {
-                    if cta_on {
-                        doc.cta = Some(s.stash_cta.take().unwrap_or(Link { label: String::new(), url: link_from_draft(&s.cta_url) }));
-                    } else {
-                        s.stash_cta = doc.cta.take();
-                    }
-                }
-                if let Some(l) = doc.cta.as_mut() {
-                    egui::Grid::new("tour-cta").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Label", l, &mut s.cta_url, "Book a demo"));
-                }
-
-                heading(ui, "End card");
-                let mut end_on = doc.end.is_some();
-                if ui.checkbox(&mut end_on, "Finish on an end card").changed() {
-                    if end_on {
-                        doc.end = Some(s.stash_end.take().unwrap_or(EndCard { text: String::new(), primary: None, secondary: None, replay: true }));
-                    } else {
-                        s.stash_end = doc.end.take();
-                    }
-                }
-                if let Some(e) = doc.end.as_mut() {
-                    text_field(ui, &mut e.text, END_TEXT_MAX, "What to do next");
-                    let primary = e.primary.get_or_insert_with(|| Link { label: String::new(), url: String::new() });
-                    egui::Grid::new("tour-end-1").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Main button", primary, &mut s.primary_url, "Get started"));
-                    let secondary = e.secondary.get_or_insert_with(|| Link { label: String::new(), url: String::new() });
-                    egui::Grid::new("tour-end-2").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| link_rows(ui, "Second button", secondary, &mut s.secondary_url, "Learn more"));
-                    ui.checkbox(&mut e.replay, "Show Replay");
-                }
-
-                heading(ui, "Autoplay");
-                ui.checkbox(&mut doc.autoplay.enabled, "Move on by itself");
-                ui.add_enabled_ui(doc.autoplay.enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        grid_label(ui, "Seconds per step");
-                        ui.add(egui::Slider::new(&mut doc.autoplay.seconds, AUTOPLAY_MIN..=AUTOPLAY_MAX).suffix(" s"));
-                    });
-                });
-
-                heading(ui, "In this editor");
-                ui.checkbox(&mut animate, "Animate hotspot").on_hover_text("Pulse the hotspot on the picture here, as the tour will. Turn off for a still ring.");
-                ui.add_space(12.0);
             });
+
+            heading(ui, "In this editor");
+            ui.checkbox(&mut animate, "Animate hotspot").on_hover_text("Pulse the hotspot on the picture here, as the tour will. Turn off for a still ring.");
+            ui.add_space(12.0);
         });
         // The theme and zoom become the next recording's, but only when this panel changed them:
         // another open recording's theme is never overwritten by this one's.

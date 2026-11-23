@@ -372,6 +372,9 @@ pub struct Editor {
     pub(crate) quit: Option<QuitAnswer>,
     /// The toolbar row as it was last drawn, for its overflow chevrons.
     toolbar_scroll: ToolbarRow,
+    /// The Properties panel of the image editor or of the Timeline view is open (the Tour view's
+    /// is its own): taken from the preference of that view kind when the view opens.
+    pub(crate) panel_open: bool,
 }
 
 /// The toolbar row's scrolling as of the last frame: how wide its content and its view are, how far
@@ -459,6 +462,7 @@ pub fn quit_progress<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G]) 
 impl Editor {
     pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context, prefs: crate::settings::EditorPrefs) -> Self {
         let tool = Tool::from_key(&prefs.tool).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle);
+        let panel_open = prefs.image_properties_open;
         let mut editor = Self {
             doc: Document::new(img),
             title,
@@ -501,6 +505,7 @@ impl Editor {
             busy: false,
             quit: None,
             toolbar_scroll: ToolbarRow::default(),
+            panel_open,
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -697,6 +702,7 @@ impl Editor {
         self.toolbar(ui);
         self.status_bar(ui);
         self.timeline(ui);
+        self.properties_panel(ui);
         self.tool_rail(ui);
         self.canvas(ui);
         // After the canvas, so a key typed in the same frame as the press still reaches the card first.
@@ -739,7 +745,8 @@ impl Editor {
             // The selection, or else the picture or the frame, as Ctrl+C copies.
             copy: !typing,
             delete: (self.selected.is_some() || self.card_selected()) && !typing,
-            properties: Some((self.in_tour_view(), self.properties_open())),
+            // Every view has its Properties panel.
+            properties: Some((true, self.properties_open())),
             keys,
         }
     }
@@ -767,23 +774,35 @@ impl Editor {
         }
     }
 
-    /// The Properties panel is open: only in the Tour view, where it is.
+    /// The Properties panel of the view shown is open.
     pub(crate) fn properties_open(&self) -> bool {
-        self.in_tour_view() && self.video.as_ref().is_some_and(|v| v.tour.settings.open)
+        match &self.video {
+            Some(v) if v.view == crate::video_editor::VideoView::Tour => v.tour.settings.open,
+            _ => self.panel_open,
+        }
     }
 
-    /// Open or close the Properties panel (the toolbar's button, the Edit menu, the panel's own
-    /// close button), and remember it for the next time the Tour view opens, in any recording.
+    /// Open or close the Properties panel of the view shown (the toolbar's button, the Edit menu,
+    /// the panel's own close button), and remember it for the next time a view of that kind opens:
+    /// the image editor, the Timeline view and the Tour view each on its own, in any window.
     pub(crate) fn toggle_properties(&mut self) {
-        if !self.in_tour_view() {
-            return;
-        }
         let open = !self.properties_open();
-        if let Some(v) = self.video.as_mut() {
-            v.tour.settings.open = open;
-        }
-        if self.prefs.tour_properties_open != open {
-            self.prefs.tour_properties_open = open;
+        let remembered = match self.video.as_mut() {
+            Some(v) if v.view == crate::video_editor::VideoView::Tour => {
+                v.tour.settings.open = open;
+                &mut self.prefs.tour_properties_open
+            }
+            Some(_) => {
+                self.panel_open = open;
+                &mut self.prefs.timeline_properties_open
+            }
+            None => {
+                self.panel_open = open;
+                &mut self.prefs.image_properties_open
+            }
+        };
+        if *remembered != open {
+            *remembered = open;
             self.prefs_changed = true;
         }
     }
@@ -1259,18 +1278,28 @@ impl Editor {
         self.properties_row(ui);
     }
 
-    /// "Properties" at the far right of the toolbar: lit while the panel is open. In this version
-    /// only the Tour view has the panel; elsewhere it is there, disabled.
+    /// "Properties" at the far right of the toolbar: lit while the panel is open. Every view has
+    /// its panel, so the button is always usable.
     fn properties_button(&mut self, ui: &mut egui::Ui) {
-        let usable = self.in_tour_view();
         let button = egui::Button::selectable(self.properties_open(), PROPERTIES).min_size(vec2(0.0, ICON));
-        if ui.add_enabled(usable, button).on_disabled_hover_text(menu_bar::NOTHING_TO_SET).clicked() {
+        if ui.add(button).clicked() {
             self.toggle_properties();
         }
     }
 
     fn effects_menu(&mut self, ui: &mut egui::Ui) {
-        let mut pick: Option<Box<dyn FnOnce(&RgbaImage) -> RgbaImage>> = None;
+        if let Some(f) = self.effect_buttons(ui, Place::Toolbar) {
+            self.effect(f);
+            ui.close();
+        }
+    }
+
+    /// The effects: the one list behind the toolbar's Effects menu and the panel's "Effects", giving
+    /// the effect clicked. The menu holds Resize as a submenu and lines between its groups; the
+    /// panel has Resize as a row of its own ([`resize_buttons`]).
+    fn effect_buttons(&self, ui: &mut egui::Ui, place: Place) -> Option<Effect> {
+        let menu = place == Place::Toolbar;
+        let mut pick: Option<Effect> = None;
         if ui.button("Drop shadow").clicked() {
             pick = Some(Box::new(effects::drop_shadow));
         }
@@ -1281,31 +1310,30 @@ impl Editor {
             let (w, c) = (self.style.width.round().max(1.0) as u32, self.style.stroke.0);
             pick = Some(Box::new(move |img: &RgbaImage| effects::border(img, w, c)));
         }
-        ui.separator();
+        if menu {
+            ui.separator();
+        }
         if ui.button("Greyscale").clicked() {
             pick = Some(Box::new(effects::greyscale));
         }
         if ui.button("Invert").clicked() {
             pick = Some(Box::new(effects::invert));
         }
-        ui.separator();
-        ui.menu_button("Resize", |ui| {
-            for p in [25, 50, 75, 125, 150, 200] {
-                if ui.button(format!("{p}%")).clicked() {
-                    pick = Some(Box::new(move |img: &RgbaImage| effects::resize(img, p)));
+        if menu {
+            ui.separator();
+            ui.menu_button("Resize", |ui| {
+                if let Some(p) = resize_buttons(ui) {
+                    pick = Some(resize_effect(p));
                 }
-            }
-        });
+            });
+        }
         if ui.button("Rotate right").clicked() {
             pick = Some(Box::new(effects::rotate_cw));
         }
         if ui.button("Rotate left").clicked() {
             pick = Some(Box::new(effects::rotate_ccw));
         }
-        if let Some(f) = pick {
-            self.effect(f);
-            ui.close();
-        }
+        pick
     }
 
     /// Colour, fill, width, text size, shadow and, for a selection, its actions.
@@ -1315,63 +1343,8 @@ impl Editor {
         if self.in_tour_view() && (self.tool == Tool::Card || self.card_selected()) {
             return self.card_properties(ui);
         }
-        let before = self.style;
-        let before_mode = self.obfuscate;
-
-        let mut c = to_color32(self.style.stroke);
-        if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).on_hover_text("Line and text colour").changed() {
-            self.style.stroke = from_color32(c);
-        }
-        let mut fill_on = self.style.fill.is_some();
-        if ui.toggle_value(&mut fill_on, "Fill").on_hover_text("Fill rectangles, ellipses, text boxes and bubbles").changed() {
-            self.style.fill = fill_on.then_some(Rgba([255, 255, 255, 255]));
-        }
-        if let Some(f) = self.style.fill {
-            let mut c = to_color32(f);
-            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::OnlyBlend).on_hover_text("Fill colour").changed() {
-                self.style.fill = Some(from_color32(c));
-            }
-        }
-        ui.add(egui::DragValue::new(&mut self.style.width).range(1.0..=20.0).speed(0.1).suffix(" px")).on_hover_text("Line width (drag or type)");
-        ui.add(egui::DragValue::new(&mut self.style.font_size).range(10.0..=96.0).speed(0.3).suffix(" pt")).on_hover_text("Text and step label size");
-        if icons::button(ui, Icon::Shadow, ICON, self.style.shadow, "Shadow").clicked() {
-            self.style.shadow = !self.style.shadow;
-        }
-        if self.tool == Tool::Obfuscate || self.selected_is_obfuscate() {
-            egui::ComboBox::from_id_salt("obfuscate-mode")
-                .width(80.0)
-                .selected_text(if self.obfuscate == ObfuscateMode::Pixelate { "Pixelate" } else { "Blur" })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Pixelate, "Pixelate");
-                    ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Blur, "Blur");
-                });
-        }
-
-        if self.tool == Tool::Spotlight || self.selected_is_spotlight() {
-            self.spotlight_slider(ui);
-        }
-
-        // Remember the change as the style of whatever tool it applies to: the
-        // selected item's tool, or the current tool for the next item drawn.
-        if self.style != before || self.obfuscate != before_mode {
-            let owner = self.selected.and_then(|id| self.doc.item(id)).map(|it| Tool::for_shape(&it.shape)).unwrap_or(self.tool);
-            self.remember_style(owner);
-        }
+        self.style_controls(ui, Place::Toolbar);
         if let Some(id) = self.selected {
-            if self.style != before || self.obfuscate != before_mode {
-                let recent = self.prop_checkpoint.is_some_and(|(pid, at)| pid == id && at.elapsed() < Duration::from_millis(700));
-                if !recent {
-                    self.doc.checkpoint();
-                }
-                self.prop_checkpoint = Some((id, Instant::now()));
-                let (style, mode) = (self.style, self.obfuscate);
-                self.doc.update(id, |it| {
-                    it.style = style;
-                    if let Shape::Obfuscate { mode: m, .. } = &mut it.shape {
-                        *m = mode;
-                    }
-                });
-            }
             ui.separator();
             if self.doc.item(id).and_then(|it| it.shape.text()).is_some() && icons::button(ui, Icon::EditText, ICON, false, "Edit text").clicked() {
                 self.edit_text(id);
@@ -1383,6 +1356,153 @@ impl Editor {
                 self.run(EditorAction::Delete);
             }
         }
+    }
+
+    /// The style of the selection, or of the current tool when nothing is selected: the one set of
+    /// controls behind the toolbar's properties row and the panel's "This shape". The toolbar lays
+    /// them out in a row; the panel gives each a line with its label. A change is applied the same
+    /// way from either place (see [`Editor::commit_style`]). True when something changed.
+    fn style_controls(&mut self, ui: &mut egui::Ui, place: Place) -> bool {
+        let before = (self.style, self.obfuscate);
+        in_row(ui, place, "Line and text colour", |ui| colour_button(ui, &mut self.style.stroke, "Line and text colour"));
+        match place {
+            Place::Toolbar => fill_controls(ui, place, &mut self.style),
+            Place::Panel => {
+                ui.horizontal(|ui| fill_controls(ui, place, &mut self.style));
+            }
+        }
+        in_row(ui, place, "Line width", |ui| ui.add(egui::DragValue::new(&mut self.style.width).range(1.0..=20.0).speed(0.1).suffix(" px")).on_hover_text("Line width (drag or type)"));
+        in_row(ui, place, "Text size", |ui| ui.add(egui::DragValue::new(&mut self.style.font_size).range(10.0..=96.0).speed(0.3).suffix(" pt")).on_hover_text("Text and step label size"));
+        match place {
+            Place::Toolbar => {
+                if icons::button(ui, Icon::Shadow, ICON, self.style.shadow, SHADOW).clicked() {
+                    self.style.shadow = !self.style.shadow;
+                }
+            }
+            Place::Panel => {
+                ui.checkbox(&mut self.style.shadow, SHADOW);
+            }
+        }
+        if self.shows_obfuscate() {
+            let salt = if place == Place::Toolbar { "obfuscate-mode" } else { "obfuscate-mode-panel" };
+            in_row(ui, place, "Hide as", |ui| {
+                egui::ComboBox::from_id_salt(salt)
+                    .width(80.0)
+                    .selected_text(if self.obfuscate == ObfuscateMode::Pixelate { "Pixelate" } else { "Blur" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Pixelate, "Pixelate");
+                        ui.selectable_value(&mut self.obfuscate, ObfuscateMode::Blur, "Blur");
+                    });
+            });
+        }
+        if self.shows_spotlight() {
+            match place {
+                Place::Toolbar => self.spotlight_slider(ui),
+                Place::Panel => {
+                    ui.horizontal(|ui| {
+                        row_label(ui, "Spotlight strength");
+                        self.dim_slider(ui);
+                    });
+                }
+            }
+        }
+        self.commit_style(before)
+    }
+
+    /// After the style controls ran: remember a change as the style of whatever tool it applies to
+    /// (the selected item's tool, or the current tool for the next item drawn), and apply it to the
+    /// selection in one undo step per burst of changes. True when something changed.
+    fn commit_style(&mut self, before: (Style, ObfuscateMode)) -> bool {
+        if (self.style, self.obfuscate) == before {
+            return false;
+        }
+        let owner = self.selected.and_then(|id| self.doc.item(id)).map(|it| Tool::for_shape(&it.shape)).unwrap_or(self.tool);
+        self.remember_style(owner);
+        if let Some(id) = self.selected {
+            let recent = self.prop_checkpoint.is_some_and(|(pid, at)| pid == id && at.elapsed() < Duration::from_millis(700));
+            if !recent {
+                self.doc.checkpoint();
+            }
+            self.prop_checkpoint = Some((id, Instant::now()));
+            let (style, mode) = (self.style, self.obfuscate);
+            self.doc.update(id, |it| {
+                it.style = style;
+                if let Shape::Obfuscate { mode: m, .. } = &mut it.shape {
+                    *m = mode;
+                }
+            });
+        }
+        true
+    }
+
+    /// "Pixelate" or "Blur" is offered: for the Obfuscate tool or a selected obfuscate shape.
+    fn shows_obfuscate(&self) -> bool {
+        self.tool == Tool::Obfuscate || self.selected_is_obfuscate()
+    }
+
+    /// The spotlight strength is offered: for the Spotlight tool or a selected spotlight.
+    fn shows_spotlight(&self) -> bool {
+        self.tool == Tool::Spotlight || self.selected_is_spotlight()
+    }
+
+    /// The Properties panel of the image editor or of the Timeline view, docked at the right of
+    /// the canvas when open. The Tour view draws its own ([`Editor::tour_settings_panel`]).
+    fn properties_panel(&mut self, ui: &mut egui::Ui) {
+        if self.in_tour_view() || !self.panel_open {
+            return;
+        }
+        let mut changed = false;
+        let close = crate::tour_cards::properties_shell(ui, "editor-properties", |ui| {
+            changed = if self.video.is_some() { self.timeline_properties(ui) } else { self.image_properties(ui) };
+        });
+        // The toolbar was drawn before the panel: draw again at once, so it shows the change too.
+        if changed {
+            ui.ctx().request_repaint();
+        }
+        if close {
+            self.toggle_properties();
+        }
+    }
+
+    /// The image editor's panel: "This shape", "Picture" and "In this editor". True when something changed.
+    fn image_properties(&mut self, ui: &mut egui::Ui) -> bool {
+        crate::tour_cards::section(ui, "This shape");
+        let mut changed = self.style_controls(ui, Place::Panel);
+        crate::tour_cards::section(ui, "Picture");
+        ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).color(theme::MUTED));
+        row_label(ui, "Resize");
+        let mut pick = ui.horizontal_wrapped(resize_buttons).inner.map(resize_effect);
+        row_label(ui, "Effects");
+        if let Some(f) = ui.horizontal_wrapped(|ui| self.effect_buttons(ui, Place::Panel)).inner {
+            pick = Some(f);
+        }
+        if let Some(f) = pick {
+            self.effect(f);
+            changed = true;
+        }
+        crate::tour_cards::section(ui, "In this editor");
+        let zoom = self.zoom;
+        ui.horizontal(|ui| {
+            row_label(ui, "Zoom");
+            self.zoom_choice(ui, "zoom-panel");
+        });
+        changed | (zoom != self.zoom)
+    }
+
+    /// The zoom choices: the status bar's and the panel's "Zoom".
+    fn zoom_choice(&mut self, ui: &mut egui::Ui, salt: &str) {
+        let z = self.zoom.unwrap_or(self.last_canvas.zoom);
+        let label = if self.zoom.is_none() { format!("Fit {:.0}%", z * 100.0) } else { format!("{:.0}%", z * 100.0) };
+        egui::ComboBox::from_id_salt(salt).width(84.0).selected_text(label).show_ui(ui, |ui| {
+            if ui.selectable_label(self.zoom.is_none(), "Fit to window").clicked() {
+                self.zoom = None;
+            }
+            for p in [25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0] {
+                if ui.selectable_label(self.zoom == Some(p / 100.0), format!("{p:.0}%")).clicked() {
+                    self.zoom = Some(p / 100.0);
+                }
+            }
+        });
     }
 
     fn key_hint(&self, action: EditorAction) -> String {
@@ -1497,18 +1617,7 @@ impl Editor {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    let z = self.zoom.unwrap_or(self.last_canvas.zoom);
-                    let label = if self.zoom.is_none() { format!("Fit {:.0}%", z * 100.0) } else { format!("{:.0}%", z * 100.0) };
-                    egui::ComboBox::from_id_salt("zoom").width(84.0).selected_text(label).show_ui(ui, |ui| {
-                        if ui.selectable_label(self.zoom.is_none(), "Fit to window").clicked() {
-                            self.zoom = None;
-                        }
-                        for p in [25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0] {
-                            if ui.selectable_label(self.zoom == Some(p / 100.0), format!("{p:.0}%")).clicked() {
-                                self.zoom = Some(p / 100.0);
-                            }
-                        }
-                    });
+                    self.zoom_choice(ui, "zoom");
                     if icons::button(ui, Icon::Actual, 22.0, self.zoom == Some(1.0), "Actual size (100%)").clicked() {
                         self.zoom = Some(1.0);
                     }
@@ -1527,12 +1636,18 @@ impl Editor {
     /// "Spotlight · darken": one strength for every spotlight in the recording,
     /// one undo step per drag, remembered for the next spotlight and recording.
     fn spotlight_slider(&mut self, ui: &mut egui::Ui) {
+        ui.label("Spotlight · darken");
+        self.dim_slider(ui);
+    }
+
+    /// The spotlight strength slider: the toolbar's (after "Spotlight · darken") and the panel's
+    /// "Spotlight strength".
+    fn dim_slider(&mut self, ui: &mut egui::Ui) {
         let selected = self.selected.and_then(|id| self.doc.item(id)).and_then(|it| match it.shape {
             Shape::Spotlight { dim, .. } => Some(dim),
             _ => None,
         });
         let mut dim = selected.unwrap_or(self.prefs.spotlight_dim).clamp(MIN_DIM, MAX_DIM);
-        ui.label("Spotlight · darken");
         let resp = ui.add(egui::Slider::new(&mut dim, MIN_DIM..=MAX_DIM).suffix("%")).on_hover_text("How dark everything outside a spotlight gets. One strength for every spotlight.");
         let dragging = self.video.as_ref().is_some_and(|v| v.tour.dim_dragging);
         if resp.changed() {
@@ -2265,6 +2380,87 @@ fn paint_chevron(p: &egui::Painter, r: Rect, right: bool, c: Color32) {
     let (tip, back) = if right { (r.center().x + w, r.center().x - w) } else { (r.center().x - w, r.center().x + w) };
     let y = r.center().y;
     p.add(egui::Shape::line(vec![pos2(back, y - h / 1.5), pos2(tip, y), pos2(back, y + h / 1.5)], egui::Stroke::new(2.0, c)));
+}
+
+/// Where a control shared by the toolbar and the Properties panel is drawn. Both are bound to the
+/// same state, so a change in one shows in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// In a row of the toolbar (or of the Timeline view's controls, or of the export panel).
+    Toolbar,
+    /// On a line of the Properties panel, with its label.
+    Panel,
+}
+
+/// An effect on the picture, as the Effects menu and the panel give it.
+type Effect = Box<dyn FnOnce(&RgbaImage) -> RgbaImage>;
+
+/// The sizes Resize offers, in percent.
+const RESIZE: [u32; 6] = [25, 50, 75, 125, 150, 200];
+
+/// The shadow switch's label and hover text.
+const SHADOW: &str = "Shadow";
+
+/// A label at the start of a line of the Properties panel, muted as the Tour view's are.
+pub(crate) fn row_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(theme::MUTED));
+}
+
+/// A control in `place`: on its own in the toolbar, after its label on a line of the panel.
+pub(crate) fn in_row<R>(ui: &mut egui::Ui, place: Place, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    match place {
+        Place::Toolbar => add(ui),
+        Place::Panel => {
+            ui.horizontal(|ui| {
+                row_label(ui, label);
+                add(ui)
+            })
+            .inner
+        }
+    }
+}
+
+/// An on/off setting: a toggle button in the toolbar, a check box in the panel, with one label.
+pub(crate) fn switch(ui: &mut egui::Ui, place: Place, on: &mut bool, label: &str) -> egui::Response {
+    match place {
+        Place::Toolbar => ui.toggle_value(on, label),
+        Place::Panel => ui.checkbox(on, label),
+    }
+}
+
+/// A colour button with `hover` as its hover text; it changes `c` when a colour is picked.
+fn colour_button(ui: &mut egui::Ui, c: &mut Rgba, hover: &str) {
+    let mut shown = to_color32(*c);
+    if egui::color_picker::color_edit_button_srgba(ui, &mut shown, egui::color_picker::Alpha::OnlyBlend).on_hover_text(hover).changed() {
+        *c = from_color32(shown);
+    }
+}
+
+/// "Fill" and, while it is on, the fill colour.
+fn fill_controls(ui: &mut egui::Ui, place: Place, style: &mut Style) {
+    let mut on = style.fill.is_some();
+    if switch(ui, place, &mut on, "Fill").on_hover_text("Fill rectangles, ellipses, text boxes and bubbles").changed() {
+        style.fill = on.then_some(Rgba([255, 255, 255, 255]));
+    }
+    if let Some(mut f) = style.fill {
+        colour_button(ui, &mut f, "Fill colour");
+        style.fill = Some(f);
+    }
+}
+
+/// The Resize sizes as buttons (the Effects menu's submenu, the panel's "Resize"): the one clicked.
+fn resize_buttons(ui: &mut egui::Ui) -> Option<u32> {
+    let mut pick = None;
+    for p in RESIZE {
+        if ui.button(format!("{p}%")).clicked() {
+            pick = Some(p);
+        }
+    }
+    pick
+}
+
+fn resize_effect(p: u32) -> Effect {
+    Box::new(move |img: &RgbaImage| effects::resize(img, p))
 }
 
 fn to_color32(c: Rgba) -> Color32 {
@@ -3060,9 +3256,9 @@ pub(crate) mod tests {
         // Nothing to undo, redo or delete yet; the picture can always be copied, as Ctrl+C copies it.
         assert!(!find(&ed, Entry::Undo).enabled && !find(&ed, Entry::Redo).enabled && !find(&ed, Entry::Delete).enabled);
         assert!(find(&ed, Entry::Copy).enabled);
-        // No Properties panel here yet: the entry is there, disabled.
+        // The image editor has its Properties panel: the entry is usable, unchecked while it is closed.
         let props = find(&ed, Entry::Properties);
-        assert!(!props.enabled && props.checked == Some(false));
+        assert!(props.enabled && props.checked == Some(false));
         let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
         ed.select(Some(id));
         assert!(find(&ed, Entry::Undo).enabled && find(&ed, Entry::Delete).enabled && !find(&ed, Entry::Redo).enabled);
@@ -3126,10 +3322,12 @@ pub(crate) mod tests {
             AppRequest::Run(Command::Exit),
         ]);
         assert!(!ed.closed && ed.doc.items().is_empty(), "nothing else happened in the editor");
-        // A disabled entry does nothing: Export and Properties here.
+        // A disabled entry does nothing: Export here.
         choose(&mut ed, "File", "Export…");
-        choose(&mut ed, "Edit", "Properties");
         assert!(!ed.open_export && !ed.prefs_changed && ed.app_requests.len() == 8);
+        // Properties opens and closes the panel, as the toolbar's button does.
+        choose(&mut ed, "Edit", "Properties");
+        assert!(ed.properties_open() && ed.prefs.image_properties_open && ed.prefs_changed && ed.app_requests.len() == 8);
     }
 
     /// The menu bar takes no keys: with a menu open or not, the editor's own shortcuts work and a
@@ -3172,27 +3370,342 @@ pub(crate) mod tests {
         assert_eq!(ed.selected, None);
     }
 
+    // ---- The Properties panel of the image editor ----
+
+    /// The Properties panel as drawn: the column of surface, as wide as the panel, at the right.
+    pub(crate) fn panel_of(out: &egui::FullOutput) -> Option<Rect> {
+        crate::theme::checks::fills(out).into_iter().find(|(r, c, _)| *c == theme::SURFACE && (r.width() - crate::tour_cards::PANEL_W).abs() <= 2.0 && r.height() > 200.0).map(|(r, ..)| r)
+    }
+
+    /// The texts drawn inside `panel` as far as they show, top to bottom: each with where it is.
+    pub(crate) fn panel_texts(out: &egui::FullOutput, panel: Rect) -> Vec<(String, Rect)> {
+        fn walk(clip: Rect, s: &egui::Shape, into: &mut Vec<(String, Rect, Rect)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(clip, s, into)),
+                egui::Shape::Text(t) => into.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()), clip)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        out.shapes.iter().for_each(|c| walk(c.clip_rect, &c.shape, &mut all));
+        let mut inside: Vec<(String, Rect)> = all.into_iter().filter(|(_, r, clip)| panel.contains(r.center()) && clip.contains(r.center())).map(|(t, r, _)| (t, r)).collect();
+        inside.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        inside
+    }
+
+    /// Where `text` is drawn inside `panel`, if it is.
+    pub(crate) fn in_panel(out: &egui::FullOutput, panel: Rect, text: &str) -> Option<Rect> {
+        panel_texts(out, panel).into_iter().find(|(t, _)| t == text).map(|(_, r)| r)
+    }
+
+    /// The panel's section titles, top to bottom: its texts as big as its own heading.
+    pub(crate) fn panel_headings(out: &egui::FullOutput, panel: Rect) -> Vec<String> {
+        let texts = panel_texts(out, panel);
+        let heading = texts.iter().find(|(t, _)| t == PROPERTIES).map(|(_, r)| r.height()).expect("the panel's heading");
+        texts.into_iter().filter(|(_, r)| (r.height() - heading).abs() < 0.5).map(|(t, _)| t).collect()
+    }
+
+    /// The labels in `order` are all in the panel, each below the one before.
+    pub(crate) fn assert_in_order(out: &egui::FullOutput, panel: Rect, order: &[&str], what: &str) {
+        let ys: Vec<f32> = order.iter().map(|t| in_panel(out, panel, t).unwrap_or_else(|| panic!("{what}: the panel shows {t:?}: {:?}", panel_texts(out, panel))).top()).collect();
+        for (w, t) in ys.windows(2).zip(order.windows(2)) {
+            assert!(w[0] < w[1], "{what}: {} comes before {}: {ys:?}", t[0], t[1]);
+        }
+    }
+
+    /// The Properties button lit: the selection fill behind its label in the toolbar.
+    pub(crate) fn button_lit(out: &egui::FullOutput) -> bool {
+        let label = crate::share_ui::tests::shapes_of(out).into_iter().find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == PROPERTIES && t.pos.y < 90.0 => Some(t.galley.rect.translate(t.pos.to_vec2())),
+            _ => None,
+        });
+        let label = label.expect("the Properties button");
+        crate::theme::checks::fills(out).iter().any(|(r, c, _)| *c == theme::SELECTION && r.contains(label.center()) && r.area() < 20_000.0)
+    }
+
+    /// The settings file written and read back, as at the next start.
+    pub(crate) fn restarted(prefs: &EditorPrefs) -> EditorPrefs {
+        let mut settings = Settings::default();
+        settings.editor = prefs.clone();
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        back.editor
+    }
+
+    /// The Properties button and the Edit menu's entry open and close the image editor's panel, the
+    /// button is lit while it is open, and the panel's own close button closes it. Whether it is open
+    /// is remembered for the next image editor, apart from the recording editor's views.
     #[test]
-    fn the_properties_button_is_at_the_far_right_and_disabled_in_the_image_editor() {
+    fn the_properties_button_and_the_edit_menu_open_and_close_the_image_editors_panel() {
         let ctx = crate::theme::test_context();
         let size = dialog_checks::WINDOW.size();
         let mut ed = editor(EditorPrefs::default());
+        assert!(!ed.properties_open(), "closed by default");
         sized_frame(&mut ed, &ctx, size, vec![]);
         let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(panel_of(&out).is_none() && !button_lit(&out));
         let at = crate::share_ui::tests::text_rect(&out, PROPERTIES).expect("the button is shown");
         assert!(at.right() > size.x - 100.0 && at.top() > 20.0 && at.bottom() < 80.0, "at the far right of the toolbar, under the menu bar: {at:?}");
+        let click = |ed: &mut Editor, at: egui::Pos2| crate::menu_bar::tests::click_at(&mut |events| sized_frame(ed, &ctx, size, events), at);
+
+        // Opened with the button: drawn at the right, beside the picture, and the button lit.
+        click(&mut ed, at.center());
+        assert!(ed.properties_open() && ed.prefs.image_properties_open && ed.prefs_changed);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let panel = panel_of(&out).expect("the panel is open");
+        assert!((panel.right() - size.x).abs() <= 1.0, "docked at the right edge: {panel:?}");
+        let canvas = crate::theme::checks::fills(&out).into_iter().filter(|(r, c, _)| *c == theme::GROUND && r.height() > 200.0 && r.width() < size.x - 10.0).map(|(r, ..)| r).max_by(|a, b| a.area().total_cmp(&b.area())).expect("the canvas");
+        assert!(canvas.right() <= panel.left() + 1.0, "beside the picture, never over it: {canvas:?} {panel:?}");
+        assert!(button_lit(&out), "the button is lit while the panel is open");
+        assert!(menu_bar::tests::find(&menu_bar::menus(&ed.menu_state()), Entry::Properties).checked == Some(true));
+        // The Tour view's and the Timeline view's settings are their own.
+        assert!(ed.prefs.tour_properties_open && !ed.prefs.timeline_properties_open);
+        let next = editor(restarted(&ed.prefs));
+        assert!(next.properties_open(), "open in the next image editor, after a restart");
+
+        // Closed with the button, then opened and closed with the Edit menu.
+        click(&mut ed, at.center());
+        assert!(!ed.properties_open() && !ed.prefs.image_properties_open);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(panel_of(&out).is_none() && !button_lit(&out));
+        assert!(!editor(restarted(&ed.prefs)).properties_open(), "closed after a restart");
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(ed.properties_open() && ed.prefs.image_properties_open);
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(!ed.properties_open() && !ed.prefs.image_properties_open);
+
+        // Closed with its own close button, at the right of its heading.
+        ed.toggle_properties();
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let panel = panel_of(&out).unwrap();
+        let heading = in_panel(&out, panel, PROPERTIES).expect("the panel's heading");
+        click(&mut ed, pos2(panel.right() - 12.0 - 11.0, heading.center().y));
+        assert!(!ed.properties_open() && !ed.prefs.image_properties_open);
+    }
+
+    /// The image editor's panel: exactly its three sections in order, each control on its line in
+    /// order; "Hide as" and "Spotlight strength" only where the toolbar shows theirs.
+    #[test]
+    fn the_image_editors_panel_shows_this_shape_the_picture_and_the_editor_in_order() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(1280.0, 1600.0);
+        let frames = |ed: &mut Editor| {
+            for _ in 0..2 {
+                sized_frame(ed, &ctx, size, vec![]);
+            }
+            sized_frame(ed, &ctx, size, vec![])
+        };
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).expect("open");
+        assert_eq!(panel_headings(&out, panel), ["Properties", "This shape", "Picture", "In this editor"]);
+        let order = ["Properties", "This shape", "Line and text colour", "Fill", "Line width", "Text size", "Shadow", "Picture", "64 × 48", "Resize", "25%", "200%", "Effects", "Drop shadow", "Rotate left", "In this editor", "Zoom"];
+        assert_in_order(&out, panel, &order, "the image editor's panel");
+        for absent in ["Hide as", "Pixelate", "Spotlight strength"] {
+            assert!(in_panel(&out, panel, absent).is_none(), "{absent} only for an obfuscate shape or a spotlight");
+        }
+        // The effects as the Effects menu lists them, Resize being a line of its own.
+        for e in ["Drop shadow", "Torn edge", "Border (current colour and width)", "Greyscale", "Invert", "Rotate right", "Rotate left"] {
+            assert!(in_panel(&out, panel, e).is_some(), "{e}");
+        }
+        for p in RESIZE {
+            assert!(in_panel(&out, panel, &format!("{p}%")).is_some(), "{p}%");
+        }
+        // The fill colour only while Fill is on.
+        let swatches = |out: &egui::FullOutput, area: Rect| crate::theme::checks::fills(out).iter().filter(|(r, c, _)| *c == Color32::WHITE && area.contains(r.center()) && r.area() < 2_000.0).count();
+        assert_eq!(swatches(&out, panel), 0);
+        ed.style.fill = Some(Rgba([255, 255, 255, 255]));
+        let out = frames(&mut ed);
+        assert!(swatches(&out, panel_of(&out).unwrap()) >= 1, "the fill colour button");
+
+        // The Obfuscate tool, and a selected obfuscate shape: "Hide as" in the panel and the choice in the toolbar.
+        let toolbar = |out: &egui::FullOutput, text: &str| crate::share_ui::tests::shapes_of(out).into_iter().any(|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == text && t.pos.y < 90.0));
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        ed.set_tool(Tool::Obfuscate);
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).unwrap();
+        assert_in_order(&out, panel, &["Shadow", "Hide as", "Picture"], "the Obfuscate tool");
+        assert!(toolbar(&out, "Pixelate"), "the toolbar shows its choice too");
+        ed.set_tool(Tool::Select);
+        let out = frames(&mut ed);
+        assert!(in_panel(&out, panel_of(&out).unwrap(), "Hide as").is_none() && !toolbar(&out, "Pixelate"), "not for the Select tool with nothing selected");
+        let id = ed.add_item(Shape::Obfuscate { rect: Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }, mode: ObfuscateMode::Blur });
+        ed.select(Some(id));
+        let out = frames(&mut ed);
+        assert!(in_panel(&out, panel_of(&out).unwrap(), "Hide as").is_some() && toolbar(&out, "Blur"), "for a selected obfuscate shape, in both places");
+
+        // The Spotlight tool: "Spotlight strength" in the panel where the toolbar shows its slider.
+        ed.select(None);
+        ed.tool = Tool::Spotlight;
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).unwrap();
+        assert_in_order(&out, panel, &["Shadow", "Spotlight strength", "Picture"], "the Spotlight tool");
+        assert!(toolbar(&out, "Spotlight · darken"));
+        ed.tool = Tool::Rectangle;
+        let out = frames(&mut ed);
+        assert!(in_panel(&out, panel_of(&out).unwrap(), "Spotlight strength").is_none() && !toolbar(&out, "Spotlight · darken"));
+    }
+
+    /// A change made in the panel is the change the toolbar makes: the same state, shown in both
+    /// places, remembered as the tool's style, and one undo step, undone and redone alike.
+    #[test]
+    fn a_change_in_the_image_editors_panel_is_the_toolbars_and_undoes_alike() {
+        let size = dialog_checks::WINDOW.size();
+        let swatches = |out: &egui::FullOutput, area: Rect| crate::theme::checks::fills(out).iter().filter(|(r, c, _)| *c == Color32::WHITE && area.contains(r.center()) && r.area() < 2_000.0).count();
+        // Fill switched on with the panel's check box, or with the toolbar's button, on a fresh editor each.
+        let mut results = Vec::new();
+        for in_the_panel in [true, false] {
+            let ctx = crate::theme::test_context();
+            let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+            let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+            ed.select(Some(id));
+            sized_frame(&mut ed, &ctx, size, vec![]);
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            let panel = panel_of(&out).unwrap();
+            let band = Rect::from_min_max(pos2(0.0, 20.0), pos2(size.x, 90.0));
+            assert_eq!((swatches(&out, panel), swatches(&out, band)), (0, 0), "no fill yet");
+            let at = if in_the_panel {
+                in_panel(&out, panel, "Fill").expect("the panel's Fill")
+            } else {
+                crate::share_ui::tests::shapes_of(&out).into_iter().find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text() == "Fill" && band.contains(t.pos) => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                    _ => None,
+                }).expect("the toolbar's Fill")
+            };
+            crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), at.center());
+            let fill = Some(Rgba([255, 255, 255, 255]));
+            assert_eq!(ed.style.fill, fill, "panel {in_the_panel}: the state both read");
+            assert_eq!(ed.doc.item(id).unwrap().style.fill, fill, "panel {in_the_panel}: the selection");
+            assert_eq!(ed.prefs.styles.get("rectangle").map(|s| s.fill), Some(fill.map(|f| f.0)), "panel {in_the_panel}: the rectangle's remembered style");
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            assert!(swatches(&out, panel) >= 1 && swatches(&out, band) >= 1, "panel {in_the_panel}: the fill colour shows in both places");
+            // One undo step: undone, the shape is there without fill; redone, with.
+            ed.run(EditorAction::Undo);
+            let undone = (ed.doc.items().len(), ed.doc.item(id).map(|it| it.style.fill));
+            ed.run(EditorAction::Redo);
+            let redone = (ed.doc.items().len(), ed.doc.item(id).map(|it| it.style.fill));
+            results.push((undone, redone));
+        }
+        assert_eq!(results[0], results[1], "the panel and the toolbar undo and redo alike");
+        assert_eq!(results[0], ((1, Some(None)), (1, Some(Some(Rgba([255, 255, 255, 255]))))));
+
+        // Shadow in the panel: the same state as the toolbar's shadow button, one undo step.
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        let shadow = ed.style.shadow;
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let at = in_panel(&out, panel_of(&out).unwrap(), "Shadow").unwrap();
         crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), at.center());
-        assert!(!ed.properties_open() && !ed.prefs_changed, "it does nothing here");
-        // Its hover text says why.
-        let hover = |ed: &mut Editor| {
-            sized_frame(ed, &ctx, size, vec![egui::Event::PointerMoved(at.center())]);
+        assert_eq!((ed.style.shadow, ed.doc.item(id).unwrap().style.shadow), (!shadow, !shadow));
+        ed.run(EditorAction::Undo);
+        assert_eq!((ed.doc.items().len(), ed.doc.item(id).unwrap().style.shadow), (1, shadow));
+
+        // An effect and a resize from the panel: the same undo step as from the Effects menu.
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let at = in_panel(&out, panel_of(&out).unwrap(), "50%").unwrap();
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), at.center());
+        assert_eq!((ed.doc.width(), ed.doc.height()), (32, 24), "resized to half");
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(in_panel(&out, panel_of(&out).unwrap(), "32 × 24").is_some(), "the picture's size follows");
+        ed.run(EditorAction::Undo);
+        assert_eq!((ed.doc.width(), ed.doc.height()), (64, 48));
+        let mut by_menu = editor(EditorPrefs::default());
+        by_menu.effect(resize_effect(50));
+        assert_eq!((by_menu.doc.width(), by_menu.doc.can_undo()), (32, true));
+
+        // The zoom chosen in the panel is the status bar's.
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let panel = panel_of(&out).unwrap();
+        let combo = panel_texts(&out, panel).into_iter().find(|(t, _)| t.starts_with("Fit ")).expect("the panel's zoom").1;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), combo.center());
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let choice = crate::menu_bar::tests::last_text_rect(&out, "200%").expect("the zoom choices");
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), choice.center());
+        assert_eq!(ed.zoom, Some(2.0));
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let status = crate::share_ui::tests::shapes_of(&out).into_iter().filter(|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == "200%" && t.pos.y > size.y - 40.0)).count();
+        assert!(status >= 1, "the status bar shows the zoom chosen in the panel");
+    }
+
+    /// A change made in the panel asks for another frame at once, so the toolbar (drawn before the
+    /// panel) shows it without waiting for the next input.
+    #[test]
+    fn a_change_in_the_panel_draws_the_toolbar_again_at_once() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+        for _ in 0..3 {
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let at = in_panel(&out, panel_of(&out).unwrap(), "Shadow").unwrap().center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::PointerMoved(at), button(true)]);
+        let before = ed.style.shadow;
+        let released = sized_frame(&mut ed, &ctx, size, vec![button(false)]);
+        assert_ne!(ed.style.shadow, before, "the click changed the shadow");
+        assert!(repaint_asked(&released), "the frame of the change asked for another");
+    }
+
+    /// Every label of the image editor's panel fits it at 100%, with each conditional line shown, in
+    /// the editor's own window and at the narrowest the editor allows.
+    #[test]
+    fn the_image_editors_panel_labels_fit_it() {
+        for size in [dialog_checks::WINDOW.size(), egui::vec2(EDITOR_MIN_SIZE[0], EDITOR_MIN_SIZE[1])] {
+            for tool in [Tool::Obfuscate, Tool::Spotlight, Tool::Text] {
+                let ctx = crate::theme::test_context();
+                let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+                ed.tool = tool;
+                ed.style.fill = Some(Rgba([255, 255, 255, 255]));
+                for _ in 0..2 {
+                    sized_frame(&mut ed, &ctx, size, vec![]);
+                }
+                let out = sized_frame(&mut ed, &ctx, size, vec![]);
+                let what = format!("the image editor's panel, {tool:?}, {size:?}");
+                let panel = panel_of(&out).unwrap_or_else(|| panic!("{what}: open"));
+                let texts = panel_texts(&out, panel);
+                assert!(texts.len() >= 10, "{what}: {texts:?}");
+                for (t, r) in &texts {
+                    assert!(panel.expand(0.5).contains_rect(*r), "{what}: {t:?} at {r:?} sticks out of the panel {panel:?}");
+                }
+                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
+            }
+        }
+    }
+
+    /// The toolbar's overflow cue works as before with the panel open: none where the row fits, a
+    /// chevron where buttons are hidden, and a click on it scrolls.
+    #[test]
+    fn the_toolbar_overflow_cue_works_with_the_panel_open() {
+        let ctx = crate::theme::test_context();
+        let prefs = EditorPrefs { image_properties_open: true, ..EditorPrefs::default() };
+        let settle = |ed: &mut Editor, size: egui::Vec2| {
+            let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+            ed.select(Some(id));
             for _ in 0..3 {
                 sized_frame(ed, &ctx, size, vec![]);
             }
             sized_frame(ed, &ctx, size, vec![])
         };
-        let shown = hover(&mut ed);
-        assert!(crate::share_ui::tests::text_rect(&shown, menu_bar::NOTHING_TO_SET).is_some(), "the hover text shows");
+        let mut ed = editor(prefs.clone());
+        let out = settle(&mut ed, dialog_checks::WINDOW.size());
+        assert!(panel_of(&out).is_some());
+        assert_eq!(ed.toolbar_scroll.cues, [None, None], "no cue when everything fits");
+        let size = egui::vec2(480.0, EDITOR_MIN_SIZE[1]);
+        let mut ed = editor(prefs);
+        settle(&mut ed, size);
+        let right = ed.toolbar_scroll.cues[1].expect("a cue at the right edge");
+        let before = ed.toolbar_scroll.offset;
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), right.center());
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(ed.toolbar_scroll.offset > before + 1.0 && ed.toolbar_scroll.cues[0].is_some(), "the chevron scrolls: {:?}", ed.toolbar_scroll);
     }
 
     /// Nothing sticks out of the toolbar at the narrowest window the editor allows, at 100%, 125%
@@ -3203,10 +3716,10 @@ pub(crate) mod tests {
     fn nothing_sticks_out_of_the_toolbar_at_the_narrowest_window_and_every_scale() {
         let size = egui::vec2(EDITOR_MIN_SIZE[0], EDITOR_MIN_SIZE[1]);
         for ppp in [1.0, 1.25, 2.0] {
-            for typing in [false, true] {
+            for (typing, open) in [(false, false), (true, false), (false, true), (true, true)] {
                 let ctx = crate::theme::test_context();
                 ctx.set_pixels_per_point(ppp);
-                let mut ed = editor(EditorPrefs::default());
+                let mut ed = editor(EditorPrefs { image_properties_open: open, ..EditorPrefs::default() });
                 if typing {
                     ed.tool = Tool::Text;
                     ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: None });
@@ -3218,10 +3731,16 @@ pub(crate) mod tests {
                     sized_frame(&mut ed, &ctx, size, vec![]);
                 }
                 let out = sized_frame(&mut ed, &ctx, size, vec![]);
-                let what = format!("the editor at {ppp}, typing {typing}");
+                let what = format!("the editor at {ppp}, typing {typing}, panel open {open}");
+                assert_eq!(panel_of(&out).is_some(), open, "{what}");
                 assert_toolbar_fits(&out, size, &what);
-                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
-                let mut ed2 = editor(EditorPrefs::default());
+                // The box a text is typed in floats over the canvas where the text is, and at this
+                // width it reaches over the panel beside it: the panel's labels are then under that
+                // box, not out of their own. The panel's labels are checked on their own elsewhere.
+                if !(typing && open) {
+                    assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
+                }
+                let mut ed2 = editor(EditorPrefs { image_properties_open: open, ..EditorPrefs::default() });
                 assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| ed2.ui(ui)), 0, "{what}");
             }
         }

@@ -16,7 +16,7 @@ use mythicshot_recording::ffmpeg::Found;
 use mythicshot_recording::{FrameReader, Recording};
 
 use crate::theme::{self, Strong as _};
-use crate::editor_ui::Editor;
+use crate::editor_ui::{Editor, Place, in_row, row_label, switch};
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
 use crate::publish::{Published, Target, access::Access, share};
@@ -1171,6 +1171,8 @@ impl Editor {
             origin: None,
         });
         editor.init_pulse_history();
+        // A recording opens in the Timeline view: its panel as it was left last time.
+        editor.panel_open = editor.prefs.timeline_properties_open;
         // Test hook: start with one selected annotation, to check the range bar.
         #[cfg(debug_assertions)]
         if std::env::var_os("MYTHICSHOT_TEST_ANNOTATE").is_some() {
@@ -1903,29 +1905,7 @@ impl Editor {
             }
         });
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Scale");
-            for s in [100, 75, 50, 25] {
-                if ui.add(egui::Button::selectable(v.edit.scale == s, format!("{s}%"))).clicked() {
-                    v.edit.scale = s;
-                }
-            }
-        });
-        match v.format {
-            Format::Gif => {
-                ui.add(egui::Slider::new(&mut v.quality, 50..=100).text("quality"));
-            }
-            Format::Mp4 | Format::Webm => {
-                ui.add(egui::Slider::new(&mut v.fps, 10..=60).text("fps"));
-            }
-            Format::Apng => {}
-        }
-        if matches!(v.format, Format::Gif | Format::Apng) {
-            ui.checkbox(&mut v.loop_forever, "Loop forever");
-        }
-        let (w, h) = video::output_size(&v.rec, &v.edit);
-        let (frames, end) = video::plan(&v.rec, &v.edit);
-        ui.label(RichText::new(format!("{w} × {h} · {} frames · {:.1} s", frames.len(), end as f64 / 1000.0)).color(theme::MUTED).size(12.0));
+        output_controls(ui, v);
         let (tour_line, tour_ok) = match tour::plan_steps(&v.rec, &v.edit, &v.events) {
             Ok(steps) => (tour_steps_label(&steps), true),
             Err(e) => (e, false),
@@ -2070,29 +2050,12 @@ impl Editor {
                 let t = v.rec.frames[v.current].t_ms as f64 / 1000.0;
                 ui.label(RichText::new(format!("Frame {} / {} · {t:05.2} s", v.current + 1, v.rec.frames.len())).monospace().color(theme::MUTED));
                 ui.separator();
-                if ui.button("Start here").on_hover_text("Trim: keep from this frame").clicked() {
-                    v.edit.trim.0 = v.current.min(v.edit.trim.1);
-                }
-                if ui.button("End here").on_hover_text("Trim: keep up to this frame").clicked() {
-                    v.edit.trim.1 = v.current.max(v.edit.trim.0);
-                }
-                let deleted = v.edit.deleted.contains(&v.current);
-                if ui.button(if deleted { "Restore frame" } else { "Delete frame" }).clicked() {
-                    if deleted {
-                        v.edit.deleted.remove(&v.current);
-                    } else {
-                        v.edit.deleted.insert(v.current);
-                    }
-                }
+                frame_buttons(ui, v);
                 ui.separator();
-                egui::ComboBox::from_id_salt("speed").width(64.0).selected_text(format!("{}×", v.edit.speed)).show_ui(ui, |ui| {
-                    for s in [0.25, 0.5, 1.0, 1.5, 2.0, 4.0] {
-                        ui.selectable_value(&mut v.edit.speed, s, format!("{s}×"));
-                    }
-                });
-                ui.toggle_value(&mut v.edit.reverse, "Reverse");
+                speed_choice(ui, "speed", &mut v.edit.speed);
+                switch(ui, Place::Toolbar, &mut v.edit.reverse, "Reverse");
                 ui.separator();
-                overlay_controls(ui, &mut v.edit.overlays);
+                overlay_controls(ui, &mut v.edit.overlays, Place::Toolbar);
                 let no_keys = !v.events.iter().any(|e| matches!(e.kind, mythicshot_editor::overlays::InputKind::KeyDown(_)));
                 if no_keys && v.edit.overlays.keys != KeyStyle::Off {
                     theme::caution_line(ui, "No key presses were recorded", theme::SMALL_SIZE, theme::Fit::Truncate)
@@ -2229,6 +2192,31 @@ impl Editor {
         }
     }
 
+    /// The Timeline view's panel: "This frame", "Playback", "Shown on the recording" and "Output",
+    /// each control the very one of the controls row or the export panel. True when something changed.
+    pub(crate) fn timeline_properties(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(v) = self.video.as_mut() else { return false };
+        // As the export panel does: a format that needs ffmpeg gives way when there is none.
+        v.format = usable_format(v.format, mythicshot_recording::ffmpeg::found());
+        let before = timeline_settings(v);
+        crate::tour_cards::section(ui, "This frame");
+        ui.label(RichText::new(format!("Frame {} of {}", v.current + 1, v.rec.frames.len())).color(theme::MUTED));
+        ui.horizontal_wrapped(|ui| frame_buttons(ui, v));
+        crate::tour_cards::section(ui, "Playback");
+        ui.horizontal(|ui| {
+            row_label(ui, "Speed");
+            speed_choice(ui, "speed-panel", &mut v.edit.speed);
+        });
+        switch(ui, Place::Panel, &mut v.edit.reverse, "Reverse");
+        crate::tour_cards::section(ui, "Shown on the recording");
+        overlay_controls(ui, &mut v.edit.overlays, Place::Panel);
+        crate::tour_cards::section(ui, "Output");
+        output_controls(ui, v);
+        let changed = timeline_settings(v) != before;
+        self.remember_export();
+        changed
+    }
+
     /// Space plays and pauses in video mode; the arrows step frames, or tour steps in the Tour view.
     pub(crate) fn video_keys(&mut self, ctx: &egui::Context) {
         if self.text_editing() || ctx.egui_wants_keyboard_input() {
@@ -2262,19 +2250,91 @@ fn toggle_play(v: &mut VideoState) {
     v.playing = Some((Instant::now(), from));
 }
 
-fn overlay_controls(ui: &mut egui::Ui, o: &mut OverlayStyle) {
-    egui::ComboBox::from_id_salt("tl-keys").width(118.0).selected_text(format!("Keys: {}", key_style_label(o.keys))).show_ui(ui, |ui| {
-        for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
-            ui.selectable_value(&mut o.keys, k, key_style_label(k));
+/// What is drawn on the recording: the Timeline view's controls row and the panel's "Shown on the
+/// recording". The toolbar's choices name what they set ("Keys: Off"); the panel's lines say it before them.
+fn overlay_controls(ui: &mut egui::Ui, o: &mut OverlayStyle, place: Place) {
+    let (keys_salt, clicks_salt) = if place == Place::Toolbar { ("tl-keys", "tl-clicks") } else { ("tl-keys-panel", "tl-clicks-panel") };
+    let shown = |name: &str, value: &str| if place == Place::Toolbar { format!("{name}: {value}") } else { value.to_string() };
+    in_row(ui, place, "Keys", |ui| {
+        egui::ComboBox::from_id_salt(keys_salt).width(118.0).selected_text(shown("Keys", key_style_label(o.keys))).show_ui(ui, |ui| {
+            for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
+                ui.selectable_value(&mut o.keys, k, key_style_label(k));
+            }
+        });
+    });
+    in_row(ui, place, "Clicks", |ui| {
+        egui::ComboBox::from_id_salt(clicks_salt).width(118.0).selected_text(shown("Clicks", click_style_label(o.clicks))).show_ui(ui, |ui| {
+            for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
+                ui.selectable_value(&mut o.clicks, c, click_style_label(c));
+            }
+        });
+    });
+    switch(ui, place, &mut o.pointer, "Pointer");
+    switch(ui, place, &mut o.halo, "Halo");
+}
+
+/// Trim to the shown frame from either end, and delete or restore it: the Timeline view's
+/// controls row and the panel's "This frame".
+fn frame_buttons(ui: &mut egui::Ui, v: &mut VideoState) {
+    if ui.button("Start here").on_hover_text("Trim: keep from this frame").clicked() {
+        v.edit.trim.0 = v.current.min(v.edit.trim.1);
+    }
+    if ui.button("End here").on_hover_text("Trim: keep up to this frame").clicked() {
+        v.edit.trim.1 = v.current.max(v.edit.trim.0);
+    }
+    let deleted = v.edit.deleted.contains(&v.current);
+    if ui.button(if deleted { "Restore frame" } else { "Delete frame" }).clicked() {
+        if deleted {
+            v.edit.deleted.remove(&v.current);
+        } else {
+            v.edit.deleted.insert(v.current);
+        }
+    }
+}
+
+/// The playback speeds: the Timeline view's controls row and the panel's "Speed".
+fn speed_choice(ui: &mut egui::Ui, salt: &str, speed: &mut f32) {
+    egui::ComboBox::from_id_salt(salt).width(64.0).selected_text(format!("{speed}×")).show_ui(ui, |ui| {
+        for s in [0.25, 0.5, 1.0, 1.5, 2.0, 4.0] {
+            ui.selectable_value(speed, s, format!("{s}×"));
         }
     });
-    egui::ComboBox::from_id_salt("tl-clicks").width(118.0).selected_text(format!("Clicks: {}", click_style_label(o.clicks))).show_ui(ui, |ui| {
-        for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
-            ui.selectable_value(&mut o.clicks, c, click_style_label(c));
+}
+
+/// The output's scale, the quality or fps of the chosen format, looping where the format loops, and
+/// what comes out: the export panel's and the panel's "Output".
+fn output_controls(ui: &mut egui::Ui, v: &mut VideoState) {
+    ui.horizontal(|ui| {
+        ui.label("Scale");
+        for s in [100, 75, 50, 25] {
+            if ui.add(egui::Button::selectable(v.edit.scale == s, format!("{s}%"))).clicked() {
+                v.edit.scale = s;
+            }
         }
     });
-    ui.toggle_value(&mut o.pointer, "Pointer");
-    ui.toggle_value(&mut o.halo, "Halo");
+    match v.format {
+        Format::Gif => {
+            ui.add(egui::Slider::new(&mut v.quality, 50..=100).text("quality"));
+        }
+        Format::Mp4 | Format::Webm => {
+            ui.add(egui::Slider::new(&mut v.fps, 10..=60).text("fps"));
+        }
+        Format::Apng => {}
+    }
+    if matches!(v.format, Format::Gif | Format::Apng) {
+        ui.checkbox(&mut v.loop_forever, "Loop forever");
+    }
+    let (w, h) = video::output_size(&v.rec, &v.edit);
+    let (frames, end) = video::plan(&v.rec, &v.edit);
+    ui.label(RichText::new(format!("{w} × {h} · {} frames · {:.1} s", frames.len(), end as f64 / 1000.0)).color(theme::MUTED).size(12.0));
+}
+
+/// What the Timeline view's panel sets, to tell whether a frame of it changed something.
+type TimelineSettings = ((usize, usize), std::collections::BTreeSet<usize>, f32, bool, OverlayStyle, u32, Format, u8, u32, bool);
+
+fn timeline_settings(v: &VideoState) -> TimelineSettings {
+    let e = &v.edit;
+    (e.trim, e.deleted.clone(), e.speed, e.reverse, e.overlays, e.scale, v.format, v.quality, v.fps, v.loop_forever)
 }
 
 #[cfg(test)]
@@ -2684,7 +2744,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recording_editors_menus_export_and_publish_and_offer_properties_only_in_the_tour_view() {
+    fn the_recording_editors_menus_export_and_publish_and_offer_properties_in_both_views() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
         let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&crate::menu_bar::menus(&ed.menu_state()), e);
@@ -2693,19 +2753,223 @@ mod tests {
         // "Publish tour…" is usable exactly when the export panel's button is: never without a site and token, as in a test run.
         assert_eq!(find(&ed, Entry::PublishTour).enabled, ed.can_publish_tour());
         assert!(!ed.can_publish_tour());
-        // The Timeline view has no panel yet: the entry is there, disabled, as is the toolbar's button.
-        assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (false, Some(false)));
-        let ctx = crate::theme::test_context();
-        let size = crate::editor_ui::dialog_checks::WINDOW.size();
-        sized(&mut ed, &ctx, size, vec![]);
-        let out = sized(&mut ed, &ctx, size, vec![]);
-        let at = crate::share_ui::tests::text_rect(&out, crate::editor_ui::PROPERTIES).expect("the button");
-        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at.center());
-        assert!(!ed.properties_open() && !ed.prefs_changed);
+        // The Timeline view has its panel, closed at first: the entry is usable and unchecked.
+        assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (true, Some(false)));
         // In the Tour view it is usable, and checked while the panel is open.
         ed.set_view(VideoView::Tour);
         assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (true, Some(true)));
         assert!(find(&ed, Entry::Export).enabled && !find(&ed, Entry::Save).enabled);
+    }
+
+    // ---- The Timeline view's Properties panel ----
+    use crate::editor_ui::tests::{assert_in_order, button_lit, in_panel, panel_headings, panel_of, panel_texts};
+
+    /// The Properties button and the Edit menu open and close the Timeline view's panel, the button
+    /// lit while it is open, and its own close button closes it. Whether it is open is remembered for
+    /// the next Timeline view, in this recording and the next, apart from the Tour view's panel.
+    #[test]
+    fn the_properties_button_and_the_edit_menu_open_and_close_the_timeline_views_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = video_editor_with(&tmp.path().join("a"), Default::default());
+        assert!(!ed.properties_open() && !ed.prefs.timeline_properties_open, "closed by default");
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        assert!(properties_panel(&out).is_none() && !button_lit(&out));
+        let at = crate::share_ui::tests::text_rect(&out, crate::editor_ui::PROPERTIES).expect("the button");
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at.center());
+        assert!(ed.properties_open() && ed.prefs.timeline_properties_open && ed.prefs_changed);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = properties_panel(&out).expect("open, docked at the right");
+        assert!((panel.right() - size.x).abs() <= 1.0, "{panel:?}");
+        assert!(button_lit(&out), "the button is lit while the panel is open");
+        // The image editor's and the Tour view's settings are their own.
+        assert!(!ed.prefs.image_properties_open && ed.prefs.tour_properties_open);
+        // To the Tour view and back: its own panel there, this one here again.
+        ed.set_view(VideoView::Tour);
+        assert!(ed.properties_open(), "the Tour view's panel, open by its own setting");
+        ed.toggle_properties();
+        assert!(!ed.prefs.tour_properties_open && ed.prefs.timeline_properties_open);
+        ed.set_view(VideoView::Timeline);
+        assert!(ed.properties_open(), "still open in the Timeline view");
+        let next = video_editor_with(&tmp.path().join("b"), crate::editor_ui::tests::restarted(&ed.prefs));
+        assert!(next.properties_open(), "open in the next recording's Timeline view, after a restart");
+
+        // Closed with the Edit menu, and opened with it again.
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(!ed.properties_open() && !ed.prefs.timeline_properties_open);
+        assert!(properties_panel(&sized(&mut ed, &ctx, size, vec![])).is_none());
+        let next = video_editor_with(&tmp.path().join("c"), crate::editor_ui::tests::restarted(&ed.prefs));
+        assert!(!next.properties_open(), "closed after a restart");
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Properties");
+        assert!(ed.properties_open() && ed.prefs.timeline_properties_open);
+
+        // Closed with its own close button, at the right of its heading.
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        let panel = properties_panel(&out).unwrap();
+        let heading = text_in(&out, crate::editor_ui::PROPERTIES, panel).unwrap();
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), egui::pos2(panel.right() - 12.0 - 11.0, heading.center().y));
+        assert!(!ed.properties_open() && !ed.prefs.timeline_properties_open);
+    }
+
+    /// The Timeline view's panel: exactly its four sections in order, each control in order; the
+    /// frame's button says what it does to the shown frame, and the output's lines follow the format.
+    #[test]
+    fn the_timeline_views_panel_shows_the_frame_playback_overlays_and_output_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(1280.0, 1600.0);
+        let prefs = crate::settings::EditorPrefs { timeline_properties_open: true, ..Default::default() };
+        let mut ed = video_editor_with(&tmp.path().join("rec"), prefs);
+        ed.video.as_mut().unwrap().format = Format::Gif;
+        let frames = |ed: &mut Editor| {
+            for _ in 0..2 {
+                sized(ed, &ctx, size, vec![]);
+            }
+            sized(ed, &ctx, size, vec![])
+        };
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).expect("open");
+        assert_eq!(panel_headings(&out, panel), ["Properties", "This frame", "Playback", "Shown on the recording", "Output"]);
+        let v = ed.video.as_ref().unwrap();
+        let count = format!("Frame 1 of {}", v.rec.frames.len());
+        let (w, h) = video::output_size(&v.rec, &v.edit);
+        let (planned, end) = video::plan(&v.rec, &v.edit);
+        let line = format!("{w} × {h} · {} frames · {:.1} s", planned.len(), end as f64 / 1000.0);
+        let order = ["Properties", "This frame", count.as_str(), "Start here", "Playback", "Speed", "Reverse", "Shown on the recording", "Keys", "Clicks", "Pointer", "Halo", "Output", "Scale", "quality", "Loop forever", line.as_str()];
+        assert_in_order(&out, panel, &order, "the Timeline view's panel");
+        for t in ["End here", "Delete frame", "100%", "75%", "50%", "25%"] {
+            assert!(in_panel(&out, panel, t).is_some(), "{t}");
+        }
+        assert!(in_panel(&out, panel, "Restore frame").is_none() && in_panel(&out, panel, "fps").is_none());
+        // A deleted frame: "Restore frame", in the panel and in the controls row alike.
+        let current = ed.video.as_ref().unwrap().current;
+        ed.video.as_mut().unwrap().edit.deleted.insert(current);
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).unwrap();
+        assert!(in_panel(&out, panel, "Restore frame").is_some() && in_panel(&out, panel, "Delete frame").is_none());
+        assert_eq!(crate::share_ui::tests::shapes_of(&out).into_iter().filter(|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == "Restore frame")).count(), 2, "in both places");
+        // APNG: no quality slider, and it loops.
+        ed.video.as_mut().unwrap().format = Format::Apng;
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).unwrap();
+        assert!(in_panel(&out, panel, "quality").is_none() && in_panel(&out, panel, "fps").is_none() && in_panel(&out, panel, "Loop forever").is_some());
+        // A video format: its fps and no looping, when ffmpeg is there to make it (else it gives way to GIF, as the export panel does).
+        ed.video.as_mut().unwrap().format = Format::Mp4;
+        let out = frames(&mut ed);
+        let panel = panel_of(&out).unwrap();
+        if ed.video.as_ref().unwrap().format == Format::Mp4 {
+            assert!(in_panel(&out, panel, "fps").is_some() && in_panel(&out, panel, "Loop forever").is_none() && in_panel(&out, panel, "quality").is_none());
+        } else {
+            assert!(in_panel(&out, panel, "quality").is_some() && in_panel(&out, panel, "fps").is_none());
+        }
+    }
+
+    /// A change made in the Timeline view's panel is the change its controls row or export panel
+    /// makes: the same state, shown in both places, remembered as they remember it, and like theirs
+    /// no step of Undo.
+    #[test]
+    fn a_change_in_the_timeline_views_panel_is_the_controls_rows_and_undoes_alike() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let prefs = crate::settings::EditorPrefs { timeline_properties_open: true, ..Default::default() };
+        let mut ed = video_editor_with(&tmp.path().join("rec"), prefs);
+        let undo_before = (ed.doc.can_undo(), ed.doc.can_redo());
+        let frame = |ed: &mut Editor| {
+            sized(ed, &ctx, size, vec![]);
+            sized(ed, &ctx, size, vec![])
+        };
+        // The text in the panel, or the same text outside it (the controls row).
+        let at = |ed: &mut Editor, text: &str, panel_side: bool| {
+            let out = frame(ed);
+            let panel = panel_of(&out).expect("open");
+            if panel_side {
+                in_panel(&out, panel, text).unwrap_or_else(|| panic!("the panel's {text}")).center()
+            } else {
+                crate::share_ui::tests::shapes_of(&out).into_iter().find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text() == text && !panel.contains(t.pos) && t.pos.y > size.y / 2.0 => Some(t.galley.rect.translate(t.pos.to_vec2()).center()),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("the controls row's {text}"))
+            }
+        };
+        let click = |ed: &mut Editor, text: &str, panel_side: bool| {
+            let p = at(ed, text, panel_side);
+            crate::menu_bar::tests::click_at(&mut |events| sized(ed, &ctx, size, events), p);
+        };
+        let v = |ed: &Editor| ed.video.as_ref().unwrap().edit.clone();
+
+        // Reverse: on in the panel, off again in the controls row.
+        click(&mut ed, "Reverse", true);
+        assert!(v(&ed).reverse, "the panel's Reverse sets the recording's");
+        click(&mut ed, "Reverse", false);
+        assert!(!v(&ed).reverse, "and the controls row's reads and sets the same");
+        // Pointer and Halo, likewise.
+        let (pointer, halo) = (v(&ed).overlays.pointer, v(&ed).overlays.halo);
+        click(&mut ed, "Pointer", true);
+        click(&mut ed, "Halo", false);
+        assert_eq!((v(&ed).overlays.pointer, v(&ed).overlays.halo), (!pointer, !halo));
+        click(&mut ed, "Pointer", false);
+        click(&mut ed, "Halo", true);
+        assert_eq!((v(&ed).overlays.pointer, v(&ed).overlays.halo), (pointer, halo));
+        // Trim from the panel at the shown frame, then from the controls row.
+        let last = ed.video.as_ref().unwrap().rec.frames.len() - 1;
+        ed.video.as_mut().unwrap().current = 2;
+        click(&mut ed, "Start here", true);
+        assert_eq!(v(&ed).trim, (2, last));
+        ed.video.as_mut().unwrap().current = 4.min(last);
+        click(&mut ed, "End here", false);
+        assert_eq!(v(&ed).trim, (2, 4.min(last)));
+        // Delete the shown frame in the panel; the controls row offers to restore it.
+        ed.video.as_mut().unwrap().current = 3;
+        click(&mut ed, "Delete frame", true);
+        assert!(v(&ed).deleted.contains(&3));
+        click(&mut ed, "Restore frame", false);
+        assert!(!v(&ed).deleted.contains(&3));
+        // The output's scale: the export panel's setting, remembered for the next recording as it remembers it.
+        ed.prefs_changed = false;
+        click(&mut ed, "50%", true);
+        assert_eq!((v(&ed).scale, ed.prefs.export_scale, ed.prefs_changed), (50, 50, true));
+        // None of it is a step of Undo, as none of it is from the controls row.
+        assert_eq!((ed.doc.can_undo(), ed.doc.can_redo()), undo_before);
+        // The frame of a change asks for another, so the controls row drawn before the panel shows it at once.
+        let p = at(&mut ed, "Reverse", true);
+        let button = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        sized(&mut ed, &ctx, size, vec![egui::Event::PointerMoved(p), button(true)]);
+        let released = sized(&mut ed, &ctx, size, vec![button(false)]);
+        assert!(v(&ed).reverse && released.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|o| o.repaint_delay == std::time::Duration::ZERO));
+    }
+
+    /// Every label of the Timeline view's panel fits it at 100%, in the editor's own window and at
+    /// the narrowest the editor allows.
+    #[test]
+    fn the_timeline_views_panel_labels_fit_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (i, size) in [crate::editor_ui::dialog_checks::WINDOW.size(), egui::vec2(crate::editor_ui::EDITOR_MIN_SIZE[0], crate::editor_ui::EDITOR_MIN_SIZE[1])].into_iter().enumerate() {
+            for format in [Format::Gif, Format::Apng] {
+                let ctx = crate::theme::test_context();
+                let prefs = crate::settings::EditorPrefs { timeline_properties_open: true, ..Default::default() };
+                let mut ed = video_editor_with(&tmp.path().join(format!("{i}{format:?}")), prefs);
+                ed.video.as_mut().unwrap().format = format;
+                // The longest choices shown.
+                ed.video.as_mut().unwrap().edit.overlays.keys = KeyStyle::Keyboard;
+                ed.video.as_mut().unwrap().edit.overlays.clicks = ClickStyle::Both;
+                for _ in 0..2 {
+                    sized(&mut ed, &ctx, size, vec![]);
+                }
+                let out = sized(&mut ed, &ctx, size, vec![]);
+                let what = format!("the Timeline view's panel, {format:?}, {size:?}");
+                let panel = panel_of(&out).unwrap_or_else(|| panic!("{what}: open"));
+                let texts = panel_texts(&out, panel);
+                assert!(texts.len() >= 10, "{what}: {texts:?}");
+                for (t, r) in &texts {
+                    assert!(panel.expand(0.5).contains_rect(*r), "{what}: {t:?} at {r:?} sticks out of the panel {panel:?}");
+                }
+                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 5);
+            }
+        }
     }
 
     /// "Export as…" asks for the system's save dialog, which a test build never opens.
@@ -2973,11 +3237,12 @@ mod tests {
         let size = egui::vec2(crate::editor_ui::EDITOR_MIN_SIZE[0], crate::editor_ui::EDITOR_MIN_SIZE[1]);
         let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         for ppp in [1.0, 1.25, 2.0] {
-            for case in ["timeline", "tour", "card", "removed"] {
+            for case in ["timeline", "timeline-open", "tour", "card", "removed"] {
                 let ctx = crate::theme::test_context();
                 ctx.set_pixels_per_point(ppp);
-                let mut ed = video_editor_with(&tmp.path().join(format!("{case}{ppp}")), Default::default());
-                if case != "timeline" {
+                let prefs = crate::settings::EditorPrefs { timeline_properties_open: case == "timeline-open", ..Default::default() };
+                let mut ed = video_editor_with(&tmp.path().join(format!("{case}{ppp}")), prefs);
+                if !case.starts_with("timeline") {
                     ed.test_tour_view();
                 }
                 if case == "card" {
@@ -2995,7 +3260,8 @@ mod tests {
                 let out = sized(&mut ed, &ctx, size, vec![]);
                 let what = format!("{case} at {ppp}");
                 crate::editor_ui::tests::assert_toolbar_fits(&out, size, &what);
-                if case != "timeline" {
+                assert_eq!(properties_panel(&out).is_some(), case != "timeline", "{what}: the panel");
+                if !case.starts_with("timeline") {
                     // The strip's first row: every text inside the window, none on top of another.
                     let row: Vec<(String, egui::Rect)> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| match s {
                         egui::Shape::Text(x) => Some((x.galley.text().to_string(), x.visual_bounding_rect())),
