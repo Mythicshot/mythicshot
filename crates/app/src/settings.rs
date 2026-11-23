@@ -307,6 +307,10 @@ pub struct EditorPrefs {
     /// The Tour view's Properties panel is open: it opens with the Tour view until it is closed,
     /// and stays closed (in every recording) until it is opened again.
     pub tour_properties_open: bool,
+    /// The image editor's Properties panel is open, in the same way: closed until it is opened.
+    pub image_properties_open: bool,
+    /// The Timeline view's Properties panel is open, in the same way: closed until it is opened.
+    pub timeline_properties_open: bool,
     /// "Add to site": the site folder and the site's title used last, empty until a tour is added.
     pub site_folder: String,
     pub site_title: String,
@@ -338,7 +342,7 @@ impl Default for SavedTheme {
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true, tour_properties_open: true, site_folder: String::new(), site_title: String::new() }
+        Self { tool: "rectangle".into(), styles: BTreeMap::new(), export_format: "gif".into(), export_scale: 100, export_quality: 90, export_loop: true, export_fps: 30, spotlight_dim: mythicshot_editor::DEFAULT_DIM, tour_theme: SavedTheme::default(), tour_animate_hotspot: true, tour_properties_open: true, image_properties_open: false, timeline_properties_open: false, site_folder: String::new(), site_title: String::new() }
     }
 }
 
@@ -890,6 +894,26 @@ tool = \"text\"
             std::fs::write(&path, toml::to_string_pretty(&s).unwrap()).unwrap();
             let back: Settings = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(back.editor.tour_properties_open, open);
+        }
+    }
+
+    #[test]
+    fn the_image_and_timeline_panels_are_closed_by_default_and_their_state_is_remembered() {
+        // A file from before these panels: it still loads, with both closed.
+        let old: Settings = toml::from_str("[editor]
+tool = \"text\"
+tour_properties_open = false
+").unwrap();
+        assert!(!old.editor.image_properties_open && !old.editor.timeline_properties_open);
+        assert!(!old.editor.tour_properties_open, "the Tour view's own setting is read as before");
+        let d = Settings::default();
+        assert!(!d.editor.image_properties_open && !d.editor.timeline_properties_open);
+        for (image, timeline) in [(true, false), (false, true), (true, true)] {
+            let mut s = Settings::default();
+            (s.editor.image_properties_open, s.editor.timeline_properties_open) = (image, timeline);
+            let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+            assert_eq!((back.editor.image_properties_open, back.editor.timeline_properties_open), (image, timeline));
+            assert!(back.editor.tour_properties_open, "each view kind is remembered on its own");
         }
     }
 
