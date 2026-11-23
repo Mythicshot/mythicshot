@@ -2,6 +2,14 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.28 (2026-11-23)
+
+- The region selector covers the whole desktop for as long as it is open. If Windows changes its scale after it is shown (which made it shrink to a part of the desktop, with the live screen moving beside it), it is put back over every monitor, hidden from view until it is drawn at the right size, and a drag already started keeps its starting point. It is put back at most three times per capture.
+- The hidden selector window is checked against the displays about once a second and again when a capture starts. If its scale is not the one Windows would give it, or the monitors changed since it was placed (one added, removed, moved, rescaled, or listed while switched off at start-up), it is placed again by way of another monitor before the selector is shown, once for each set of displays. The check reads only what Windows already knows about the monitors, so it costs nothing noticeable while a selection is dragged.
+- If a monitor is added, removed, moved or rescaled while the region selector is open, the capture is cancelled with "The region selector could not be shown." instead of leaving a selector that no longer matches the screens.
+- The live draw window stays on the recorded area's pixels if a scale change resizes it.
+- `capture.log` says when the selector was put back after it was shown, when the hidden window disagreed with the displays and was placed again, and when the displays changed during a capture.
+
 ## 0.2.27 (2026-11-22)
 
 - The main window and every editor window have a menu bar at the top: File, Edit, Preferences and Help. Its entries are what the app already does (capture and record a region, open the Tours page, save, export, publish a tour, undo, redo, copy, delete, each Preferences section, the Workspace page, the README's troubleshooting help, the log folder, the download page), with their shortcuts beside them; an entry that does not apply is greyed out. About Mythicshot opens Preferences › General, where the version is.

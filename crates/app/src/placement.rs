@@ -172,6 +172,32 @@ pub fn place_advance(stage: PlaceStage, step: PlaceStep, look: Look) -> PlaceSta
     }
 }
 
+/// Times a pinned window is put back on its pixels after it was shown.
+pub const MAX_PIN_CORRECTIONS: u8 = 3;
+
+/// What to do about a pinned window that is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinStep {
+    Keep,
+    /// Not on its pixels: put it back, the nth time.
+    PutBack { n: u8 },
+    /// Not on its pixels and the corrections are used up: left where it is (logged once).
+    GiveUp,
+}
+
+/// `placed`: the first placement ended with the window on its pixels. One that was shown where it
+/// was because placement gave up is left there: put-backs are for a window that was in place and
+/// then moved.
+pub fn pin_step(readable: bool, on_target: bool, corrections: u8, placed: bool) -> PinStep {
+    if !readable || on_target || !placed {
+        PinStep::Keep
+    } else if corrections < MAX_PIN_CORRECTIONS {
+        PinStep::PutBack { n: corrections + 1 }
+    } else {
+        PinStep::GiveUp
+    }
+}
+
 /// Puts one of our windows, created hidden by egui, on its rectangle in pixels and shows it:
 /// cloaked first, so a scale change Windows only delivers on show (winit then resizes the
 /// window to keep its size in points) is undone before anyone sees it, and so its first frame
@@ -187,17 +213,34 @@ pub struct Placer {
     cloaked: bool,
     /// Take the keyboard once uncloaked.
     focus: Focus,
+    /// Kept on its pixels after it is shown (a window whose contents are laid out in pixels,
+    /// not points), with the corrections made so far and whether giving up was logged.
+    pinned: bool,
+    corrections: u8,
+    gave_up: bool,
+    /// The placement ended with the window on its pixels (uncloaked in place, not shown anyway).
+    placed: bool,
 }
 
 impl Placer {
     pub fn new(title: &'static str, target: PxRect, focus: Focus) -> Self {
-        Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus }
+        Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus, pinned: false, corrections: 0, gave_up: false, placed: false }
+    }
+
+    /// Keep the window on its pixels once shown: a scale change afterwards, which winit answers
+    /// by keeping its size in points, is put back (at most [`MAX_PIN_CORRECTIONS`] times).
+    pub fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
     }
 
     /// Each frame after the viewport `id` was asked for. Its window appears at the end of the
     /// frame it was first asked for, so the first look may find nothing.
     pub fn tick(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
         if self.stage == PlaceStage::Done {
+            if self.pinned {
+                self.keep_pinned(ctx, id);
+            }
             return;
         }
         self.looks = self.looks.saturating_add(1);
@@ -222,7 +265,10 @@ impl Placer {
                 self.cloaked = self.hwnd.is_some_and(|h| platform::set_cloaked(h, true));
                 ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
             }
-            PlaceStep::Uncloak { put_back } => self.finish(ctx, id, if put_back { "placed; scale changed on show, put back" } else { "placed" }),
+            PlaceStep::Uncloak { put_back } => {
+                self.placed = true;
+                self.finish(ctx, id, if put_back { "placed; scale changed on show, put back" } else { "placed" });
+            }
             PlaceStep::Anyway { shown } => {
                 if !shown {
                     ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
@@ -240,6 +286,28 @@ impl Placer {
         if self.stage != PlaceStage::Done {
             // Look again soon: the window waits for this to appear.
             ctx.request_repaint();
+        }
+    }
+
+    /// A pinned window on screen: put back on its pixels if something moved or sized it.
+    fn keep_pinned(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
+        let Some(hwnd) = self.hwnd else { return };
+        let Some((_, client)) = platform::window_rects(hwnd) else { return };
+        match pin_step(true, client == self.target, self.corrections, self.placed) {
+            PinStep::Keep => {}
+            PinStep::PutBack { n } => {
+                let before = capture_window::state(hwnd);
+                self.corrections = n;
+                let placed = capture_window::place(hwnd, self.target, capture_window::TRIES);
+                ctx.request_repaint_of(id);
+                let why = format!("moved after show, put back (correction {n} of {MAX_PIN_CORRECTIONS}); was {}", before.map_or("-".into(), |w| capture_log::px(w.client)));
+                capture_log::append(&[capture_log::placed_line(&capture_log::now(), self.title, self.target, capture_window::state(hwnd), placed.tries, self.looks, &why)]);
+            }
+            PinStep::GiveUp => {
+                if !std::mem::replace(&mut self.gave_up, true) {
+                    capture_log::append(&[capture_log::placed_line(&capture_log::now(), self.title, self.target, capture_window::state(hwnd), 0, self.looks, "moved after show, corrections used up, left where it is")]);
+                }
+            }
         }
     }
 
@@ -447,6 +515,26 @@ mod tests {
         for step in [PlaceStep::Show, PlaceStep::Uncloak { put_back: false }, PlaceStep::Uncloak { put_back: true }, PlaceStep::Anyway { shown: false }, PlaceStep::Anyway { shown: true }] {
             assert!(paints_after(step), "{step:?}");
         }
+    }
+
+    #[test]
+    fn a_pinned_window_moved_after_show_is_put_back_a_bounded_number_of_times() {
+        assert_eq!(pin_step(true, true, 0, true), PinStep::Keep);
+        assert_eq!(pin_step(false, false, 0, true), PinStep::Keep, "nothing to read: nothing to do");
+        assert_eq!(pin_step(true, false, 0, false), PinStep::Keep, "shown off its pixels because placement gave up: left there");
+        let mut corrections = 0;
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            let s = pin_step(true, false, corrections, true);
+            if let PinStep::PutBack { n } = s {
+                corrections = n;
+            }
+            steps.push(s);
+        }
+        assert_eq!(steps[..3], [PinStep::PutBack { n: 1 }, PinStep::PutBack { n: 2 }, PinStep::PutBack { n: 3 }]);
+        assert!(steps[3..].iter().all(|s| *s == PinStep::GiveUp));
+        assert!(Placer::new("t", PxRect::new(0, 0, 10, 10), Focus::None).pinned().pinned);
+        assert!(!Placer::new("t", PxRect::new(0, 0, 10, 10), Focus::None).pinned, "only the live draw layer is pinned");
     }
 
     #[test]
