@@ -344,6 +344,10 @@ impl Default for EditorPrefs {
 
 impl Default for Settings {
     fn default() -> Self {
+        // A test build saves nothing into the user's own Pictures folder.
+        #[cfg(test)]
+        let pictures = test_data_dir();
+        #[cfg(not(test))]
         let pictures = directories::UserDirs::new()
             .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
@@ -481,8 +485,20 @@ fn writing() -> std::sync::MutexGuard<'static, ()> {
     WRITING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The folder a test build uses in place of the user's own config, projects and Pictures folders:
+/// one per test run, in the temp folder.
+#[cfg(test)]
+pub fn test_data_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("mythicshot-test-{}", std::process::id()))
+}
+
 impl Settings {
     pub fn path() -> PathBuf {
+        // A test build never touches the user's own settings, logs or projects.
+        #[cfg(test)]
+        if cfg!(test) {
+            return test_data_dir().join("config").join("settings.toml");
+        }
         // Debug builds can use a throwaway config folder for tests.
         #[cfg(debug_assertions)]
         if let Some(dir) = std::env::var_os("MYTHICSHOT_CONFIG_DIR") {

@@ -304,6 +304,11 @@ impl Store {
     /// debug build with `MYTHICSHOT_CONFIG_DIR` set uses that folder, as the settings file does.
     /// None when the user's folder cannot be found; there is no other place to fall back to.
     pub fn default_root() -> Option<PathBuf> {
+        // A test build never touches the user's own projects.
+        #[cfg(test)]
+        if cfg!(test) {
+            return Some(crate::settings::test_data_dir().join("projects"));
+        }
         #[cfg(debug_assertions)]
         if let Some(dir) = std::env::var_os("MYTHICSHOT_CONFIG_DIR") {
             return Some(PathBuf::from(dir).join("projects"));

@@ -221,12 +221,14 @@ pub fn menus(state: &State) -> Vec<Menu> {
 }
 
 /// What the menu bar did in a frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BarOut {
     /// The entry clicked.
     pub picked: Option<Entry>,
     /// One of its menus is open: Esc is the menu's, to close it, in the next frame.
     pub open: bool,
+    /// Where the bar is, so a press on it is not taken as a press elsewhere in the window.
+    pub rect: egui::Rect,
 }
 
 /// The menu bar across the top of a window, above everything else in it: a panel of its own on
@@ -234,7 +236,7 @@ pub struct BarOut {
 pub fn bar(ui: &mut egui::Ui, id: &'static str, state: &State) -> BarOut {
     let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(4, 1));
     let (mut picked, mut open) = (None, false);
-    egui::Panel::top(id).resizable(false).frame(frame).show(ui, |ui| {
+    let rect = egui::Panel::top(id).resizable(false).frame(frame).show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             for menu in menus(state) {
                 open |= ui.menu_button(menu.title, |ui| {
@@ -256,7 +258,7 @@ pub fn bar(ui: &mut egui::Ui, id: &'static str, state: &State) -> BarOut {
             }
         });
     });
-    BarOut { picked, open: open && picked.is_none() }
+    BarOut { picked, open: open && picked.is_none(), rect: rect.response.rect }
 }
 
 /// One entry: a button with its shortcut on the right, or a check box; disabled when it does

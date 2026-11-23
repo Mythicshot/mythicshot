@@ -1556,7 +1556,7 @@ impl Editor {
 
     /// Ask for a folder, then export a tour bundle into a new subfolder of it.
     fn export_tour(&mut self) {
-        if let Some(parent) = rfd::FileDialog::new().set_directory(&self.dest.output_dir).pick_folder() {
+        if let Some(parent) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&self.dest.output_dir), "tour folder") {
             self.start_tour(&parent);
         }
     }
@@ -1616,7 +1616,7 @@ impl Editor {
     /// replacing a file that exists.
     fn export_tour_file(&mut self) {
         let name = tour_file_name(&tour_stem(&self.dest, chrono::Local::now()));
-        if let Some(path) = rfd::FileDialog::new().set_directory(&self.dest.output_dir).set_file_name(&name).add_filter("Web page", &["html"]).save_file() {
+        if let Some(path) = crate::dialogs::save_file(rfd::FileDialog::new().set_directory(&self.dest.output_dir).set_file_name(&name).add_filter("Web page", &["html"]), "tour file") {
             self.start_tour_file(path);
         }
     }
@@ -1867,7 +1867,7 @@ impl Editor {
         let Some(v) = self.video.as_ref() else { return };
         let ext = v.format.extension();
         let name = dest::new_path_with_extension(&self.dest, ext).ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
-        if let Some(p) = rfd::FileDialog::new().set_directory(&self.dest.output_dir).set_file_name(&name).add_filter(v.format.label(), &[ext]).save_file() {
+        if let Some(p) = crate::dialogs::save_file(rfd::FileDialog::new().set_directory(&self.dest.output_dir).set_file_name(&name).add_filter(v.format.label(), &[ext]), "export as") {
             self.start_export(Some(p));
         }
     }
@@ -2706,6 +2706,89 @@ mod tests {
         ed.set_view(VideoView::Tour);
         assert_eq!((find(&ed, Entry::Properties).enabled, find(&ed, Entry::Properties).checked), (true, Some(true)));
         assert!(find(&ed, Entry::Export).enabled && !find(&ed, Entry::Save).enabled);
+    }
+
+    /// "Export as…" asks for the system's save dialog, which a test build never opens.
+    #[test]
+    fn export_as_never_opens_a_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
+        mythicshot_destinations::stubs::take();
+        ed.export_as();
+        ed.export_tour();
+        ed.export_tour_file();
+        assert_eq!(mythicshot_destinations::stubs::take(), ["save dialog: export as", "folder dialog: tour folder", "save dialog: tour file"]);
+        assert!(!ed.exporting(), "nothing was exported");
+    }
+
+    /// Quit never drops an export, a tour export or a publish that is running: the app stays and
+    /// says so. A recording never exported asks first; "Export and close" lets the app go once the
+    /// export has ended, and closes nothing before.
+    #[test]
+    fn quit_never_drops_a_running_export_and_waits_for_one_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = video_editor_with(&tmp.path().join("a"), Default::default());
+        ed.dest.output_dir = tmp.path().to_path_buf();
+        ed.start_export(Some(tmp.path().join("running.gif")));
+        assert!(ed.exporting());
+        assert_eq!(crate::editor_ui::start_quit(&mut [&mut ed], false), crate::editor_ui::QuitStart::StillRunning);
+        assert!(!ed.closed && !ed.confirm_close);
+
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = video_editor_with(&tmp.path().join("b"), Default::default());
+        ed.dest.output_dir = tmp.path().to_path_buf();
+        assert_eq!(crate::editor_ui::start_quit(&mut [&mut ed], false), crate::editor_ui::QuitStart::Asked, "a recording never exported");
+        sized(&mut ed, &ctx, size, vec![]);
+        let out = sized(&mut ed, &ctx, size, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "Export this recording?").is_some());
+        let at = crate::share_ui::tests::text_rect(&out, "Export and close").unwrap().center();
+        crate::menu_bar::tests::click_at(&mut |events| sized(&mut ed, &ctx, size, events), at);
+        assert!(ed.exporting(), "the export started");
+        assert_eq!(crate::editor_ui::quit_progress(&mut [&mut ed]), crate::editor_ui::QuitProgress::Waiting);
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while ed.exporting() && Instant::now() < deadline {
+            sized(&mut ed, &ctx, size, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!ed.exporting(), "the export ended");
+        assert!(!ed.closed, "the editor did not close on its own");
+        assert_eq!(crate::editor_ui::quit_progress(&mut [&mut ed]), crate::editor_ui::QuitProgress::Exit);
+    }
+
+    /// While a guide card's text is typed, Edit's Undo, Redo, Copy and Delete are disabled, and
+    /// opening the menu does not end the typing: the card stays, and the next letters reach it.
+    #[test]
+    fn the_edit_menu_waits_while_a_guide_card_is_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = crate::editor_ui::dialog_checks::WINDOW.size();
+        let mut ed = video_editor_with(&tmp.path().join("rec"), Default::default());
+        ed.test_tour_view();
+        ed.select(None);
+        for _ in 0..2 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        click_text(&mut ed, &ctx, "Start here");
+        for _ in 0..2 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        assert!(ed.card_typing_id().is_some(), "typing on the card's title");
+        let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&crate::menu_bar::menus(&ed.menu_state()), e).enabled;
+        for e in [Entry::Undo, Entry::Redo, Entry::Copy, Entry::Delete] {
+            assert!(!find(&ed, e), "{e:?} while the card is typed");
+        }
+        crate::menu_bar::tests::choose(&mut |events| sized(&mut ed, &ctx, size, events), "Edit", "Delete");
+        assert!(ed.card_typing_id().is_some(), "opening the menu did not end the typing");
+        let src = ed.tour_src().unwrap();
+        let title = |ed: &Editor| ed.video.as_ref().unwrap().edit.tour_doc.steps.get(&src).and_then(|s| s.card.as_ref()).map(|c| c.title.clone());
+        assert_eq!(title(&ed).as_deref(), Some("Start here"), "the card is still there");
+        for _ in 0..3 {
+            sized(&mut ed, &ctx, size, vec![]);
+        }
+        sized(&mut ed, &ctx, size, vec![egui::Event::Text("!".into())]);
+        sized(&mut ed, &ctx, size, vec![]);
+        assert!(title(&ed).is_some_and(|t| t.contains('!')), "the next letter reached the card: {:?}", title(&ed));
     }
 
     #[test]

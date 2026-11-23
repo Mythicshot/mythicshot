@@ -155,7 +155,8 @@ pub fn blocked_reason(server: &str) -> Option<String> {
 
 /// Put `text` on the clipboard; false when it could not be set. Tests never reach the real clipboard.
 pub fn copy_to_clipboard(text: &str) -> bool {
-    if cfg!(test) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("clipboard text {text}")) {
         return false;
     }
     arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())).is_ok()

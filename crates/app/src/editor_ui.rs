@@ -260,6 +260,10 @@ fn color_image_to_rgba(img: &egui::ColorImage) -> RgbaImage {
 
 /// What is on the system clipboard right now, for the right-click Paste here.
 fn read_clipboard() -> Option<Pasted> {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed("read clipboard") {
+        return None;
+    }
     let mut c = arboard::Clipboard::new().ok()?;
     if let Ok(t) = c.get_text().map(|t| t.replace("\r\n", "\n")) {
         if !t.trim().is_empty() {
@@ -329,7 +333,7 @@ pub struct Editor {
     /// A page the status message offers to open in the browser ("Open site"); cleared by the next message.
     pub(crate) status_open: Option<PathBuf>,
     pub closed: bool,
-    confirm_close: bool,
+    pub(crate) confirm_close: bool,
     /// Where the canvas was right-clicked, for the menu's Paste here.
     menu_at: Option<Pt>,
     /// Where the pointer is over the picture, for Ctrl+V of text or images.
@@ -357,6 +361,82 @@ pub struct Editor {
     open_export: bool,
     /// One of the menu bar's menus was open in the last frame: Esc closes it and does nothing else.
     menu_open: bool,
+    /// The menu bar is being used (a menu is open, or the pointer is on the bar): typing on a text
+    /// or a guide card goes on, and gets the keyboard back once the menu is done.
+    pub(crate) menu_hold: bool,
+    /// Something is being captured or recorded: Capture region and Record region are greyed out.
+    pub busy: bool,
+    /// Quitting asked this editor its close question: its answer, until the quit goes on or stops.
+    pub(crate) quit: Option<QuitAnswer>,
+}
+
+/// An editor's answer to its close question when Quit asked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAnswer {
+    /// The question is still up.
+    Waiting,
+    /// Saved, exported (or exporting) or discarded: the app may go once every editor agrees.
+    Go,
+    /// Cancel: the app stays, and nothing is closed.
+    Stay,
+}
+
+/// What Quit does first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitStart {
+    /// Nothing would be lost: the app goes now.
+    Exit,
+    /// Editors that would lose something show their close question; see [`quit_progress`].
+    Asked,
+    /// A recording, an export, a publish or a GIF being saved is running: the app stays and says so.
+    StillRunning,
+}
+
+/// How a quit that asked stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitProgress {
+    Waiting,
+    /// Every editor asked agreed and nothing runs any more: the app goes now.
+    Exit,
+    /// One said Cancel: every question is gone and nothing was closed.
+    Cancelled,
+}
+
+/// What the app says when Quit finds work still running.
+pub const STILL_RUNNING: &str = "Mythicshot is still recording, exporting or publishing. Quit again when it is done.";
+
+/// Quit (the File menu, the tray): go at once when nothing would be lost; ask every editor that
+/// would lose something its close question, as its close button does; and never drop work that is
+/// running (`running`: a recording or a GIF being saved, outside the editors).
+pub fn start_quit<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G], running: bool) -> QuitStart {
+    if running || editors.iter().any(|e| e.exporting()) {
+        return QuitStart::StillRunning;
+    }
+    let mut asked = false;
+    for e in editors.iter_mut().filter(|e| !e.closed && e.asks_before_closing()) {
+        e.quit = Some(QuitAnswer::Waiting);
+        e.confirm_close = true;
+        asked = true;
+    }
+    if asked { QuitStart::Asked } else { QuitStart::Exit }
+}
+
+/// After [`start_quit`] asked: wait for every answer and for an export chosen in a question to end.
+/// A Cancel ends every question and closes nothing.
+pub fn quit_progress<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G]) -> QuitProgress {
+    let answers: Vec<QuitAnswer> = editors.iter().filter(|e| !e.closed).filter_map(|e| e.quit).collect();
+    if answers.contains(&QuitAnswer::Stay) {
+        for e in editors.iter_mut() {
+            if e.quit.take().is_some() {
+                e.confirm_close = false;
+            }
+        }
+        return QuitProgress::Cancelled;
+    }
+    if answers.contains(&QuitAnswer::Waiting) || editors.iter().any(|e| !e.closed && e.exporting()) {
+        return QuitProgress::Waiting;
+    }
+    QuitProgress::Exit
 }
 
 impl Editor {
@@ -400,6 +480,9 @@ impl Editor {
             app_requests: Vec::new(),
             open_export: false,
             menu_open: false,
+            menu_hold: false,
+            busy: false,
+            quit: None,
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -519,7 +602,7 @@ impl Editor {
     /// never exported. A recording opened from a saved project never asks: the question says
     /// the recording is deleted, which would be untrue, and edits that were not sent to the
     /// site are discarded.
-    fn asks_before_closing(&self) -> bool {
+    pub(crate) fn asks_before_closing(&self) -> bool {
         match &self.video {
             Some(v) if v.origin.is_some() => false,
             Some(v) => self.doc.dirty || !v.exported,
@@ -588,6 +671,8 @@ impl Editor {
         }
         let menu = menu_bar::bar(ui, "editor-menu-bar", &self.menu_state());
         self.menu_open = menu.open;
+        let on_bar = ctx.input(|i| i.pointer.press_origin().or(i.pointer.hover_pos()).is_some_and(|p| menu.rect.contains(p)));
+        self.menu_hold = menu.open || on_bar;
         if let Some(entry) = menu.picked {
             self.menu_entry(entry, &ctx);
         }
@@ -597,7 +682,10 @@ impl Editor {
         self.tool_rail(ui);
         self.canvas(ui);
         // After the canvas, so a key typed in the same frame as the press still reaches the card first.
-        self.end_card_typing_on_press(&ctx, press);
+        // A press on the menu bar, or in one of its menus, leaves the typing on.
+        if !self.menu_hold {
+            self.end_card_typing_on_press(&ctx, press);
+        }
         self.text_editor(&ctx);
         self.share_window(&ctx);
         if self.confirm_close {
@@ -619,17 +707,20 @@ impl Editor {
     pub(crate) fn menu_state(&self) -> menu_bar::State {
         let (global, keys) = (&self.global_keys, &self.keys);
         let keys = menu_bar::Keys::from(|a| global.get(&a).cloned().unwrap_or_default(), |a| keys.get(&a).cloned().unwrap_or_default());
+        // While a text or a guide card's text is typed, its keys are the text's (as `shortcuts`
+        // leaves them): undo, redo, copy and delete would act on the picture instead.
+        let typing = self.text.is_some() || self.card_typing_id().is_some();
         menu_bar::State {
-            busy: false,
+            busy: self.busy,
             // The image editor saves; the recording editor exports, from its export panel.
             save: self.video.is_none(),
             export: self.video.is_some(),
             publish: self.can_publish_tour(),
-            undo: self.doc.can_undo(),
-            redo: self.doc.can_redo(),
+            undo: self.doc.can_undo() && !typing,
+            redo: self.doc.can_redo() && !typing,
             // The selection, or else the picture or the frame, as Ctrl+C copies.
-            copy: true,
-            delete: self.selected.is_some() || self.card_selected(),
+            copy: !typing,
+            delete: (self.selected.is_some() || self.card_selected()) && !typing,
             properties: Some((self.in_tour_view(), self.properties_open())),
             keys,
         }
@@ -647,6 +738,7 @@ impl Editor {
             Entry::PublishTour => self.open_publish_picker(),
             Entry::Properties => self.toggle_properties(),
             Entry::CloseWindow => self.ask_to_close(),
+            Entry::CaptureRegion | Entry::RecordRegion if self.busy => {}
             entry => {
                 if let Some(request) = entry.app_request() {
                     self.app_requests.push(request);
@@ -807,9 +899,10 @@ impl Editor {
         let n = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let marker = format!("Mythicshot annotation {n}");
         // Tests leave the real clipboard alone.
-        if !cfg!(test) {
-            let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(marker.clone()));
-        }
+        #[cfg(test)]
+        mythicshot_destinations::stubs::stubbed(format!("clipboard text {marker}"));
+        #[cfg(not(test))]
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(marker.clone()));
         if let Ok(mut c) = ITEM_CLIPBOARD.lock() {
             *c = Some(CopiedItem { shape: it.shape.clone(), style: it.style, marker, pastes: 0 });
         }
@@ -1722,13 +1815,17 @@ impl Editor {
             return self.commit_text();
         }
         let screen = self.last_to_scr(at);
+        let hold = self.menu_hold;
         let mut commit = false;
         egui::Area::new(egui::Id::unique("editor-text")).fixed_pos(screen + vec2(0.0, -4.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 let t = self.text.as_mut().expect("text edit");
                 let size = (self.style.font_size * self.zoom.unwrap_or(1.0)).clamp(12.0, 40.0);
                 let resp = ui.add(egui::TextEdit::multiline(&mut t.buffer).desired_width(280.0).desired_rows(2).font(FontId::proportional(size)).hint_text("Type, then Enter"));
-                if !t.focused {
+                if hold && !resp.has_focus() {
+                    // The menu bar took the keyboard: the text gets it back when the menu is done.
+                    t.focused = false;
+                } else if !t.focused && !hold {
                     resp.request_focus();
                     t.focused = true;
                 }
@@ -1788,6 +1885,26 @@ impl Editor {
             });
             choice
         });
+        // Asked by Quit: the answer goes to the app, and nothing closes until every editor agreed.
+        if self.quit.is_some() {
+            match modal.inner {
+                Some(0) if is_video => {
+                    self.start_export(None);
+                    (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false);
+                }
+                Some(0) => {
+                    self.save();
+                    if !self.doc.dirty {
+                        (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false);
+                    }
+                }
+                Some(1) => (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false),
+                Some(_) => (self.quit, self.confirm_close) = (Some(QuitAnswer::Stay), false),
+                None if modal.should_close() => (self.quit, self.confirm_close) = (Some(QuitAnswer::Stay), false),
+                None => {}
+            }
+            return;
+        }
         match modal.inner {
             Some(0) if is_video => {
                 if let Some(v) = self.video.as_mut() {
@@ -2713,6 +2830,153 @@ pub(crate) mod tests {
         let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
         out.textures_delta.clear();
         out
+    }
+
+    /// The toolbar's Save as… asks for the system's file dialog, which a test build never opens:
+    /// the stub answers as if cancelled. The right-click Paste reads no real clipboard.
+    #[test]
+    fn save_as_and_paste_here_never_reach_the_desktop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = editor(EditorPrefs::default());
+        ed.dest.output_dir = tmp.path().to_path_buf();
+        mythicshot_destinations::stubs::take();
+        ed.send(DestId::FileAs);
+        assert_eq!(ed.saved, None);
+        let asked = mythicshot_destinations::stubs::take();
+        assert!(matches!(asked.as_slice(), [a] if a.starts_with("save as dialog: ")), "{asked:?}");
+        assert!(read_clipboard().is_none());
+        assert_eq!(mythicshot_destinations::stubs::take(), ["read clipboard"]);
+    }
+
+    /// Click the button that says `label` in one frame's drawing, as a user does.
+    fn click_label(ed: &mut Editor, ctx: &egui::Context, label: &str) {
+        let size = dialog_checks::WINDOW.size();
+        sized_frame(ed, ctx, size, vec![]);
+        let out = sized_frame(ed, ctx, size, vec![]);
+        let at = crate::menu_bar::tests::last_text_rect(&out, label).unwrap_or_else(|| panic!("{label} is shown")).center();
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(ed, ctx, size, events), at);
+    }
+
+    #[test]
+    fn quit_with_nothing_to_lose_goes_at_once_and_asks_nothing() {
+        let (mut a, mut b) = (editor(EditorPrefs::default()), editor(EditorPrefs::default()));
+        assert_eq!(start_quit(&mut [&mut a, &mut b], false), QuitStart::Exit);
+        assert!(!a.confirm_close && !b.confirm_close && a.quit.is_none());
+        assert_eq!(start_quit::<&mut Editor>(&mut [], false), QuitStart::Exit, "no editor open");
+    }
+
+    #[test]
+    fn quit_with_an_unsaved_capture_asks_and_cancel_keeps_everything() {
+        let ctx = crate::theme::test_context();
+        let mut clean = editor(EditorPrefs::default());
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        assert_eq!(start_quit(&mut [&mut clean, &mut ed], false), QuitStart::Asked);
+        assert!(ed.confirm_close && !clean.confirm_close, "only the editor that would lose something asks");
+        assert_eq!(quit_progress(&mut [&mut clean, &mut ed]), QuitProgress::Waiting);
+        // Its own close question, as its close button shows it.
+        sized_frame(&mut ed, &ctx, dialog_checks::WINDOW.size(), vec![]);
+        let out = sized_frame(&mut ed, &ctx, dialog_checks::WINDOW.size(), vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "Save this capture?").is_some());
+        click_label(&mut ed, &ctx, "Cancel");
+        assert_eq!(quit_progress(&mut [&mut clean, &mut ed]), QuitProgress::Cancelled);
+        assert!(!ed.closed && !ed.confirm_close && ed.quit.is_none() && ed.doc.items().len() == 1, "nothing closed or lost");
+        assert!(!clean.closed);
+    }
+
+    #[test]
+    fn quit_goes_only_when_every_editor_agrees_and_closes_nothing_before() {
+        let ctx = crate::theme::test_context();
+        let make = || {
+            let mut ed = editor(EditorPrefs::default());
+            ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+            ed
+        };
+        // One says Don't save, the other Cancel: the app stays and neither window closed.
+        let (mut a, mut b) = (make(), make());
+        assert_eq!(start_quit(&mut [&mut a, &mut b], false), QuitStart::Asked);
+        click_label(&mut a, &ctx, "Don't save");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Waiting);
+        assert!(!a.closed, "not closed while the other editor has not answered");
+        click_label(&mut b, &ctx, "Cancel");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Cancelled);
+        assert!(!a.closed && !b.closed && a.doc.items().len() == 1 && b.doc.items().len() == 1);
+        // Both say Don't save: the app goes.
+        let (mut a, mut b) = (make(), make());
+        start_quit(&mut [&mut a, &mut b], false);
+        click_label(&mut a, &ctx, "Don't save");
+        click_label(&mut b, &ctx, "Don't save");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Exit);
+        // Save saves first, then counts as agreed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = make();
+        c.dest.output_dir = tmp.path().to_path_buf();
+        start_quit(&mut [&mut c], false);
+        click_label(&mut c, &ctx, "Save");
+        assert!(c.saved.as_ref().is_some_and(|p| p.is_file()));
+        assert_eq!(quit_progress(&mut [&mut c]), QuitProgress::Exit);
+    }
+
+    #[test]
+    fn quit_while_a_recording_or_a_gif_is_saved_keeps_the_app_and_asks_nothing() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        assert_eq!(start_quit(&mut [&mut ed], true), QuitStart::StillRunning);
+        assert!(!ed.confirm_close && ed.quit.is_none() && !ed.closed);
+    }
+
+    /// While a text is typed, Edit's Undo, Redo, Copy and Delete are disabled (the keys belong to
+    /// the text, as `shortcuts` leaves them); opening the menu keeps the text, and typing goes on
+    /// once the menu is closed.
+    #[test]
+    fn the_edit_menu_waits_while_a_text_is_typed() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: String::new(), focused: false, step: None });
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::Text("Hel".into())]);
+        let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&menu_bar::menus(&ed.menu_state()), e).enabled;
+        for e in [Entry::Undo, Entry::Copy, Entry::Delete] {
+            assert!(!find(&ed, e), "{e:?} while typing");
+        }
+        // Opened and used while typing: the disabled entries do nothing, and the text stays.
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Delete");
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Undo");
+        assert_eq!(ed.doc.items().len(), 1, "nothing was deleted or undone");
+        assert_eq!(ed.text.as_ref().map(|t| t.buffer.as_str()), Some("Hel"), "the text is kept and still typed");
+        // The menu closed with the click; the text gets the keyboard back.
+        for _ in 0..2 {
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::Text("lo".into())]);
+        assert_eq!(ed.text.as_ref().map(|t| t.buffer.as_str()), Some("Hello"), "typing goes on after the menu");
+        // Done typing: the entries work again.
+        ed.text = None;
+        assert!(find(&ed, Entry::Undo) && find(&ed, Entry::Copy) && find(&ed, Entry::Delete));
+    }
+
+    /// While something is being captured or recorded, an editor's Capture region and Record region
+    /// are greyed out and do nothing, like the main window's tiles.
+    #[test]
+    fn the_editors_capture_entries_wait_while_something_is_captured() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs::default());
+        ed.busy = true;
+        let menus = menu_bar::menus(&ed.menu_state());
+        assert!(!crate::menu_bar::tests::find(&menus, Entry::CaptureRegion).enabled && !crate::menu_bar::tests::find(&menus, Entry::RecordRegion).enabled);
+        for entry in ["Capture region", "Record region"] {
+            crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "File", entry);
+        }
+        assert!(ed.app_requests.is_empty());
+        ed.busy = false;
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "File", "Capture region");
+        assert_eq!(ed.app_requests, vec![AppRequest::Run(crate::tray::Command::Region)]);
     }
 
     #[test]

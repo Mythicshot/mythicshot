@@ -245,7 +245,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
             changed = true;
         }
         if ui.button("Browse…").clicked() {
-            if let Some(p) = rfd::FileDialog::new().set_directory(&s.output_dir).pick_folder() {
+            if let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
                 s.output_dir = p;
                 changed = true;
             }

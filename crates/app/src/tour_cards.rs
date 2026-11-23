@@ -344,6 +344,9 @@ struct FieldCtx {
     editing: Option<Field>,
     focus: bool,
     clicked: Option<Field>,
+    /// The menu bar is being used: the text being typed keeps its place and gets the keyboard
+    /// back afterwards.
+    hold: bool,
 }
 
 /// One of the card's texts: drawn (with bold) until clicked, then typed in place, capped at `cap`.
@@ -353,10 +356,12 @@ fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut Str
     if fc.editing == Some(which) {
         let edit = if lines == Lines::Paragraph { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
         let resp = ui.add(edit.id(field_id(fc.instance, fc.src, which)).frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
-        if fc.focus {
+        if fc.focus && !fc.hold {
             resp.request_focus();
             fc.focus = false;
-        } else if !resp.has_focus() {
+        } else if !resp.has_focus() && fc.hold {
+            fc.focus = true;
+        } else if !resp.has_focus() && !fc.focus {
             fc.editing = None;
         }
         if text.chars().count() > cap {
@@ -722,7 +727,7 @@ impl Editor {
         };
         let selected = state.selected;
         let instance = v.tour.instance;
-        let mut fc = FieldCtx { instance, src, editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None };
+        let mut fc = FieldCtx { instance, src, editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None, hold: self.menu_hold };
         let before = card.clone();
         let next_fill = accent;
         let next_ink = on_accent(accent);
@@ -1002,7 +1007,7 @@ impl Editor {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!loading, egui::Button::new("Add logo…")).on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
-                                    && let Some(path) = rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]).pick_file()
+                                    && let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]), "cover logo")
                                 {
                                     // Checked first, so a file that is not a usable logo never reaches the tour.
                                     s.logo_job = Some(start_logo_check(path));
