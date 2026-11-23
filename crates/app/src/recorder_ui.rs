@@ -1,14 +1,13 @@
-//! A recording session on screen (screen 3 of the mockup): a countdown, a red
-//! frame around the recorded area, and the control bar. The frame is a
-//! transparent, click-through window; the bar is the root window. Both are
-//! kept out of screen capture, so neither shows up in the GIF.
+//! A recording session on screen: the control bar, with a countdown and then the
+//! timer. The bar is the root window, kept out of screen capture, so it never shows
+//! up in the GIF.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, RichText, Stroke, StrokeKind, vec2};
+use eframe::egui::{self, RichText, Stroke, vec2};
 use mythicshot_capture::PxRect;
 use mythicshot_editor::Item;
 use mythicshot_editor::overlays::InputEvent;
@@ -18,12 +17,10 @@ use mythicshot_recording::{Recorder, Recording, Target};
 use crate::theme::{self, Strong as _};
 use crate::icons::{self, Icon};
 use crate::live_draw::LiveDraw;
-use crate::placement::{self, Focus, Placer};
+use crate::placement;
 use crate::platform::{self, WindowId};
 use crate::video::{self, Edit};
 
-pub const FRAME_TITLE: &str = "Mythicshot recording frame";
-const BORDER: f32 = placement::FRAME_BORDER;
 /// GIF size relative to the compressed frames on disk, measured on game
 /// footage (94 MB of frames became a 13.4 MB GIF). Only an estimate.
 const GIF_RATIO: f64 = 0.14;
@@ -46,22 +43,9 @@ pub enum BarAction {
     Discard,
 }
 
-#[derive(Default)]
-struct FrameState {
-    paused: bool,
-}
-
 /// The whole seconds left of the countdown as the bar shows them, never below 1.
 fn seconds_left(left: Duration) -> u32 {
     (left.as_secs_f32().ceil() as u32).max(1)
-}
-
-/// The log line for one countdown: whether there is a frame, and how Windows composites it.
-fn countdown_line(time: &str, secs: u32, frame: Option<&str>) -> String {
-    match frame {
-        Some(note) => format!("-- {time} countdown of {secs} s · frame window: {note}"),
-        None => format!("-- {time} countdown of {secs} s · no frame"),
-    }
 }
 
 pub struct Session {
@@ -72,18 +56,8 @@ pub struct Session {
     /// The monitor the area is on, to keep the bar on screen, and its scale.
     monitor: PxRect,
     monitor_scale: f32,
-    /// Puts the red frame's window around the area in pixels, then shows it.
-    frame_placer: Placer,
-    /// The frame's rectangle in points for egui, a first guess the placer corrects.
-    frame_guess: (egui::Pos2, egui::Vec2),
-    /// A frame is shown only around a region: a whole screen has no room for one, and needs none.
-    frame_wanted: bool,
-    /// The countdown's length, for `capture.log`.
-    countdown_secs: u32,
     phase: Phase,
     fps: u32,
-    frame: Arc<Mutex<FrameState>>,
-    frame_hidden_from_capture: bool,
     /// The app that had focus when recording began; it gets focus back.
     pub previous_foreground: Option<WindowId>,
     pub draw: LiveDraw,
@@ -108,22 +82,14 @@ impl Session {
             width: clipped.w,
             height: clipped.h,
         };
-        let frame = placement::frame_rect(clipped, &monitors);
-        let frame_guess = placement::guess_points(frame, placement::scale_for(frame, &monitors));
         let mut s = Session {
             rect: clipped,
             title,
             target,
             monitor: mon.rect,
             monitor_scale: mon.scale,
-            frame_placer: Placer::new(FRAME_TITLE, frame, Focus::None),
-            frame_guess,
-            frame_wanted: clipped != mon.rect,
-            countdown_secs,
             phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(countdown_secs as u64) },
             fps,
-            frame: Arc::new(Mutex::new(FrameState::default())),
-            frame_hidden_from_capture: false,
             previous_foreground: platform::foreground_window(),
             draw: LiveDraw::default(),
         };
@@ -143,8 +109,6 @@ impl Session {
     pub fn tick(&mut self) -> Result<(), String> {
         if let Phase::Countdown { until } = self.phase {
             if Instant::now() >= until {
-                let note = platform::find_window(FRAME_TITLE).filter(|_| self.frame_wanted).map(platform::composition_note);
-                crate::capture_log::append(&[countdown_line(&crate::capture_log::now(), self.countdown_secs, note.as_deref())]);
                 self.go_live()?;
             }
         }
@@ -196,49 +160,6 @@ impl Session {
     /// Where the control bar goes, in desktop pixels, sized in its monitor's scale.
     pub fn bar_rect(&self) -> PxRect {
         placement::bar_rect(self.rect, self.monitor, self.monitor_scale)
-    }
-
-    /// The red frame: a transparent, click-through window just outside the area. Only a region
-    /// gets one; the countdown is told in the bar.
-    pub fn show_frame(&mut self, ctx: &egui::Context) {
-        if !self.frame_wanted {
-            return;
-        }
-        {
-            let mut f = self.frame.lock().expect("frame state");
-            f.paused = matches!(&self.phase, Phase::Live(r) if r.is_paused());
-        }
-        // Created hidden, put on its pixels around the area, then shown (see `Placer`).
-        // Click-through only once shown: that style makes the window a layered one, and a
-        // window made layered while hidden stayed blank on screen (no frame, no countdown).
-        let builder = egui::ViewportBuilder::default()
-            .with_title(FRAME_TITLE)
-            .with_position(self.frame_guess.0)
-            .with_inner_size(self.frame_guess.1)
-            .with_visible(false)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_mouse_passthrough(self.frame_placer.shown())
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_active(false);
-        let state = self.frame.clone();
-        let frame_id = egui::ViewportId::from_hash_of("rec-frame");
-        ctx.show_viewport_deferred(frame_id, builder, move |ui, _| {
-            let Ok(f) = state.lock() else { return };
-            let full = ui.ctx().content_rect();
-            let painter = ui.painter();
-            let color = if f.paused { theme::RECORD_PAUSED } else { theme::RECORD };
-            painter.rect_stroke(full.shrink(BORDER / 2.0), 0.0, Stroke::new(BORDER - 1.0, color), StrokeKind::Middle);
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
-        });
-        self.frame_placer.tick(ctx, frame_id);
-        if !self.frame_hidden_from_capture {
-            if let Some(h) = platform::find_window(FRAME_TITLE) {
-                self.frame_hidden_from_capture = platform::exclude_from_capture(h);
-            }
-        }
     }
 
     /// The control bar's contents (drawn in the root window).
@@ -429,14 +350,8 @@ mod tests {
             target: Target { display: String::new(), origin: (0, 0), x: 0, y: 0, width: 640, height: 480 },
             monitor: rect,
             monitor_scale: 1.0,
-            frame_placer: Placer::new(FRAME_TITLE, placement::frame_rect(rect, &[]), Focus::None),
-            frame_guess: placement::guess_points(rect, 1.0),
-            frame_wanted: true,
-            countdown_secs: 3,
             phase: Phase::Countdown { until: Instant::now() + Duration::from_secs(3600) },
             fps: 15,
-            frame: Default::default(),
-            frame_hidden_from_capture: false,
             previous_foreground: None,
             draw: LiveDraw::default(),
         }
@@ -450,12 +365,6 @@ mod tests {
         assert_eq!(seconds_left(Duration::from_millis(2000)), 2);
         assert_eq!(seconds_left(Duration::from_millis(40)), 1);
         assert_eq!(seconds_left(Duration::ZERO), 1);
-    }
-
-    #[test]
-    fn the_log_says_whether_a_countdown_had_a_frame() {
-        assert_eq!(countdown_line("T", 3, Some("exstyle 0x80028 · not layered · cloaked 0")), "-- T countdown of 3 s · frame window: exstyle 0x80028 · not layered · cloaked 0");
-        assert_eq!(countdown_line("T", 3, None), "-- T countdown of 3 s · no frame");
     }
 
     #[test]
