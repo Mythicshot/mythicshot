@@ -292,6 +292,9 @@ static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// How far each paste lands from the last, in image pixels.
 const PASTE_OFFSET: f32 = 16.0;
 
+/// The number the next editor gets, for its own widget ids.
+static NEXT_EDITOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// How long a held status message stays when the user does nothing in the editor.
 const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -375,6 +378,11 @@ pub struct Editor {
     /// The Properties panel of the image editor or of the Timeline view is open (the Tour view's
     /// is its own): taken from the preference of that view kind when the view opens.
     pub(crate) panel_open: bool,
+    /// This editor's number, for the ids of its Properties panel: editor windows share one egui
+    /// context, and each panel keeps its own scroll.
+    instance: u64,
+    /// Where the canvas was in the last frame, for the box a text is typed in.
+    canvas_rect: Option<Rect>,
 }
 
 /// The toolbar row's scrolling as of the last frame: how wide its content and its view are, how far
@@ -506,6 +514,8 @@ impl Editor {
             quit: None,
             toolbar_scroll: ToolbarRow::default(),
             panel_open,
+            instance: NEXT_EDITOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            canvas_rect: None,
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -1271,7 +1281,7 @@ impl Editor {
         }
         ui.separator();
         if self.video.is_none() {
-            let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
+            let fx = icons::button(ui, Icon::Effects, ICON, false, EFFECTS_HINT);
             egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
             ui.separator();
         }
@@ -1300,37 +1310,37 @@ impl Editor {
     fn effect_buttons(&self, ui: &mut egui::Ui, place: Place) -> Option<Effect> {
         let menu = place == Place::Toolbar;
         let mut pick: Option<Effect> = None;
-        if ui.button("Drop shadow").clicked() {
+        if applied(ui.button("Drop shadow"), place) {
             pick = Some(Box::new(effects::drop_shadow));
         }
-        if ui.button("Torn edge").clicked() {
+        if applied(ui.button("Torn edge"), place) {
             pick = Some(Box::new(effects::torn_edge));
         }
-        if ui.button("Border (current colour and width)").clicked() {
+        if applied(ui.button("Border (current colour and width)"), place) {
             let (w, c) = (self.style.width.round().max(1.0) as u32, self.style.stroke.0);
             pick = Some(Box::new(move |img: &RgbaImage| effects::border(img, w, c)));
         }
         if menu {
             ui.separator();
         }
-        if ui.button("Greyscale").clicked() {
+        if applied(ui.button("Greyscale"), place) {
             pick = Some(Box::new(effects::greyscale));
         }
-        if ui.button("Invert").clicked() {
+        if applied(ui.button("Invert"), place) {
             pick = Some(Box::new(effects::invert));
         }
         if menu {
             ui.separator();
             ui.menu_button("Resize", |ui| {
-                if let Some(p) = resize_buttons(ui) {
+                if let Some(p) = resize_buttons(ui, place) {
                     pick = Some(resize_effect(p));
                 }
             });
         }
-        if ui.button("Rotate right").clicked() {
+        if applied(ui.button("Rotate right"), place) {
             pick = Some(Box::new(effects::rotate_cw));
         }
-        if ui.button("Rotate left").clicked() {
+        if applied(ui.button("Rotate left"), place) {
             pick = Some(Box::new(effects::rotate_ccw));
         }
         pick
@@ -1452,7 +1462,7 @@ impl Editor {
             return;
         }
         let mut changed = false;
-        let close = crate::tour_cards::properties_shell(ui, "editor-properties", |ui| {
+        let close = crate::tour_cards::properties_shell(ui, ("editor-properties", self.instance), |ui| {
             changed = if self.video.is_some() { self.timeline_properties(ui) } else { self.image_properties(ui) };
         });
         // The toolbar was drawn before the panel: draw again at once, so it shows the change too.
@@ -1470,9 +1480,10 @@ impl Editor {
         let mut changed = self.style_controls(ui, Place::Panel);
         crate::tour_cards::section(ui, "Picture");
         ui.label(egui::RichText::new(format!("{} × {}", self.doc.width(), self.doc.height())).color(theme::MUTED));
-        row_label(ui, "Resize");
-        let mut pick = ui.horizontal_wrapped(resize_buttons).inner.map(resize_effect);
-        row_label(ui, "Effects");
+        // The toolbar's Effects button says what an effect does to the annotations; so do these.
+        row_label(ui, "Resize").on_hover_text(EFFECTS_HINT);
+        let mut pick = ui.horizontal_wrapped(|ui| resize_buttons(ui, Place::Panel)).inner.map(resize_effect);
+        row_label(ui, "Effects").on_hover_text(EFFECTS_HINT);
         if let Some(f) = ui.horizontal_wrapped(|ui| self.effect_buttons(ui, Place::Panel)).inner {
             pick = Some(f);
         }
@@ -1685,6 +1696,7 @@ impl Editor {
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::GROUND)).show(ui, |ui| {
+            self.canvas_rect = Some(ui.max_rect());
             let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
             let avail = ui.available_size();
             let fit = ((avail.x - 32.0) / w).min((avail.y - 32.0) / h).clamp(0.05, 1.0);
@@ -1992,7 +2004,15 @@ impl Editor {
         let screen = self.last_to_scr(at);
         let hold = self.menu_hold;
         let mut commit = false;
-        egui::Area::new(egui::Id::unique("editor-text")).fixed_pos(screen + vec2(0.0, -4.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+        let mut area = egui::Area::new(egui::Id::unique(TEXT_AREA)).fixed_pos(screen + vec2(0.0, -4.0)).order(egui::Order::Foreground);
+        // With the Properties panel open the box stays over the canvas, never over the panel's rows.
+        // With it closed it is placed exactly as it always was.
+        if self.properties_open()
+            && let Some(canvas) = self.canvas_rect
+        {
+            area = area.constrain_to(canvas);
+        }
+        area.show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 let t = self.text.as_mut().expect("text edit");
                 let size = (self.style.font_size * self.zoom.unwrap_or(1.0)).clamp(12.0, 40.0);
@@ -2395,15 +2415,32 @@ pub(crate) enum Place {
 /// An effect on the picture, as the Effects menu and the panel give it.
 type Effect = Box<dyn FnOnce(&RgbaImage) -> RgbaImage>;
 
+/// The id of the box a text is typed in.
+const TEXT_AREA: &str = "editor-text";
+
 /// The sizes Resize offers, in percent.
 const RESIZE: [u32; 6] = [25, 50, 75, 125, 150, 200];
 
 /// The shadow switch's label and hover text.
 const SHADOW: &str = "Shadow";
 
+/// The Effects button's hover text, which the panel's "Effects" and "Resize" carry too.
+const EFFECTS_HINT: &str = "Effects (flatten annotations into the image)";
+
 /// A label at the start of a line of the Properties panel, muted as the Tour view's are.
-pub(crate) fn row_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).color(theme::MUTED));
+pub(crate) fn row_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(egui::RichText::new(text).color(theme::MUTED))
+}
+
+/// Whether a button that changes the picture or the recording was clicked. In the panel, which
+/// stays open (unlike the toolbar's menus), a button clicked with the mouse lets go of the keyboard
+/// focus, so a later Space or Enter does not apply it again; reached with Tab, it keeps the focus.
+pub(crate) fn applied(resp: egui::Response, place: Place) -> bool {
+    let clicked = resp.clicked();
+    if clicked && place == Place::Panel && resp.ctx.input(|i| i.pointer.any_click()) {
+        resp.surrender_focus();
+    }
+    clicked
 }
 
 /// A control in `place`: on its own in the toolbar, after its label on a line of the panel.
@@ -2449,10 +2486,10 @@ fn fill_controls(ui: &mut egui::Ui, place: Place, style: &mut Style) {
 }
 
 /// The Resize sizes as buttons (the Effects menu's submenu, the panel's "Resize"): the one clicked.
-fn resize_buttons(ui: &mut egui::Ui) -> Option<u32> {
+fn resize_buttons(ui: &mut egui::Ui, place: Place) -> Option<u32> {
     let mut pick = None;
     for p in RESIZE {
-        if ui.button(format!("{p}%")).clicked() {
+        if applied(ui.button(format!("{p}%")), place) {
             pick = Some(p);
         }
     }
@@ -3682,6 +3719,131 @@ pub(crate) mod tests {
 
     /// The toolbar's overflow cue works as before with the panel open: none where the row fits, a
     /// chevron where buttons are hidden, and a click on it scrolls.
+    /// Two editors with their panels open keep their own scroll: scrolling one leaves the other where it was.
+    #[test]
+    fn two_editors_panels_scroll_on_their_own() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(EDITOR_MIN_SIZE[0], EDITOR_MIN_SIZE[1]);
+        let prefs = EditorPrefs { image_properties_open: true, ..EditorPrefs::default() };
+        let (mut a, mut b) = (editor(prefs.clone()), editor(prefs));
+        let picture_y = |ed: &mut Editor| {
+            for _ in 0..2 {
+                sized_frame(ed, &ctx, size, vec![]);
+            }
+            let out = sized_frame(ed, &ctx, size, vec![]);
+            let panel = panel_of(&out).expect("open");
+            in_panel(&out, panel, "Picture").expect("Picture in sight").top()
+        };
+        let (a0, b0) = (picture_y(&mut a), picture_y(&mut b));
+        assert!((a0 - b0).abs() < 0.5, "both start at the top: {a0} {b0}");
+        // Scroll A's panel down with the wheel over it.
+        let over = pos2(size.x - 100.0, size.y / 2.0);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -100.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+        sized_frame(&mut a, &ctx, size, vec![egui::Event::PointerMoved(over), wheel]);
+        for _ in 0..3 {
+            sized_frame(&mut a, &ctx, size, vec![egui::Event::PointerMoved(over)]);
+        }
+        let a1 = picture_y(&mut a);
+        assert!(a1 < a0 - 20.0, "A's panel scrolled: {a0} -> {a1}");
+        let b1 = picture_y(&mut b);
+        assert!((b1 - b0).abs() < 0.5, "B's panel stayed where it was: {b0} -> {b1}");
+    }
+
+    /// The panel's "Effects" and "Resize" carry the toolbar's Effects button's hover text: an effect
+    /// flattens the annotations into the picture.
+    #[test]
+    fn the_panels_effects_and_resize_say_what_the_effects_button_says() {
+        let size = egui::vec2(1280.0, 1600.0);
+        for label in ["Effects", "Resize"] {
+            let ctx = crate::theme::test_context();
+            let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+            sized_frame(&mut ed, &ctx, size, vec![]);
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            let at = in_panel(&out, panel_of(&out).unwrap(), label).unwrap_or_else(|| panic!("{label}")).center();
+            let hint = |out: &egui::FullOutput| crate::share_ui::tests::text_rect(out, EFFECTS_HINT);
+            assert!(hint(&out).is_none(), "no hover text before the pointer is there");
+            sized_frame(&mut ed, &ctx, size, vec![egui::Event::PointerMoved(at)]);
+            for _ in 0..3 {
+                sized_frame(&mut ed, &ctx, size, vec![]);
+            }
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            let shown = hint(&out).unwrap_or_else(|| panic!("{label}: the hover text shows"));
+            assert!((shown.center().y - at.y).abs() < 80.0, "{label}: by the label: {shown:?} {at:?}");
+        }
+    }
+
+    /// Where the box a text is typed in was drawn last.
+    fn text_box(ctx: &egui::Context) -> Rect {
+        ctx.memory(|m| m.area_rect(egui::Id::unique(TEXT_AREA))).expect("the text box")
+    }
+
+    /// With the panel open, the box a text is typed in stays over the canvas and never covers the
+    /// panel's rows; with the panel closed it is placed exactly as before, at the text's spot.
+    #[test]
+    fn the_text_box_keeps_off_the_panel_and_is_placed_as_before_without_it() {
+        let size = egui::vec2(EDITOR_MIN_SIZE[0], EDITOR_MIN_SIZE[1]);
+        let typing = |open: bool, img: RgbaImage, at: Pt| {
+            let ctx = crate::theme::test_context();
+            let s = Settings::default();
+            let mut ed = Editor::new(img, "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs { image_properties_open: open, ..EditorPrefs::default() });
+            ed.zoom = Some(1.0);
+            ed.tool = Tool::Text;
+            ed.text = Some(TextEdit { item: None, at, buffer: "Here".into(), focused: true, step: None });
+            for _ in 0..3 {
+                sized_frame(&mut ed, &ctx, size, vec![]);
+            }
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            (text_box(&ctx), ed.last_to_scr(at) + vec2(0.0, -4.0), panel_of(&out), out)
+        };
+        // Closed: at the text's spot, as before.
+        let (r, spot, panel, _) = typing(false, RgbaImage::new(64, 48), pt(3.0, 4.0));
+        assert!(panel.is_none());
+        assert!((r.min - spot).length() <= 1.0, "at the spot: {r:?} {spot:?}");
+        // Near the right edge it is kept inside the window, as egui keeps it, reaching where the panel would be.
+        let (r, spot, _, _) = typing(false, RgbaImage::new(64, 48), pt(60.0, 4.0));
+        assert!((r.top() - spot.y).abs() <= 1.0 && (r.right() - size.x).abs() <= 1.0 && r.left() > size.x - crate::tour_cards::PANEL_W - 50.0, "kept inside the window, as before: {r:?} {spot:?}");
+        // Open: inside the canvas, off the panel, at the same height.
+        for at in [pt(3.0, 4.0), pt(60.0, 4.0)] {
+            let (r, spot, panel, out) = typing(true, RgbaImage::new(64, 48), at);
+            let panel = panel.expect("open");
+            assert!(r.right() <= panel.left() + 0.5 && !r.intersects(panel.shrink(0.5)), "off the panel: {r:?} {panel:?}");
+            assert!((r.top() - spot.y).abs() <= 1.0, "at the text's height: {r:?} {spot:?}");
+            for row in ["Line width", "Text size"] {
+                let lr = in_panel(&out, panel, row).unwrap_or_else(|| panic!("{row}"));
+                assert!(!r.intersects(lr), "{row} at {lr:?} is not under the box {r:?}");
+            }
+            assert!(crate::theme::checks::assert_texts_fit(&out, "typing with the panel open") >= 3);
+        }
+    }
+
+    /// A button of the panel that changes the picture, clicked with the mouse, does not keep the
+    /// keyboard: a later Space or Enter does not apply it again. One click, one effect, one undo step.
+    #[test]
+    fn a_panel_effect_clicked_once_is_applied_once_whatever_keys_follow() {
+        let size = egui::vec2(1280.0, 1600.0);
+        for (button, after) in [("Rotate right", (48, 64)), ("50%", (32, 24)), ("Invert", (64, 48))] {
+            let ctx = crate::theme::test_context();
+            let mut ed = editor(EditorPrefs { image_properties_open: true, ..EditorPrefs::default() });
+            ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+            sized_frame(&mut ed, &ctx, size, vec![]);
+            let out = sized_frame(&mut ed, &ctx, size, vec![]);
+            let at = in_panel(&out, panel_of(&out).unwrap(), button).unwrap_or_else(|| panic!("{button}")).center();
+            crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), at);
+            let pixel = ed.doc.flatten().get_pixel(0, 0).0;
+            assert_eq!((ed.doc.width(), ed.doc.height()), after, "{button}: applied");
+            assert_eq!(ctx.memory(|m| m.focused()), None, "{button}: the button let go of the keyboard");
+            for key in [Key::Space, Key::Enter] {
+                for pressed in [true, false] {
+                    sized_frame(&mut ed, &ctx, size, vec![egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE }]);
+                }
+                sized_frame(&mut ed, &ctx, size, vec![]);
+            }
+            assert_eq!(((ed.doc.width(), ed.doc.height()), ed.doc.flatten().get_pixel(0, 0).0), (after, pixel), "{button}: not applied again");
+            ed.run(EditorAction::Undo);
+            assert_eq!((ed.doc.width(), ed.doc.height(), ed.doc.can_undo()), (64, 48, false), "{button}: exactly one undo step");
+        }
+    }
+
     #[test]
     fn the_toolbar_overflow_cue_works_with_the_panel_open() {
         let ctx = crate::theme::test_context();
@@ -3734,12 +3896,7 @@ pub(crate) mod tests {
                 let what = format!("the editor at {ppp}, typing {typing}, panel open {open}");
                 assert_eq!(panel_of(&out).is_some(), open, "{what}");
                 assert_toolbar_fits(&out, size, &what);
-                // The box a text is typed in floats over the canvas where the text is, and at this
-                // width it reaches over the panel beside it: the panel's labels are then under that
-                // box, not out of their own. The panel's labels are checked on their own elsewhere.
-                if !(typing && open) {
-                    assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
-                }
+                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
                 let mut ed2 = editor(EditorPrefs { image_properties_open: open, ..EditorPrefs::default() });
                 assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| ed2.ui(ui)), 0, "{what}");
             }
