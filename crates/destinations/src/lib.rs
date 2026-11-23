@@ -129,6 +129,11 @@ pub fn send(dest: DestId, img: &RgbaImage, ctx: &Context) -> Result<Sent, String
         }
         DestId::FileAs => {
             let name = new_path(ctx)?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // A test build never opens the system's file dialog: it is as if the user cancelled it.
+            #[cfg(feature = "test-stubs")]
+            if stubs::stubbed(format!("save as dialog: {name}")) {
+                return Ok(Sent::Cancelled);
+            }
             let picked = rfd::FileDialog::new()
                 .set_directory(&ctx.output_dir)
                 .set_file_name(&name)
@@ -164,6 +169,33 @@ pub fn send(dest: DestId, img: &RgbaImage, ctx: &Context) -> Result<Sent, String
             Ok(Sent::EmailFallback)
         }
         DestId::Editor | DestId::Picker => Err(format!("{} is handled by the app", dest.label())),
+    }
+}
+
+/// Whether this build answers desktop calls with stubs (a test build). The app refuses to start
+/// when it does, so a build with the stubs can never pass for a real one.
+pub const STUBBED: bool = cfg!(feature = "test-stubs");
+
+/// The stand-ins test builds use for every call that would reach the desktop: each records what
+/// was asked for, on the calling thread, and does nothing else.
+#[cfg(feature = "test-stubs")]
+pub mod stubs {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Note that `what` was asked for. Always true: the caller returns the stub's answer.
+    pub fn stubbed(what: impl Into<String>) -> bool {
+        let what = what.into();
+        CALLS.with(|c| c.borrow_mut().push(what));
+        true
+    }
+
+    /// What this thread asked for since the last call, oldest first.
+    pub fn take() -> Vec<String> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 }
 
@@ -251,12 +283,20 @@ pub fn save(img: &RgbaImage, path: &Path, format: ImageFormat, jpeg_quality: u8)
 }
 
 pub fn copy_to_clipboard(img: &RgbaImage) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if stubs::stubbed(format!("clipboard image {}x{}", img.width(), img.height())) {
+        return Ok(());
+    }
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
     cb.set_image(arboard::ImageData { width: img.width() as usize, height: img.height() as usize, bytes: Cow::Borrowed(img.as_raw()) })
         .map_err(|e| format!("could not copy to clipboard: {e}"))
 }
 
 pub fn image_from_clipboard() -> Result<RgbaImage, String> {
+    #[cfg(feature = "test-stubs")]
+    if stubs::stubbed("read clipboard image") {
+        return Err("There is no image on the clipboard".to_string());
+    }
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
     let data = cb.get_image().map_err(|_| "There is no image on the clipboard".to_string())?;
     RgbaImage::from_raw(data.width as u32, data.height as u32, data.bytes.into_owned()).ok_or_else(|| "clipboard image has an unexpected size".to_string())

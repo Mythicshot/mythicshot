@@ -613,7 +613,12 @@ fn keyring_message(e: &keyring::Error) -> String {
 }
 
 impl SecretStore for OsStore {
+    // A test build never reads or writes the user's credential store: it holds no token there.
     fn get(&self) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: read") {
+            return Ok(None);
+        }
         match Self::entry()?.get_password() {
             Ok(s) => Ok(Some(s)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -621,9 +626,18 @@ impl SecretStore for OsStore {
         }
     }
     fn set(&self, secret: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: write") {
+            let _ = secret;
+            return Ok(());
+        }
         Self::entry()?.set_password(secret).map_err(|e| keyring_message(&e))
     }
     fn delete(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: delete") {
+            return Ok(());
+        }
         match Self::entry()?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(keyring_message(&e)),

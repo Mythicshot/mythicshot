@@ -1,4 +1,4 @@
-//! Guide cards on the Tour view's canvas and the Tour settings panel.
+//! Guide cards on the Tour view's canvas and the Properties panel.
 //!
 //! A guide card is tour data (`TourDoc::steps`), not an annotation: it is drawn as an
 //! egui overlay above the canvas, where the shared placement rule puts it, so it can
@@ -172,7 +172,7 @@ pub struct CardUi {
     removed: Option<(usize, Card)>,
 }
 
-/// The Tour settings panel's state: open or not, and the text of fields that must be valid before they reach the tour.
+/// The Properties panel's state: open or not, and the text of fields that must be valid before they reach the tour.
 #[derive(Default)]
 pub struct SettingsUi {
     pub open: bool,
@@ -344,6 +344,9 @@ struct FieldCtx {
     editing: Option<Field>,
     focus: bool,
     clicked: Option<Field>,
+    /// The menu bar is being used: the text being typed keeps its place and gets the keyboard
+    /// back afterwards.
+    hold: bool,
 }
 
 /// One of the card's texts: drawn (with bold) until clicked, then typed in place, capped at `cap`.
@@ -353,10 +356,12 @@ fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut Str
     if fc.editing == Some(which) {
         let edit = if lines == Lines::Paragraph { egui::TextEdit::multiline(text).desired_rows(1) } else { egui::TextEdit::singleline(text) };
         let resp = ui.add(edit.id(field_id(fc.instance, fc.src, which)).frame(egui::Frame::NONE).margin(Margin::ZERO).font(font).text_color(color).hint_text(RichText::new(hint.0).color(hint.1)).char_limit(cap).desired_width(width));
-        if fc.focus {
+        if fc.focus && !fc.hold {
             resp.request_focus();
             fc.focus = false;
-        } else if !resp.has_focus() {
+        } else if !resp.has_focus() && fc.hold {
+            fc.focus = true;
+        } else if !resp.has_focus() && !fc.focus {
             fc.editing = None;
         }
         if text.chars().count() > cap {
@@ -381,7 +386,25 @@ fn card_field(ui: &mut egui::Ui, fc: &mut FieldCtx, which: Field, text: &mut Str
     }
 }
 
-/// A section heading in the Tour settings panel.
+/// The Properties panel's heading. Approved wording.
+pub(crate) const PROPERTIES: &str = crate::editor_ui::PROPERTIES;
+/// The close button's hover text.
+pub(crate) const CLOSE_PROPERTIES: &str = "Close Properties";
+/// The panel's two sections, in this order: the shown step's settings, then the tour's. Approved wording.
+pub(crate) const THIS_STEP: &str = "This step";
+pub(crate) const TOUR: &str = "Tour";
+
+/// One of the Properties panel's two sections ([`THIS_STEP`], [`TOUR`]): a line, then its title,
+/// a size up from the headings inside it.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(RichText::new(title).bold().size(theme::STRONG_SIZE).color(theme::TEXT));
+    ui.add_space(2.0);
+}
+
+/// A heading inside a section of the Properties panel.
 fn heading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.separator();
@@ -704,7 +727,7 @@ impl Editor {
         };
         let selected = state.selected;
         let instance = v.tour.instance;
-        let mut fc = FieldCtx { instance, src, editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None };
+        let mut fc = FieldCtx { instance, src, editing: if selected { state.editing } else { None }, focus: state.focus, clicked: None, hold: self.menu_hold };
         let before = card.clone();
         let next_fill = accent;
         let next_ink = on_accent(accent);
@@ -779,7 +802,8 @@ impl Editor {
         }
     }
 
-    /// The Tour settings panel, at the right of the canvas.
+    /// The Properties panel, docked at the right of the canvas: first the shown step's settings
+    /// ("This step"), then the tour's ("Tour"), then the editor's own ("In this editor").
     pub(crate) fn tour_settings_panel(&mut self, ui: &mut egui::Ui) {
         let step = self.card_step();
         let placing = self.placing_pulse();
@@ -825,16 +849,42 @@ impl Editor {
                 s.secondary_url = doc.end.as_ref().and_then(|e| e.secondary.as_ref()).map(|l| l.url.clone()).unwrap_or_default();
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Tour settings").bold().size(theme::STRONG_SIZE).color(theme::TEXT));
+                ui.label(RichText::new(PROPERTIES).bold().size(theme::STRONG_SIZE).color(theme::TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::button(ui, Icon::Close, 22.0, false, "Close Tour settings").clicked() {
+                    if icons::button(ui, Icon::Close, 22.0, false, CLOSE_PROPERTIES).clicked() {
                         close = true;
                     }
                 });
             });
-            ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(theme::MUTED).size(12.0));
             egui::ScrollArea::vertical().id_salt("tour-settings-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
+
+                section(ui, THIS_STEP);
+                match step {
+                    None => {
+                        ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
+                    }
+                    Some((src, i, _, has_click)) => {
+                        ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
+                        let x = doc.steps.entry(src).or_default();
+                        pulse = pulse_row(ui, has_click, x.pulse.is_some(), placing == Some(src)).map(|a| (src, a));
+                        ui.label("Zoom to the spotlight");
+                        ui.horizontal(|ui| {
+                            for (z, label) in [(None, "Follow the tour"), (Some(true), "On"), (Some(false), "Off")] {
+                                if ui.add(egui::Button::selectable(x.zoom == z, label)).clicked() {
+                                    x.zoom = z;
+                                }
+                            }
+                        });
+                        let mut anywhere = x.advance == Advance::Anywhere;
+                        if ui.checkbox(&mut anywhere, "Continue on a click anywhere").on_hover_text("A click anywhere on the picture moves on, not only on the hotspot").changed() {
+                            x.advance = if anywhere { Advance::Anywhere } else { Advance::Hotspot };
+                        }
+                    }
+                }
+
+                section(ui, TOUR);
+                ui.label(RichText::new("How the tour looks and plays. None of it is drawn into the step images.").color(theme::MUTED).size(12.0));
                 let t = &mut doc.theme;
 
                 heading(ui, "Card style");
@@ -957,7 +1007,7 @@ impl Editor {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!loading, egui::Button::new("Add logo…")).on_hover_text("A PNG or JPEG; it is shrunk to 512 pixels").clicked()
-                                    && let Some(path) = rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]).pick_file()
+                                    && let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new().add_filter("PNG or JPEG", &["png", "jpg", "jpeg"]), "cover logo")
                                 {
                                     // Checked first, so a file that is not a usable logo never reaches the tour.
                                     s.logo_job = Some(start_logo_check(path));
@@ -1022,38 +1072,11 @@ impl Editor {
                     });
                 });
 
-                heading(ui, "This step");
-                match step {
-                    None => {
-                        ui.label(RichText::new("Show a step to set these").color(theme::MUTED));
-                    }
-                    Some((src, i, _, has_click)) => {
-                        ui.label(RichText::new(format!("Step {}", i + 1)).color(theme::MUTED).size(12.0));
-                        let x = doc.steps.entry(src).or_default();
-                        pulse = pulse_row(ui, has_click, x.pulse.is_some(), placing == Some(src)).map(|a| (src, a));
-                        ui.label("Zoom to the spotlight");
-                        ui.horizontal(|ui| {
-                            for (z, label) in [(None, "Follow the tour"), (Some(true), "On"), (Some(false), "Off")] {
-                                if ui.add(egui::Button::selectable(x.zoom == z, label)).clicked() {
-                                    x.zoom = z;
-                                }
-                            }
-                        });
-                        let mut anywhere = x.advance == Advance::Anywhere;
-                        if ui.checkbox(&mut anywhere, "Continue on a click anywhere").on_hover_text("A click anywhere on the picture moves on, not only on the hotspot").changed() {
-                            x.advance = if anywhere { Advance::Anywhere } else { Advance::Hotspot };
-                        }
-                    }
-                }
-
                 heading(ui, "In this editor");
                 ui.checkbox(&mut animate, "Animate hotspot").on_hover_text("Pulse the hotspot on the picture here, as the tour will. Turn off for a still ring.");
                 ui.add_space(12.0);
             });
         });
-        if close {
-            v.tour.settings.open = false;
-        }
         // The theme and zoom become the next recording's, but only when this panel changed them:
         // another open recording's theme is never overwritten by this one's.
         if let Some(saved) = changed_theme(&theme_before, saved_theme(&v.edit.tour_doc)) {
@@ -1069,6 +1092,10 @@ impl Editor {
         if animate != animate_before {
             self.prefs.tour_animate_hotspot = animate;
             self.prefs_changed = true;
+        }
+        // Closed with its own button: as with the toolbar's button, it stays closed next time.
+        if close {
+            self.toggle_properties();
         }
     }
 

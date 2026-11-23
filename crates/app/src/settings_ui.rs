@@ -31,6 +31,19 @@ pub enum Tab {
     Hotkeys,
 }
 
+impl Tab {
+    /// The page's sections, left to right: its tab row, and the Preferences menu of every window.
+    pub const ALL: [Tab; 3] = [Tab::General, Tab::Output, Tab::Hotkeys];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Output => "Output",
+            Tab::Hotkeys => "Hotkeys",
+        }
+    }
+}
+
 /// A shortcut slot: a global hotkey or a key inside the editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bind {
@@ -129,9 +142,9 @@ type Removal = Result<Removed, String>;
 fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hooks: Hooks<'_>) -> Vec<UiAction> {
     let mut out = Vec::new();
     ui.horizontal(|ui| {
-        for (tab, name) in [(Tab::General, "General"), (Tab::Output, "Output"), (Tab::Hotkeys, "Hotkeys")] {
+        for tab in Tab::ALL {
             let selected = state.tab == tab;
-            if ui.add(egui::Button::selectable(selected, name).min_size(vec2(96.0, 30.0))).clicked() {
+            if ui.add(egui::Button::selectable(selected, tab.label()).min_size(vec2(96.0, 30.0))).clicked() {
                 state.tab = tab;
                 out.push(UiAction::StopListening);
             }
@@ -232,7 +245,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
             changed = true;
         }
         if ui.button("Browse…").clicked() {
-            if let Some(p) = rfd::FileDialog::new().set_directory(&s.output_dir).pick_folder() {
+            if let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
                 s.output_dir = p;
                 changed = true;
             }

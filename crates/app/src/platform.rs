@@ -71,6 +71,10 @@ pub fn stop_raw_keyboard_input() {}
 /// and tell running apps the keyboard settings changed.
 #[cfg(windows)]
 pub fn set_snipping_tool_prtsc(on: bool) -> Result<(), String> {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("set snipping tool print screen {on}")) {
+        return Ok(());
+    }
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_DWORD, RegSetKeyValueW};
     use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
@@ -121,6 +125,10 @@ pub fn installer_step(_step: &str) {}
 /// Move the mouse pointer by a few pixels (arrow keys in the region selector).
 #[cfg(windows)]
 pub fn nudge_cursor(dx: i32, dy: i32) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("nudge cursor {dx} {dy}")) {
+        return;
+    }
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
     let mut p = POINT::default();
@@ -191,6 +199,10 @@ pub fn is_window_visible(hwnd: WindowId) -> bool {
 /// press winit's focus request sends. False when Windows did not allow it.
 #[cfg(windows)]
 pub fn take_foreground(hwnd: WindowId) -> bool {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("take foreground {hwnd}")) {
+        return false;
+    }
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
     unsafe {
@@ -333,6 +345,10 @@ pub fn foreground_window() -> Option<WindowId> {
 /// Give focus back to the app that had it before one of our windows appeared.
 #[cfg(windows)]
 pub fn set_foreground(hwnd: WindowId) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("set foreground {hwnd}")) {
+        return;
+    }
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
     unsafe {
@@ -414,6 +430,10 @@ pub fn autostart_enabled() -> bool {
 
 #[cfg(windows)]
 pub fn set_autostart(on: bool) -> Result<(), String> {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("set autostart {on}")) {
+        return Ok(());
+    }
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
     use windows::core::w;
     unsafe {
@@ -450,6 +470,10 @@ fn open_arg(path: &Path) -> String {
 
 /// Open a file with its default app.
 pub fn open_path(path: &Path) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("open path {}", path.display())) {
+        return;
+    }
     #[cfg(windows)]
     let result = {
         use std::os::windows::process::CommandExt;
@@ -474,6 +498,10 @@ fn select_arg(path: &Path) -> String {
 
 /// Show a file selected in the file manager.
 pub fn reveal(path: &Path) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("reveal {}", path.display())) {
+        return;
+    }
     #[cfg(windows)]
     let result = {
         use std::os::windows::process::CommandExt;
@@ -489,6 +517,10 @@ pub fn reveal(path: &Path) {
 }
 
 pub fn open_folder(path: &Path) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("open folder {}", path.display())) {
+        return;
+    }
     let _ = std::fs::create_dir_all(path);
     #[cfg(windows)]
     let cmd = "explorer";

@@ -15,7 +15,8 @@ use mythicshot_editor::{Bounds, Document, Item, MAX_DIM, MIN_DIM, ObfuscateMode,
 use mythicshot_destinations::{self as dest, Context, DestId, Sent};
 
 use crate::theme::{self, Strong as _};
-use crate::hotkeys::{self, EditorAction};
+use crate::hotkeys::{self, Action, EditorAction};
+use crate::menu_bar::{self, AppRequest, Entry};
 use crate::icons::{self, Icon};
 
 const HANDLE: f32 = 8.0;
@@ -24,6 +25,8 @@ const ICON: f32 = 28.0;
 const RAIL: f32 = 84.0;
 /// A tool button on the rail.
 const TOOL_BUTTON: f32 = 36.0;
+/// The toolbar's button for the settings panel, and the panel's heading. Approved wording.
+pub(crate) const PROPERTIES: &str = "Properties";
 /// The rail's sections, like a mockup palette; `None` has no heading.
 /// The Spotlight and Guide card tools show only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
@@ -257,6 +260,10 @@ fn color_image_to_rgba(img: &egui::ColorImage) -> RgbaImage {
 
 /// What is on the system clipboard right now, for the right-click Paste here.
 fn read_clipboard() -> Option<Pasted> {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed("read clipboard") {
+        return None;
+    }
     let mut c = arboard::Clipboard::new().ok()?;
     if let Ok(t) = c.get_text().map(|t| t.replace("\r\n", "\n")) {
         if !t.trim().is_empty() {
@@ -326,7 +333,7 @@ pub struct Editor {
     /// A page the status message offers to open in the browser ("Open site"); cleared by the next message.
     pub(crate) status_open: Option<PathBuf>,
     pub closed: bool,
-    confirm_close: bool,
+    pub(crate) confirm_close: bool,
     /// Where the canvas was right-clicked, for the menu's Paste here.
     menu_at: Option<Pt>,
     /// Where the pointer is over the picture, for Ctrl+V of text or images.
@@ -346,6 +353,90 @@ pub struct Editor {
     pub prefs_changed: bool,
     /// A new default overlay style chosen in the GIF editor, for the app to save.
     pub overlay_default: Option<mythicshot_editor::overlays::OverlayStyle>,
+    /// The global shortcuts, for the menu bar to show beside Capture region and Record region.
+    pub global_keys: BTreeMap<Action, String>,
+    /// What this window's menu bar asked of the app, in order; the app takes them each frame.
+    pub app_requests: Vec<AppRequest>,
+    /// "Export…" was chosen in the menu bar: the toolbar's export panel opens on the next frame.
+    open_export: bool,
+    /// One of the menu bar's menus was open in the last frame: Esc closes it and does nothing else.
+    menu_open: bool,
+    /// The menu bar is being used (a menu is open, or the pointer is on the bar): typing on a text
+    /// or a guide card goes on, and gets the keyboard back once the menu is done.
+    pub(crate) menu_hold: bool,
+    /// Something is being captured or recorded: Capture region and Record region are greyed out.
+    pub busy: bool,
+    /// Quitting asked this editor its close question: its answer, until the quit goes on or stops.
+    pub(crate) quit: Option<QuitAnswer>,
+}
+
+/// An editor's answer to its close question when Quit asked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAnswer {
+    /// The question is still up.
+    Waiting,
+    /// Saved, exported (or exporting) or discarded: the app may go once every editor agrees.
+    Go,
+    /// Cancel: the app stays, and nothing is closed.
+    Stay,
+}
+
+/// What Quit does first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitStart {
+    /// Nothing would be lost: the app goes now.
+    Exit,
+    /// Editors that would lose something show their close question; see [`quit_progress`].
+    Asked,
+    /// A recording, an export, a publish or a GIF being saved is running: the app stays and says so.
+    StillRunning,
+}
+
+/// How a quit that asked stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitProgress {
+    Waiting,
+    /// Every editor asked agreed and nothing runs any more: the app goes now.
+    Exit,
+    /// One said Cancel: every question is gone and nothing was closed.
+    Cancelled,
+}
+
+/// What the app says when Quit finds work still running.
+pub const STILL_RUNNING: &str = "Mythicshot is still recording, exporting or publishing. Quit again when it is done.";
+
+/// Quit (the File menu, the tray): go at once when nothing would be lost; ask every editor that
+/// would lose something its close question, as its close button does; and never drop work that is
+/// running (`running`: a recording or a GIF being saved, outside the editors).
+pub fn start_quit<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G], running: bool) -> QuitStart {
+    if running || editors.iter().any(|e| e.exporting()) {
+        return QuitStart::StillRunning;
+    }
+    let mut asked = false;
+    for e in editors.iter_mut().filter(|e| !e.closed && e.asks_before_closing()) {
+        e.quit = Some(QuitAnswer::Waiting);
+        e.confirm_close = true;
+        asked = true;
+    }
+    if asked { QuitStart::Asked } else { QuitStart::Exit }
+}
+
+/// After [`start_quit`] asked: wait for every answer and for an export chosen in a question to end.
+/// A Cancel ends every question and closes nothing.
+pub fn quit_progress<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G]) -> QuitProgress {
+    let answers: Vec<QuitAnswer> = editors.iter().filter(|e| !e.closed).filter_map(|e| e.quit).collect();
+    if answers.contains(&QuitAnswer::Stay) {
+        for e in editors.iter_mut() {
+            if e.quit.take().is_some() {
+                e.confirm_close = false;
+            }
+        }
+        return QuitProgress::Cancelled;
+    }
+    if answers.contains(&QuitAnswer::Waiting) || editors.iter().any(|e| !e.closed && e.exporting()) {
+        return QuitProgress::Waiting;
+    }
+    QuitProgress::Exit
 }
 
 impl Editor {
@@ -385,6 +476,13 @@ impl Editor {
             prefs,
             prefs_changed: false,
             overlay_default: None,
+            global_keys: BTreeMap::new(),
+            app_requests: Vec::new(),
+            open_export: false,
+            menu_open: false,
+            menu_hold: false,
+            busy: false,
+            quit: None,
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -504,7 +602,7 @@ impl Editor {
     /// never exported. A recording opened from a saved project never asks: the question says
     /// the recording is deleted, which would be untrue, and edits that were not sent to the
     /// site are discarded.
-    fn asks_before_closing(&self) -> bool {
+    pub(crate) fn asks_before_closing(&self) -> bool {
         match &self.video {
             Some(v) if v.origin.is_some() => false,
             Some(v) => self.doc.dirty || !v.exported,
@@ -549,10 +647,8 @@ impl Editor {
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.asks_before_closing() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.confirm_close = true;
-            } else {
-                self.closed = true;
             }
+            self.ask_to_close();
         }
         self.shift = ctx.input(|i| i.modifiers.shift);
         // A pick for the guide card's spot ends when the window loses the keyboard, but not while a
@@ -573,13 +669,23 @@ impl Editor {
         if modal {
             inert(ui);
         }
+        let menu = menu_bar::bar(ui, "editor-menu-bar", &self.menu_state());
+        self.menu_open = menu.open;
+        let on_bar = ctx.input(|i| i.pointer.press_origin().or(i.pointer.hover_pos()).is_some_and(|p| menu.rect.contains(p)));
+        self.menu_hold = menu.open || on_bar;
+        if let Some(entry) = menu.picked {
+            self.menu_entry(entry, &ctx);
+        }
         self.toolbar(ui);
         self.status_bar(ui);
         self.timeline(ui);
         self.tool_rail(ui);
         self.canvas(ui);
         // After the canvas, so a key typed in the same frame as the press still reaches the card first.
-        self.end_card_typing_on_press(&ctx, press);
+        // A press on the menu bar, or in one of its menus, leaves the typing on.
+        if !self.menu_hold {
+            self.end_card_typing_on_press(&ctx, press);
+        }
         self.text_editor(&ctx);
         self.share_window(&ctx);
         if self.confirm_close {
@@ -587,8 +693,86 @@ impl Editor {
         }
     }
 
+    /// Close the window as its close button does: at once, or after the close question when
+    /// something would be lost.
+    fn ask_to_close(&mut self) {
+        if self.asks_before_closing() {
+            self.confirm_close = true;
+        } else {
+            self.closed = true;
+        }
+    }
+
+    /// What the menu bar shows in this window now.
+    pub(crate) fn menu_state(&self) -> menu_bar::State {
+        let (global, keys) = (&self.global_keys, &self.keys);
+        let keys = menu_bar::Keys::from(|a| global.get(&a).cloned().unwrap_or_default(), |a| keys.get(&a).cloned().unwrap_or_default());
+        // While a text or a guide card's text is typed, its keys are the text's (as `shortcuts`
+        // leaves them): undo, redo, copy and delete would act on the picture instead.
+        let typing = self.text.is_some() || self.card_typing_id().is_some();
+        menu_bar::State {
+            busy: self.busy,
+            // The image editor saves; the recording editor exports, from its export panel.
+            save: self.video.is_none(),
+            export: self.video.is_some(),
+            publish: self.can_publish_tour(),
+            undo: self.doc.can_undo() && !typing,
+            redo: self.doc.can_redo() && !typing,
+            // The selection, or else the picture or the frame, as Ctrl+C copies.
+            copy: !typing,
+            delete: (self.selected.is_some() || self.card_selected()) && !typing,
+            properties: Some((self.in_tour_view(), self.properties_open())),
+            keys,
+        }
+    }
+
+    /// Run a menu entry the way this window's own button or key runs it.
+    fn menu_entry(&mut self, entry: Entry, ctx: &egui::Context) {
+        match entry {
+            Entry::Save => self.run(EditorAction::Save),
+            Entry::Undo => self.run(EditorAction::Undo),
+            Entry::Redo => self.run(EditorAction::Redo),
+            Entry::Copy => self.run(EditorAction::Copy),
+            Entry::Delete => self.run(EditorAction::Delete),
+            Entry::Export => self.open_export = self.video.is_some(),
+            Entry::PublishTour => self.open_publish_picker(),
+            Entry::Properties => self.toggle_properties(),
+            Entry::CloseWindow => self.ask_to_close(),
+            Entry::CaptureRegion | Entry::RecordRegion if self.busy => {}
+            entry => {
+                if let Some(request) = entry.app_request() {
+                    self.app_requests.push(request);
+                    // The app takes it on its own frame: wake it.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+        }
+    }
+
+    /// The Properties panel is open: only in the Tour view, where it is.
+    pub(crate) fn properties_open(&self) -> bool {
+        self.in_tour_view() && self.video.as_ref().is_some_and(|v| v.tour.settings.open)
+    }
+
+    /// Open or close the Properties panel (the toolbar's button, the Edit menu, the panel's own
+    /// close button), and remember it for the next time the Tour view opens, in any recording.
+    pub(crate) fn toggle_properties(&mut self) {
+        if !self.in_tour_view() {
+            return;
+        }
+        let open = !self.properties_open();
+        if let Some(v) = self.video.as_mut() {
+            v.tour.settings.open = open;
+        }
+        if self.prefs.tour_properties_open != open {
+            self.prefs.tour_properties_open = open;
+            self.prefs_changed = true;
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        // With a menu of the menu bar open, Esc is left to it: it closes the menu, and only that.
+        if !self.menu_open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             if self.card_escape() {
                 // The guide card stopped typing or was unselected.
             } else if self.pulse_escape() {
@@ -715,9 +899,10 @@ impl Editor {
         let n = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let marker = format!("Mythicshot annotation {n}");
         // Tests leave the real clipboard alone.
-        if !cfg!(test) {
-            let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(marker.clone()));
-        }
+        #[cfg(test)]
+        mythicshot_destinations::stubs::stubbed(format!("clipboard text {marker}"));
+        #[cfg(not(test))]
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(marker.clone()));
         if let Ok(mut c) = ITEM_CLIPBOARD.lock() {
             *c = Some(CopiedItem { shape: it.shape.clone(), style: it.style, marker, pastes: 0 });
         }
@@ -939,61 +1124,89 @@ impl Editor {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if self.video.is_some() {
-                    let exp = icons::button(ui, Icon::Export, ICON, false, "Export (GIF, APNG, MP4, WebM)");
-                    egui::Popup::menu(&exp).show(|ui| self.export_menu(ui));
-                    if icons::button(ui, Icon::Copy, ICON, false, "Copy this frame").clicked() {
-                        self.copy_frame();
-                    }
-                    if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
-                        crate::platform::open_folder(&self.dest.output_dir);
-                    }
-                } else if icons::button(ui, Icon::Save, ICON, false, &self.key_hint(EditorAction::Save)).clicked() {
-                    self.save();
-                }
-                if self.video.is_none() {
-                    if icons::button(ui, Icon::SaveAs, ICON, false, "Save as…").clicked() {
-                        self.send(DestId::FileAs);
-                    }
-                    if icons::button(ui, Icon::Copy, ICON, false, &self.key_hint(EditorAction::Copy)).clicked() {
-                        self.copy();
-                    }
-                    let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
-                    egui::Popup::menu(&send).show(|ui| {
-                        for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
-                            if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
-                                self.send(d);
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        if icons::menu_row(ui, Icon::Export, crate::share_ui::MENU_ENTRY).clicked() {
-                            self.open_share_image();
-                            ui.close();
-                        }
-                    });
-                    if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
-                        crate::platform::open_folder(&self.dest.output_dir);
-                    }
-                }
-                ui.separator();
-                let (can_undo, can_redo) = (self.doc.can_undo(), self.doc.can_redo());
-                if ui.add_enabled_ui(can_undo, |ui| icons::button(ui, Icon::Undo, ICON, false, &self.key_hint(EditorAction::Undo))).inner.clicked() {
-                    self.run(EditorAction::Undo);
-                }
-                if ui.add_enabled_ui(can_redo, |ui| icons::button(ui, Icon::Redo, ICON, false, &self.key_hint(EditorAction::Redo))).inner.clicked() {
-                    self.run(EditorAction::Redo);
-                }
-                ui.separator();
-                if self.video.is_none() {
-                    let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
-                    egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
-                    ui.separator();
-                }
-                self.properties_row(ui);
+                // "Properties" keeps its room at the far right; on a narrow window the rest of the
+                // row scrolls under it (wheel or drag) instead of pushing it out of the window.
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                let button = ui.fonts_mut(|f| f.layout_no_wrap(PROPERTIES.into(), font, theme::TEXT).size().x) + 2.0 * ui.spacing().button_padding.x;
+                let room = (ui.available_width() - button - 2.0 * ui.spacing().item_spacing.x - 8.0).max(0.0);
+                egui::ScrollArea::horizontal().id_salt("editor-toolbar-row").max_width(room).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                    ui.horizontal(|ui| self.toolbar_row(ui));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.properties_button(ui));
             });
         });
+    }
+
+    /// The toolbar's actions, left to right: saving or exporting, undo and redo, effects, and the
+    /// properties of the selection or of the next item drawn.
+    fn toolbar_row(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if self.video.is_some() {
+            let exp = icons::button(ui, Icon::Export, ICON, false, "Export (GIF, APNG, MP4, WebM)");
+            // "Export…" in the File menu opens this same panel.
+            if std::mem::take(&mut self.open_export) {
+                egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&exp));
+            }
+            egui::Popup::menu(&exp).show(|ui| self.export_menu(ui));
+            if icons::button(ui, Icon::Copy, ICON, false, "Copy this frame").clicked() {
+                self.copy_frame();
+            }
+            if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
+                crate::platform::open_folder(&self.dest.output_dir);
+            }
+        } else if icons::button(ui, Icon::Save, ICON, false, &self.key_hint(EditorAction::Save)).clicked() {
+            self.save();
+        }
+        if self.video.is_none() {
+            if icons::button(ui, Icon::SaveAs, ICON, false, "Save as…").clicked() {
+                self.send(DestId::FileAs);
+            }
+            if icons::button(ui, Icon::Copy, ICON, false, &self.key_hint(EditorAction::Copy)).clicked() {
+                self.copy();
+            }
+            let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
+            egui::Popup::menu(&send).show(|ui| {
+                for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
+                    if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
+                        self.send(d);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if icons::menu_row(ui, Icon::Export, crate::share_ui::MENU_ENTRY).clicked() {
+                    self.open_share_image();
+                    ui.close();
+                }
+            });
+            if icons::button(ui, Icon::Folder, ICON, false, "Open captures folder").clicked() {
+                crate::platform::open_folder(&self.dest.output_dir);
+            }
+        }
+        ui.separator();
+        let (can_undo, can_redo) = (self.doc.can_undo(), self.doc.can_redo());
+        if ui.add_enabled_ui(can_undo, |ui| icons::button(ui, Icon::Undo, ICON, false, &self.key_hint(EditorAction::Undo))).inner.clicked() {
+            self.run(EditorAction::Undo);
+        }
+        if ui.add_enabled_ui(can_redo, |ui| icons::button(ui, Icon::Redo, ICON, false, &self.key_hint(EditorAction::Redo))).inner.clicked() {
+            self.run(EditorAction::Redo);
+        }
+        ui.separator();
+        if self.video.is_none() {
+            let fx = icons::button(ui, Icon::Effects, ICON, false, "Effects (flatten annotations into the image)");
+            egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
+            ui.separator();
+        }
+        self.properties_row(ui);
+    }
+
+    /// "Properties" at the far right of the toolbar: lit while the panel is open. In this version
+    /// only the Tour view has the panel; elsewhere it is there, disabled.
+    fn properties_button(&mut self, ui: &mut egui::Ui) {
+        let usable = self.in_tour_view();
+        let button = egui::Button::selectable(self.properties_open(), PROPERTIES).min_size(vec2(0.0, ICON));
+        if ui.add_enabled(usable, button).on_disabled_hover_text(menu_bar::NOTHING_TO_SET).clicked() {
+            self.toggle_properties();
+        }
     }
 
     fn effects_menu(&mut self, ui: &mut egui::Ui) {
@@ -1602,13 +1815,17 @@ impl Editor {
             return self.commit_text();
         }
         let screen = self.last_to_scr(at);
+        let hold = self.menu_hold;
         let mut commit = false;
         egui::Area::new(egui::Id::unique("editor-text")).fixed_pos(screen + vec2(0.0, -4.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 let t = self.text.as_mut().expect("text edit");
                 let size = (self.style.font_size * self.zoom.unwrap_or(1.0)).clamp(12.0, 40.0);
                 let resp = ui.add(egui::TextEdit::multiline(&mut t.buffer).desired_width(280.0).desired_rows(2).font(FontId::proportional(size)).hint_text("Type, then Enter"));
-                if !t.focused {
+                if hold && !resp.has_focus() {
+                    // The menu bar took the keyboard: the text gets it back when the menu is done.
+                    t.focused = false;
+                } else if !t.focused && !hold {
                     resp.request_focus();
                     t.focused = true;
                 }
@@ -1668,6 +1885,26 @@ impl Editor {
             });
             choice
         });
+        // Asked by Quit: the answer goes to the app, and nothing closes until every editor agreed.
+        if self.quit.is_some() {
+            match modal.inner {
+                Some(0) if is_video => {
+                    self.start_export(None);
+                    (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false);
+                }
+                Some(0) => {
+                    self.save();
+                    if !self.doc.dirty {
+                        (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false);
+                    }
+                }
+                Some(1) => (self.quit, self.confirm_close) = (Some(QuitAnswer::Go), false),
+                Some(_) => (self.quit, self.confirm_close) = (Some(QuitAnswer::Stay), false),
+                None if modal.should_close() => (self.quit, self.confirm_close) = (Some(QuitAnswer::Stay), false),
+                None => {}
+            }
+            return;
+        }
         match modal.inner {
             Some(0) if is_video => {
                 if let Some(v) = self.video.as_mut() {
@@ -1977,6 +2214,9 @@ struct CanvasGeom {
     zoom: f32,
 }
 
+/// The smallest an editor window can be made, in points.
+pub(crate) const EDITOR_MIN_SIZE: [f32; 2] = [760.0, 480.0];
+
 /// One editor window and its viewport.
 pub struct EditorWindow {
     pub id: egui::ViewportId,
@@ -1996,7 +2236,7 @@ impl EditorWindow {
 
     pub fn show(&self, ctx: &egui::Context, icon: Arc<egui::IconData>, first_frame: bool) {
         let title = self.editor.lock().map(|e| format!("{} – Mythicshot", e.title())).unwrap_or_default();
-        let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1280.0, 820.0]).with_min_inner_size([760.0, 480.0]).with_icon(icon);
+        let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1280.0, 820.0]).with_min_inner_size(EDITOR_MIN_SIZE).with_icon(icon);
         let editor = self.editor.clone();
         let id = self.id;
         ctx.show_viewport_deferred(id, builder, move |ui, _class| {
@@ -2116,7 +2356,15 @@ pub(crate) mod dialog_checks {
     /// it, a tool's key and a scroll over the canvas change nothing.
     pub(crate) fn assert_inert_and_solid(make: impl Fn() -> Editor, open: impl Fn(&mut Editor), is_open: impl Fn(&Editor) -> bool) {
         // Find a tool button on the rail: a point a click on which changes the tool with no dialog open.
-        let rail = (0..80).map(|i| pos2(RAIL / 2.0, 40.0 + i as f32 * 8.0)).find(|&at| {
+        // The search starts at the rail's own top, below the menu bar and the toolbar, so it never
+        // clicks a toolbar button (Save as… would open the system's file dialog).
+        let top = {
+            let (mut ed, ctx) = (make(), crate::theme::test_context());
+            frame(&mut ed, &ctx, vec![]);
+            let painted = frame(&mut ed, &ctx, vec![]);
+            big_fills(&painted.editor).into_iter().find(|(r, c, ..)| *c == theme::SURFACE && r.left() <= 0.5 && (r.width() - RAIL).abs() <= 1.0).map(|(r, _)| r.top()).expect("the rail")
+        };
+        let rail = (0..80).map(|i| pos2(RAIL / 2.0, top + 4.0 + i as f32 * 8.0)).find(|&at| {
             let (mut ed, ctx) = (make(), crate::theme::test_context());
             frame(&mut ed, &ctx, vec![]);
             let before = ed.tool;
@@ -2158,7 +2406,7 @@ pub(crate) mod dialog_checks {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::settings::{EditorPrefs, Settings};
 
@@ -2573,6 +2821,391 @@ mod tests {
         assert!(crate::theme::checks::assert_texts_fit(&out, "the editor while a text is typed") >= 3);
         fn shown_has(shown: &[(String, Rect)], part: &str) -> bool {
             shown.iter().any(|(t, _)| t.contains(part))
+        }
+    }
+
+    /// One frame of `ed` in a window `size` points big, with `events`, half a second after the last.
+    pub(crate) fn sized_frame(ed: &mut Editor, ctx: &egui::Context, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)), time: Some(ctx.input(|i| i.time) + 0.5), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// The toolbar's Save as… asks for the system's file dialog, which a test build never opens:
+    /// the stub answers as if cancelled. The right-click Paste reads no real clipboard.
+    #[test]
+    fn save_as_and_paste_here_never_reach_the_desktop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ed = editor(EditorPrefs::default());
+        ed.dest.output_dir = tmp.path().to_path_buf();
+        mythicshot_destinations::stubs::take();
+        ed.send(DestId::FileAs);
+        assert_eq!(ed.saved, None);
+        let asked = mythicshot_destinations::stubs::take();
+        assert!(matches!(asked.as_slice(), [a] if a.starts_with("save as dialog: ")), "{asked:?}");
+        assert!(read_clipboard().is_none());
+        assert_eq!(mythicshot_destinations::stubs::take(), ["read clipboard"]);
+    }
+
+    /// Click the button that says `label` in one frame's drawing, as a user does.
+    fn click_label(ed: &mut Editor, ctx: &egui::Context, label: &str) {
+        let size = dialog_checks::WINDOW.size();
+        sized_frame(ed, ctx, size, vec![]);
+        let out = sized_frame(ed, ctx, size, vec![]);
+        let at = crate::menu_bar::tests::last_text_rect(&out, label).unwrap_or_else(|| panic!("{label} is shown")).center();
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(ed, ctx, size, events), at);
+    }
+
+    #[test]
+    fn quit_with_nothing_to_lose_goes_at_once_and_asks_nothing() {
+        let (mut a, mut b) = (editor(EditorPrefs::default()), editor(EditorPrefs::default()));
+        assert_eq!(start_quit(&mut [&mut a, &mut b], false), QuitStart::Exit);
+        assert!(!a.confirm_close && !b.confirm_close && a.quit.is_none());
+        assert_eq!(start_quit::<&mut Editor>(&mut [], false), QuitStart::Exit, "no editor open");
+    }
+
+    #[test]
+    fn quit_with_an_unsaved_capture_asks_and_cancel_keeps_everything() {
+        let ctx = crate::theme::test_context();
+        let mut clean = editor(EditorPrefs::default());
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        assert_eq!(start_quit(&mut [&mut clean, &mut ed], false), QuitStart::Asked);
+        assert!(ed.confirm_close && !clean.confirm_close, "only the editor that would lose something asks");
+        assert_eq!(quit_progress(&mut [&mut clean, &mut ed]), QuitProgress::Waiting);
+        // Its own close question, as its close button shows it.
+        sized_frame(&mut ed, &ctx, dialog_checks::WINDOW.size(), vec![]);
+        let out = sized_frame(&mut ed, &ctx, dialog_checks::WINDOW.size(), vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, "Save this capture?").is_some());
+        click_label(&mut ed, &ctx, "Cancel");
+        assert_eq!(quit_progress(&mut [&mut clean, &mut ed]), QuitProgress::Cancelled);
+        assert!(!ed.closed && !ed.confirm_close && ed.quit.is_none() && ed.doc.items().len() == 1, "nothing closed or lost");
+        assert!(!clean.closed);
+    }
+
+    #[test]
+    fn quit_goes_only_when_every_editor_agrees_and_closes_nothing_before() {
+        let ctx = crate::theme::test_context();
+        let make = || {
+            let mut ed = editor(EditorPrefs::default());
+            ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+            ed
+        };
+        // One says Don't save, the other Cancel: the app stays and neither window closed.
+        let (mut a, mut b) = (make(), make());
+        assert_eq!(start_quit(&mut [&mut a, &mut b], false), QuitStart::Asked);
+        click_label(&mut a, &ctx, "Don't save");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Waiting);
+        assert!(!a.closed, "not closed while the other editor has not answered");
+        click_label(&mut b, &ctx, "Cancel");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Cancelled);
+        assert!(!a.closed && !b.closed && a.doc.items().len() == 1 && b.doc.items().len() == 1);
+        // Both say Don't save: the app goes.
+        let (mut a, mut b) = (make(), make());
+        start_quit(&mut [&mut a, &mut b], false);
+        click_label(&mut a, &ctx, "Don't save");
+        click_label(&mut b, &ctx, "Don't save");
+        assert_eq!(quit_progress(&mut [&mut a, &mut b]), QuitProgress::Exit);
+        // Save saves first, then counts as agreed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = make();
+        c.dest.output_dir = tmp.path().to_path_buf();
+        start_quit(&mut [&mut c], false);
+        click_label(&mut c, &ctx, "Save");
+        assert!(c.saved.as_ref().is_some_and(|p| p.is_file()));
+        assert_eq!(quit_progress(&mut [&mut c]), QuitProgress::Exit);
+    }
+
+    #[test]
+    fn quit_while_a_recording_or_a_gif_is_saved_keeps_the_app_and_asks_nothing() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        assert_eq!(start_quit(&mut [&mut ed], true), QuitStart::StillRunning);
+        assert!(!ed.confirm_close && ed.quit.is_none() && !ed.closed);
+    }
+
+    /// While a text is typed, Edit's Undo, Redo, Copy and Delete are disabled (the keys belong to
+    /// the text, as `shortcuts` leaves them); opening the menu keeps the text, and typing goes on
+    /// once the menu is closed.
+    #[test]
+    fn the_edit_menu_waits_while_a_text_is_typed() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: String::new(), focused: false, step: None });
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::Text("Hel".into())]);
+        let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&menu_bar::menus(&ed.menu_state()), e).enabled;
+        for e in [Entry::Undo, Entry::Copy, Entry::Delete] {
+            assert!(!find(&ed, e), "{e:?} while typing");
+        }
+        // Opened and used while typing: the disabled entries do nothing, and the text stays.
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Delete");
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "Edit", "Undo");
+        assert_eq!(ed.doc.items().len(), 1, "nothing was deleted or undone");
+        assert_eq!(ed.text.as_ref().map(|t| t.buffer.as_str()), Some("Hel"), "the text is kept and still typed");
+        // The menu closed with the click; the text gets the keyboard back.
+        for _ in 0..2 {
+            sized_frame(&mut ed, &ctx, size, vec![]);
+        }
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::Text("lo".into())]);
+        assert_eq!(ed.text.as_ref().map(|t| t.buffer.as_str()), Some("Hello"), "typing goes on after the menu");
+        // Done typing: the entries work again.
+        ed.text = None;
+        assert!(find(&ed, Entry::Undo) && find(&ed, Entry::Copy) && find(&ed, Entry::Delete));
+    }
+
+    /// While something is being captured or recorded, an editor's Capture region and Record region
+    /// are greyed out and do nothing, like the main window's tiles.
+    #[test]
+    fn the_editors_capture_entries_wait_while_something_is_captured() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs::default());
+        ed.busy = true;
+        let menus = menu_bar::menus(&ed.menu_state());
+        assert!(!crate::menu_bar::tests::find(&menus, Entry::CaptureRegion).enabled && !crate::menu_bar::tests::find(&menus, Entry::RecordRegion).enabled);
+        for entry in ["Capture region", "Record region"] {
+            crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "File", entry);
+        }
+        assert!(ed.app_requests.is_empty());
+        ed.busy = false;
+        crate::menu_bar::tests::choose(&mut |events| sized_frame(&mut ed, &ctx, size, events), "File", "Capture region");
+        assert_eq!(ed.app_requests, vec![AppRequest::Run(crate::tray::Command::Region)]);
+    }
+
+    #[test]
+    fn the_image_editors_menus_offer_its_save_undo_copy_and_delete() {
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        ed.global_keys = Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        let find = |ed: &Editor, e: Entry| crate::menu_bar::tests::find(&menu_bar::menus(&ed.menu_state()), e);
+        // Saving is this editor's; exporting and publishing a tour are the recording editor's.
+        assert!(find(&ed, Entry::Save).enabled && !find(&ed, Entry::Export).enabled && !find(&ed, Entry::PublishTour).enabled);
+        assert_eq!(find(&ed, Entry::Save).shortcut, "Ctrl+S");
+        assert_eq!(find(&ed, Entry::CaptureRegion).shortcut, "PrtSc");
+        // Nothing to undo, redo or delete yet; the picture can always be copied, as Ctrl+C copies it.
+        assert!(!find(&ed, Entry::Undo).enabled && !find(&ed, Entry::Redo).enabled && !find(&ed, Entry::Delete).enabled);
+        assert!(find(&ed, Entry::Copy).enabled);
+        // No Properties panel here yet: the entry is there, disabled.
+        let props = find(&ed, Entry::Properties);
+        assert!(!props.enabled && props.checked == Some(false));
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.select(Some(id));
+        assert!(find(&ed, Entry::Undo).enabled && find(&ed, Entry::Delete).enabled && !find(&ed, Entry::Redo).enabled);
+    }
+
+    #[test]
+    fn the_image_editors_menu_entries_do_what_its_keys_and_buttons_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let make = || {
+            let mut ed = editor(EditorPrefs::default());
+            ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+            ed.dest.output_dir = tmp.path().to_path_buf();
+            ed
+        };
+        let size = dialog_checks::WINDOW.size();
+        let choose = |ed: &mut Editor, menu: &str, entry: &str| crate::menu_bar::tests::choose(&mut |events| sized_frame(ed, &ctx, size, events), menu, entry);
+        let rect = Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 });
+
+        // Undo and Redo, as Ctrl+Z and Ctrl+Y.
+        let mut ed = make();
+        ed.add_item(rect.clone());
+        choose(&mut ed, "Edit", "Undo");
+        assert!(ed.doc.items().is_empty() && ed.doc.can_redo());
+        choose(&mut ed, "Edit", "Redo");
+        assert_eq!(ed.doc.items().len(), 1);
+        // Copy and Delete act on the selection, as Ctrl+C and Delete do.
+        let id = ed.doc.items()[0].id;
+        ed.use_select_tool();
+        ed.select(Some(id));
+        choose(&mut ed, "Edit", "Copy");
+        assert_eq!(ed.status_text(), Some("Copied the annotation"));
+        choose(&mut ed, "Edit", "Delete");
+        assert!(ed.doc.items().is_empty() && ed.selected.is_none());
+        // Save, as Ctrl+S: a new file named by the pattern, in the captures folder.
+        choose(&mut ed, "File", "Save");
+        let saved = ed.saved.clone().expect("saved");
+        assert!(saved.starts_with(tmp.path()) && saved.is_file(), "{saved:?}");
+        // Close window, as the window's close button: at once when nothing would be lost...
+        choose(&mut ed, "File", "Close window");
+        assert!(ed.closed && !ed.confirm_close);
+        // ...and after the close question when something would.
+        let mut ed = make();
+        ed.add_item(rect.clone());
+        choose(&mut ed, "File", "Close window");
+        assert!(ed.confirm_close && !ed.closed);
+        // What only the app can do goes to it, as the hotkeys and the tray menu ask for it.
+        let mut ed = make();
+        for (menu, entry) in [("File", "Capture region"), ("File", "Record region"), ("File", "Open tours"), ("Preferences", "Hotkeys"), ("Preferences", "Workspace"), ("Help", "About Mythicshot"), ("Help", "Open the log folder"), ("File", "Quit Mythicshot")] {
+            choose(&mut ed, menu, entry);
+        }
+        use crate::tray::Command;
+        assert_eq!(ed.app_requests, vec![
+            AppRequest::Run(Command::Region),
+            AppRequest::Run(Command::Record),
+            AppRequest::Page(crate::main_window::Page::Tours),
+            AppRequest::Preferences(crate::settings_ui::Tab::Hotkeys),
+            AppRequest::Page(crate::main_window::Page::Workspace),
+            AppRequest::Preferences(crate::settings_ui::Tab::General),
+            AppRequest::LogFolder,
+            AppRequest::Run(Command::Exit),
+        ]);
+        assert!(!ed.closed && ed.doc.items().is_empty(), "nothing else happened in the editor");
+        // A disabled entry does nothing: Export and Properties here.
+        choose(&mut ed, "File", "Export…");
+        choose(&mut ed, "Edit", "Properties");
+        assert!(!ed.open_export && !ed.prefs_changed && ed.app_requests.len() == 8);
+    }
+
+    /// The menu bar takes no keys: with a menu open or not, the editor's own shortcuts work and a
+    /// text being typed gets its letters; and Esc closes an open menu before anything else.
+    #[test]
+    fn the_menu_bar_leaves_the_editors_keys_and_typing_alone() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let key = |k: Key, modifiers: Modifiers| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        // A tool's key and Ctrl+Z, with the menus closed.
+        sized_frame(&mut ed, &ctx, size, vec![key(Key::E, Modifiers::NONE)]);
+        assert_eq!(ed.tool, Tool::Ellipse);
+        ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        sized_frame(&mut ed, &ctx, size, vec![ctrl(Key::Z)]);
+        assert!(ed.doc.items().is_empty(), "Ctrl+Z undid");
+        // Typing a text: the letters go to the text, not to the tools.
+        ed.tool = Tool::Text;
+        ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: String::new(), focused: false, step: None });
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        sized_frame(&mut ed, &ctx, size, vec![egui::Event::Text("re".into()), key(Key::R, Modifiers::NONE)]);
+        assert_eq!(ed.tool, Tool::Text, "R reached the tools while a text was typed");
+        assert_eq!(ed.text.as_ref().map(|t| t.buffer.as_str()), Some("re"));
+        ed.text = None;
+        // With the File menu open, Esc closes the menu and leaves the selection alone.
+        let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+        ed.use_select_tool();
+        ed.select(Some(id));
+        let open = crate::menu_bar::tests::open_menu(&mut |events| sized_frame(&mut ed, &ctx, size, events), "File");
+        assert!(crate::menu_bar::tests::last_text_rect(&open, "Quit Mythicshot").is_some(), "the menu is open");
+        sized_frame(&mut ed, &ctx, size, vec![key(Key::Escape, Modifiers::NONE)]);
+        let closed = sized_frame(&mut ed, &ctx, size, vec![]);
+        assert!(crate::menu_bar::tests::last_text_rect(&closed, "Quit Mythicshot").is_none(), "Esc closed the menu");
+        assert_eq!(ed.selected, Some(id), "and did not reach the editor");
+        // The next Esc is the editor's again.
+        sized_frame(&mut ed, &ctx, size, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert_eq!(ed.selected, None);
+    }
+
+    #[test]
+    fn the_properties_button_is_at_the_far_right_and_disabled_in_the_image_editor() {
+        let ctx = crate::theme::test_context();
+        let size = dialog_checks::WINDOW.size();
+        let mut ed = editor(EditorPrefs::default());
+        sized_frame(&mut ed, &ctx, size, vec![]);
+        let out = sized_frame(&mut ed, &ctx, size, vec![]);
+        let at = crate::share_ui::tests::text_rect(&out, PROPERTIES).expect("the button is shown");
+        assert!(at.right() > size.x - 100.0 && at.top() > 20.0 && at.bottom() < 80.0, "at the far right of the toolbar, under the menu bar: {at:?}");
+        crate::menu_bar::tests::click_at(&mut |events| sized_frame(&mut ed, &ctx, size, events), at.center());
+        assert!(!ed.properties_open() && !ed.prefs_changed, "it does nothing here");
+        // Its hover text says why.
+        let hover = |ed: &mut Editor| {
+            sized_frame(ed, &ctx, size, vec![egui::Event::PointerMoved(at.center())]);
+            for _ in 0..3 {
+                sized_frame(ed, &ctx, size, vec![]);
+            }
+            sized_frame(ed, &ctx, size, vec![])
+        };
+        let shown = hover(&mut ed);
+        assert!(crate::share_ui::tests::text_rect(&shown, menu_bar::NOTHING_TO_SET).is_some(), "the hover text shows");
+    }
+
+    /// Nothing sticks out of the toolbar at the narrowest window the editor allows, at 100%, 125%
+    /// and 200%: with a shape selected (the longest row of properties) and while a text is typed,
+    /// every label lies inside the window and the toolbar, and the Properties button is whole, at
+    /// the right, and covers nothing else.
+    #[test]
+    fn nothing_sticks_out_of_the_toolbar_at_the_narrowest_window_and_every_scale() {
+        let size = egui::vec2(EDITOR_MIN_SIZE[0], EDITOR_MIN_SIZE[1]);
+        for ppp in [1.0, 1.25, 2.0] {
+            for typing in [false, true] {
+                let ctx = crate::theme::test_context();
+                ctx.set_pixels_per_point(ppp);
+                let mut ed = editor(EditorPrefs::default());
+                if typing {
+                    ed.tool = Tool::Text;
+                    ed.text = Some(TextEdit { item: None, at: pt(3.0, 4.0), buffer: "Here".into(), focused: true, step: None });
+                } else {
+                    let id = ed.add_item(Shape::Rect(Bounds { x0: 5.0, y0: 5.0, x1: 30.0, y1: 30.0 }));
+                    ed.select(Some(id));
+                }
+                for _ in 0..2 {
+                    sized_frame(&mut ed, &ctx, size, vec![]);
+                }
+                let out = sized_frame(&mut ed, &ctx, size, vec![]);
+                let what = format!("the editor at {ppp}, typing {typing}");
+                assert_toolbar_fits(&out, size, &what);
+                assert!(crate::theme::checks::assert_texts_fit(&out, &what) >= 3);
+                let mut ed2 = editor(EditorPrefs::default());
+                assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| ed2.ui(ui)), 0, "{what}");
+            }
+        }
+    }
+
+    /// The toolbar of a frame `size` points big: the band of surface just under the menu bar.
+    /// Every text in it, as far as it shows, lies inside the window, and the Properties button is
+    /// whole, at the right end of the band, with no other text showing under it.
+    pub(crate) fn assert_toolbar_fits(out: &egui::FullOutput, size: egui::Vec2, what: &str) {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), size);
+        // The toolbar's "Properties" (the panel's heading, when it is open, is lower down).
+        let label = crate::share_ui::tests::shapes_of(out)
+            .into_iter()
+            .find_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.text() == PROPERTIES && t.pos.y < 90.0 => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{what}: the Properties button"));
+        // The button: the smallest filled or outlined rectangle around its whole label.
+        let button = crate::share_ui::tests::shapes_of(out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if (r.fill.a() > 0 || r.stroke.width > 0.0) && r.rect.contains_rect(label) && r.rect.area() < 20_000.0 => Some(r.rect),
+                _ => None,
+            })
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .unwrap_or_else(|| panic!("{what}: the Properties button's frame"));
+        let band = crate::theme::checks::fills(out).into_iter().filter(|(r, c, _)| *c == theme::SURFACE && r.contains(button.center()) && r.width() >= size.x - 1.0).map(|(r, ..)| r).min_by(|a, b| a.area().total_cmp(&b.area()));
+        let band = band.unwrap_or_else(|| panic!("{what}: the toolbar's band"));
+        assert!(window.contains_rect(button) && band.expand(0.5).contains_rect(button), "{what}: the Properties button {button:?} is whole, in the toolbar {band:?}");
+        assert!(button.right() >= size.x - 16.0, "{what}: at the far right: {button:?}");
+        // Each text as it shows: cut to its clip, so what scrolls under the button is not counted.
+        fn texts(clip: Rect, s: &egui::Shape, into: &mut Vec<(Rect, egui::epaint::TextShape)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(clip, s, into)),
+                egui::Shape::Text(t) => into.push((clip, t.clone())),
+                _ => {}
+            }
+        }
+        let mut shown = Vec::new();
+        out.shapes.iter().for_each(|c| texts(c.clip_rect, &c.shape, &mut shown));
+        for (clip, t) in shown {
+            {
+                let r = t.visual_bounding_rect().intersect(clip);
+                if !r.is_positive() || !band.contains(r.center()) {
+                    continue;
+                }
+                assert!(window.expand(0.5).contains_rect(r) && band.expand(0.5).contains_rect(r), "{what}: {:?} at {r:?} leaves the toolbar {band:?}", t.galley.text());
+                if t.galley.text() != PROPERTIES {
+                    assert!(!r.intersects(button), "{what}: {:?} at {r:?} is under the Properties button {button:?}", t.galley.text());
+                }
+            }
         }
     }
 

@@ -11,6 +11,7 @@
 mod app_icon;
 mod capture_log;
 mod capture_window;
+mod dialogs;
 mod editor_ui;
 mod home_ui;
 mod hotkeys;
@@ -19,6 +20,7 @@ mod icons;
 mod input;
 mod live_draw;
 mod main_window;
+mod menu_bar;
 mod overlay;
 mod placement;
 mod password;
@@ -213,6 +215,10 @@ struct App {
     draw_when_live: bool,
     /// The recording kept as a video that is being expanded for an editor.
     opening: Option<Opening>,
+    /// Quit asked the editors that would lose something, and waits for their answers.
+    quitting: bool,
+    /// The capture waiting in `hide_then_run` came from an editor's menu bar, for the capture log.
+    menu_capture: bool,
 }
 
 impl App {
@@ -326,6 +332,8 @@ impl App {
             started: Instant::now(),
             draw_when_live: false,
             opening: None,
+            quitting: false,
+            menu_capture: false,
             wake: {
                 let (wake, woken) = mpsc::channel::<()>();
                 let relay = ctx.clone();
@@ -457,7 +465,42 @@ impl App {
             // The main window, on Home or on Preferences. Already open, it comes to the front on that page.
             Command::OpenApp | Command::Preferences => self.window_request = main_window::request_for(cmd),
             Command::OpenFolder => platform::open_folder(&self.settings.output_dir),
-            Command::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
+            Command::Exit => self.quit(ctx),
+        }
+    }
+
+    /// Quit from the File menu or the tray: at once when nothing would be lost; otherwise each
+    /// editor that would lose something asks first, and work still running keeps the app.
+    fn quit(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            return;
+        }
+        let running = self.session.is_some() || !self.encoding.is_empty();
+        let mut guards: Vec<_> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok()).collect();
+        let start = editor_ui::start_quit(&mut guards, running);
+        drop(guards);
+        match start {
+            editor_ui::QuitStart::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
+            editor_ui::QuitStart::Asked => self.quitting = true,
+            editor_ui::QuitStart::StillRunning => self.notify(editor_ui::STILL_RUNNING.into()),
+        }
+    }
+
+    /// While Quit waits for the editors' answers: go once all agreed, stay on a Cancel.
+    fn tick_quit(&mut self, ctx: &egui::Context) {
+        if !self.quitting {
+            return;
+        }
+        let mut guards: Vec<_> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok()).collect();
+        let progress = editor_ui::quit_progress(&mut guards);
+        drop(guards);
+        match progress {
+            editor_ui::QuitProgress::Waiting => ctx.request_repaint_after(Duration::from_millis(200)),
+            editor_ui::QuitProgress::Cancelled => self.quitting = false,
+            editor_ui::QuitProgress::Exit => {
+                self.quitting = false;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
         }
     }
 
@@ -793,16 +836,22 @@ impl App {
         }
     }
 
+    /// Show a new editor window. Its menu bar shows the global shortcuts beside Capture region and Record region.
+    fn add_editor(&mut self, mut editor: editor_ui::Editor) {
+        editor.global_keys = self.settings.hotkeys.clone();
+        self.editors.push((editor_ui::EditorWindow::new(editor), true));
+    }
+
     fn open_editor(&mut self, img: image::RgbaImage, title: String) {
         let editor = editor_ui::Editor::new(img, title.clone(), self.settings.editor_keys.clone(), self.settings.dest_context(&title), self.settings.editor.clone());
-        self.editors.push((editor_ui::EditorWindow::new(editor), true));
+        self.add_editor(editor);
     }
 
     /// Open a recording in the editor's video mode (the GIF editor).
     fn open_video_editor(&mut self, rec: Arc<mythicshot_recording::Recording>, events: Vec<mythicshot_editor::overlays::InputEvent>, items: Vec<mythicshot_editor::Item>, title: String) {
         let s = &self.settings;
         match editor_ui::Editor::new_video(rec.clone(), events, items, title.clone(), s.editor_keys.clone(), s.dest_context(&title), s.overlays, s.editor.clone()) {
-            Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Ok(editor) => self.add_editor(editor),
             Err(e) => {
                 rec.delete_files();
                 self.notify(format!("Could not open the recording: {e}"));
@@ -819,7 +868,7 @@ impl App {
         let store = project::Store::default_root().map(project::Store::at);
         if let Some(opened) = open_at_once(store.as_ref(), &key, &self.settings) {
             match opened {
-                Ok(editor) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+                Ok(editor) => self.add_editor(editor),
                 Err(sentence) => self.edit_failed(&key, sentence),
             }
             return;
@@ -850,7 +899,7 @@ impl App {
             s.tours.open_ended(&key);
         }
         match after_open(cancelled, result).map(|ready| ready.and_then(|loaded| open_loaded(loaded, &self.settings))) {
-            Some(Ok(editor)) => self.editors.push((editor_ui::EditorWindow::new(editor), true)),
+            Some(Ok(editor)) => self.add_editor(editor),
             Some(Err(sentence)) => self.edit_failed(&key, sentence),
             None => {}
         }
@@ -863,7 +912,7 @@ impl App {
     }
 
     fn open_file(&mut self) {
-        let picked = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir).pick_file();
+        let picked = dialogs::pick_file(rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir), "open image");
         let Some(path) = picked else { return };
         match image::open(&path) {
             Ok(img) => {
@@ -876,6 +925,18 @@ impl App {
 
     fn show_editors(&mut self, ctx: &egui::Context) {
         self.collect_editor_prefs();
+        let busy = self.activity().busy();
+        for (w, _) in &self.editors {
+            if let Ok(mut e) = w.editor.lock() {
+                e.busy = busy;
+            }
+        }
+        // What the editors' menu bars asked for since the last frame, in the order they asked.
+        let requests: Vec<menu_bar::AppRequest> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok().map(|mut e| std::mem::take(&mut e.app_requests))).flatten().collect();
+        for request in requests {
+            self.menu_request(ctx, request);
+        }
+        self.tick_quit(ctx);
         self.editors.retain(|(w, _)| !w.is_closed());
         for (w, first) in &mut self.editors {
             w.show(ctx, self.icon.clone(), std::mem::take(first));
@@ -913,6 +974,57 @@ impl App {
         if self.prefs_save_at.is_some_and(|t| Instant::now() >= t) {
             self.prefs_save_at = None;
             self.save_settings();
+        }
+    }
+
+    /// Do what a window's menu bar asked of the app. Showing the main window is held back while
+    /// something is being captured, as from the tray menu.
+    fn menu_request(&mut self, ctx: &egui::Context, request: menu_bar::AppRequest) {
+        use menu_bar::AppRequest;
+        match request {
+            // A capture from an editor's File menu waits a moment, as one from the main window does,
+            // so the menu has closed and the editor has drawn again before the desktop is taken.
+            AppRequest::Run(cmd @ (Command::Region | Command::Record)) => {
+                if tray::pending_may_run(self.activity()) {
+                    self.menu_capture = true;
+                    self.hide_then_run.start(cmd, Instant::now());
+                }
+            }
+            AppRequest::Run(cmd) => {
+                self.trigger = "menu bar";
+                self.run(ctx, cmd);
+            }
+            AppRequest::Page(page) => {
+                if tray::allowed(Command::OpenApp, self.activity()) {
+                    self.window_request = Some(main_window::Request::Page(page));
+                }
+            }
+            AppRequest::Preferences(tab) => {
+                if tray::allowed(Command::Preferences, self.activity()) {
+                    if let Ok(mut s) = self.window.lock() {
+                        s.open_preferences(tab);
+                    }
+                    self.window_request = Some(main_window::Request::Page(main_window::Page::Preferences));
+                }
+            }
+            AppRequest::LogFolder => {
+                // `crash.log` and `capture.log` are beside the settings file.
+                if let Some(dir) = Settings::path().parent() {
+                    platform::open_folder(dir);
+                }
+            }
+            AppRequest::Troubleshooting => {
+                // The app points nowhere else for help: the README the installer puts beside the program.
+                match std::env::current_exe().map(|exe| menu_bar::readme_beside(&exe)) {
+                    Ok(readme) if readme.is_file() => platform::open_path(&readme),
+                    _ => self.notify(menu_bar::NO_README.into()),
+                }
+            }
+            AppRequest::DownloadPage => {
+                if let Err(e) = dest::open_url(menu_bar::DOWNLOAD_PAGE) {
+                    self.notify(e);
+                }
+            }
         }
     }
 
@@ -982,6 +1094,7 @@ impl App {
         for (w, _) in &self.editors {
             if let Ok(mut e) = w.editor.lock() {
                 e.keys = self.settings.editor_keys.clone();
+                e.global_keys = self.settings.hotkeys.clone();
                 e.set_output(self.settings.dest_context(""));
             }
         }
@@ -1124,13 +1237,16 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture, edit_project) = {
+        let (actions, edited, tab, capture, edit_project, requests) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take())
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests))
         };
+        for request in requests {
+            self.menu_request(ctx, request);
+        }
         self.settings_state.tab = tab;
         let edited = edited.unwrap_or_else(|| self.settings.clone());
         // Which app the user is in, for a capture started from the main window.
@@ -1190,6 +1306,7 @@ impl App {
                 s.settle(ctx);
             }
             self.window_request = None;
+            self.menu_capture = false;
             // Focus goes back to the app the user came from, so "Window" captures that one.
             if let Some(previous) = self.last_foreground.get() {
                 platform::set_foreground(previous);
@@ -1201,7 +1318,7 @@ impl App {
             if tray::pending_may_run(self.activity()) {
                 // "Window" never captures one of our own windows.
                 let front = platform::foreground_window().map(platform::window_kind);
-                self.trigger = "app window";
+                self.trigger = if std::mem::take(&mut self.menu_capture) { "menu bar" } else { "app window" };
                 self.run(ctx, main_window::tile_command(cmd, front));
             }
         }
@@ -1415,6 +1532,12 @@ fn install_crash_log() {
 }
 
 fn main() -> eframe::Result {
+    // A build with the test stubs answers every file dialog, clipboard, print, mail and browser
+    // call with a stub: it must never run as the app.
+    if dest::STUBBED {
+        eprintln!("This is a test build of Mythicshot; it does not run as the app.");
+        std::process::exit(2);
+    }
     install_crash_log();
     // Steps the installer runs; these never start the app.
     let args: Vec<String> = std::env::args().collect();

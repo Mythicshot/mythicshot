@@ -32,6 +32,11 @@ tempfile = "3"
 # Content hashes in the names of a site's shared player files.
 sha2 = "0.11"
 
+[dev-dependencies]
+# Tests never reach the desktop: the destinations' file dialog, clipboard, printer, mail and
+# browser calls are stubbed in test builds only (dev-dependencies are not part of `cargo build`).
+mythicshot-destinations = { path = "../destinations", features = ["test-stubs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 

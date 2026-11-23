@@ -6,6 +6,12 @@ license.workspace = true
 publish.workspace = true
 description = "Where a finished capture goes: file, clipboard, printer, email"
 
+[features]
+# Test builds only: every call that would reach the desktop (a file dialog, the clipboard, the
+# printer, the mail app, the browser) is recorded and answered harmlessly instead. Turned on by the
+# app's dev-dependencies, so only `cargo test` builds have it; the app refuses to start with it.
+test-stubs = []
+
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }

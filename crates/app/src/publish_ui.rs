@@ -1277,7 +1277,7 @@ pub const CHAPTER_NOT_ON_SITE: &str = "This chapter is no longer on the site, so
 /// has not been added again: an update of the tour's first chapter carries the tour's
 /// settings, so the tour on the site would lose its logo. The wording is proposed and waits
 /// for the owner's approval.
-pub const UPDATE_REMOVES_LOGO: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Tour settings to keep it.";
+pub const UPDATE_REMOVES_LOGO: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Properties to keep it.";
 
 /// The line under the Update choice about a cover logo that is missing: only while Update is
 /// offered, and only for a recording that was opened without its logo and still has none.
@@ -3217,7 +3217,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_update_choice_says_when_updating_removes_the_cover_logo_and_only_then() {
-        const LINE: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Tour settings to keep it.";
+        const LINE: &str = "The cover logo could not be opened with this recording, so updating removes it from the tour. Add the logo again in Properties to keep it.";
         let offered = || edit_picker(Some(Some("0.1.4")), Some(vec![listed_tour("published")]));
         // The recording lost its logo when it was opened, and Update is offered: the line shows, for a draft too.
         let mut p = offered().with_logo_missing(true);

@@ -243,7 +243,7 @@ impl SiteDialog {
             if let Some(start) = self.folder.as_deref().and_then(existing_start) {
                 dialog = dialog.set_directory(start);
             }
-            if let Some(f) = dialog.pick_folder() {
+            if let Some(f) = crate::dialogs::pick_folder(dialog, "site folder") {
                 self.gone = None;
                 self.look_at(f, false);
             }

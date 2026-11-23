@@ -588,7 +588,8 @@ pub mod checks {
         fn open<'a>(clip: Rect, s: &'a Shape, boxes: &mut Vec<Rect>, texts: &mut Vec<(Rect, Rect, &'a egui::epaint::TextShape)>) {
             match s {
                 Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, boxes, texts)),
-                Shape::Rect(r) if (r.fill.a() > 0 || r.stroke.width > 0.0) && r.rect.area() < 150_000.0 => boxes.push(r.rect),
+                // What a box shows of itself: a box scrolled out of sight holds nothing.
+                Shape::Rect(r) if (r.fill.a() > 0 || r.stroke.width > 0.0) && r.rect.area() < 150_000.0 && r.rect.intersect(clip).is_positive() => boxes.push(r.rect),
                 Shape::Text(t) if !t.galley.text().trim().is_empty() && !t.galley.elided => texts.push((t.visual_bounding_rect(), clip, t)),
                 _ => {}
             }

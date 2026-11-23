@@ -10,6 +10,10 @@ fn wide(s: &str) -> Vec<u16> {
 /// Hand the file to the system's "print" verb (the image viewer's print dialog).
 #[cfg(windows)]
 pub fn print(path: &Path) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if crate::stubs::stubbed(format!("print {}", path.display())) {
+        return Ok(());
+    }
     let target = path.to_string_lossy();
     shell_execute("print", &target).map_err(|code| format!("Windows could not print {target} (code {code})"))
 }
@@ -17,6 +21,10 @@ pub fn print(path: &Path) -> Result<(), String> {
 /// Open a link with its default app. The error never repeats the link.
 #[cfg(windows)]
 pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if crate::stubs::stubbed(format!("open url {url}")) {
+        return Ok(());
+    }
     shell_execute("open", url).map_err(open_failed)
 }
 
@@ -43,6 +51,10 @@ fn shell_execute(verb: &str, target: &str) -> Result<(), isize> {
 /// no answer within a moment means the compose window is up.
 #[cfg(windows)]
 pub fn email(path: &Path, subject: &str) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if crate::stubs::stubbed(format!("email {} ({subject})", path.display())) {
+        return Ok(());
+    }
     use std::sync::mpsc;
     use std::time::Duration;
     let (path, subject) = (path.to_string_lossy().into_owned(), subject.to_string());
@@ -80,6 +92,10 @@ fn mapi_send(path: &str, subject: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn print(path: &Path) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if crate::stubs::stubbed(format!("print {}", path.display())) {
+        return Ok(());
+    }
     let cmd = if cfg!(target_os = "macos") { "lpr" } else { "lp" };
     std::process::Command::new(cmd).arg(path).status().map_err(|e| format!("could not run {cmd}: {e}")).and_then(|s| if s.success() { Ok(()) } else { Err(format!("{cmd} failed")) })
 }
@@ -91,6 +107,10 @@ pub fn email(_path: &Path, _subject: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(feature = "test-stubs")]
+    if crate::stubs::stubbed(format!("open url {url}")) {
+        return Ok(());
+    }
     let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(cmd).arg(url).spawn().map(|_| ()).map_err(|e| format!("could not run {cmd}: {e}"))
 }
