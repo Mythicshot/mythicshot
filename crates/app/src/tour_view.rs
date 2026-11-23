@@ -561,6 +561,10 @@ impl Editor {
             }
         }
         let open = self.prefs.tour_properties_open;
+        if view == VideoView::Timeline {
+            // The Timeline view's panel as it was left last time, in any recording.
+            self.panel_open = self.prefs.timeline_properties_open;
+        }
         let Some(v) = self.video.as_mut() else { return };
         if view == VideoView::Tour {
             // The Properties panel opens with the Tour view, unless it was closed last time.

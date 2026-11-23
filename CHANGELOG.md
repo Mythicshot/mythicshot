@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.30 (2026-11-23)
+
+- "Properties", at the right end of the toolbar, and Edit › Properties now open a Properties panel in the image editor and in the Timeline view too, at the right of the picture. The toolbar keeps every control it had; the panel is a second place for the same settings, and a change in one shows in the other at once.
+- In the image editor the panel shows "This shape" (line and text colour, fill, line width, text size, shadow, and Hide as or Spotlight strength where the toolbar shows them), "Picture" (its size, Resize and the effects) and "In this editor" (Zoom). A change made there is undone and redone exactly as the same change made in the toolbar.
+- In the Timeline view the panel shows "This frame" (Frame N of M, Start here, End here, Delete or Restore frame), "Playback" (Speed, Reverse), "Shown on the recording" (Keys, Clicks, Pointer, Halo) and "Output" (Scale, the quality or fps of the chosen format, Loop forever where the format loops, and the output's size and length).
+- Whether the panel is open is remembered for the image editor, the Timeline view and the Tour view each on its own, also after a restart. In the image editor and the Timeline view it starts closed.
+
 ## 0.2.29 (2026-11-23)
 
 - When the editor's toolbar is too wide for the window, a small arrow at its right end shows that more buttons are hidden that way, and one at its left end once it is scrolled. Clicking an arrow scrolls the toolbar that way. When everything fits, no arrow is shown.
