@@ -289,6 +289,29 @@ mod tests {
         assert_eq!((new_picture.width() * real.ppp, new_picture.height() * real.ppp), (bounds.w as f32, bounds.h as f32));
     }
 
+    /// The owner's capture of 2026-11-23: a scale change after show left the window at its
+    /// size in points (8960x2160 at 300% = 2987x720 at 100%), at 0,1. Mapping from there keeps
+    /// the cursor right but covers a third of the desktop; once put back on the bounds at the
+    /// scale Windows gives it there (200%), the picture is pixel-exact over the whole desktop
+    /// and the cursor right on every monitor.
+    #[test]
+    fn after_a_correction_the_mapping_covers_the_desktop_pixel_for_pixel() {
+        let mons = [mon(2560, 0, 2560, 1440, 1.0), mon(5120, 0, 3840, 2160, 2.0), mon(0, 0, 2560, 1440, 1.0)];
+        let bounds = union(mons.iter().map(|m| m.rect)).unwrap();
+        let shrunk = Mapping { client: PxRect::new(0, 1, 2987, 720), ppp: 1.0 };
+        assert!(check_window(&mons, bounds, shrunk.client, shrunk, false).is_empty(), "the fallback maps right where it reaches");
+        assert!(!shrunk.client.contains(5120, 0) && !shrunk.client.contains(0, 1000), "but most of the desktop is outside it");
+        let corrected = Mapping { client: window_rect(bounds, 0), ppp: 2.0 };
+        let bad = check_window(&mons, bounds, corrected.client, corrected, true);
+        assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(5)]);
+        let pic = corrected.picture_rect(bounds);
+        assert_eq!((pic.width() * 2.0, pic.height() * 2.0), (8960.0, 2160.0), "one image pixel per screen pixel");
+        // A drag anchored before the correction (in pixels) and finished after it keeps both ends.
+        let anchor = shrunk.to_px(pointer(shrunk.client, 1.0, 300, 200));
+        let end = corrected.to_px(pointer(corrected.client, 2.0, 6000, 1500));
+        assert_eq!(PxRect::from_corners(anchor.0, anchor.1, end.0, end.1), PxRect::from_corners(300, 200, 6000, 1500));
+    }
+
     #[test]
     fn window_rect_inset_keeps_the_picture_exact() {
         let b = PxRect::new(-1920, -100, 7040, 1540);

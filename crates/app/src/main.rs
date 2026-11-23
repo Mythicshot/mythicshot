@@ -523,8 +523,15 @@ impl App {
         let target = overlay::geometry::window_rect(desktop.bounds, 0);
         let mut lines = vec![capture_log::header(&capture_log::now(), std::mem::replace(&mut self.trigger, "other"), record)];
         lines.extend(desktop.monitors.iter().enumerate().map(|(i, m)| capture_log::monitor_line(i, m)));
-        lines.push(capture_log::request_line(desktop.bounds, ctx.pixels_per_point(), target, self.root.and_then(capture_window::state)));
-        self.presenting = Some(capture_window::Presenting::new(target, started, lines));
+        let before = self.root.and_then(capture_window::state);
+        lines.push(capture_log::request_line(desktop.bounds, ctx.pixels_per_point(), target, before));
+        // The parked window against the displays as Windows reports them now: a DPI that is not
+        // the one Windows gives it where it sits, or displays that changed since it was parked,
+        // are logged and settled again before the selector is shown.
+        let displays = capture_window::DisplaySet::now();
+        let (notes, settle) = self.parking.capture_notes(&displays, before);
+        lines.extend(notes);
+        self.presenting = Some(capture_window::Presenting::new(target, started, lines, displays, settle));
         self.overlay = Some(Overlay::new(desktop, self.settings.magnifier, record));
     }
 

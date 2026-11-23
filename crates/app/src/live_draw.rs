@@ -179,7 +179,8 @@ impl LiveDraw {
         }
         let (placer, (pos, size)) = self.placer.get_or_insert_with(|| {
             let guess = placement::guess_points(rect, placement::scale_for(rect, &mythicshot_capture::list_monitors()));
-            (Placer::new(DRAW_TITLE, rect, Focus::Plain), guess)
+            // Its strokes are in the area's pixels: kept on them if a scale change resizes it.
+            (Placer::new(DRAW_TITLE, rect, Focus::Plain).pinned(), guess)
         });
         // Created hidden, put on the area's pixels, then shown and given the keyboard with a
         // plain request (never a synthetic key press over a recording); see `Placer`.

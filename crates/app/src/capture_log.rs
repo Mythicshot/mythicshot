@@ -99,19 +99,64 @@ pub fn shown_line(frame: u32, anyway: bool, dpi_pending: bool, cloaked: bool) ->
     format!("shown after frame {frame}: {why}{}", if cloaked { " · cloaked until a frame is painted" } else { " · not cloaked" })
 }
 
-pub fn uncloak_line(frame: u32, ok: bool, anyway: bool, dpi_pending: bool, dpi: Option<u32>) -> String {
+/// `correction`: 0 when the window is uncloaked after it was first shown, n after the nth
+/// correction.
+pub fn uncloak_line(frame: u32, ok: bool, anyway: bool, dpi_pending: bool, correction: u8, dpi: Option<u32>) -> String {
     let result = if ok { "uncloaked" } else { "UNCLOAK FAILED: window hidden, capture cancelled" };
     let why = if anyway { "NOT settled in time" } else if dpi_pending { "settled, scale changed on show" } else { "settled" };
-    format!("{result} after frame {frame}: {why} · dpi {}", opt(dpi, |d| d.to_string()))
+    let after = if correction > 0 { format!(" after correction {correction}") } else { String::new() };
+    format!("{result} after frame {frame}: {why}{after} · dpi {}", opt(dpi, |d| d.to_string()))
 }
 
 pub fn uncloak_at_end_line(frame: u32, ok: bool) -> String {
     format!("{} after frame {frame}: the selection ended while it was still cloaked", if ok { "uncloaked" } else { "UNCLOAK FAILED" })
 }
 
-pub fn limit_line(frame: u32, moves: u8, shown: bool, client: Option<PxRect>) -> String {
-    let why = if shown { "on screen".to_string() } else { format!("{moves} moves used") };
+/// Placement gave up. `corrections`: Some(n) when the window was on screen and n corrections
+/// were used; None when it was not shown yet and its moves were used up.
+pub fn limit_line(frame: u32, moves: u8, corrections: Option<u8>, client: Option<PxRect>) -> String {
+    let why = match corrections {
+        Some(n) => format!("on screen, {n} corrections used"),
+        None => format!("{moves} moves used"),
+    };
     format!("frame {frame}: placement stopped ({why}); not on target, mapping follows client {}", opt(client, px))
+}
+
+fn dpi(w: Option<WinState>) -> String {
+    opt(w.and_then(|w| w.dpi), |d| d.to_string())
+}
+
+/// The window was put back on its target after it had been on screen.
+#[allow(clippy::too_many_arguments)]
+pub fn correction_line(frame: u32, n: u8, max: u8, before: Option<WinState>, target: PxRect, moves: u8, after: Option<WinState>, recloaked: bool) -> String {
+    format!(
+        "frame {frame}: moved after show, correction {n} of {max}: was {} · put back on {} with {moves} moves · now {} · dpi {} -> {} · re-cloaked {}",
+        win(before),
+        px(target),
+        win(after),
+        dpi(before),
+        dpi(after),
+        yes(recloaked)
+    )
+}
+
+/// Before it was first shown, the window went by another monitor so its scale was worked out again.
+pub fn settle_line(frame: u32, before: Option<WinState>, away: PxRect, after: Option<WinState>) -> String {
+    format!("frame {frame}: re-parked before showing, by way of {}: was {} · now {} · dpi {} -> {}", px(away), win(before), win(after), dpi(before), dpi(after))
+}
+
+pub fn displays_changed_line(frame: u32, was: &str, now: &str) -> String {
+    format!("frame {frame}: displays changed during the capture (was {was}; now {now}): capture cancelled")
+}
+
+/// At the start of a capture, something in which the parked window disagrees with the displays.
+pub fn capture_note_line(problem: &str, settle: bool) -> String {
+    format!("note: {problem} · {}", if settle { "re-parked by way of another monitor before showing" } else { "corrected while the window is placed" })
+}
+
+/// A check of the parked window found it disagreeing with the displays.
+pub fn parked_check_line(time: &str, problems: &[String], settle: bool) -> String {
+    format!("-- {time} parked window checked: {} · parking again{}", problems.join("; "), if settle { " by way of another monitor" } else { "" })
 }
 
 pub fn focus_line(plain: bool) -> String {
@@ -127,8 +172,9 @@ pub fn placed_line(time: &str, title: &str, target: PxRect, now: Option<WinState
     format!("-- {time} \"{title}\" asked for {} · {} · {moves} moves, {looks} looks · {why}", px(target), win(now))
 }
 
-pub fn park_line(time: &str, why: &str, target: PxRect, now: Option<WinState>, tries: u32) -> String {
-    format!("-- {time} hidden window parked ({why}) over {} with {tries} moves: {}", px(target), win(now))
+pub fn park_line(time: &str, why: &str, target: PxRect, away: Option<PxRect>, now: Option<WinState>, tries: u32) -> String {
+    let by = away.map(|a| format!(" by way of {}", px(a))).unwrap_or_default();
+    format!("-- {time} hidden window parked ({why}) over {}{by} with {tries} moves: {}", px(target), win(now))
 }
 
 fn yes(b: bool) -> &'static str {
@@ -194,9 +240,40 @@ mod tests {
         );
         assert_eq!(finish_line("cancel", None, None, None), "finish: cancel · selection - pt = - px · crop -");
         assert_eq!(shown_line(2, true, false, false), "shown after frame 2: NOT settled, shown anyway · not cloaked");
-        assert_eq!(uncloak_line(4, false, false, false, Some(192)), "UNCLOAK FAILED: window hidden, capture cancelled after frame 4: settled · dpi 192");
-        assert_eq!(limit_line(9, 6, false, Some(PxRect::new(0, 0, 10, 10))), "frame 9: placement stopped (6 moves used); not on target, mapping follows client 0,0 10x10");
+        assert_eq!(uncloak_line(4, false, false, false, 0, Some(192)), "UNCLOAK FAILED: window hidden, capture cancelled after frame 4: settled · dpi 192");
+        assert_eq!(limit_line(9, 6, None, Some(PxRect::new(0, 0, 10, 10))), "frame 9: placement stopped (6 moves used); not on target, mapping follows client 0,0 10x10");
         assert_eq!(header("2026-11-21 10:00:00.000", "hotkey", false), "== 2026-11-21 10:00:00.000 region capture · trigger hotkey · screenshot");
+    }
+
+    #[test]
+    fn corrections_settling_and_display_changes_are_logged() {
+        let shrunk = WinState { outer: PxRect::new(0, 0, 2987, 720), client: PxRect::new(0, 1, 2987, 720), dpi: Some(96), visible: true };
+        let back = WinState { outer: PxRect::new(0, -1, 8960, 2160), client: PxRect::new(0, 0, 8960, 2160), dpi: Some(192), visible: true };
+        assert_eq!(
+            correction_line(4, 1, 3, Some(shrunk), PxRect::new(0, 0, 8960, 2160), 2, Some(back), true),
+            "frame 4: moved after show, correction 1 of 3: was window 0,0 2987x720 client 0,1 2987x720 dpi 96 visible · put back on 0,0 8960x2160 with 2 moves · now window 0,-1 8960x2160 client 0,0 8960x2160 dpi 192 visible · dpi 96 -> 192 · re-cloaked yes"
+        );
+        assert_eq!(uncloak_line(6, true, false, false, 1, Some(192)), "uncloaked after frame 6: settled after correction 1 · dpi 192");
+        let hidden = |dpi| WinState { outer: PxRect::new(0, -1, 8960, 2160), client: PxRect::new(0, 0, 8960, 2160), dpi: Some(dpi), visible: false };
+        assert_eq!(
+            settle_line(1, Some(hidden(288)), PxRect::new(0, 0, 2560, 1440), Some(hidden(192))),
+            "frame 1: re-parked before showing, by way of 0,0 2560x1440: was window 0,-1 8960x2160 client 0,0 8960x2160 dpi 288 hidden · now window 0,-1 8960x2160 client 0,0 8960x2160 dpi 192 hidden · dpi 288 -> 192"
+        );
+        assert_eq!(
+            displays_changed_line(7, "0,0 2560x1440 @96", "0,0 2560x1440 @96, 2560,0 2560x1440 @96"),
+            "frame 7: displays changed during the capture (was 0,0 2560x1440 @96; now 0,0 2560x1440 @96, 2560,0 2560x1440 @96): capture cancelled"
+        );
+        assert_eq!(capture_note_line("window dpi 288 matches no monitor (expected 192 where it sits)", true), "note: window dpi 288 matches no monitor (expected 192 where it sits) · re-parked by way of another monitor before showing");
+        assert_eq!(
+            park_line("t", "scale not the displays'", PxRect::new(0, 0, 8960, 2160), Some(PxRect::new(0, 0, 2560, 1440)), Some(hidden(192)), 4),
+            "-- t hidden window parked (scale not the displays') over 0,0 8960x2160 by way of 0,0 2560x1440 with 4 moves: window 0,-1 8960x2160 client 0,0 8960x2160 dpi 192 hidden"
+        );
+        assert_eq!(
+            park_line("t", "start", PxRect::new(0, 0, 8960, 2160), None, Some(hidden(192)), 2),
+            "-- t hidden window parked (start) over 0,0 8960x2160 with 2 moves: window 0,-1 8960x2160 client 0,0 8960x2160 dpi 192 hidden",
+            "unchanged without a detour"
+        );
+        assert_eq!(parked_check_line("t", &["a".into(), "b".into()], false), "-- t parked window checked: a; b · parking again");
     }
 
     #[test]

@@ -43,7 +43,17 @@ pub struct Overlay {
     pub selection_pt: Option<Rect>,
     texture: Option<TextureHandle>,
     window_mode: bool,
+    /// Where a drag started, in desktop pixels: it stays on that pixel if the window is put
+    /// back on its target (or moves) during the drag.
     drag_from: Option<(i32, i32)>,
+    /// The desktop pixel the primary button went down on, read with the mapping of that frame:
+    /// egui only says a drag started some frames later, maybe after the mapping changed.
+    press_px: Option<(i32, i32)>,
+    /// The mapping of the last frame: when it changes and egui has no pointer event since, the
+    /// pointer's position in points is from the old mapping and is read from the OS instead.
+    last_map: Option<Mapping>,
+    /// The pointer in desktop pixels as the OS reports it (a stand-in in tests).
+    os_cursor: fn() -> Option<(i32, i32)>,
     pub magnifier: bool,
     /// Selecting an area to record rather than to screenshot.
     pub record: bool,
@@ -51,7 +61,19 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new(desktop: Desktop, magnifier: bool, record: bool) -> Self {
-        Self { desktop, note: FrameNote::default(), selection_pt: None, texture: None, window_mode: false, drag_from: None, magnifier, record }
+        Self {
+            desktop,
+            note: FrameNote::default(),
+            selection_pt: None,
+            texture: None,
+            window_mode: false,
+            drag_from: None,
+            press_px: None,
+            last_map: None,
+            os_cursor: platform::cursor_pos,
+            magnifier,
+            record,
+        }
     }
 
     /// One frame. `client` is the window's client area in desktop pixels as Windows reports
@@ -111,18 +133,27 @@ impl Overlay {
             platform::nudge_cursor(arrows.0, arrows.1);
         }
 
+        // The window was put back (or moved) since the last frame and the pointer has not moved
+        // since: egui's position is in the old window's points. The OS says where it is.
+        let map_changed = self.last_map.is_some_and(|m| m != map);
+        self.last_map = Some(map);
+        let pointer_event = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        let from_os = if map_changed && !pointer_event { (self.os_cursor)().map(|(x, y)| map.px_to_pt(x, y)) } else { None };
         // Before the mouse moves, egui has no pointer position; ask the OS.
-        let hover = response
-            .hover_pos()
+        let hover = from_os
+            .or_else(|| response.hover_pos())
             .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
-            .or_else(|| platform::cursor_pos().map(|(x, y)| map.px_to_pt(x, y)));
+            .or_else(|| (self.os_cursor)().map(|(x, y)| map.px_to_pt(x, y)));
         let cursor = hover.map(to_px);
         self.note = FrameNote { content: (full.min.x, full.min.y, full.width(), full.height()), ppp, client, hover_px: cursor, texture_new };
         let hovered_window = cursor.and_then(|(x, y)| self.desktop.window_at(x, y)).map(|w| w.rect);
 
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            self.press_px = ctx.input(|i| i.pointer.press_origin()).map(to_px);
+        }
         if !self.window_mode {
             if response.drag_started() {
-                self.drag_from = response.interact_pointer_pos().map(to_px);
+                self.drag_from = self.press_px.or_else(|| response.interact_pointer_pos().map(to_px));
             }
         }
         let selection = match (self.drag_from, cursor) {
@@ -273,6 +304,63 @@ mod tests {
                 _ => None,
             })
             .expect("the picture is painted")
+    }
+
+    /// One frame on a context kept across frames, with these events.
+    fn step(ctx: &egui::Context, ov: &mut Overlay, ppp: f32, client: PxRect, events: Vec<egui::Event>) -> Outcome {
+        let mut input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(client.w as f32 / ppp, client.h as f32 / ppp))), events, ..Default::default() };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let mut outcome = Outcome::Continue;
+        let mut out = ctx.run_ui(input, |ui| outcome = ov.ui(ui, Some(client)));
+        out.textures_delta.clear();
+        outcome
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn a_drag_across_a_correction_keeps_its_anchor_pixel_and_ends_on_the_pointers_pixel() {
+        let bounds = PxRect::new(0, 0, 900, 300);
+        // Pressed while the window was the shrunk one: a third of the desktop at 100%.
+        let shrunk = PxRect::new(0, 1, 300, 100);
+        let ctx = egui::Context::default();
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        ov.os_cursor = || None;
+        let press = pos2(10.0, 20.0);
+        // egui hit-tests against the widgets of the frame before: one frame first.
+        step(&ctx, &mut ov, 1.0, shrunk, vec![egui::Event::PointerMoved(press)]);
+        assert!(matches!(step(&ctx, &mut ov, 1.0, shrunk, vec![button(press, true)]), Outcome::Continue));
+        assert_eq!(ov.note.hover_px, Some((10, 21)));
+        // Put back on the bounds at 200% before egui says the drag started: the press stays on
+        // the pixel it was made on, not on its points read with the new mapping.
+        let to = pos2(200.0, 100.0);
+        assert!(matches!(step(&ctx, &mut ov, 2.0, bounds, vec![egui::Event::PointerMoved(to - vec2(1.0, 0.0))]), Outcome::Continue));
+        assert!(matches!(step(&ctx, &mut ov, 2.0, bounds, vec![egui::Event::PointerMoved(to)]), Outcome::Continue));
+        assert_eq!(ov.drag_from, Some((10, 21)), "the anchor pixel (read with the new mapping it would be 20,40)");
+        assert_eq!(ov.note.hover_px, Some((400, 200)));
+        match step(&ctx, &mut ov, 2.0, bounds, vec![button(to, false)]) {
+            Outcome::Capture(sel) => assert_eq!(sel, PxRect::from_corners(10, 21, 400, 200)),
+            _ => panic!("the drag ends in a capture"),
+        }
+    }
+
+    #[test]
+    fn after_a_correction_with_no_pointer_event_the_pointer_is_read_from_the_os() {
+        let bounds = PxRect::new(0, 0, 900, 300);
+        let ctx = egui::Context::default();
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        ov.os_cursor = || Some((640, 250));
+        step(&ctx, &mut ov, 1.0, PxRect::new(0, 1, 300, 100), vec![egui::Event::PointerMoved(pos2(10.0, 20.0))]);
+        assert_eq!(ov.note.hover_px, Some((10, 21)), "egui's pointer while the mapping holds");
+        // The window was put back; the pointer did not move, so egui's position is in the old
+        // window's points (10,20 would read as 20,40 now).
+        step(&ctx, &mut ov, 2.0, bounds, Vec::new());
+        assert_eq!(ov.note.hover_px, Some((640, 250)), "where the OS says the pointer is");
+        // The mapping holds again: egui's pointer is used.
+        step(&ctx, &mut ov, 2.0, bounds, vec![egui::Event::PointerMoved(pos2(5.0, 6.0))]);
+        assert_eq!(ov.note.hover_px, Some((10, 12)));
     }
 
     #[test]
