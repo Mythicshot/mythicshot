@@ -641,6 +641,12 @@ impl Presenting {
         platform::window_rects(hwnd).map(|(_, client)| client)
     }
 
+    /// Whether [`Self::before_frame`] moved the window (placed it, settled it or put it back) just
+    /// now: the frame's input was taken before, so its pointer positions are of the window as it was.
+    pub fn moved(&self) -> bool {
+        self.placed.moved
+    }
+
     /// After each frame of the selector: show the window once the frame was right, uncloak it
     /// once a frame after a correction was right.
     pub fn after_frame(&mut self, ctx: &egui::Context, note: &FrameNote) -> After {
@@ -1188,6 +1194,18 @@ mod tests {
         let ctx = egui::Context::default();
         assert_eq!(pres.after_frame(&ctx, &FrameNote::default()), After::Abort);
         assert_eq!(pres.lines, ["frame 5: displays changed during the capture (was a; now b): capture cancelled"]);
+    }
+
+    /// The overlay is told the window moved before a frame exactly when `before_frame` placed,
+    /// settled or put it back that frame (each sets `placed.moved`), and not otherwise.
+    #[test]
+    fn the_selector_is_told_when_the_window_moved_before_the_frame() {
+        let mut pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), DisplaySet::from_monitors(&owners()), false);
+        assert!(!pres.moved(), "nothing moved yet");
+        pres.placed = Placed { moved: true, on_target: true, readable: true, tries: 1 };
+        assert!(pres.moved(), "put back before this frame");
+        pres.placed = Placed { moved: false, on_target: true, readable: true, tries: 0 };
+        assert!(!pres.moved());
     }
 
     #[test]

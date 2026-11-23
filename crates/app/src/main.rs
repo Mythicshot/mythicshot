@@ -1421,7 +1421,8 @@ impl eframe::App for App {
 
         if let Some(ov) = self.overlay.as_mut() {
             let client = self.presenting.as_mut().and_then(|p| p.before_frame(&ctx, self.root));
-            match ov.ui(ui, client) {
+            let moved = self.presenting.as_ref().is_some_and(capture_window::Presenting::moved);
+            match ov.ui(ui, client, moved) {
                 Outcome::Continue => {
                     let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
                     if after == Some(capture_window::After::Abort) {
