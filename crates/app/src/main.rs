@@ -528,7 +528,12 @@ impl App {
         // The parked window against the displays as Windows reports them now: a DPI that is not
         // the one Windows gives it where it sits, or displays that changed since it was parked,
         // are logged and settled again before the selector is shown.
+        // The light reading every check compares with; the full listing taken for the picture is
+        // compared with it once here, so a disagreement between the two shows in the log.
         let displays = capture_window::DisplaySet::now();
+        if capture_window::listings_disagree(&desktop.monitors, &displays) {
+            lines.push(capture_log::listings_line(&capture_window::DisplaySet::from_monitors(&desktop.monitors).describe(), &displays.describe()));
+        }
         let (notes, settle) = self.parking.capture_notes(&displays, before);
         lines.extend(notes);
         self.presenting = Some(capture_window::Presenting::new(target, started, lines, displays, settle));

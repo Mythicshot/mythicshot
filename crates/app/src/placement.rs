@@ -185,8 +185,11 @@ pub enum PinStep {
     GiveUp,
 }
 
-pub fn pin_step(readable: bool, on_target: bool, corrections: u8) -> PinStep {
-    if !readable || on_target {
+/// `placed`: the first placement ended with the window on its pixels. One that was shown where it
+/// was because placement gave up is left there: put-backs are for a window that was in place and
+/// then moved.
+pub fn pin_step(readable: bool, on_target: bool, corrections: u8, placed: bool) -> PinStep {
+    if !readable || on_target || !placed {
         PinStep::Keep
     } else if corrections < MAX_PIN_CORRECTIONS {
         PinStep::PutBack { n: corrections + 1 }
@@ -215,11 +218,13 @@ pub struct Placer {
     pinned: bool,
     corrections: u8,
     gave_up: bool,
+    /// The placement ended with the window on its pixels (uncloaked in place, not shown anyway).
+    placed: bool,
 }
 
 impl Placer {
     pub fn new(title: &'static str, target: PxRect, focus: Focus) -> Self {
-        Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus, pinned: false, corrections: 0, gave_up: false }
+        Self { title, target, hwnd: None, stage: PlaceStage::Seeking, looks: 0, moves: 0, cloaked: false, focus, pinned: false, corrections: 0, gave_up: false, placed: false }
     }
 
     /// Keep the window on its pixels once shown: a scale change afterwards, which winit answers
@@ -260,7 +265,10 @@ impl Placer {
                 self.cloaked = self.hwnd.is_some_and(|h| platform::set_cloaked(h, true));
                 ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
             }
-            PlaceStep::Uncloak { put_back } => self.finish(ctx, id, if put_back { "placed; scale changed on show, put back" } else { "placed" }),
+            PlaceStep::Uncloak { put_back } => {
+                self.placed = true;
+                self.finish(ctx, id, if put_back { "placed; scale changed on show, put back" } else { "placed" });
+            }
             PlaceStep::Anyway { shown } => {
                 if !shown {
                     ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
@@ -285,7 +293,7 @@ impl Placer {
     fn keep_pinned(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
         let Some(hwnd) = self.hwnd else { return };
         let Some((_, client)) = platform::window_rects(hwnd) else { return };
-        match pin_step(true, client == self.target, self.corrections) {
+        match pin_step(true, client == self.target, self.corrections, self.placed) {
             PinStep::Keep => {}
             PinStep::PutBack { n } => {
                 let before = capture_window::state(hwnd);
@@ -511,12 +519,13 @@ mod tests {
 
     #[test]
     fn a_pinned_window_moved_after_show_is_put_back_a_bounded_number_of_times() {
-        assert_eq!(pin_step(true, true, 0), PinStep::Keep);
-        assert_eq!(pin_step(false, false, 0), PinStep::Keep, "nothing to read: nothing to do");
+        assert_eq!(pin_step(true, true, 0, true), PinStep::Keep);
+        assert_eq!(pin_step(false, false, 0, true), PinStep::Keep, "nothing to read: nothing to do");
+        assert_eq!(pin_step(true, false, 0, false), PinStep::Keep, "shown off its pixels because placement gave up: left there");
         let mut corrections = 0;
         let mut steps = Vec::new();
         for _ in 0..6 {
-            let s = pin_step(true, false, corrections);
+            let s = pin_step(true, false, corrections, true);
             if let PinStep::PutBack { n } = s {
                 corrections = n;
             }

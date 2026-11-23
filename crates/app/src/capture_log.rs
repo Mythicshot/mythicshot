@@ -150,8 +150,30 @@ pub fn displays_changed_line(frame: u32, was: &str, now: &str) -> String {
 }
 
 /// At the start of a capture, something in which the parked window disagrees with the displays.
-pub fn capture_note_line(problem: &str, settle: bool) -> String {
-    format!("note: {problem} · {}", if settle { "re-parked by way of another monitor before showing" } else { "corrected while the window is placed" })
+pub fn capture_note_line(problem: &str, action: NoteAction) -> String {
+    let what = match action {
+        NoteAction::Settle => "re-parked by way of another monitor before showing",
+        NoteAction::AlreadySettled => "already re-parked for these displays: not again, corrected after show if it moves",
+        NoteAction::Place => "corrected while the window is placed",
+    };
+    format!("note: {problem} · {what}")
+}
+
+/// What is done at the start of a capture about a parked window that disagrees with the displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteAction {
+    /// Moved by way of another monitor before it is shown.
+    Settle,
+    /// That was done already for these displays and is not repeated.
+    AlreadySettled,
+    /// Only placed on its target, as every capture does.
+    Place,
+}
+
+/// At the start of a capture, the full monitor listing (taken for the picture) and the light
+/// reading the checks use did not agree.
+pub fn listings_line(full: &str, light: &str) -> String {
+    format!("note: the monitor listing for the picture ({full}) is not the one the checks read ({light})")
 }
 
 /// A check of the parked window found it disagreeing with the displays.
@@ -263,7 +285,7 @@ mod tests {
             displays_changed_line(7, "0,0 2560x1440 @96", "0,0 2560x1440 @96, 2560,0 2560x1440 @96"),
             "frame 7: displays changed during the capture (was 0,0 2560x1440 @96; now 0,0 2560x1440 @96, 2560,0 2560x1440 @96): capture cancelled"
         );
-        assert_eq!(capture_note_line("window dpi 288 matches no monitor (expected 192 where it sits)", true), "note: window dpi 288 matches no monitor (expected 192 where it sits) · re-parked by way of another monitor before showing");
+        assert_eq!(capture_note_line("window dpi 288 matches no monitor (expected 192 where it sits)", NoteAction::Settle), "note: window dpi 288 matches no monitor (expected 192 where it sits) · re-parked by way of another monitor before showing");
         assert_eq!(
             park_line("t", "scale not the displays'", PxRect::new(0, 0, 8960, 2160), Some(PxRect::new(0, 0, 2560, 1440)), Some(hidden(192)), 4),
             "-- t hidden window parked (scale not the displays') over 0,0 8960x2160 by way of 0,0 2560x1440 with 4 moves: window 0,-1 8960x2160 client 0,0 8960x2160 dpi 192 hidden"

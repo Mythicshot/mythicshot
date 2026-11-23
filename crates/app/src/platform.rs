@@ -179,6 +179,39 @@ pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
     (dpi != 0).then_some(dpi)
 }
 
+/// The monitors as Windows' window manager knows them, cheaply: each one's rectangle in desktop
+/// pixels and its effective DPI, from `EnumDisplayMonitors`, `GetMonitorInfoW` and
+/// `GetDpiForMonitor` only. Unlike the full monitor listing it asks the display driver nothing
+/// (no display settings) and loads no library, so it can be read while a selection is dragged.
+/// The rectangle and DPI are the ones the full listing reports for a process aware of each
+/// monitor's DPI, as this one is.
+#[cfg(windows)]
+pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows::core::BOOL {
+        let out = unsafe { &mut *(data.0 as *mut Vec<(mythicshot_capture::PxRect, u32)>) };
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let (mut dx, mut dy) = (0u32, 0u32);
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() && unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok() {
+            let r = info.rcMonitor;
+            out.push((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx));
+        }
+        true.into()
+    }
+    let mut out: Vec<(mythicshot_capture::PxRect, u32)> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut out as *mut _ as isize));
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
+    mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect()
+}
+
 /// Move and size a window to an outer rectangle in desktop pixels, without showing it,
 /// activating it or changing its place in the stack.
 #[cfg(windows)]

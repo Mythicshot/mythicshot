@@ -76,9 +76,18 @@ impl DisplaySet {
         Self { mons }
     }
 
-    /// The monitors there are now.
+    /// From the light reading: rectangles and effective DPIs.
+    pub fn from_layout(layout: &[(PxRect, u32)]) -> Self {
+        let mons: Vec<MonitorInfo> = layout.iter().map(|&(rect, dpi)| MonitorInfo { name: String::new(), primary: false, rect, scale: dpi as f32 / 96.0 }).collect();
+        Self::from_monitors(&mons)
+    }
+
+    /// The monitors there are now, from the light reading ([`platform::monitor_layout`]): cheap
+    /// enough for every check while parked and the poll during a capture. Every comparison is
+    /// between two light readings; the full listing is only compared with it once per capture
+    /// (see [`listings_disagree`]).
     pub fn now() -> Self {
-        Self::from_monitors(&mythicshot_capture::list_monitors())
+        Self::from_layout(&platform::monitor_layout())
     }
 
     fn key(&self) -> Vec<(PxRect, u32)> {
@@ -335,11 +344,25 @@ impl Parking {
 
     /// At the start of a capture: lines for the log about anything in which the parked window
     /// disagrees with the displays `now`, and whether it should be settled again (by way of
-    /// another monitor) before the selector is shown.
-    pub fn capture_notes(&self, now: &DisplaySet, win: Option<WinState>) -> (Vec<String>, bool) {
+    /// another monitor) before the selector is shown. As with the checks while parked, that is
+    /// done once per set of displays: a scale Windows still gets wrong after it is left to the
+    /// correction after show, instead of costing every capture two moves and two scale changes.
+    pub fn capture_notes(&mut self, now: &DisplaySet, win: Option<WinState>) -> (Vec<String>, bool) {
         let mismatches = check_parked(self.parked_for.as_ref(), now, win);
-        let settle = mismatches.iter().any(Mismatch::wants_settle) && now.target().is_some_and(|t| now.away_rect(t).is_some());
-        (mismatches.iter().map(|m| capture_log::capture_note_line(&m.describe(), settle)).collect(), settle)
+        let wanted = mismatches.iter().any(Mismatch::wants_settle) && now.target().is_some_and(|t| now.away_rect(t).is_some());
+        let done_before = self.settled_for.as_ref() == Some(now);
+        let settle = wanted && !done_before;
+        if settle {
+            self.settled_for = Some(now.clone());
+        }
+        let action = if settle {
+            capture_log::NoteAction::Settle
+        } else if wanted {
+            capture_log::NoteAction::AlreadySettled
+        } else {
+            capture_log::NoteAction::Place
+        };
+        (mismatches.iter().map(|m| capture_log::capture_note_line(&m.describe(), action)).collect(), settle)
     }
 }
 
@@ -378,8 +401,12 @@ pub enum Drift {
 }
 
 /// Whether a window in `stage`, its client area on its target or not, needs putting back.
-pub fn drift(stage: Stage, on_target: bool) -> Drift {
+/// `placed_when_shown`: it was on its target when it came on screen. Corrections are for a
+/// window that was in place and then moved; one shown off its target because placement gave
+/// up is mapped from where it is (as the log already says), not cloaked and uncloaked again.
+pub fn drift(stage: Stage, on_target: bool, placed_when_shown: bool) -> Drift {
     match stage {
+        Stage::Shown { .. } if !placed_when_shown => Drift::InPlace,
         Stage::Shown { corrections } if !on_target => {
             if corrections < MAX_CORRECTIONS {
                 Drift::Correct { n: corrections + 1 }
@@ -389,6 +416,20 @@ pub fn drift(stage: Stage, on_target: bool) -> Drift {
         }
         _ => Drift::InPlace,
     }
+}
+
+/// Whether the window was on its target when it came on screen, after a frame that took it from
+/// `before` to `after` (`on_target` that frame); `so_far` until then.
+pub fn placed_when_shown(before: Stage, after: Stage, on_target: bool, so_far: bool) -> bool {
+    let came_on_screen = !matches!(before, Stage::Shown { .. }) && matches!(after, Stage::Shown { .. });
+    if came_on_screen { on_target } else { so_far }
+}
+
+/// Whether listings of the same monitors disagree: the full one taken for the picture and the
+/// light one every check compares with. Both read rectangles in desktop pixels and the effective
+/// DPI; a scale is turned back into a DPI by rounding scale × 96.
+pub fn listings_disagree(full: &[MonitorInfo], light: &DisplaySet) -> bool {
+    !full.is_empty() && !light.is_empty() && DisplaySet::from_monitors(full) != *light
 }
 
 /// The stage for correction `n`: cloaked again, waiting for a right frame, when Windows cloaked
@@ -493,6 +534,8 @@ pub struct Presenting {
     abort: Option<String>,
     /// Lines were added outside the logged frames: write them after this frame.
     flush_due: bool,
+    /// It was on its target when it came on screen: only then is it corrected if it moves.
+    placed_when_shown: bool,
 }
 
 /// Whether the displays changed during a capture, so its frozen picture is no longer of the
@@ -523,6 +566,7 @@ impl Presenting {
             settle_by,
             abort: None,
             flush_due: false,
+            placed_when_shown: false,
         }
     }
 
@@ -571,7 +615,7 @@ impl Presenting {
         // size in points). Cloaked again and put back, a bounded number of times.
         if let Stage::Shown { .. } = self.stage
             && let Some((_, client)) = platform::window_rects(hwnd)
-            && let Drift::Correct { n } = drift(self.stage, client == self.target)
+            && let Drift::Correct { n } = drift(self.stage, client == self.target, self.placed_when_shown)
         {
             let before = state(hwnd);
             let cloaked = platform::set_cloaked(hwnd, true);
@@ -645,7 +689,9 @@ impl Presenting {
             }
         }
         let was_shown = matches!(self.stage, Stage::Shown { .. });
+        let before = self.stage;
         self.stage = advance(self.stage, decided, facts, cloaked);
+        self.placed_when_shown = placed_when_shown(before, self.stage, facts.on_target, self.placed_when_shown);
         if was_shown && self.focus_due {
             self.focus_due = false;
             // A plain request first; winit's, with its synthetic Alt key, only when refused.
@@ -875,8 +921,8 @@ mod tests {
         // A shown window that is not on its target is corrected, not left where it is.
         let off = Facts { on_target: false, content_matches: false, ..RIGHT };
         assert_eq!(step(Stage::Shown { corrections: 0 }, 30, off), Step::Wait);
-        assert_eq!(drift(Stage::Shown { corrections: 0 }, false), Drift::Correct { n: 1 });
-        assert_eq!(drift(Stage::Shown { corrections: 0 }, true), Drift::InPlace);
+        assert_eq!(drift(Stage::Shown { corrections: 0 }, false, true), Drift::Correct { n: 1 });
+        assert_eq!(drift(Stage::Shown { corrections: 0 }, true, true), Drift::InPlace);
     }
 
     /// What `Presenting` decides over frames, without a window: before each frame a window on
@@ -885,10 +931,11 @@ mod tests {
     /// the target before the frame, and the facts after it. Returns the steps and the drifts.
     fn presenting(frames: &[(bool, Facts)], cloaking: bool) -> (Vec<Step>, Vec<Drift>, Stage) {
         let mut stage = Stage::Hidden;
+        let mut placed = false;
         let (mut steps, mut drifts) = (Vec::new(), Vec::new());
         for (i, (on_target, f)) in frames.iter().enumerate() {
             let mut f = *f;
-            let d = drift(stage, *on_target);
+            let d = drift(stage, *on_target, placed);
             drifts.push(d);
             if let Drift::Correct { n } = d {
                 stage = correcting(n, cloaking);
@@ -896,7 +943,9 @@ mod tests {
                 f = Facts { moved: true, on_target: true, ..f };
             }
             let s = step(stage, i as u32 + 1, f);
+            let before = stage;
             stage = advance(stage, s, f, cloaking);
+            placed = placed_when_shown(before, stage, f.on_target, placed);
             steps.push(s);
         }
         (steps, drifts, stage)
@@ -956,8 +1005,8 @@ mod tests {
     #[test]
     fn a_scale_change_while_cloaked_is_still_handled_by_the_ordinary_placement() {
         let cloaked = Stage::Cloaked { frames: 0, settled: false, dpi_pending: true, correction: 0 };
-        assert_eq!(drift(cloaked, false), Drift::InPlace, "no correction while it is cloaked: it is placed as before");
-        assert_eq!(drift(Stage::Hidden, false), Drift::InPlace);
+        assert_eq!(drift(cloaked, false, true), Drift::InPlace, "no correction while it is cloaked: it is placed as before");
+        assert_eq!(drift(Stage::Hidden, false, true), Drift::InPlace);
         assert!(move_budget(cloaked, 0) > 0);
     }
 
@@ -993,7 +1042,8 @@ mod tests {
     #[test]
     fn a_window_dpi_that_matches_no_monitor_at_capture_start_is_logged_and_settled_before_showing() {
         let now = DisplaySet::from_monitors(&owners());
-        let p = Parking { parked_for: Some(now.clone()), ..Parking::default() };
+        let fresh = || Parking { parked_for: Some(now.clone()), ..Parking::default() };
+        let mut p = fresh();
         let (notes, settle) = p.capture_notes(&now, Some(parked(288)));
         assert!(settle, "re-parked by way of another monitor before the selector is shown");
         assert_eq!(notes, ["note: window dpi 288 matches no monitor (expected 192 where it sits) · re-parked by way of another monitor before showing"]);
@@ -1001,11 +1051,11 @@ mod tests {
         let pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), now.clone(), settle);
         assert_eq!(pres.settle_by, Some(PxRect::new(0, 0, 2560, 1440)));
         // Some monitor's DPI, but not the TV's: also settled.
-        let (notes, settle) = p.capture_notes(&now, Some(parked(96)));
+        let (notes, settle) = fresh().capture_notes(&now, Some(parked(96)));
         assert!(settle);
         assert_eq!(notes, ["note: window dpi 96 is not the 192 Windows gives it where it sits · re-parked by way of another monitor before showing"]);
         // Right: nothing said, nothing done.
-        assert_eq!(p.capture_notes(&now, Some(parked(192))), (Vec::new(), false));
+        assert_eq!(fresh().capture_notes(&now, Some(parked(192))), (Vec::new(), false));
         let pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), now, false);
         assert_eq!(pres.settle_by, None);
     }
@@ -1050,6 +1100,72 @@ mod tests {
         assert_eq!(recheck(&m, true, false), None, "the last parking could not reach the target");
         // A failed reading of the displays (no monitors) never re-parks.
         assert_eq!(check_parked(Some(&now), &DisplaySet::from_monitors(&[]), Some(parked(288))), Vec::new());
+    }
+
+    #[test]
+    fn a_wrong_scale_that_survives_the_detour_costs_only_the_first_capture_a_detour() {
+        let now = DisplaySet::from_monitors(&owners());
+        let mut p = Parking { parked_for: Some(now.clone()), ..Parking::default() };
+        let (_, first) = p.capture_notes(&now, Some(parked(288)));
+        assert!(first, "the first capture goes by another monitor");
+        // Windows still says 288 afterwards: later captures on these displays do not detour,
+        // but the log still says what was wrong.
+        for _ in 0..3 {
+            let (notes, settle) = p.capture_notes(&now, Some(parked(288)));
+            assert!(!settle);
+            assert_eq!(notes, ["note: window dpi 288 matches no monitor (expected 192 where it sits) · already re-parked for these displays: not again, corrected after show if it moves"]);
+            assert_eq!(Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), now.clone(), settle).settle_by, None);
+        }
+        // A detour by the idle check counts as well.
+        let mut q = Parking { parked_for: Some(now.clone()), settled_for: Some(now.clone()), ..Parking::default() };
+        assert!(!q.capture_notes(&now, Some(parked(288))).1);
+        // Other displays: one detour again.
+        let mut tv_off = owners();
+        tv_off.truncate(2);
+        let other = DisplaySet::from_monitors(&tv_off);
+        assert!(p.capture_notes(&other, Some(WinState { client: PxRect::new(2560, 0, 2560, 1440), ..parked(288) })).1);
+    }
+
+    #[test]
+    fn a_window_shown_off_target_because_placement_gave_up_is_not_corrected() {
+        // Never on target while hidden: shown anyway after 8 frames, uncloaked anyway after 8
+        // more, then off target every frame.
+        let wrong = Facts { on_target: false, ..RIGHT };
+        let frames = vec![(false, wrong); (MAX_HIDDEN_FRAMES + MAX_CLOAKED_FRAMES + 10) as usize];
+        let (steps, drifts, stage) = presenting(&frames, true);
+        assert!(steps.contains(&Step::Show { dpi_pending: false, anyway: true }));
+        assert!(steps.contains(&Step::Uncloak { anyway: true }));
+        assert!(drifts.iter().all(|d| *d == Drift::InPlace), "no re-cloak and uncloak cycles: {drifts:?}");
+        assert_eq!(stage, Stage::Shown { corrections: 0 });
+        assert_eq!(drift(Stage::Shown { corrections: 0 }, false, false), Drift::InPlace);
+        // On target when it came on screen: corrected when it moves.
+        assert!(placed_when_shown(Stage::Cloaked { frames: 1, settled: true, dpi_pending: false, correction: 0 }, Stage::Shown { corrections: 0 }, true, false));
+        assert!(!placed_when_shown(Stage::Cloaked { frames: 8, settled: false, dpi_pending: false, correction: 0 }, Stage::Shown { corrections: 0 }, false, false));
+        assert!(placed_when_shown(Stage::Shown { corrections: 0 }, Stage::Shown { corrections: 0 }, false, true), "a later move does not undo it");
+        // A correction uncloaked anyway off target ends the corrections.
+        let mut frames = vec![(true, RIGHT), (true, RIGHT), (true, RIGHT), (false, RIGHT)];
+        frames.extend(std::iter::repeat_n((false, wrong), MAX_CLOAKED_FRAMES as usize + 5));
+        let (_, drifts, _) = presenting(&frames, true);
+        assert_eq!(drifts.iter().filter(|d| matches!(d, Drift::Correct { .. })).count(), 1);
+    }
+
+    #[test]
+    fn the_light_reading_and_the_full_listing_compare_equal_for_the_same_monitors() {
+        // The full listing gives a scale (effective DPI / 96 as f32), the light one the DPI.
+        for dpi in (96..=480).step_by(24).chain([100, 110, 125, 144, 168, 216, 264, 288, 336]) {
+            let full = [mon(0, 0, 2560, 1440, dpi as f32 / 96.0, true), mon(2560, -200, 3840, 2160, 2.0, false)];
+            let light = DisplaySet::from_layout(&[(PxRect::new(2560, -200, 3840, 2160), 192), (PxRect::new(0, 0, 2560, 1440), dpi)]);
+            assert!(!listings_disagree(&full, &light), "dpi {dpi}");
+            assert_eq!(DisplaySet::from_monitors(&full), light, "dpi {dpi}");
+        }
+        let light = DisplaySet::from_layout(&[(PxRect::new(0, 0, 2560, 1440), 96)]);
+        assert!(listings_disagree(&[mon(0, 0, 2560, 1440, 1.25, true)], &light), "another scale");
+        assert!(listings_disagree(&[mon(0, 0, 2560, 1400, 1.0, true)], &light), "another size");
+        assert!(!listings_disagree(&[], &light) && !listings_disagree(&[mon(0, 0, 1, 1, 1.0, true)], &DisplaySet::from_layout(&[])), "a failed reading says nothing");
+        assert_eq!(
+            capture_log::listings_line("0,0 2560x1400 @96", "0,0 2560x1440 @96"),
+            "note: the monitor listing for the picture (0,0 2560x1400 @96) is not the one the checks read (0,0 2560x1440 @96)"
+        );
     }
 
     #[test]
