@@ -1,6 +1,7 @@
 //! A recording session on screen: the control bar, with a countdown and then the
-//! timer. The bar is the root window, kept out of screen capture, so it never shows
-//! up in the GIF.
+//! timer, and the glass band just outside a recorded region or window. The bar is
+//! the root window and the band four native strips, all kept out of screen capture,
+//! so neither shows up in the GIF.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +17,7 @@ use mythicshot_recording::{Recorder, Recording, Target};
 
 use crate::theme::{self, Strong as _};
 use crate::icons::{self, Icon};
+use crate::glass_band::{self, Band};
 use crate::live_draw::LiveDraw;
 use crate::placement;
 use crate::platform::{self, WindowId};
@@ -61,6 +63,9 @@ pub struct Session {
     /// The app that had focus when recording began; it gets focus back.
     pub previous_foreground: Option<WindowId>,
     pub draw: LiveDraw,
+    /// The glass band around the area, up from the countdown until the session ends; its
+    /// windows go with the session, however it ends.
+    band: Band,
 }
 
 impl Session {
@@ -92,7 +97,10 @@ impl Session {
             fps,
             previous_foreground: platform::foreground_window(),
             draw: LiveDraw::default(),
+            band: Band::new(clipped, &monitors.iter().map(|m| m.rect).collect::<Vec<_>>()),
         };
+        // Shown from the start of the countdown (none around a whole monitor).
+        s.band.on(glass_band::Event::Countdown);
         if countdown_secs == 0 {
             s.go_live()?;
         }
@@ -100,8 +108,9 @@ impl Session {
     }
 
     fn go_live(&mut self) -> Result<(), String> {
-        let rec = Recorder::start(self.target.clone(), self.fps)?;
+        let rec = Recorder::start(self.target.clone(), self.fps).inspect_err(|_| self.band.on(glass_band::Event::Fail))?;
         self.phase = Phase::Live(rec);
+        self.band.on(glass_band::Event::Live);
         Ok(())
     }
 
@@ -114,9 +123,11 @@ impl Session {
         }
         if let Phase::Live(rec) = &self.phase {
             if let Some(e) = rec.error() {
+                self.band.on(glass_band::Event::Fail);
                 return Err(e);
             }
         }
+        self.band.keep_on_top(Instant::now());
         Ok(())
     }
 
@@ -130,20 +141,24 @@ impl Session {
 
     pub fn toggle_pause(&mut self) {
         if let Phase::Live(rec) = &self.phase {
-            rec.set_paused(!rec.is_paused());
+            let pause = !rec.is_paused();
+            rec.set_paused(pause);
+            self.band.on(if pause { glass_band::Event::Pause } else { glass_band::Event::Resume });
         }
     }
 
     /// Stop. `None` if it was still counting down.
-    pub fn stop(self) -> Option<Result<Recording, String>> {
-        match self.phase {
+    pub fn stop(mut self) -> Option<Result<Recording, String>> {
+        self.band.on(glass_band::Event::Stop);
+        match std::mem::replace(&mut self.phase, Phase::Countdown { until: Instant::now() }) {
             Phase::Countdown { .. } => None,
             Phase::Live(rec) => Some(rec.stop()),
         }
     }
 
-    pub fn discard(self) {
-        if let Phase::Live(rec) = self.phase {
+    pub fn discard(mut self) {
+        self.band.on(glass_band::Event::Cancel);
+        if let Phase::Live(rec) = std::mem::replace(&mut self.phase, Phase::Countdown { until: Instant::now() }) {
             rec.discard();
         }
     }
@@ -154,6 +169,7 @@ impl Session {
             rec.discard();
         }
         self.draw.reset();
+        self.band.on(glass_band::Event::Restart);
         self.go_live()
     }
 
@@ -354,7 +370,60 @@ mod tests {
             fps: 15,
             previous_foreground: None,
             draw: LiveDraw::default(),
+            band: Band::new(rect, &[rect]),
         }
+    }
+
+    /// A session around a region of a 1920 by 1080 monitor, its band shown as `Session::new`
+    /// shows it (stubbed: no window is made in a test build).
+    fn counting_down_around(rect: PxRect) -> Session {
+        let monitor = PxRect::new(0, 0, 1920, 1080);
+        let mut s = counting_down();
+        s.rect = rect;
+        s.monitor = monitor;
+        s.band = Band::new(rect, &[monitor]);
+        s.band.on(glass_band::Event::Countdown);
+        s
+    }
+
+    /// The session's band: shown from the countdown, raised on the bar's ticks, kept through a
+    /// pause, gone when the session is stopped, discarded or dropped after a failure; never around
+    /// a whole monitor.
+    #[test]
+    fn the_glass_band_lives_as_long_as_the_session() {
+        use mythicshot_destinations::stubs;
+        let region = PxRect::new(100, 100, 640, 480);
+        let _ = stubs::take();
+        let s = counting_down_around(region);
+        assert!(s.band.is_open() && s.band.life() == glass_band::Life::Counting);
+        assert_eq!(stubs::take(), ["band open 92,92 656x8; 92,580 656x8; 92,100 8x480; 740,100 8x480".to_string()]);
+        // Stopped during the countdown.
+        assert!(s.stop().is_none());
+        assert_eq!(stubs::take(), ["band close 4".to_string()]);
+        // Discarded.
+        let s = counting_down_around(region);
+        let _ = stubs::take();
+        s.discard();
+        assert_eq!(stubs::take(), ["band close 4".to_string()]);
+        // Dropped without a word, as a failed session is.
+        let s = counting_down_around(region);
+        let _ = stubs::take();
+        drop(s);
+        assert_eq!(stubs::take(), ["band close 4".to_string()]);
+        // A tick re-asserts topmost on the timer, without opening anything again.
+        let mut s = counting_down_around(region);
+        let _ = stubs::take();
+        std::thread::sleep(glass_band::RAISE_EVERY + Duration::from_millis(20));
+        s.tick().unwrap();
+        s.tick().unwrap();
+        assert_eq!(stubs::take(), ["band raise 4".to_string()], "once per interval");
+        drop(s);
+        // A whole monitor: no band at all.
+        let _ = stubs::take();
+        let s = counting_down_around(PxRect::new(0, 0, 1920, 1080));
+        assert!(!s.band.is_open());
+        drop(s);
+        assert!(stubs::take().is_empty());
     }
 
     /// The recording bar, a window of its own, paints all of itself opaque, pixel by pixel at 125%.

@@ -8,7 +8,7 @@
 //! fields of a [`Palette`], so a light app theme can be added later as a second palette fed
 //! through [`visuals`]; only [`DARK`] ships, and the role constants below read from it.
 //!
-//! Windows can be see-through (the clear colour is transparent, for the recording frame), so
+//! Windows can be see-through (the clear colour is transparent, for the live draw window), so
 //! every window paints an opaque [`GROUND`] or [`SURFACE`], dialogs and menus an opaque
 //! [`RAISED`] with a 1px [`BORDER_STRONG`] edge, and nothing here has a shadow.
 
@@ -153,6 +153,27 @@ pub const SELECTION_EDGE: Color32 = DARK.accent;
 pub const SELECTION_HALO: Color32 = DARK.ground;
 /// How wide the dark band is on each side of the gold line.
 pub const SELECTION_HALO_WIDTH: f32 = 1.0;
+/// The glass band around the region being chosen in the region selector and around the area
+/// being recorded: from the region outwards, a bright edge, a translucent white band and a dark
+/// edge, each a whole number of pixels wide. The bright edge reads on dark pictures, the dark
+/// edge on light ones. Neutral on purpose: the same in screenshot and record mode, recording or
+/// paused. The colours are premultiplied, as egui keeps them and as a layered window takes them.
+/// The bright edge, on the side facing the region: white at 95%.
+pub const GLASS_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 242);
+/// The band between the two edges: white at 30%.
+pub const GLASS_FILL: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 77);
+/// The dark edge, outermost: black at 60%.
+pub const GLASS_RIM: Color32 = Color32::from_black_alpha(153);
+/// The width of the bright edge in pixels.
+pub const GLASS_EDGE_PX: u32 = 1;
+/// The width of the translucent band in pixels.
+pub const GLASS_FILL_PX: u32 = 6;
+/// The width of the dark edge in pixels.
+pub const GLASS_RIM_PX: u32 = 1;
+/// The glass band's layers from the region outwards: each one's width in pixels and colour.
+pub const GLASS_LAYERS: [(u32, Color32); 3] = [(GLASS_EDGE_PX, GLASS_EDGE), (GLASS_FILL_PX, GLASS_FILL), (GLASS_RIM_PX, GLASS_RIM)];
+/// The whole band's width in pixels.
+pub const GLASS_BAND_PX: u32 = GLASS_EDGE_PX + GLASS_FILL_PX + GLASS_RIM_PX;
 /// The light fill of a selection handle.
 pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
@@ -171,7 +192,7 @@ pub const METER_OVER: Color32 = DARK.caution_border;
 pub const CHIP: Color32 = DARK.border;
 /// The recording indicator and the frames cut from a recording: a functional red from the danger role.
 pub const RECORD: Color32 = DARK.danger_border;
-/// The recording frame and dot while paused: the brand's gold, near the amber it replaces.
+/// The recording dot while paused: the brand's gold, near the amber it replaces.
 pub const RECORD_PAUSED: Color32 = DARK.gold;
 
 // Type: Manrope for the interface (the brand's dense desktop scale), Hack for monospace.
@@ -410,6 +431,18 @@ pub fn selection_outline(painter: &egui::Painter, rect: egui::Rect, radius: f32,
     let halo = SELECTION_HALO_WIDTH;
     painter.rect_stroke(rect, radius, Stroke::new(width + 2.0 * halo, SELECTION_HALO), egui::StrokeKind::Outside);
     painter.rect_stroke(rect.expand(halo), radius + halo, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
+}
+
+/// The glass band just outside `rect` (see [`GLASS_LAYERS`]), each layer as many pixels wide as
+/// the band around a recording, at `pixels_per_point`. The region selector marks the region with
+/// it in screenshot and in record mode alike.
+pub fn glass_band(painter: &egui::Painter, rect: egui::Rect, pixels_per_point: f32) {
+    let mut out = 0.0;
+    for (px, colour) in GLASS_LAYERS {
+        let width = px as f32 / pixels_per_point;
+        painter.rect_stroke(rect.expand(out), 0.0, Stroke::new(width, colour), egui::StrokeKind::Outside);
+        out += width;
+    }
 }
 
 /// A handle of what is selected on the user's picture, `side` points square around `center`: a
@@ -678,6 +711,9 @@ pub(crate) mod tests {
             ("selection gold on a black picture", SELECTION_EDGE, Color32::BLACK, 3.0),
             ("selection gold against its halo", SELECTION_EDGE, SELECTION_HALO, 3.0),
             ("handle fill against the selection halo", HANDLE_FILL, SELECTION_HALO, 3.0),
+            ("glass band's bright edge on a near-black picture", blend(GLASS_EDGE, Color32::from_rgb(12, 12, 14)), Color32::from_rgb(12, 12, 14), 3.0),
+            ("glass band's dark edge on a white picture", blend(GLASS_RIM, Color32::WHITE), Color32::WHITE, 3.0),
+            ("glass band's bright edge against its dark edge, on a mid-grey picture", blend(GLASS_EDGE, Color32::from_gray(128)), blend(GLASS_RIM, Color32::from_gray(128)), 3.0),
         ] {
             all.push((name.to_string(), fg, bg, min));
         }
@@ -756,16 +792,26 @@ pub(crate) mod tests {
                 })
             };
             // Cross-sections at a quarter of each side, from the edge outwards.
-            let across = |image: &image::RgbaImage, what: &str, failed: &mut Vec<String>| {
+            let across_by = |image: &image::RgbaImage, what: &str, failed: &mut Vec<String>, reach: f32| {
                 let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
                 let (qx, qy) = (l + rect.width() / 4.0, t + rect.height() / 4.0);
-                for (side, a, z) in [("top", egui::pos2(qx, t), egui::pos2(qx, t - 6.0)), ("bottom", egui::pos2(qx, b), egui::pos2(qx, b + 6.0)), ("left", egui::pos2(l, qy), egui::pos2(l - 6.0, qy)), ("right", egui::pos2(r, qy), egui::pos2(r + 6.0, qy))] {
+                for (side, a, z) in [("top", egui::pos2(qx, t), egui::pos2(qx, t - reach)), ("bottom", egui::pos2(qx, b), egui::pos2(qx, b + reach)), ("left", egui::pos2(l, qy), egui::pos2(l - reach, qy)), ("right", egui::pos2(r, qy), egui::pos2(r + reach, qy))] {
                     if !reads_against(image, ppp, a, z, bg) {
                         failed.push(format!("{what} on {name}, {side} side"));
                     }
                 }
             };
+            let across = |image: &image::RgbaImage, what: &str, failed: &mut Vec<String>| across_by(image, what, failed, 6.0);
             across(&draw(&|p| selection_outline(p, rect, 2.0, 1.0)), "the selection outline", &mut failed);
+            // The glass band of the region selector, across its whole width: the bright edge
+            // reads on the dark picture, the dark edge on the white one.
+            across_by(&draw(&|p| glass_band(p, rect, ppp)), "the glass band", &mut failed, GLASS_BAND_PX as f32 / ppp + 0.5);
+            // And over the selector's scrim, as it is drawn there.
+            let image = draw(&|p| {
+                p.rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, SCRIM);
+                glass_band(p, rect, ppp);
+            });
+            across_by(&image, "the glass band over the scrim", &mut failed, GLASS_BAND_PX as f32 / ppp + 0.5);
             across(&draw(&|p| selection_outline(p, rect, 0.0, 2.0)), "the crop edge", &mut failed);
             // A dashed line has gaps, so along each side, over more than one dash and gap (10
             // points), some pixel reads; across it, the dark line under the dashes reads on white.
@@ -787,6 +833,62 @@ pub(crate) mod tests {
             }
         }
         assert!(failed.is_empty(), "lost on the picture: {failed:?}");
+    }
+
+    /// A premultiplied colour over an opaque one, as egui and a layered window blend it.
+    fn blend(fg: Color32, bg: Color32) -> Color32 {
+        let a = f32::from(fg.a()) / 255.0;
+        let mix = |f: u8, b: u8| (f32::from(f) + f32::from(b) * (1.0 - a)).round().min(255.0) as u8;
+        Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
+    }
+
+    /// The glass band is what the owner approved: from the region outwards 1 px of white at 95%,
+    /// 6 px of white at 30% and 1 px of black at 60%, premultiplied, and neutral: none of its
+    /// colours is the recording red or the paused gold.
+    #[test]
+    fn the_glass_band_is_a_bright_edge_a_translucent_band_and_a_dark_edge() {
+        assert_eq!(GLASS_LAYERS.map(|(px, _)| px), [1, 6, 1]);
+        assert_eq!(GLASS_BAND_PX, 8);
+        assert_eq!(GLASS_EDGE.to_array(), [242, 242, 242, 242]);
+        assert_eq!(GLASS_FILL.to_array(), [77, 77, 77, 77]);
+        assert_eq!(GLASS_RIM.to_array(), [0, 0, 0, 153]);
+        for (_, c) in GLASS_LAYERS {
+            assert!(c.r() <= c.a() && c.g() <= c.a() && c.b() <= c.a(), "{c:?} is premultiplied");
+            assert!(c.r() == c.g() && c.g() == c.b(), "{c:?} is a neutral grey");
+            assert!(c != RECORD && c != RECORD_PAUSED);
+        }
+    }
+
+    /// The selector's band, drawn at 100% and at 200%: three strokes just outside the region, in
+    /// the band's colours, each as many pixels wide as its layer, nothing drawn inside the region.
+    #[test]
+    fn the_glass_band_in_the_selector_lies_just_outside_the_region_in_whole_pixels() {
+        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(100.0, 60.0));
+        for ppp in [1.0, 1.25, 2.0] {
+            let ctx = test_context();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| glass_band(ui.painter(), rect, ppp));
+            out.textures_delta.clear();
+            let mut strokes = Vec::new();
+            fn walk(s: &egui::Shape, into: &mut Vec<egui::epaint::RectShape>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                    egui::Shape::Rect(r) => into.push(r.clone()),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut strokes));
+            assert_eq!(strokes.len(), 3, "{ppp}");
+            let mut out_by = 0.0;
+            for (r, (px, colour)) in strokes.iter().zip(GLASS_LAYERS) {
+                assert_eq!(r.stroke.color, colour, "{ppp}");
+                assert!((r.stroke.width * ppp - px as f32).abs() < 1e-4, "{ppp}: {} pixels", r.stroke.width * ppp);
+                assert_eq!(r.stroke_kind, egui::StrokeKind::Outside);
+                assert_eq!(r.fill, Color32::TRANSPARENT, "nothing is drawn over the region");
+                assert!((r.rect.min.x - (rect.min.x - out_by)).abs() < 1e-4 && (r.rect.max.y - (rect.max.y + out_by)).abs() < 1e-4, "{ppp}: {:?}", r.rect);
+                out_by += r.stroke.width;
+            }
+            assert!((out_by * ppp - GLASS_BAND_PX as f32).abs() < 1e-4);
+        }
     }
 
     /// A button is never a pill: egui's buttons, fields and dropdowns have a corner radius of at
