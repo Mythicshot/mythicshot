@@ -361,6 +361,243 @@ pub fn exclude_from_capture(hwnd: WindowId) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
 
+/// One strip of the glass band to open: where it goes, in desktop pixels, and its pixels, top
+/// row first, premultiplied BGRA.
+pub struct StripPixels {
+    pub rect: mythicshot_capture::PxRect,
+    pub pixels: Vec<u8>,
+}
+
+/// What opening one strip came to, for `capture.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedStrip {
+    /// The window, if it was made.
+    pub window: Option<WindowId>,
+    /// How Windows composites it ([`composition_note`]), or why it was not made.
+    pub note: String,
+    /// `UpdateLayeredWindow` took its pixels.
+    pub pixels_set: bool,
+    /// It is kept out of every capture.
+    pub excluded: bool,
+    pub visible: bool,
+}
+
+/// The glass band's open windows and the thread that made them (only that thread may destroy them).
+#[derive(Debug)]
+pub struct BandWindows {
+    windows: Vec<WindowId>,
+    thread: u32,
+}
+
+/// Open the glass band's strips: one native layered window each, made on this thread, which must
+/// keep its message loop running (the app's main thread does). See [`band_native::open_strip`].
+/// The windows made, if any, and what became of each strip, in order.
+pub fn band_open(strips: &[StripPixels]) -> (Option<BandWindows>, Vec<OpenedStrip>) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("band open {}", strips.iter().map(|s| mythicshot_capture_px(s.rect)).collect::<Vec<_>>().join("; "))) {
+        let opened: Vec<OpenedStrip> = (1..=strips.len()).map(|i| OpenedStrip { window: Some(i as WindowId), note: "stub".into(), pixels_set: true, excluded: true, visible: true }).collect();
+        return (Some(BandWindows { windows: (1..=strips.len() as WindowId).collect(), thread: 0 }), opened);
+    }
+    #[cfg(windows)]
+    {
+        let opened: Vec<OpenedStrip> = strips.iter().map(|s| band_native::open_strip(s)).collect();
+        let windows: Vec<WindowId> = opened.iter().filter_map(|o| o.window).collect();
+        let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        ((!windows.is_empty()).then_some(BandWindows { windows, thread }), opened)
+    }
+    #[cfg(not(windows))]
+    {
+        let opened = strips.iter().map(|_| OpenedStrip { window: None, note: "not on this system".into(), pixels_set: false, excluded: false, visible: false }).collect();
+        (None, opened)
+    }
+}
+
+#[cfg(test)]
+fn mythicshot_capture_px(r: mythicshot_capture::PxRect) -> String {
+    crate::capture_log::px(r)
+}
+
+/// Put the band's strips back on top of every other topmost window, shown, without activating
+/// them or moving them: another topmost window (or one that became topmost later) can otherwise
+/// cover them.
+pub fn band_raise(band: &BandWindows) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("band raise {}", band.windows.len())) {
+        return;
+    }
+    #[cfg(windows)]
+    for &h in &band.windows {
+        band_native::raise(h);
+    }
+    #[cfg(not(windows))]
+    let _ = band;
+}
+
+/// Destroy the band's strips. From another thread than the one that made them, each is asked to
+/// close instead, and its own thread destroys it.
+pub fn band_close(band: BandWindows) {
+    #[cfg(test)]
+    if mythicshot_destinations::stubs::stubbed(format!("band close {}", band.windows.len())) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let here = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        for &h in &band.windows {
+            band_native::close(h, here == band.thread);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = band;
+}
+
+/// The glass band's strips as native windows. Each is made layered from the start, given its
+/// pixels with `UpdateLayeredWindow` while still hidden, and only then shown, topmost and without
+/// activation. Windows keeps those pixels and composites them itself: nothing is painted later,
+/// so the window cannot be shown blank the way a window made layered while hidden, and painted by
+/// the window library afterwards, was.
+#[cfg(windows)]
+mod band_native {
+    use super::{OpenedStrip, StripPixels, WindowId};
+    use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HGDIOBJ, ReleaseDC, SelectObject,
+    };
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATE, PostMessageW, RegisterClassExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
+        SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WM_CLOSE, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+    use windows::core::{PCWSTR, w};
+
+    const CLASS: PCWSTR = w!("MythicshotGlassBand");
+
+    /// Every hit passes through to the window below, and a click never activates a strip.
+    unsafe extern "system" fn strip_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        match msg {
+            WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            _ => unsafe { DefWindowProcW(h, msg, wp, lp) },
+        }
+    }
+
+    fn instance() -> Option<HINSTANCE> {
+        unsafe { GetModuleHandleW(None) }.ok().map(|m| HINSTANCE(m.0))
+    }
+
+    /// The strips' window class. Only a registration that worked is remembered: a failed one is
+    /// tried again at the next recording, and a class already registered counts as done.
+    fn class() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError};
+        static REGISTERED: AtomicBool = AtomicBool::new(false);
+        if REGISTERED.load(Ordering::Relaxed) {
+            return true;
+        }
+        let class = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(strip_proc), hInstance: instance().unwrap_or_default(), lpszClassName: CLASS, ..Default::default() };
+        let ok = unsafe { RegisterClassExW(&class) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS };
+        if ok {
+            REGISTERED.store(true, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// One strip, in this order, which is what keeps it from ever being shown blank: created
+    /// hidden and layered (never made layered later), kept out of capture, given its pixels with
+    /// `UpdateLayeredWindow` (see [`set_pixels`]), and only then shown topmost without activation.
+    pub fn open_strip(s: &StripPixels) -> OpenedStrip {
+        let failed = |note: String| OpenedStrip { window: None, note, pixels_set: false, excluded: false, visible: false };
+        if !class() {
+            return failed("RegisterClassExW failed".into());
+        }
+        let r = s.rect;
+        // Layered from creation, topmost, never activated, a tool window (no taskbar button,
+        // not in Alt+Tab), click-through. Created hidden.
+        let ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let h = match unsafe { CreateWindowExW(ex, CLASS, w!("Mythicshot glass band"), WS_POPUP, r.x, r.y, r.w as i32, r.h as i32, None, None, instance(), None) } {
+            Ok(h) => h,
+            Err(e) => return failed(format!("CreateWindowExW failed: {e}")),
+        };
+        let id = h.0 as WindowId;
+        // Out of every capture before it is ever shown.
+        let mut excluded = super::exclude_from_capture(id);
+        let pixels_set = set_pixels(h, s);
+        // Shown only now, with its pixels in place: topmost, not activated, where it already is.
+        unsafe {
+            let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        }
+        if !excluded {
+            excluded = super::exclude_from_capture(id);
+        }
+        let visible = unsafe { IsWindowVisible(h) }.as_bool();
+        OpenedStrip { window: Some(id), note: super::composition_note(id), pixels_set, excluded, visible }
+    }
+
+    /// Hand a strip's pixels to Windows: a 32-bit top-down bitmap with premultiplied alpha, put
+    /// on the strip's rectangle with per-pixel alpha.
+    fn set_pixels(h: HWND, s: &StripPixels) -> bool {
+        let r = s.rect;
+        if s.pixels.len() != r.w as usize * r.h as usize * 4 {
+            return false;
+        }
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
+            let mem = CreateCompatibleDC(Some(screen));
+            if mem.is_invalid() {
+                ReleaseDC(None, screen);
+                return false;
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: r.w as i32, biHeight: -(r.h as i32), biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let ok = match CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(dib) => {
+                    let ok = !bits.is_null() && {
+                        std::ptr::copy_nonoverlapping(s.pixels.as_ptr(), bits as *mut u8, s.pixels.len());
+                        let old = SelectObject(mem, HGDIOBJ(dib.0));
+                        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                        let at = POINT { x: r.x, y: r.y };
+                        let size = SIZE { cx: r.w as i32, cy: r.h as i32 };
+                        let from = POINT { x: 0, y: 0 };
+                        let ok = UpdateLayeredWindow(h, Some(screen), Some(&at), Some(&size), Some(mem), Some(&from), COLORREF(0), Some(&blend), ULW_ALPHA).is_ok();
+                        SelectObject(mem, old);
+                        ok
+                    };
+                    // Deleted whether or not its bits came back.
+                    let _ = DeleteObject(HGDIOBJ(dib.0));
+                    ok
+                }
+                Err(_) => false,
+            };
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            ok
+        }
+    }
+
+    pub fn raise(id: WindowId) {
+        unsafe {
+            let _ = SetWindowPos(HWND(id as *mut _), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        }
+    }
+
+    pub fn close(id: WindowId, own_thread: bool) {
+        let h = HWND(id as *mut _);
+        unsafe {
+            if own_thread {
+                let _ = DestroyWindow(h);
+            } else {
+                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
 /// Find one of our windows by its exact title: only this process's, never another program's
 /// window that happens to have the same title.
 #[cfg(windows)]

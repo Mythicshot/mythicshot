@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.33 (2026-11-24)
+
+- The region you select is marked by a glass band just outside it: a bright edge, a translucent band and a dark edge, eight pixels in all. It replaces the thin gold line of a screenshot selection and the red line of a recording selection, for a dragged region and for a window. The size label sits clear of it.
+- While a region or a window is being recorded, the same band stays around the recorded area from the countdown until the recording ends. It stays on top when you switch applications, never takes the focus, lets clicks through, is not in the taskbar or Alt+Tab, and is kept out of the recording. A recording of a whole screen has none. Not confirmed on a real screen yet.
+- `capture.log` gets one line when the band is shown, saying how Windows shows each of its four strips, and one when there is none.
+
 ## 0.2.32 (2026-11-24)
 
 - Profiles: when the profile made from the earlier connection turns out to be the same account as another profile, the two are joined with the token that was just checked with the site, never with the other profile's, which may no longer work. If the token cannot be moved and read back, nothing is joined.

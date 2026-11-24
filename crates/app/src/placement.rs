@@ -86,6 +86,57 @@ pub fn bar_rect(rect: PxRect, monitor: PxRect, scale: f32) -> PxRect {
     PxRect::new(x, y, bw as u32, bh as u32)
 }
 
+/// One of the glass band's four strips around a recorded area. The top and bottom strips take
+/// the corners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strip {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl Strip {
+    pub fn name(self) -> &'static str {
+        match self {
+            Strip::Top => "top",
+            Strip::Bottom => "bottom",
+            Strip::Left => "left",
+            Strip::Right => "right",
+        }
+    }
+}
+
+/// The glass band's strips just outside a recorded `area`, [`crate::theme::GLASS_BAND_PX`]
+/// pixels thick, cut to the desktop (the box around `monitors`). A strip that falls wholly off
+/// every monitor is left out, and an area that is a whole monitor gets no band at all.
+pub fn band_strips(area: PxRect, monitors: &[PxRect]) -> Vec<(Strip, PxRect)> {
+    if monitors.contains(&area) {
+        return Vec::new();
+    }
+    let t = crate::theme::GLASS_BAND_PX;
+    let ti = t as i32;
+    let raw = [
+        (Strip::Top, PxRect::new(area.x - ti, area.y - ti, area.w + 2 * t, t)),
+        (Strip::Bottom, PxRect::new(area.x - ti, area.bottom(), area.w + 2 * t, t)),
+        (Strip::Left, PxRect::new(area.x - ti, area.y, t, area.h)),
+        (Strip::Right, PxRect::new(area.right(), area.y, t, area.h)),
+    ];
+    let desktop = monitors.iter().copied().reduce(|a, b| {
+        let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+        PxRect::new(x, y, (a.right().max(b.right()) - x) as u32, (a.bottom().max(b.bottom()) - y) as u32)
+    });
+    raw.into_iter()
+        .filter_map(|(s, r)| {
+            let r = match desktop {
+                Some(d) => r.intersect(&d)?,
+                None => r,
+            };
+            (monitors.is_empty() || monitors.iter().any(|m| m.intersect(&r).is_some())).then_some((s, r))
+        })
+        .collect()
+}
+
 /// A rectangle in points for a viewport builder, from pixels at `scale`. Only a first guess:
 /// the window is moved onto its pixels by a [`Placer`] before it is shown.
 pub fn guess_points(r: PxRect, scale: f32) -> (egui::Pos2, egui::Vec2) {
@@ -401,6 +452,86 @@ mod tests {
                 // On the left edge next to another monitor: never across it.
                 let r = picker_rect((m.rect.x, m.rect.y), &mons);
                 assert!(inside(r, m.rect), "{name}: edge {r:?}");
+            }
+        }
+    }
+
+    fn pixels(r: PxRect) -> Vec<(i32, i32)> {
+        (r.y..r.bottom()).flat_map(|y| (r.x..r.right()).map(move |x| (x, y))).collect()
+    }
+
+    /// Every pixel at most `t` pixels outside `area` (and not in it), in desktop pixels.
+    fn ring(area: PxRect, t: i32) -> std::collections::BTreeSet<(i32, i32)> {
+        pixels(PxRect::new(area.x - t, area.y - t, area.w + 2 * t as u32, area.h + 2 * t as u32)).into_iter().filter(|&(x, y)| !area.contains(x, y)).collect()
+    }
+
+    /// Around a region with room on every side, the four strips are 8 px thick and tile the band
+    /// exactly: together they cover every pixel within 8 px outside the area, none twice, none in
+    /// the area. Top and bottom take the corners.
+    #[test]
+    fn the_band_strips_tile_the_band_around_a_region_without_overlap() {
+        let monitors = [PxRect::new(0, 0, 1920, 1080), PxRect::new(1920, 0, 2560, 1440)];
+        for area in [PxRect::new(100, 200, 640, 480), PxRect::new(1900, 300, 50, 16), PxRect::new(8, 8, 1904, 1064)] {
+            let strips = band_strips(area, &monitors);
+            assert_eq!(strips.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [Strip::Top, Strip::Bottom, Strip::Left, Strip::Right]);
+            for (s, r) in &strips {
+                let thick = if matches!(s, Strip::Top | Strip::Bottom) { r.h } else { r.w };
+                assert_eq!(thick, 8, "{s:?} {r:?}");
+                assert!(r.intersect(&area).is_none(), "{s:?} {r:?} never lies on the recorded area");
+            }
+            let (top, bottom, left, right) = (strips[0].1, strips[1].1, strips[2].1, strips[3].1);
+            assert_eq!(top, PxRect::new(area.x - 8, area.y - 8, area.w + 16, 8), "the top strip takes both top corners");
+            assert_eq!(bottom, PxRect::new(area.x - 8, area.bottom(), area.w + 16, 8));
+            assert_eq!(left, PxRect::new(area.x - 8, area.y, 8, area.h));
+            assert_eq!(right, PxRect::new(area.right(), area.y, 8, area.h));
+            let mut seen = std::collections::BTreeSet::new();
+            for (s, r) in &strips {
+                for p in pixels(*r) {
+                    assert!(seen.insert(p), "{s:?} covers {p:?} a second time");
+                }
+            }
+            assert_eq!(seen, ring(area, 8), "{area:?}: the strips are the band, exactly");
+        }
+    }
+
+    /// At the desktop's edge the band is cut off; a strip wholly off the desktop is left out, and
+    /// what is left still never touches the area. Beside another monitor it goes on over that one.
+    #[test]
+    fn the_band_is_clipped_at_the_desktops_edges() {
+        let left = PxRect::new(-1920, 0, 1920, 1080);
+        let main = PxRect::new(0, 0, 2560, 1440);
+        let monitors = [left, main];
+        let desktop = PxRect::new(-1920, 0, 1920 + 2560, 1440);
+        // In the top-left corner of the left monitor: no top or left strip.
+        let area = PxRect::new(-1920, 0, 400, 300);
+        let strips = band_strips(area, &monitors);
+        assert_eq!(strips, vec![(Strip::Bottom, PxRect::new(-1920, 300, 408, 8)), (Strip::Right, PxRect::new(-1520, 0, 8, 300))]);
+        // Three px from the right edge of the main monitor: the right strip is 3 px wide, the top
+        // and bottom strips stop at the edge.
+        let area = PxRect::new(2000, 500, 557, 200);
+        let strips = band_strips(area, &monitors);
+        assert_eq!(strips, vec![(Strip::Top, PxRect::new(1992, 492, 568, 8)), (Strip::Bottom, PxRect::new(1992, 700, 568, 8)), (Strip::Left, PxRect::new(1992, 500, 8, 200)), (Strip::Right, PxRect::new(2557, 500, 3, 200))]);
+        // Against the edge between the two monitors: the left strip lies on the left monitor.
+        let area = PxRect::new(0, 100, 300, 200);
+        assert!(band_strips(area, &monitors).contains(&(Strip::Left, PxRect::new(-8, 100, 8, 200))));
+        // Every strip of every area stays on the desktop and off the area.
+        for area in [PxRect::new(-1920, 1000, 1920, 80), PxRect::new(2400, 1400, 160, 40), PxRect::new(-5, -5, 20, 20)] {
+            for (s, r) in band_strips(area, &monitors) {
+                assert!(inside(r, desktop) && r.intersect(&area).is_none(), "{area:?} {s:?} {r:?}");
+            }
+        }
+    }
+
+    /// A recording of a whole monitor gets no band, whichever monitor it is.
+    #[test]
+    fn a_whole_monitor_gets_no_band() {
+        for (name, mons) in layouts() {
+            let rects: Vec<PxRect> = mons.iter().map(|m| m.rect).collect();
+            for m in &rects {
+                assert!(band_strips(*m, &rects).is_empty(), "{name}: {m:?}");
+                // One pixel short of it is a region, and gets what band there is room for.
+                let region = PxRect::new(m.x + 1, m.y + 1, m.w - 2, m.h - 2);
+                assert_eq!(band_strips(region, &rects).len(), 4, "{name}: {region:?}");
             }
         }
     }

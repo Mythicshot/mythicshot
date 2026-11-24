@@ -13,6 +13,7 @@ mod capture_log;
 mod capture_window;
 mod dialogs;
 mod editor_ui;
+mod glass_band;
 mod home_ui;
 mod hotkeys;
 mod hook;
@@ -693,8 +694,7 @@ impl App {
         }
     }
 
-    /// Hide the control bar and stop logging input; the frame window goes when
-    /// it is no longer shown.
+    /// Hide the control bar and stop logging input. The glass band went with the session.
     fn end_session(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.bar_showing = None;
@@ -735,7 +735,7 @@ impl App {
         }
     }
 
-    /// Each frame while recording: countdown, frame window, errors, focus.
+    /// Each frame while recording: countdown, the glass band kept on top, errors, focus.
     fn tick_recording(&mut self, ctx: &egui::Context) {
         match self.bar_showing.as_mut().map(|bar| bar.tick(ctx, self.root)) {
             Some(capture_window::BarState::Shown) => self.bar_showing = None,
@@ -1407,7 +1407,7 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Transparent, so the recording frame window can be see-through. Every
+        // Transparent, so the live draw window can be see-through. Every
         // other window paints its own background.
         [0.0, 0.0, 0.0, 0.0]
     }
@@ -1603,7 +1603,7 @@ fn main() -> eframe::Result {
             .with_taskbar(false)
             .with_always_on_top()
             // eframe's OpenGL backend picks one pixel format for every window from
-            // the root; it must have alpha for the recording frame to be see-through.
+            // the root; it must have alpha for the live draw window to be see-through.
             .with_transparent(true)
             .with_resizable(false)
             .with_position([-32000.0, -32000.0])

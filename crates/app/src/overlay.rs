@@ -1,7 +1,7 @@
 //! The region selector (screen 2 of the mockup): the frozen desktop, dimmed,
-//! with a selection, a magnifier and a hint bar. In record mode the selection
-//! is red and the result starts a recording instead of a screenshot; Tab
-//! switches between the two.
+//! with a selection, a magnifier and a hint bar. The selection carries the
+//! glass band in both modes; in record mode the result starts a recording
+//! instead of a screenshot. Tab switches between the two.
 
 use eframe::egui::{self, Align2, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2};
 use mythicshot_capture::{Desktop, PxRect};
@@ -189,12 +189,10 @@ impl Overlay {
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.max.y), full.max), 0.0, theme::SCRIM);
                 painter.rect_filled(Rect::from_min_max(pos2(full.min.x, h.min.y), pos2(h.min.x, h.max.y)), 0.0, theme::SCRIM);
                 painter.rect_filled(Rect::from_min_max(pos2(h.max.x, h.min.y), pos2(full.max.x, h.max.y)), 0.0, theme::SCRIM);
-                if self.record {
-                    painter.rect_stroke(h, 0.0, Stroke::new(3.0, theme::RECORD), StrokeKind::Outside);
-                } else {
-                    // Over the darkened desktop, which can be light: two-tone, as on a picture.
-                    theme::selection_outline(painter, h, 0.0, 2.0);
-                }
+                // The same glass band in both modes, the one that goes around a recording, in
+                // whole pixels: a bright edge, a translucent band and a dark edge read on any
+                // desktop, dark or light.
+                theme::glass_band(painter, h, ppp);
             }
             None => {
                 painter.rect_filled(full, 0.0, theme::SCRIM);
@@ -204,7 +202,9 @@ impl Overlay {
         if let Some(sel) = hole {
             let r = to_pt(sel);
             let text = format!("{} × {} · at {}, {}", sel.w, sel.h, sel.x, sel.y);
-            let at = if r.min.y > 28.0 { r.left_top() - vec2(0.0, 6.0) } else { r.left_bottom() + vec2(0.0, 22.0) };
+            // Clear of the glass band: moved out by its thickness, above the region or below it.
+            let band = theme::GLASS_BAND_PX as f32 / ppp;
+            let at = if r.min.y > 28.0 + band { r.left_top() - vec2(0.0, 6.0 + band) } else { r.left_bottom() + vec2(0.0, 22.0 + band) };
             label(painter, at, Align2::LEFT_BOTTOM, &text);
         }
 
@@ -425,6 +425,120 @@ mod tests {
         step(&ctx, &mut ov, 2.0, bounds, vec![egui::Event::PointerMoved(press)]);
         step(&ctx, &mut ov, 2.0, bounds, vec![button(press, true)]);
         assert_eq!(ov.press_px, Some((20, 40)));
+    }
+
+    /// The outlines a frame strokes around rectangles: each one's rectangle, width and colour.
+    fn outlines(out: &egui::FullOutput) -> Vec<(Rect, f32, egui::Color32)> {
+        fn walk(s: &egui::Shape, into: &mut Vec<(Rect, f32, egui::Color32)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                egui::Shape::Rect(r) if r.stroke.width > 0.0 => into.push((r.rect, r.stroke.width, r.stroke.color)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut all));
+        all
+    }
+
+    /// The selector's hole, marked with the glass band and nothing else: the band's filled layers
+    /// just outside `hole` (in points), never the old red line or the gold outline.
+    fn assert_glass_band(out: &egui::FullOutput, hole: Rect, ppp: f32, what: &str) {
+        theme::checks::assert_glass_band(out, hole, ppp, what);
+        for (r, _, c) in outlines(out) {
+            assert!(c != theme::RECORD && c != theme::SELECTION_EDGE && c != theme::SELECTION_HALO, "{what}: a {c:?} outline at {r:?}");
+        }
+    }
+
+    /// The size label's box: the surface-raised fill under the text that gives the size.
+    fn size_label(out: &egui::FullOutput) -> Rect {
+        let mut text = None;
+        fn walk(s: &egui::Shape, text: &mut Option<Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, text)),
+                egui::Shape::Text(t) if t.galley.text().contains('\u{d7}') => *text = Some(t.visual_bounding_rect()),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut text));
+        let text = text.expect("the size label is drawn");
+        theme::checks::fills(out).into_iter().filter(|(r, c, _)| *c == theme::RAISED && r.contains(text.center())).map(|(r, ..)| r).next().expect("its box")
+    }
+
+    /// The size label is moved clear of the band: above the region when there is room, below it
+    /// otherwise, its box never over any of the band's pixels.
+    #[test]
+    fn the_size_label_stays_clear_of_the_band() {
+        let bounds = PxRect::new(0, 0, 800, 400);
+        for ppp in [1.0, 1.25, 2.0] {
+            for (from, to, above) in [(pos2(20.0, 80.0), pos2(160.0, 140.0), true), (pos2(20.0, 4.0), pos2(160.0, 70.0), false)] {
+                // On whole pixels at this scale.
+                let snap = |p: Pos2| pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
+                let (from, to) = (snap(from), snap(to));
+                let ctx = egui::Context::default();
+                let mut ov = Overlay::new(desktop(bounds), false, false);
+                ov.os_cursor = || None;
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(from)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![button(from, true)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to - vec2(1.0, 0.0))]);
+                let out = step_out(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to)]);
+                let hole = Rect::from_min_max(from, to);
+                let label = size_label(&out);
+                assert_eq!(label.max.y <= hole.min.y, above, "{ppp}: the label {label:?} against the region {hole:?}");
+                for (band, _) in theme::glass_band_rects(hole, ppp) {
+                    assert!(!label.intersect(band).is_positive(), "{ppp}, above {above}: the label {label:?} covers the band at {band:?}");
+                }
+            }
+        }
+    }
+
+    /// One frame with these events, its output kept.
+    fn step_out(ctx: &egui::Context, ov: &mut Overlay, ppp: f32, client: PxRect, events: Vec<egui::Event>) -> egui::FullOutput {
+        let mut input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(client.w as f32 / ppp, client.h as f32 / ppp))), events, ..Default::default() };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let mut out = ctx.run_ui(input, |ui| {
+            let _ = ov.ui(ui, Some(client), false);
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    /// A dragged region carries the glass band in screenshot mode and in record mode alike.
+    #[test]
+    fn a_dragged_region_carries_the_glass_band_in_both_modes() {
+        let bounds = PxRect::new(0, 0, 800, 400);
+        for record in [false, true] {
+            for ppp in [1.0, 2.0] {
+                let ctx = egui::Context::default();
+                let mut ov = Overlay::new(desktop(bounds), false, record);
+                ov.os_cursor = || None;
+                let (from, to) = (pos2(20.0, 30.0), pos2(120.0, 90.0));
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(from)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![button(from, true)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to - vec2(1.0, 0.0))]);
+                let out = step_out(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to)]);
+                assert!(ov.drag_from.is_some(), "a drag is under way");
+                assert_glass_band(&out, Rect::from_min_max(from, to), ppp, &format!("record {record}, {ppp}"));
+            }
+        }
+    }
+
+    /// A window under the pointer in window mode carries the same band, in both modes.
+    #[test]
+    fn a_hovered_window_carries_the_glass_band_in_both_modes() {
+        let bounds = PxRect::new(0, 0, 800, 400);
+        for record in [false, true] {
+            let ppp = 1.25;
+            let mut d = desktop(bounds);
+            d.windows.push(mythicshot_capture::WindowInfo { title: String::new(), app: String::new(), rect: PxRect::new(100, 50, 300, 200), focused: false });
+            let ctx = egui::Context::default();
+            let mut ov = Overlay::new(d, false, record);
+            ov.os_cursor = || None;
+            ov.window_mode = true;
+            let out = step_out(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(pos2(200.0, 100.0))]);
+            let hole = Rect::from_min_max(pos2(100.0 / ppp, 50.0 / ppp), pos2(400.0 / ppp, 250.0 / ppp));
+            assert_glass_band(&out, hole, ppp, &format!("window, record {record}"));
+        }
     }
 
     #[test]
