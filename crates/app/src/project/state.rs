@@ -77,6 +77,10 @@ pub struct ProjectFile {
     pub tour_id: String,
     #[serde(default)]
     pub chapter_id: String,
+    /// The id of the profile the tour belongs to (see `profiles`). Left out when empty: a file
+    /// saved before profiles, whose tour belongs to the profile the old connection became.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
     #[serde(default)]
     pub tour_title: String,
     #[serde(default)]
@@ -381,6 +385,8 @@ impl Default for SavedStyle {
 
 /// The editor state a project is saved from.
 pub struct Snapshot<'a> {
+    /// The id of the profile the tour belongs to; empty when none is known.
+    pub profile: &'a str,
     pub rec: &'a Recording,
     pub title: &'a str,
     pub tour_title: &'a str,
@@ -884,6 +890,7 @@ pub fn to_file(key: &ProjectKey, snap: &Snapshot<'_>, now_ms: i64, frames_bytes:
         server: key.server.clone(),
         tour_id: key.tour_id.clone(),
         chapter_id: key.chapter_id.clone(),
+        profile: snap.profile.to_string(),
         tour_title: snap.tour_title.to_string(),
         title: snap.title.to_string(),
         steps: snap.steps,
@@ -1086,7 +1093,7 @@ pub(super) mod tests {
     }
 
     fn build_as(rec: &Recording, edit: &Edit, events: &[InputEvent], items: &[Item], store: StoreInfo) -> (ProjectFile, Vec<Blob>) {
-        let snap = Snapshot { rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit, events, items };
+        let snap = Snapshot { profile: "", rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit, events, items };
         let (file, blobs, dropped) = to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES, store);
         assert_eq!(dropped, Vec::<String>::new());
         (file, blobs)
@@ -1692,7 +1699,7 @@ pub(super) mod tests {
         let (items, events) = (items(), events());
         let build = |logo: &Path| {
             let edit = edit(&rec, Some(logo));
-            let snap = Snapshot { rec: &rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &events, items: &items };
+            let snap = Snapshot { profile: "", rec: &rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &events, items: &items };
             to_file(&key(), &snap, SAVED_AT, FRAMES_BYTES, StoreInfo::default())
         };
         // A logo file that is gone.

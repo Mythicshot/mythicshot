@@ -1012,7 +1012,7 @@ mod tests {
         let dir = tempfile::tempdir_in(&recordings).unwrap().keep();
         let rec = mythicshot_recording::Recording::synthetic_in(&dir, 64, 48, &[0, 500, 1000], 1500).unwrap();
         let edit = crate::video::Edit::new(&rec, Default::default());
-        let snap = project::Snapshot { rec: &rec, title, tour_title, steps: 2, edit: &edit, events: &[], items: &[] };
+        let snap = project::Snapshot { profile: "", rec: &rec, title, tour_title, steps: 2, edit: &edit, events: &[], items: &[] };
         store.save(&key(tour, chapter), &snap).unwrap().info
     }
 
@@ -1023,7 +1023,7 @@ mod tests {
     /// What the store's list says of a saved recording, with no disk behind it.
     fn info(site: &str, tour: &str, chapter: &str, tour_title: &str, title: &str, saved_at: i64, bytes: u64) -> ProjectInfo {
         let dir = Path::new("projects").join(site).join(tour).join(chapter);
-        ProjectInfo { key: key(tour, chapter), title: title.into(), tour_title: tour_title.into(), saved_at, bytes, frames_bytes: bytes, dir, problem: None, form: Form::Frames, convert: ConvertState::NotTried }
+        ProjectInfo { profile: String::new(), key: key(tour, chapter), title: title.into(), tour_title: tour_title.into(), saved_at, bytes, frames_bytes: bytes, dir, problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     fn listed(projects: Vec<ProjectInfo>) -> Listed {

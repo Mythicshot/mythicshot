@@ -97,6 +97,9 @@ pub struct ProjectInfo {
     /// The tour and chapter ids are the folder's names. The address is the one the project file
     /// names when it belongs in this folder, else the one asked for, else empty.
     pub key: ProjectKey,
+    /// The id of the profile the tour belongs to, as the project file says; empty for a file
+    /// saved before profiles, and for one that cannot be read.
+    pub profile: String,
     pub title: String,
     pub tour_title: String,
     /// Milliseconds since 1970.
@@ -360,7 +363,7 @@ impl Store {
         self.bump();
         // Built from what was written: the save is done, whatever a second look at the folder says.
         let (form, convert) = (form_of_store(&file.store), convert_state(&file.store, self.codec_id().as_deref()));
-        let info = ProjectInfo { key: key.clone(), title: file.title, tour_title: file.tour_title, saved_at: file.saved_at, bytes: bytes_in(&dir), frames_bytes: file.frames_bytes, dir, problem: None, form, convert };
+        let info = ProjectInfo { key: key.clone(), profile: file.profile, title: file.title, tour_title: file.tour_title, saved_at: file.saved_at, bytes: bytes_in(&dir), frames_bytes: file.frames_bytes, dir, problem: None, form, convert };
         Ok(Saved { info, left_out })
     }
 
@@ -1725,9 +1728,9 @@ fn read_info(dir: &Path, site: &str, tour: &str, chapter: &str, server: Option<&
         Some("video") => Form::Video,
         _ => Form::Frames,
     };
-    let frames_bytes = match &parsed {
-        Some(Ok(file)) => file.frames_bytes,
-        _ => 0,
+    let (frames_bytes, profile) = match &parsed {
+        Some(Ok(file)) => (file.frames_bytes, file.profile.clone()),
+        _ => (0, String::new()),
     };
     let (named_server, title, tour_title, saved_at, problem, form, convert) = match &parsed {
         Some(Ok(file)) => {
@@ -1745,7 +1748,7 @@ fn read_info(dir: &Path, site: &str, tour: &str, chapter: &str, server: Option<&
         _ => (word("server"), word("title"), word("tour_title"), loose_saved_at, Some(Problem::Damaged), loose_form, ConvertState::NotTried),
     };
     let server = if site_of(&named_server) == site { named_server } else { server.unwrap_or("").to_string() };
-    Some(ProjectInfo { key: ProjectKey { server, tour_id: tour.to_string(), chapter_id: chapter.to_string() }, title, tour_title, saved_at, bytes: bytes_in(dir), frames_bytes, dir: dir.to_path_buf(), problem, form, convert })
+    Some(ProjectInfo { key: ProjectKey { server, tour_id: tour.to_string(), chapter_id: chapter.to_string() }, profile, title, tour_title, saved_at, bytes: bytes_in(dir), frames_bytes, dir: dir.to_path_buf(), problem, form, convert })
 }
 
 /// The folder name of a site: the first 16 hex characters of the SHA-256 of its address.
@@ -1914,7 +1917,7 @@ mod tests {
         }
 
         fn snap(&self) -> Snapshot<'_> {
-            Snapshot { rec: &self.rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &self.edit, events: &self.events, items: &self.items }
+            Snapshot { profile: "", rec: &self.rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &self.edit, events: &self.events, items: &self.items }
         }
 
         fn save(&self, key: &ProjectKey) -> Saved {
@@ -1952,7 +1955,7 @@ mod tests {
         let gone = recorded(w.tmp.path(), "gone", 4);
         std::fs::remove_file(w.tmp.path().join("gone").join(FRAMES_FILE)).unwrap();
         let edit = Edit::new(&gone, Default::default());
-        let snap = Snapshot { rec: &gone, title: "Gone", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &gone, title: "Gone", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         let err = w.store.save(&key_1(), &snap).unwrap_err();
         assert_eq!(err, "the recording's files could not be copied.");
         assert_eq!(tree(w.store.root()), Vec::<String>::new());
@@ -1967,7 +1970,7 @@ mod tests {
         // A recording that cannot be kept at all says so in its own words.
         let empty = Recording::timing_only(100, 80, &[], 0);
         let edit = Edit::new(&empty, Default::default());
-        let snap = Snapshot { rec: &empty, title: "Empty", tour_title: "Customer onboarding", steps: 0, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &empty, title: "Empty", tour_title: "Customer onboarding", steps: 0, edit: &edit, events: &[], items: &[] };
         assert_eq!(w.store.save(&key_1(), &snap).unwrap_err(), "the recording has no frames to keep.");
         // Every one of them fits after the colon of the user's sentence.
         for said in ["the disk is full.", "the recording's files could not be copied.", "the folder for saved recordings could not be made.", "the recording has no frames to keep.", SAVING_CANCELLED] {
@@ -2209,7 +2212,7 @@ mod tests {
         }
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
         let before = changes(&w.store);
-        let snap = Snapshot { rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &items };
+        let snap = Snapshot { profile: "", rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &items };
         let second = w.store.save(&key_1(), &snap).unwrap();
         assert_eq!(changes(&w.store), before + 1);
         assert_eq!((second.info.title.as_str(), second.info.problem, second.info.dir.clone()), ("Chapter one, again", None, first.info.dir.clone()));
@@ -2243,7 +2246,7 @@ mod tests {
         let whole = contents(&dir);
         let l = loaded(&w.store, &key_1());
         let (edit, items) = edited(&w);
-        let snap = Snapshot { rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &items };
+        let snap = Snapshot { profile: "", rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &items };
         // Everything is written, and then the new project file cannot take the old one's place.
         let refuse = |_: &Path, to: &Path| -> io::Result<()> {
             assert!(to.ends_with(PROJECT_FILE));
@@ -2272,7 +2275,7 @@ mod tests {
         // The same tour and chapter, saved from a recording that is not the project's own.
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         let refuse = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("the rename was refused")) };
         w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
         assert_eq!(contents(&dir), whole);
@@ -2301,7 +2304,7 @@ mod tests {
         let whole = contents(&dir);
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         // While the frames are being kept, an editor opens the project.
         let opened = std::cell::RefCell::new(None);
         let slow = |rec: &Recording, to: &Path| {
@@ -2328,7 +2331,7 @@ mod tests {
         std::fs::remove_file(dir.join(FRAMES_FILE)).unwrap();
         assert!(!frames_are(&dir, frames.len() as u64));
         // A save from the open editor is refused, and writes nothing.
-        let snap = Snapshot { rec: &l.rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+        let snap = Snapshot { profile: "", rec: &l.rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
         let err = w.store.save(&key_1(), &snap).unwrap_err();
         assert!(err.ends_with('.'), "{err}");
         assert_eq!(contents(&dir), whole.into_iter().filter(|(name, _)| name != FRAMES_FILE).collect::<Vec<_>>());
@@ -2343,14 +2346,14 @@ mod tests {
         let l = loaded(&w.store, &key_1());
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         let err = w.store.save(&key_1(), &snap).unwrap_err();
         assert!(err.ends_with('.'), "{err}");
         assert_eq!(contents(&dir), whole);
         // As many frames at the same times, with no pointer, and still not the same frames.
         let alike = recorded_of(w.tmp.path(), "alike", FRAMES, 3);
         assert_eq!(alike.frames.iter().map(|m| (m.t_ms, m.cursor)).collect::<Vec<_>>(), l.rec.frames.iter().map(|m| (m.t_ms, m.cursor)).collect::<Vec<_>>());
-        let snap = Snapshot { rec: &alike, title: "Alike", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+        let snap = Snapshot { profile: "", rec: &alike, title: "Alike", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
         let err = w.store.save(&key_1(), &snap).unwrap_err();
         assert!(err.contains("another recording"), "{err}");
         assert_eq!(contents(&dir), whole);
@@ -2369,7 +2372,7 @@ mod tests {
         std::fs::write(dir.join(logo_name()), b"").unwrap();
         // The same state is saved again: the files have the right names, and not the right sizes.
         let edit = w.edit.clone();
-        let snap = Snapshot { rec: &l.rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &w.events, items: &w.items };
+        let snap = Snapshot { profile: "", rec: &l.rec, title: "Chapter one", tour_title: "Customer onboarding", steps: 3, edit: &edit, events: &w.events, items: &w.items };
         let saved = w.store.save(&key_1(), &snap).unwrap();
         assert_eq!(saved.left_out, Vec::<String>::new());
         assert_eq!(std::fs::read(dir.join(&name)).unwrap(), whole);
@@ -2765,7 +2768,7 @@ mod tests {
         let whole = contents(&dir);
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         // The old project moves out of the way, and then nothing can be moved into its place:
         // not the new one, and not the old one back.
         let stuck = |from: &Path, to: &Path| if to == dir { Err(io::Error::other("the rename was refused")) } else { std::fs::rename(from, to) };
@@ -2923,7 +2926,7 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"old note").unwrap();
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        let snap = Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
+        let snap = Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] };
         // The new project arrives with a file of that name already in it.
         let with_a_note = |rec: &Recording, to: &Path| {
             std::fs::write(to.join("notes.txt"), b"new note").unwrap();
@@ -2967,7 +2970,7 @@ mod tests {
         // A save over it does not write through the link, and a removal does not reach through it.
         let other = recorded(w.tmp.path(), "other", 4);
         let edit = Edit::new(&other, Default::default());
-        w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+        w.store.save(&key_1(), &Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
         assert_eq!(contents(&outside), kept);
         // The link stays behind with the replaced project; the new project has none and opens.
         assert!(std::fs::symlink_metadata(dir.join(PICTURES)).is_err(), "the link was not moved into the new project");
@@ -3325,7 +3328,7 @@ mod tests {
             assert_eq!(w.store.remove_project(&dir), Ok(Removed::WhenItsEditorCloses));
             assert_eq!(w.store.list(), vec![]);
             let (edit, items) = edited(&w);
-            let snap = Snapshot { rec: &open.rec, title: "Late", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &open.restored.events, items: &items };
+            let snap = Snapshot { profile: "", rec: &open.rec, title: "Late", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &open.restored.events, items: &items };
             // A save that fails changes nothing: the removal still stands.
             let refuse = |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("the rename was refused")) };
             w.store.save_with(&key_1(), &snap, &Steps { keep_frames: &real_frames, rename: &refuse }).unwrap_err();
@@ -3550,7 +3553,7 @@ mod tests {
 
             // An Update from the editor that opened it: still format 1, with no word of the store
             // section, and the text is the one the format writes for the frames form.
-            let snap = Snapshot { rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &l.restored.edit, events: &l.restored.events, items: &l.restored.items };
+            let snap = Snapshot { profile: "", rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &l.restored.edit, events: &l.restored.events, items: &l.restored.items };
             let saved = w.store.save(&key_1(), &snap).unwrap();
             assert_eq!((saved.info.form, saved.info.convert, saved.info.problem), (Form::Frames, ConvertState::NotTried, None));
             let text = std::fs::read_to_string(dir.join(PROJECT_FILE)).unwrap();
@@ -4008,7 +4011,7 @@ mod tests {
             let (c, conv) = converted(&w, &key_1());
             let other = recorded(w.tmp.path(), "other", 4);
             let edit = Edit::new(&other, Default::default());
-            w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+            w.store.save(&key_1(), &Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
             assert!(conv.cancelled());
             refused("saved over", &c, &conv);
             drop(conv);
@@ -4392,7 +4395,7 @@ mod tests {
             let l = open_with(&w.store, &key_1(), &Fake::default(), &w.tmp.path().join("edit")).unwrap();
             let mut edit = l.restored.edit.clone();
             edit.trim = (2, 5);
-            let snap = Snapshot { rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &l.restored.items };
+            let snap = Snapshot { profile: "", rec: &l.rec, title: "Chapter one, again", tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &l.restored.events, items: &l.restored.items };
             let epoch = changes(&w.store);
             let saved = w.store.save(&key_1(), &snap).unwrap();
             assert_eq!(changes(&w.store), epoch + 1);
@@ -4436,7 +4439,7 @@ mod tests {
             // The same times, pointers and size, expanded from the video of another project.
             assert!(elsewhere.rec.same_timing(&mythicshot_recording::open_video_index(&dir).unwrap()));
             fn snap<'a>(w: &'a World, rec: &'a Recording) -> Snapshot<'a> {
-                Snapshot { rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items }
+                Snapshot { profile: "", rec, title: "Late", tour_title: "Customer onboarding", steps: 3, edit: &w.edit, events: &w.events, items: &w.items }
             }
             let err = w.store.save(&own, &snap(&w, &elsewhere.rec)).unwrap_err();
             assert!(err.contains("another recording") && reads_as_a_reason(&err, w.tmp.path()), "{err}");
@@ -4446,7 +4449,7 @@ mod tests {
             // The project's own recording with other times is not its recording either.
             let shorter = recorded(w.tmp.path(), "other", 4);
             let edit = Edit::new(&shorter, Default::default());
-            let err = w.store.save(&own, &Snapshot { rec: &shorter, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap_err();
+            let err = w.store.save(&own, &Snapshot { profile: "", rec: &shorter, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap_err();
             assert!(err.ends_with('.'), "{err}");
             assert_eq!(contents(&dir), whole);
             // Its own recording is taken.
@@ -4461,7 +4464,7 @@ mod tests {
             w.save(&first);
             swap(&w, &first);
             let l = open_with(&w.store, &first, &Fake::default(), &w.tmp.path().join("edit")).unwrap();
-            let snap = Snapshot { rec: &l.rec, title: "As a new tour", tour_title: "Another tour", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+            let snap = Snapshot { profile: "", rec: &l.rec, title: "As a new tour", tour_title: "Another tour", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
             let saved = w.store.save(&second, &snap).unwrap();
             let dir = w.dir(&second);
             assert_eq!((saved.info.form, saved.info.convert, saved.info.problem, saved.info.bytes), (Form::Video, ConvertState::Done, None, size_of(&dir)));
@@ -4482,7 +4485,7 @@ mod tests {
             let third = key(SITE_B, TOUR_1, CH_1);
             drop(again.open);
             assert_eq!(w.store.remove_tour(SITE_A, TOUR_2), Ok(1));
-            let snap = Snapshot { rec: &again.rec, title: "Without its video", tour_title: "Another tour", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
+            let snap = Snapshot { profile: "", rec: &again.rec, title: "Without its video", tour_title: "Another tour", steps: 3, edit: &w.edit, events: &w.events, items: &w.items };
             let saved = w.store.save(&third, &snap).unwrap();
             assert_eq!((saved.info.form, saved.info.convert, project_file(&w.dir(&third)).format), (Form::Frames, ConvertState::NotTried, 1));
             assert!(frames_form(&w.dir(&third)));
@@ -4677,7 +4680,7 @@ mod tests {
             assert_eq!(w.store.next_candidate(TEST_CODEC, 0), None);
             // It opens as before, an Update from its editor keeps the mark, and a save from a new recording drops it.
             let l = loaded(&w.store, &key_1());
-            let snap = Snapshot { rec: &l.rec, title: "Again", tour_title: "Customer onboarding", steps: 3, edit: &l.restored.edit, events: &l.restored.events, items: &l.restored.items };
+            let snap = Snapshot { profile: "", rec: &l.rec, title: "Again", tour_title: "Customer onboarding", steps: 3, edit: &l.restored.edit, events: &l.restored.events, items: &l.restored.items };
             assert_eq!(w.store.save(&key_1(), &snap).unwrap().info.convert, ConvertState::NotSmaller);
             assert_eq!(project_file(&dir).store.convert, Some(mark));
             drop(l);
@@ -4817,7 +4820,7 @@ mod tests {
             let edit = Edit::new(&other, Default::default());
             let started = Instant::now();
             // The conversion never lets go here: the save waits its two seconds once, outside the lock.
-            w.store.save(&key_1(), &Snapshot { rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+            w.store.save(&key_1(), &Snapshot { profile: "", rec: &other, title: "Shorter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
             let took = started.elapsed();
             assert!(conv.cancelled());
             assert!(took >= LET_GO && took < LET_GO * 2 - Duration::from_millis(400), "{took:?}");

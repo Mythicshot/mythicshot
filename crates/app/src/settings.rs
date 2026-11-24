@@ -102,6 +102,14 @@ pub struct Settings {
     /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
     /// says nothing is left, so the delete can be finished after a restart.
     pub unfinished_deletes: Vec<UnfinishedDelete>,
+    /// The profiles: a name, a site address and (in the credential store, never here) a token
+    /// each. See `profiles`.
+    pub profiles: Vec<crate::profiles::Profile>,
+    /// The id of the profile uploads, sharing and the Tours page use; None for none.
+    pub active_profile: Option<String>,
+    /// The one connection of the versions before profiles was looked at, and made the first
+    /// profile when there was one. Files from before profiles have no such key: false.
+    pub profiles_migrated: bool,
     /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
     #[serde(skip)]
     pub load_problem: Option<LoadProblem>,
@@ -381,6 +389,9 @@ impl Default for Settings {
             store_recordings_as_video: true,
             saved_recordings_warn_gb: DEFAULT_WARN_GB,
             unfinished_deletes: Vec::new(),
+            profiles: Vec::new(),
+            active_profile: None,
+            profiles_migrated: false,
             load_problem: None,
             open_editor: None,
             save_to_file: None,
@@ -719,6 +730,9 @@ impl Settings {
             publish_saved_for: _,
             publish_binding_settled: _,
             unfinished_deletes: _,
+            profiles: _,
+            active_profile: _,
+            profiles_migrated: _,
             load_problem: _,
             open_editor: _,
             save_to_file: _,

@@ -152,7 +152,7 @@ fn a_real_recording_goes_through_save_convert_list_expand_update_and_remove() {
     let (width, height, count) = (original.width, original.height, original.frames.len());
     println!("1. recording: {width} x {height}, {count} frames, {} ms", original.end_ms);
     let edit = Edit::new(&original, Default::default());
-    let snap = Snapshot { rec: &original, title: "A real recording", tour_title: "End to end", steps: 1, edit: &edit, events: &[], items: &[] };
+    let snap = Snapshot { profile: "", rec: &original, title: "A real recording", tour_title: "End to end", steps: 1, edit: &edit, events: &[], items: &[] };
     let saved = store.save_while(&key, &snap, &|| true).unwrap();
     assert!(saved.left_out.is_empty(), "{:?}", saved.left_out);
     let dir = saved.info.dir.clone();
@@ -243,7 +243,7 @@ fn a_real_recording_goes_through_save_convert_list_expand_update_and_remove() {
     // 5. An Update saves over the open project: only the project file changes.
     let before = files(&dir);
     std::thread::sleep(Duration::from_millis(5));
-    let update = Snapshot { rec: &loaded.rec, title: "A real recording, updated", tour_title: "End to end", steps: 1, edit: &loaded.restored.edit, events: &loaded.restored.events, items: &loaded.restored.items };
+    let update = Snapshot { profile: "", rec: &loaded.rec, title: "A real recording, updated", tour_title: "End to end", steps: 1, edit: &loaded.restored.edit, events: &loaded.restored.events, items: &loaded.restored.items };
     let updated = store.save_while(&key, &update, &|| true).unwrap();
     let after = files(&dir);
     assert_eq!(names(&dir), AS_VIDEO);

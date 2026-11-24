@@ -15,6 +15,7 @@ use eframe::egui::{self, RichText};
 
 use crate::theme::{self, Strong as _};
 use crate::project::{self, Store};
+use crate::profiles::{self, Book, Pin};
 use crate::publish::access::{Access, Granted};
 use crate::publish::{self, Finished, Images, Outcome, RemoteTour, Target};
 use crate::share_ui::{self, who};
@@ -74,9 +75,31 @@ struct Config {
     /// A fingerprint of the saved token ([`publish::token_fingerprint`]), never the token: tells
     /// whether it is the one a site refused.
     fingerprint: Option<String>,
+    /// The profiles and the active one: `server`, `saved_for` and the token follow the active one.
+    book: Book,
+    /// The profiles changed and the settings file does not hold it yet.
+    book_change: bool,
+    /// A page or a dialog asked for the add form or the list of profiles on the Workspace page.
+    profiles_request: Option<ProfilesRequest>,
+    /// The name the update that adds profiles gave the existing connection, said this run.
+    migrated: Option<String>,
 }
 
-static CONFIG: Mutex<Config> = Mutex::new(Config { server: String::new(), test_server: None, token: TokenStatus::Checking, generation: 0, saved_for: None, saved_for_change: None, keep_recordings: true, warn_gb: 0, fingerprint: None });
+static CONFIG: Mutex<Config> = Mutex::new(Config {
+    server: String::new(),
+    test_server: None,
+    token: TokenStatus::Checking,
+    generation: 0,
+    saved_for: None,
+    saved_for_change: None,
+    keep_recordings: true,
+    warn_gb: 0,
+    fingerprint: None,
+    book: Book { list: Vec::new(), active: None },
+    book_change: false,
+    profiles_request: None,
+    migrated: None,
+});
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -91,12 +114,19 @@ pub fn init(settings: &crate::settings::Settings) {
     if let Ok(server) = std::env::var("MYTHICSHOT_TEST_PUBLISH") {
         config().test_server = Some(server);
     }
-    set_server(&settings.publish_server);
-    config().saved_for = settings.publish_saved_for.as_deref().and_then(|a| publish::check_server(a).ok());
+    {
+        let mut c = config();
+        c.book = Book::of(settings);
+        follow_active(&mut c);
+    }
     set_keep_recordings(settings.keep_published_recordings);
     set_warn_gb(settings.saved_recordings_warn_gb);
     project::set_enabled(settings.store_recordings_as_video);
-    std::thread::spawn(refresh_token_now);
+    // The active profile is checked once at start, like after every switch.
+    std::thread::spawn(|| {
+        refresh_token_now();
+        check_active_profile();
+    });
     std::thread::spawn(|| {
         let temp = std::env::temp_dir();
         sweep_stale(&temp, STALE_AFTER);
@@ -160,8 +190,11 @@ pub fn warn_gb() -> u32 {
     config().warn_gb
 }
 
-pub fn set_server(server: &str) {
-    config().server = server.to_string();
+/// The address and the token's site follow the active profile; none without one.
+fn follow_active(c: &mut Config) {
+    let server = c.book.active().map(|p| p.server.clone());
+    c.server = server.clone().unwrap_or_default();
+    c.saved_for = server.and_then(|s| publish::check_server(&s).ok());
 }
 
 /// The server publishes go to: the test hook's when set, else the saved one.
@@ -188,20 +221,27 @@ pub fn token_epoch() -> u64 {
 
 /// Look the token up on this thread; never call it on the UI thread.
 pub fn refresh_token_now() {
-    let generation = {
-        let mut c = config();
-        c.generation += 1;
-        c.token = TokenStatus::Checking;
-        c.generation
-    };
-    let (status, fingerprint) = match publish::load_token() {
-        Ok(Some(mut token)) => {
+    let (generation, key) = begin_refresh(&mut config());
+    finish_refresh(generation, key);
+}
+
+/// A new lookup of the active profile's token: the windows show "Checking" from now on, and
+/// what was read from the site with the earlier number is read again.
+fn begin_refresh(c: &mut Config) -> (u64, Option<String>) {
+    c.generation += 1;
+    c.token = TokenStatus::Checking;
+    (c.generation, c.book.active().map(|p| publish::profile_key(&p.id)))
+}
+
+fn finish_refresh(generation: u64, key: Option<String>) {
+    let (status, fingerprint) = match key.map(|k| publish::load_token_at(&publish::OsKeys, &k)) {
+        Some(Ok(Some(mut token))) => {
             let fingerprint = publish::token_fingerprint(&token);
             wipe(&mut token);
             (TokenStatus::Saved, Some(fingerprint))
         }
-        Ok(None) => (TokenStatus::Missing, None),
-        Err(e) => (TokenStatus::Unavailable(e), None),
+        None | Some(Ok(None)) => (TokenStatus::Missing, None),
+        Some(Err(e)) => (TokenStatus::Unavailable(e), None),
     };
     let mut c = config();
     if c.generation == generation {
@@ -210,21 +250,38 @@ pub fn refresh_token_now() {
     }
 }
 
-/// Whether the site refused the saved token (401) the last time it was sent: it was revoked
-/// or disconnected on the site. Such a token is saved but does not connect; the windows say
-/// so and point to the Workspace page. Cleared when the site accepts it again, or when
-/// another token is saved.
+/// Whether the active profile cannot be used until it is signed in again: the site refused its
+/// token (401), now or before. Such a token is saved but does not connect; the windows say so.
+/// It stays so until a new sign-in for the same account passes the check, also when the site
+/// would take the old token again. A site that is merely unreachable changes nothing.
 pub fn token_refused() -> bool {
-    let fingerprint = config().fingerprint.clone();
-    fingerprint.is_some_and(|f| publish::is_refused(&f))
+    sync_profile_state();
+    let c = config();
+    c.book.active().is_some_and(|p| p.state == profiles::State::SignInAgain) || c.fingerprint.as_ref().is_some_and(|f| publish::is_refused(f))
+}
+
+/// A refusal of the active profile's token that the profile does not show yet makes it need a
+/// new sign-in, and the settings file is told.
+pub fn sync_profile_state() {
+    let mut c = config();
+    let refused = c.fingerprint.as_ref().is_some_and(|f| publish::is_refused(f));
+    if let Some(id) = c.book.active.clone()
+        && refused
+        && profiles::mark_refused(&mut c.book, &id)
+    {
+        c.book_change = true;
+    }
 }
 
 /// What the windows add to [`publish::REJECTED_TOKEN`] for a token the site no longer takes.
 pub const SIGN_IN_AGAIN: &str = "Sign in again on the Workspace page of the main window.";
 
-/// The whole sentence for a token the site refused: the existing one, and where to fix it.
+/// The whole sentence for a token the site refused: with a profile, that it needs a new sign-in.
 pub fn refused_reason() -> String {
-    format!("{} {SIGN_IN_AGAIN}", publish::REJECTED_TOKEN)
+    match config().book.active() {
+        Some(p) => profiles::needs_sign_in(&p.name),
+        None => format!("{} {SIGN_IN_AGAIN}", publish::REJECTED_TOKEN),
+    }
 }
 
 // ---- The token belongs to one site ----
@@ -286,12 +343,10 @@ pub fn token_site() -> Option<String> {
     }
 }
 
-/// Tie the saved token to `site` (None: to no address). Called when a token is saved or
-/// forgotten, and for "Use it for this address instead". The app writes it to the settings.
+/// What the Workspace page calls when a token is saved or forgotten. With profiles a token
+/// belongs to its profile's address and to nothing else, so nothing is tied here.
 pub fn bind_token(site: Option<String>) {
-    let mut c = config();
-    c.saved_for = site.clone();
-    c.saved_for_change = Some(site.unwrap_or_default());
+    let _ = site;
 }
 
 /// A new binding the settings file does not hold yet, once.
@@ -303,23 +358,179 @@ pub fn has_token_site_change() -> bool {
     config().saved_for_change.is_some()
 }
 
-/// The saved token for a job that is about to send it to `server`, and to nowhere else: a
-/// token saved for another address is refused here, whatever the caller checked.
+/// The active profile's token for a job that is about to send it to `server`, and to nowhere
+/// else: refused for any other address than the profile's, whatever the caller checked. A job
+/// that runs a while takes a [`pin`] when it starts and uses [`token_for_pin`], so a switch of
+/// profile meanwhile changes nothing for it.
 pub fn token_for(server: &str) -> Result<String, String> {
-    if let Some(problem) = binding_problem(token_site().as_deref(), server) {
-        return Err(format!("{problem} {FIX_ON_WORKSPACE}"));
-    }
-    token_for_job()
+    token_for_pin(&pin_for(server))
 }
 
-/// The saved token, for a background job that is about to use it. A missing token and
-/// an unusable store are both errors, each with its own message.
-fn token_for_job() -> Result<String, String> {
-    match publish::load_token() {
-        Ok(Some(t)) => Ok(t),
-        Ok(None) => Err(ADD_SERVER_AND_TOKEN.to_string()),
-        Err(e) => Err(e),
+/// The active profile, for a job starting now that sends to `server`.
+pub fn pin_for(server: &str) -> Pin {
+    Pin { server: server.to_string(), ..pin() }
+}
+
+/// The profile a job starting now uses, and the address it sends to.
+pub fn pin() -> Pin {
+    let c = config();
+    Pin { profile: c.book.active().map(|p| p.id.clone()), server: c.test_server.clone().unwrap_or_else(|| c.server.clone()) }
+}
+
+/// The token of the profile `pin` names, for `pin.server` only; see [`profiles::token_for`].
+/// In a debug build run with the test hook, the hook's address takes the place of the profile's.
+pub fn token_for_pin(pin: &Pin) -> Result<String, String> {
+    let (book, test) = {
+        let c = config();
+        (c.book.clone(), c.test_server.clone())
+    };
+    if let Some(test) = test {
+        if let Some(problem) = binding_problem(publish::check_server(&test).ok().as_deref(), &pin.server) {
+            return Err(format!("{problem} {FIX_ON_WORKSPACE}"));
+        }
+        let Some(id) = pin.profile.as_deref() else { return Err(ADD_SERVER_AND_TOKEN.to_string()) };
+        return publish::load_token_at(&publish::OsKeys, &publish::profile_key(id))?.ok_or_else(|| ADD_SERVER_AND_TOKEN.to_string());
     }
+    profiles::token_for(&book, &publish::OsKeys, pin)
+}
+
+// ---- Profiles ----
+
+/// What a page or a dialog asks of the Workspace page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilesRequest {
+    Add,
+    Manage,
+}
+
+/// The profiles and the active one, as they are now.
+pub fn book() -> Book {
+    config().book.clone()
+}
+
+/// Make `id` the active profile: the address, the token, the Tours page and every dialog that
+/// has not started a job follow it; a running job keeps the profile it started with. The token
+/// is looked up again and the site asked once, off this thread. False for no such profile.
+pub fn switch_profile(id: &str) -> bool {
+    let (generation, key) = {
+        let mut c = config();
+        if !c.book.switch(id) {
+            return false;
+        }
+        follow_active(&mut c);
+        c.book_change = true;
+        begin_refresh(&mut c)
+    };
+    std::thread::spawn(move || {
+        finish_refresh(generation, key);
+        check_active_profile();
+    });
+    true
+}
+
+/// Change the profiles with `change` on the thread that calls (it may use the credential store:
+/// never the UI thread), then follow the active one and look its token up again.
+pub fn change_profiles<T>(change: impl FnOnce(&mut Book, &dyn publish::KeyStore) -> T) -> T {
+    let (out, generation, key) = {
+        let mut c = config();
+        let before = c.book.clone();
+        let out = change(&mut c.book, &publish::OsKeys);
+        if c.book != before {
+            c.book_change = true;
+        }
+        follow_active(&mut c);
+        let (generation, key) = begin_refresh(&mut c);
+        (out, generation, key)
+    };
+    finish_refresh(generation, key);
+    out
+}
+
+/// Ask the site once who the active profile's token belongs to, on this thread: its workspace
+/// becomes the profile's label, and a refusal (401) makes it need a new sign-in.
+pub fn check_active_profile() {
+    let pin = pin();
+    let Some(id) = pin.profile.clone() else { return };
+    if let Ok(mut token) = token_for_pin(&pin) {
+        let answer = publish::workspace(&pin.server, &token);
+        wipe(&mut token);
+        match answer {
+            Ok(ws) => note_workspace(&id, &ws.name),
+            Err(e) if e == publish::REJECTED_TOKEN => sync_profile_state(),
+            Err(_) => {}
+        }
+    }
+}
+
+/// The site answered for profile `id` and named its workspace.
+pub fn note_workspace(id: &str, workspace: &str) {
+    let mut c = config();
+    if profiles::note_workspace(&mut c.book, id, workspace) {
+        c.book_change = true;
+    }
+}
+
+/// The site at `server` answered for the active profile's token and named its workspace.
+pub fn note_workspace_at(server: &str, workspace: &str) {
+    let id = {
+        let c = config();
+        c.book.active().filter(|p| publish::check_server(&p.server).ok() == publish::check_server(server).ok()).map(|p| p.id.clone())
+    };
+    if let Some(id) = id {
+        note_workspace(&id, workspace);
+    }
+}
+
+/// The profiles as the settings file should now hold them, once after each change.
+pub fn take_book_change() -> Option<Book> {
+    let mut c = config();
+    std::mem::take(&mut c.book_change).then(|| c.book.clone())
+}
+
+pub fn has_book_change() -> bool {
+    config().book_change
+}
+
+/// Ask for the add form or the list of profiles on the Workspace page.
+pub fn request_profiles(request: ProfilesRequest) {
+    config().profiles_request = Some(request);
+}
+
+pub fn take_profiles_request() -> Option<ProfilesRequest> {
+    config().profiles_request.take()
+}
+
+pub fn has_profiles_request() -> bool {
+    config().profiles_request.is_some()
+}
+
+/// The update that adds profiles made the existing connection the profile with this name.
+pub fn set_migrated(name: Option<String>) {
+    config().migrated = name;
+}
+
+/// What the pages say this run about that, with the profile's name as it is now; None when it
+/// made none, or the profile is gone.
+pub fn migrated_notice() -> Option<String> {
+    let c = config();
+    c.migrated.as_ref()?;
+    c.book.get(profiles::MIGRATED_ID).map(|p| profiles::migrated(&p.name))
+}
+
+/// Sign out of the active profile: its token is removed from this computer and it waits for a
+/// new sign-in. On the thread that calls: never the UI thread.
+pub fn forget_active_token() -> Result<(), String> {
+    change_profiles(|book, store| match book.active.clone() {
+        Some(id) => profiles::sign_out(book, store, &id),
+        None => Ok(()),
+    })
+}
+
+/// A token is never stored for a profile without its check (the add form on the Workspace
+/// page does that): what the Workspace page's own Save would do is refused.
+pub fn store_without_check(token: &str) -> Result<(), String> {
+    let _ = token;
+    Err(ADD_SERVER_AND_TOKEN.to_string())
 }
 
 /// Overwrite a string's bytes, then empty it, so a token typed into a field does not
@@ -1686,7 +1897,12 @@ impl Picker {
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading("Publish tour");
+            ui.horizontal(|ui| {
+                ui.heading("Publish tour");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::profiles_ui::dropdown(ui, "publish-picker", true);
+                });
+            });
             ui.add_space(4.0);
             let hint = |ui: &mut egui::Ui, text: &str| {
                 ui.horizontal(|ui| {
@@ -2061,7 +2277,12 @@ impl Picker {
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
         share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading("Publish tour");
+            ui.horizontal(|ui| {
+                ui.heading("Publish tour");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::profiles_ui::dropdown(ui, "publish-picker", true);
+                });
+            });
             ui.add_space(4.0);
             let into = self.goes();
             let restricted = self.who_shown(&Shown::OnlyNew(None)) == WhoShown::Choice && self.who.chosen() != who::Choice::Anyone;

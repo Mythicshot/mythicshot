@@ -744,7 +744,7 @@ mod tests {
 
         fn save_recording(&self, chapter: &str, rec: &Recording) -> ProjectInfo {
             let edit = Edit::new(rec, Default::default());
-            let saved = self.store.save(&key(chapter), &Snapshot { rec, title: "Chapter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
+            let saved = self.store.save(&key(chapter), &Snapshot { profile: "", rec, title: "Chapter", tour_title: "Customer onboarding", steps: 1, edit: &edit, events: &[], items: &[] }).unwrap();
             // The time of saving is in milliseconds: the next save is a later one.
             std::thread::sleep(Duration::from_millis(3));
             saved.info

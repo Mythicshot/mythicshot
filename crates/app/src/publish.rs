@@ -543,14 +543,17 @@ pub fn full_workspace(error: &str) -> Option<&str> {
 
 /// The stored token: `Ok(None)` when none is stored, `Err` when the credential store
 /// cannot be used (locked, unavailable), so the UI can say so instead of asking for a new token.
+#[cfg(test)]
 pub fn load_token() -> Result<Option<String>, String> {
     load_token_from(&OsStore)
 }
 
+#[cfg(test)]
 pub fn store_token(token: &str) -> Result<(), String> {
     store_token_in(&OsStore, token)
 }
 
+#[cfg(test)]
 pub fn forget_token() -> Result<(), String> {
     forget_token_in(&OsStore)
 }
@@ -589,11 +592,102 @@ impl fmt::Debug for Token {
 trait SecretStore {
     fn get(&self) -> Result<Option<String>, String>;
     fn set(&self, secret: &str) -> Result<(), String>;
+    #[cfg_attr(not(test), allow(dead_code))]
     fn delete(&self) -> Result<(), String>;
 }
 
+/// The credential store by entry name: one entry per profile ([`profile_key`]), and the one
+/// entry of the versions before profiles ([`LEGACY_KEY`]). The real one is the OS credential
+/// store ([`OsKeys`]); tests use a fake, and a test build never reaches the real one.
+pub trait KeyStore {
+    fn get(&self, key: &str) -> Result<Option<String>, String>;
+    fn set(&self, key: &str, secret: &str) -> Result<(), String>;
+    fn delete(&self, key: &str) -> Result<(), String>;
+}
+
+/// The entry that held the one token before profiles.
+pub const LEGACY_KEY: &str = KEYRING_USER;
+
+/// The entry that holds the token of the profile with this id.
+pub fn profile_key(id: &str) -> String {
+    format!("profile-{id}")
+}
+
+/// The OS credential store, entry by entry.
+pub struct OsKeys;
+
+impl OsKeys {
+    fn entry(key: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(KEYRING_SERVICE, key).map_err(|e| keyring_message(&e))
+    }
+}
+
+impl KeyStore for OsKeys {
+    // A test build never reads or writes the user's credential store: it holds no token there.
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: read") {
+            let _ = key;
+            return Ok(None);
+        }
+        match Self::entry(key)?.get_password() {
+            Ok(s) => Ok(Some(s)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(keyring_message(&e)),
+        }
+    }
+    fn set(&self, key: &str, secret: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: write") {
+            let _ = (key, secret);
+            return Ok(());
+        }
+        Self::entry(key)?.set_password(secret).map_err(|e| keyring_message(&e))
+    }
+    fn delete(&self, key: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if mythicshot_destinations::stubs::stubbed("credential store: delete") {
+            let _ = key;
+            return Ok(());
+        }
+        match Self::entry(key)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(keyring_message(&e)),
+        }
+    }
+}
+
+/// The token in entry `key`, read as [`load_token`] reads the one entry.
+pub fn load_token_at(store: &dyn KeyStore, key: &str) -> Result<Option<String>, String> {
+    load_token_from(&Keyed(store, key))
+}
+
+/// Store `token` in entry `key`; only a token as [`Token::parse`] takes it is stored.
+pub fn store_token_at(store: &dyn KeyStore, key: &str, token: &str) -> Result<(), String> {
+    store_token_in(&Keyed(store, key), token)
+}
+
+/// One entry of a [`KeyStore`], as a [`SecretStore`].
+struct Keyed<'a>(&'a dyn KeyStore, &'a str);
+
+impl SecretStore for Keyed<'_> {
+    fn get(&self) -> Result<Option<String>, String> {
+        self.0.get(self.1)
+    }
+    fn set(&self, secret: &str) -> Result<(), String> {
+        self.0.set(self.1, secret)
+    }
+    fn delete(&self) -> Result<(), String> {
+        self.0.delete(self.1)
+    }
+}
+
+/// The one entry of the versions before profiles: only the tests still reach it this way (the
+/// migration reads it through [`OsKeys`]).
+#[cfg(test)]
 struct OsStore;
 
+#[cfg(test)]
 impl OsStore {
     fn entry() -> Result<keyring::Entry, String> {
         keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| keyring_message(&e))
@@ -615,6 +709,7 @@ fn keyring_message(e: &keyring::Error) -> String {
     format!("Could not use the credential store: {what}.")
 }
 
+#[cfg(test)]
 impl SecretStore for OsStore {
     // A test build never reads or writes the user's credential store: it holds no token there.
     fn get(&self) -> Result<Option<String>, String> {
@@ -667,6 +762,7 @@ fn store_token_in(store: &dyn SecretStore, token: &str) -> Result<(), String> {
     store.set(&token.0)
 }
 
+#[cfg(test)]
 fn forget_token_in(store: &dyn SecretStore) -> Result<(), String> {
     store.delete()
 }

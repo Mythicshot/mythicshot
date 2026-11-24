@@ -61,6 +61,12 @@ const WHAT: &str = "Could not sign in";
 pub struct Secret(String);
 
 impl Secret {
+    /// A secret made from a token a test holds.
+    #[cfg(test)]
+    pub fn new(text: String) -> Secret {
+        Secret(text)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }

@@ -190,6 +190,8 @@ pub struct Shared {
     pub tours: ToursState,
     /// The Workspace page: the token field and what the site said about itself.
     pub workspace: WorkspaceState,
+    /// The Workspace page's profiles: the dropdown, the add form and the list.
+    pub profiles: crate::profiles_ui::Panel,
     /// A capture a Home tile asked for; the app hides the window, then runs it.
     pub capture: Option<Command>,
     /// A saved recording the Tours page asked to edit; the app opens it in an editor.
@@ -204,7 +206,7 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -394,7 +396,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -455,9 +457,15 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: 
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
         Page::Tours => tours_ui::ui(ui, &mut s.tours, tours_conn, out),
         Page::Workspace => {
-            // The site address is a setting like any other: the app saves it on its next frame.
-            if workspace_ui::ui(ui, &mut s.workspace, &mut s.prefs.settings.publish_server, &workspace_ui::Conn::current()) {
-                s.prefs.actions.push(UiAction::SettingsChanged);
+            // The profiles first: the dropdown, the notices, the add form or the list. The rows
+            // below are the active profile's, at its own address.
+            let request = publish_ui::take_profiles_request();
+            if s.profiles.ui(ui, request) == crate::profiles_ui::Below::Details
+                && let Some(active) = publish_ui::book().active().cloned()
+            {
+                s.workspace.profile_mode = true;
+                let mut address = active.server;
+                workspace_ui::ui(ui, &mut s.workspace, &mut address, &workspace_ui::Conn::current());
             }
         }
         Page::Preferences => {
@@ -1118,10 +1126,10 @@ pub(crate) mod tests {
         let tours = drawn(&ctx, &mut s);
         assert!(tours.lines().any(|l| l == tours_ui::RECORD_A_TOUR) && !tours.contains("Recent"), "{tours}");
         assert!(tours.contains(tours_ui::NOT_CONNECTED) || tours.contains(tours_ui::CHECKING), "{tours}");
-        // Workspace, with nothing set up: the rows are there and no site is asked.
+        // Workspace, with no profile: the add form, with "Save profile" not usable yet, and no site is asked.
         s.nav.go(Page::Workspace);
         let workspace = drawn(&ctx, &mut s);
-        for word in ["Site", "Status", "Token", "Test connection", "Open site"] {
+        for word in ["Workspace", crate::profiles::SITE_ADDRESS, crate::profiles::SIGN_IN, crate::profiles::ADDRESS_HINT, crate::profiles::CANCEL, crate::profiles::SAVE_PROFILE] {
             assert!(workspace.lines().any(|l| l == word), "Workspace is missing {word:?} in:\n{workspace}");
         }
         assert!(!workspace.contains("Recent"));

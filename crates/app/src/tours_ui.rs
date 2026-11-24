@@ -1826,6 +1826,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 
     ui.horizontal(|ui| {
         ui.heading("Tours");
+        ui.add_space(8.0);
+        // The profile the list, the storage use and every action here belong to.
+        if crate::profiles_ui::dropdown(ui, "tours", true) {
+            ui.ctx().request_repaint();
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.add(theme::primary_button(RECORD_A_TOUR)).on_hover_text("Go to Home, where a recording starts").clicked() {
                 clicks.push(Click::RecordTour);
@@ -1841,6 +1846,10 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     });
     ui.add_space(10.0);
 
+    if let Some(text) = publish_ui::migrated_notice() {
+        crate::profiles_ui::note(ui, crate::profiles_ui::Tone::Ok, &text);
+        ui.add_space(8.0);
+    }
     if let Some(notice) = m.notice().cloned() {
         notice_ui(ui, &notice, &mut clicks);
     }
@@ -3431,7 +3440,7 @@ pub(crate) mod tests {
 
     /// What the store's list says of a saved chapter of a tour on the test site, with no disk behind it.
     fn info(tour: &str, chapter: &str, title: &str, bytes: u64, problem: Option<Problem>) -> ProjectInfo {
-        ProjectInfo { key: key(&site().server, tour, chapter), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, frames_bytes: bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
+        ProjectInfo { key: key(&site().server, tour, chapter), profile: String::new(), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, frames_bytes: bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
     }
 
     /// A model with a loaded list and these saved recordings.
@@ -3455,7 +3464,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir_in(&recordings).unwrap().keep();
         let rec = mythicshot_recording::Recording::synthetic_in(&dir, 64, 48, &[0, 500, 1000], 1500).unwrap();
         let edit = crate::video::Edit::new(&rec, Default::default());
-        let snap = project::Snapshot { rec: &rec, title, tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &[], items: &[] };
+        let snap = project::Snapshot { profile: "", rec: &rec, title, tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &[], items: &[] };
         store.save(&key(server, tour, chapter), &snap).unwrap().info
     }
 

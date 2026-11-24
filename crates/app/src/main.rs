@@ -26,6 +26,8 @@ mod placement;
 mod password;
 mod platform;
 mod popups;
+mod profiles;
+mod profiles_ui;
 mod project;
 mod publish;
 mod publish_ui;
@@ -255,9 +257,24 @@ impl App {
         let mut settings = Settings::load();
         // Once per install, and on disk before anything else can change the address.
         let mut save_retry = settings::SaveRetry::default();
-        if publish_ui::settle_first_binding(&mut settings) {
+        let settled = publish_ui::settle_first_binding(&mut settings);
+        // The one connection of the versions before profiles becomes the first profile, once.
+        // A store that cannot be used now changes nothing: the next start tries again.
+        let migrated_before = settings.profiles_migrated;
+        let made = profiles::migrate(&mut settings, &publish::OsKeys).unwrap_or_else(|e| {
+            eprintln!("Profiles: the existing connection was not carried over this time: {e}");
+            None
+        });
+        if settled || settings.profiles_migrated != migrated_before {
             save_retry.record(&settings.save(), Instant::now());
         }
+        // The old credential entry goes only once the settings that name its profile are on disk.
+        if !save_retry.pending()
+            && let Err(e) = profiles::remove_legacy(&settings, &publish::OsKeys)
+        {
+            eprintln!("Profiles: the old credential entry stays for now: {e}");
+        }
+        publish_ui::set_migrated(made);
         publish_ui::init(&settings);
         let mut hotkeys = Hotkeys::new();
         hotkeys.take_print_screen = settings.take_print_screen;
@@ -1064,7 +1081,7 @@ impl App {
     /// (the app is closing) does not wait for that.
     fn save_publish_state(&mut self, now_or_never: bool) {
         let unfinished = self.window.lock().is_ok_and(|s| s.tours.unfinished().is_changed());
-        let wanted = unfinished || publish_ui::has_token_site_change() || self.save_retry.pending();
+        let wanted = unfinished || publish_ui::has_token_site_change() || publish_ui::has_book_change() || self.save_retry.pending();
         if wanted && (now_or_never || self.save_retry.allows(Instant::now())) {
             self.save_settings();
         }
@@ -1076,6 +1093,9 @@ impl App {
     fn save_settings(&mut self) {
         if let Some(site) = publish_ui::take_token_site_change() {
             self.settings.publish_saved_for = Some(site);
+        }
+        if let Some(book) = publish_ui::take_book_change() {
+            book.write_to(&mut self.settings);
         }
         let unfinished = self.window.lock().map(|s| s.tours.unfinished()).ok();
         let mut result = Ok(());
@@ -1098,7 +1118,6 @@ impl App {
 
     fn settings_changed(&mut self) {
         self.save_settings();
-        publish_ui::set_server(&self.settings.publish_server);
         publish_ui::set_keep_recordings(self.settings.keep_published_recordings);
         publish_ui::set_warn_gb(self.settings.saved_recordings_warn_gb);
         project::set_enabled(self.settings.store_recordings_as_video);
@@ -1245,6 +1264,13 @@ impl App {
     /// hidden, and keep it drawn while it is open.
     fn main_window(&mut self, ctx: &egui::Context) {
         self.save_publish_state(false);
+        // "+ Add profile…" or "Manage profiles…" in a dialog: the Workspace page takes it.
+        if publish_ui::has_profiles_request()
+            && self.window.lock().is_ok_and(|s| !s.nav.is_open() || s.nav.page() != main_window::Page::Workspace)
+            && tray::allowed(Command::OpenApp, self.activity())
+        {
+            self.window_request = Some(main_window::Request::Page(main_window::Page::Workspace));
+        }
         if self.save_retry.pending() {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }

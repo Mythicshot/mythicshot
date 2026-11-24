@@ -269,7 +269,9 @@ pub struct Vault {
 
 impl Default for Vault {
     fn default() -> Self {
-        Vault { store: Arc::new(publish::store_token), forget: Arc::new(publish::forget_token), refresh: Arc::new(publish_ui::refresh_token_now) }
+        // A token is stored for a profile only through its check (the add form); Sign out signs
+        // out of the active profile, which then waits for a new sign-in.
+        Vault { store: Arc::new(publish_ui::store_without_check), forget: Arc::new(publish_ui::forget_active_token), refresh: Arc::new(publish_ui::refresh_token_now) }
     }
 }
 
@@ -335,6 +337,9 @@ pub struct WorkspaceState {
     vault: Vault,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// The page shows the active profile: its address cannot be edited here, and signing in
+    /// (again) and the profile's token are the profiles panel's above (see `profiles_ui`).
+    pub profile_mode: bool,
 }
 
 impl Default for WorkspaceState {
@@ -355,6 +360,7 @@ impl Default for WorkspaceState {
             vault: Vault::default(),
             open: Arc::new(sign_in_ui::open_in_browser),
             clock: Arc::new(connect::RealClock::new()),
+            profile_mode: false,
         }
     }
 }
@@ -376,6 +382,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// leaves the count unknown; the connection itself still stands.
 fn ask(server: &str, token: &str) -> Result<Info, String> {
     let ws = publish::workspace(server, token)?;
+    publish_ui::note_workspace_at(server, &ws.name);
     let tours = publish::list_tours(server, token).ok().map(|t| Counts::of(&t));
     Ok(Info { workspace: ws.name, version: ws.version, tours })
 }
@@ -536,7 +543,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     let refused = conn.refused || lock(&p.check).rejected(site.as_ref());
     let info = info.filter(|_| !refused);
     let connected = info.is_some();
-    let rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    let mut rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    if p.profile_mode {
+        // A profile is signed in (again) only through its check, in the panel above.
+        rows.sign_in = false;
+    }
     // "Signed in as" belongs to the token the sign-in saved, and goes when it changes.
     if conn.token != TokenStatus::Checking
         && let Some((_, epoch)) = p.account.as_mut()
@@ -551,8 +562,10 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
-    ui.heading("Workspace");
-    ui.add_space(12.0);
+    if !p.profile_mode {
+        ui.heading("Workspace");
+        ui.add_space(12.0);
+    }
 
     let row = |ui: &mut egui::Ui, name: &str| {
         ui.label(RichText::new(name).color(theme::MUTED));
@@ -568,6 +581,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                     let mut shown = t.clone();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
                     ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(theme::MUTED).size(12.0));
+                }
+                None if p.profile_mode => {
+                    // The address is the profile's own.
+                    let mut shown = server.clone();
+                    ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
                 }
                 None => {
                     if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(340.0)).changed() {
@@ -630,7 +648,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             ui.end_row();
         }
 
-        if rows.sign_in || conn.token == TokenStatus::Checking {
+        if (rows.sign_in || conn.token == TokenStatus::Checking) && !p.profile_mode {
             row(ui, "Token");
             ui.vertical(|ui| token_ui(ui, p, conn, &effective, busy));
             ui.end_row();
@@ -648,7 +666,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     });
 
     // The token was saved for another address: say so, and send nothing until the user decides.
-    if let Some(problem) = &problem {
+    if let Some(problem) = problem.as_ref().filter(|_| !p.profile_mode) {
         ui.add_space(10.0);
         theme::caution_line(ui, problem.as_str(), theme::BODY_SIZE, theme::Fit::Wrap);
         ui.horizontal(|ui| {
@@ -697,7 +715,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     if rows.sign_in && conn.token != TokenStatus::Checking {
         ui.add(egui::Label::new(RichText::new(SIGN_IN_HINT).color(theme::MUTED).size(12.0)).wrap());
     }
-    if conn.token == TokenStatus::Saved || p.pasting {
+    if conn.token == TokenStatus::Saved || (p.pasting && !p.profile_mode) {
         ui.label(RichText::new(TOKEN_NOTE).color(theme::MUTED).size(12.0));
     }
 
