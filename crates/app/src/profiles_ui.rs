@@ -273,6 +273,11 @@ impl OwnerPrompt {
 
 // ---- Adding a profile, and signing one in again ----
 
+/// The paste field's hint and its button: the app's existing wording for a pasted token and for
+/// checking a site.
+const PASTE_HINT: &str = "Paste the token from the site's setup page";
+const CHECK_PASTE: &str = "Test connection";
+
 /// What a sign-in is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purpose {
@@ -296,12 +301,13 @@ pub enum Step {
 /// What Sign in does on its own thread for the add form: ask the site at `server` for a code,
 /// show it, wait for it, then check the new token with the site. Only a sign-in that passed the
 /// check is handed over, through `slot`, and only as long as nobody cancelled; nothing is ever
-/// stored here. Every failure is the same sentence ([`profiles::NOT_SAVED`]).
+/// stored here. A failure says "This profile was not saved." and then the app's existing
+/// sentence for it ([`profiles::not_saved`]).
 pub fn add_work(server: String, slot: Arc<Mutex<Option<Candidate>>>, clock: Arc<dyn Clock + Send + Sync>) -> impl FnOnce(&Reporter) -> Result<Option<String>, ConnectError> + Send + 'static {
     move |r| {
-        let not_saved = |e: ConnectError| match e {
-            ConnectError::Cancelled => ConnectError::Cancelled,
-            _ => ConnectError::Failed(profiles::NOT_SAVED.to_string()),
+        let not_saved = |e: ConnectError| match e.text() {
+            None => ConnectError::Cancelled,
+            Some((_, why)) => ConnectError::Failed(profiles::not_saved(&why)),
         };
         let started = connect::start(&server, &connect::device_name()).map_err(not_saved)?;
         r.code(Code::of(&started));
@@ -310,7 +316,8 @@ pub fn add_work(server: String, slot: Arc<Mutex<Option<Candidate>>>, clock: Arc<
             return Err(ConnectError::Cancelled);
         }
         let account = connected.account.clone();
-        let candidate = profiles::checked(&started.server, connected.account, connected.token).map_err(ConnectError::Failed)?;
+        let signed_in = profiles::SignedIn { name: connected.account.clone(), id: connected.account_id.clone() };
+        let candidate = profiles::checked(&started.server, signed_in, connected.token).map_err(ConnectError::Failed)?;
         // A cancel while the site was asked: the token goes with the candidate, unstored.
         if r.cancelled() {
             return Err(ConnectError::Cancelled);
@@ -332,16 +339,29 @@ pub struct AddFlow {
     /// A save or renewal running on its thread, and its end.
     working: bool,
     done: Arc<Mutex<Option<Done>>>,
-    /// Why the last save could not be made.
+    /// Why the last save, or the last pasted token, could not be taken.
     pub error: Option<String>,
+    /// "Paste a token instead" was clicked: the paste field shows (for a site without Sign in).
+    pasting: bool,
+    /// The pasted token; only ever a masked field, wiped when it is checked or the form goes.
+    paste: String,
+    /// The check of a pasted token, running on its thread, and its end.
+    pasted: Arc<Mutex<Option<Result<Candidate, String>>>>,
+    checking_paste: bool,
     shelf: Arc<dyn Shelf>,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
 }
 
+impl Drop for AddFlow {
+    fn drop(&mut self) {
+        publish_ui::wipe(&mut self.paste);
+    }
+}
+
 impl AddFlow {
     pub fn new(purpose: Purpose, address: String, shelf: Arc<dyn Shelf>, open: Opener, clock: Arc<dyn Clock + Send + Sync>) -> AddFlow {
-        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, shelf, open, clock }
+        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, shelf, open, clock }
     }
 
     /// The form for the app's own profiles, the real browser and the real clock.
@@ -479,8 +499,61 @@ impl AddFlow {
         }
     }
 
-    /// Cancel: whatever was signed in goes, unstored.
+    /// Whether Cancel can be pressed: not while a save or renewal runs (it would not stop it).
+    #[cfg(test)]
+    pub fn can_cancel(&self) -> bool {
+        !self.working
+    }
+
+    /// "Paste a token instead": the field for a token from the site's setup page.
+    pub fn begin_paste(&mut self) {
+        self.pasting = true;
+    }
+
+    #[cfg(test)]
+    pub fn type_paste_for_test(&mut self, token: &str) {
+        self.paste = token.to_string();
+    }
+
+    /// Whether the pasted token can be checked: an address the address rule takes, a token, and
+    /// nothing else running.
+    pub fn can_check_paste(&self) -> bool {
+        matches!(self.step, Step::Address) && self.pasting && !self.working && !self.checking_paste && self.sign_in.is_none() && !self.paste.trim().is_empty() && publish::check_server(&self.address).is_ok()
+    }
+
+    /// Check the pasted token with the site, as a sign-in is checked, before anything is saved.
+    /// The field is wiped at once; the token goes to the check's thread and nowhere else.
+    pub fn check_paste(&mut self) {
+        if !self.can_check_paste() {
+            return;
+        }
+        let Ok(server) = publish::check_server(&self.address) else { return };
+        self.error = None;
+        self.checking_paste = true;
+        let token = connect::Secret::new(std::mem::take(&mut self.paste));
+        let slot = self.pasted.clone();
+        std::thread::spawn(move || {
+            let result = if publish::is_token(token.expose()) {
+                profiles::checked(&server, profiles::SignedIn::default(), token)
+            } else {
+                Err(profiles::not_saved(publish::NOT_A_TOKEN))
+            };
+            *lock(&slot) = Some(result);
+        });
+    }
+
+    /// Whether a pasted token is being checked.
+    #[cfg(test)]
+    pub fn is_checking_paste(&self) -> bool {
+        self.checking_paste
+    }
+
+    /// Cancel: whatever was signed in goes, unstored. Not while a save or renewal runs.
     pub fn cancel(&mut self) {
+        if self.working {
+            return;
+        }
+        publish_ui::wipe(&mut self.paste);
         self.sign_in = None;
         *lock(&self.slot) = None;
         self.step = Step::Finished;
@@ -492,6 +565,19 @@ impl AddFlow {
     }
 
     fn poll_done(&mut self) {
+        let pasted = lock(&self.pasted).take();
+        if let Some(result) = pasted {
+            self.checking_paste = false;
+            match result {
+                // Cancelled meanwhile: the token goes, unstored.
+                Ok(_) if self.is_finished() => {}
+                Ok(candidate) => {
+                    self.pasting = false;
+                    self.accept(candidate);
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
         let Some(done) = lock(&self.done).take() else { return };
         self.working = false;
         match done {
@@ -526,7 +612,7 @@ impl AddFlow {
         {
             self.on_sign_in(action);
         }
-        if self.working || self.sign_in.is_some() {
+        if self.working || self.checking_paste || self.sign_in.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let mut pressed: Option<&'static str> = None;
@@ -547,13 +633,28 @@ impl AddFlow {
                     theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                 }
                 ui.add(egui::Label::new(RichText::new(profiles::ADDRESS_HINT).color(theme::MUTED).size(12.0)).wrap());
+                // A site without Sign in: a token from its setup page, checked the same way.
+                if self.pasting {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.paste).password(true).hint_text(PASTE_HINT).desired_width(240.0));
+                        let can = matches!(self.step, Step::Address) && !self.working && !self.checking_paste && self.sign_in.is_none() && !self.paste.trim().is_empty() && publish::check_server(&self.address).is_ok();
+                        if ui.add_enabled(can, egui::Button::new(CHECK_PASTE)).clicked() {
+                            pressed = Some(CHECK_PASTE);
+                        }
+                        if self.checking_paste {
+                            ui.add(egui::Spinner::new());
+                        }
+                    });
+                } else if ui.add_enabled(!self.working && self.sign_in.is_none(), egui::Link::new(crate::workspace_ui::PASTE_INSTEAD)).clicked() {
+                    self.begin_paste();
+                }
                 if let Some(e) = &self.error {
                     ui.add_space(6.0);
                     note(ui, Tone::Bad, e);
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(profiles::CANCEL).clicked() {
+                    if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
                         pressed = Some(profiles::CANCEL);
                     }
                     ui.add_enabled(false, theme::primary_button(profiles::SAVE_PROFILE));
@@ -569,7 +670,7 @@ impl AddFlow {
                 ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(300.0));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(profiles::CANCEL).clicked() {
+                    if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
                         pressed = Some(profiles::CANCEL);
                     }
                     if ui.add_enabled(!self.working, theme::primary_button(profiles::SAVE_PROFILE)).clicked() {
@@ -595,6 +696,7 @@ impl AddFlow {
             Some(profiles::SAVE_PROFILE) => self.save(),
             Some(profiles::SWITCH_TO_IT) => self.switch_to_it(),
             Some(profiles::CANCEL) => self.cancel(),
+            Some(CHECK_PASTE) => self.check_paste(),
             _ => {}
         }
     }
@@ -746,6 +848,11 @@ impl Panel {
         }
         if let Some(e) = &self.error {
             note(ui, Tone::Bad, e);
+            ui.add_space(8.0);
+        }
+        // The update that adds profiles could not run at this start: the store's own sentence.
+        if let Some(problem) = publish_ui::migration_problem() {
+            theme::caution_line(ui, problem, theme::BODY_SIZE, theme::Fit::Wrap);
             ui.add_space(8.0);
         }
         self.remove_window(ui.ctx());

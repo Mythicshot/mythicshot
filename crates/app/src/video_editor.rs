@@ -864,12 +864,13 @@ fn logo_missing(origin: &Origin, edit: &Edit) -> bool {
     origin.logo_dropped && edit.tour_doc.logo_path.is_none()
 }
 
-/// Whether the active profile `active` may update `r`'s tour: it belongs to it (or, with no
-/// profile at all, nothing is sent anyway).
+/// Whether the active profile `active` may update `r`'s tour: it belongs to it, or it is a tour
+/// linked before profiles that nobody owns yet (then only at its own address, which the caller
+/// checks; the update's save stamps the profile on it). With no profile at all nothing is sent.
 fn owned_by(r: &Replaceable, active: Option<&str>) -> bool {
     let book = publish_ui::book();
     debug_assert!(active.is_none() || book.active.as_deref() == active || book.active.is_none());
-    matches!(profiles::owner_of(&book, &r.profile), Owner::Active | Owner::NoProfile)
+    matches!(profiles::owner_of(&book, &r.profile), Owner::Active | Owner::Unowned | Owner::NoProfile)
 }
 
 /// Whether the project `key` belongs to the site at `server`: projects are tied to the exact
@@ -4716,7 +4717,7 @@ mod tests {
 
     /// A profile on the test site.
     fn on_site(id: &str, name: &str, server: &str) -> crate::profiles::Profile {
-        crate::profiles::Profile { id: id.into(), name: name.into(), server: server.into(), account: None, workspace: None, state: crate::profiles::State::Ready, named: true }
+        crate::profiles::Profile { id: id.into(), name: name.into(), server: server.into(), account: None, workspace: None, identity: None, state: crate::profiles::State::Ready, named: true }
     }
 
     #[test]
@@ -4727,7 +4728,7 @@ mod tests {
         let mut ed = editor_of(&st);
         let server = "https://tours.example.com";
         // Two profiles on the same site: the address alone does not decide.
-        let book = |active: &str| Book { list: vec![on_site(MIGRATED_ID, "Alex · mythicshot.com", server), on_site("pb", "Sandbox admin", server)], active: Some(active.into()) };
+        let book = |active: &str| Book { list: vec![on_site(MIGRATED_ID, "Alex · mythicshot.com", server), on_site("pb", "Sandbox admin", server)], active: Some(active.into()), legacy: Some(MIGRATED_ID.into()) };
         let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
         let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
         let replace = Dialog::Replace { title: "Typed chapter".into(), target: target.clone(), logo_missing: false };
@@ -4750,6 +4751,25 @@ mod tests {
         // A new recording belongs to nobody yet.
         let fresh = editor_of(&state(&tmp.path().join("fresh")));
         assert_eq!(dialog_in(fresh.video.as_ref().unwrap(), server, TITLE.into(), &book(MIGRATED_ID)), Dialog::New(TITLE.into()));
+    }
+
+    #[test]
+    fn an_update_of_a_recording_nobody_owns_yet_goes_by_its_address_and_stamps_the_profile() {
+        use crate::profiles::Book;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, info, ed) = reopened_and_changed(tmp.path(), &s);
+        assert!(info.profile.is_empty(), "kept before profiles");
+        // No connection was carried over: the recording is nobody's, not a removed profile's.
+        let book = |server: &str| Book { list: vec![on_site("pb", "Sandbox admin", server)], active: Some("pb".into()), legacy: None };
+        let v = ed.video.as_ref().unwrap();
+        assert!(matches!(dialog_in(v, &s.base, TITLE.into(), &book(&s.base)), Dialog::Replace { .. }), "the active profile at its own address may update it");
+        assert!(matches!(dialog_in(v, "https://other.example.com", TITLE.into(), &book("https://other.example.com")), Dialog::Elsewhere { .. }), "at another address only a new tour or chapter");
+        // The update's save stamps the profile it went with.
+        let mut state = state_of(&ed);
+        state.profile = "pb".into();
+        update_to(&s, &state, &store, &Arc::new(Run::default())).unwrap();
+        assert_eq!(store.list().into_iter().find(|i| i.key == key).unwrap().profile, "pb");
     }
 
     #[test]

@@ -141,6 +141,22 @@ impl RemoteTour {
 pub struct Workspace {
     pub name: String,
     pub version: Option<String>,
+    /// The workspace's id, when the site names one (`workspace_id`, or `workspace` as `{id, name}`).
+    pub id: Option<String>,
+    /// The account the token belongs to, by its id, when the site names one (`account_id`, or
+    /// `account` as `{id, …}`).
+    pub account: Option<String>,
+}
+
+/// An id as a site writes it: plain text or a whole number, short and without control characters.
+pub(crate) fn id_text(v: Option<&Value>) -> Option<String> {
+    let text = match v? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) if n.is_u64() || n.is_i64() => n.to_string(),
+        _ => return None,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty() && text.len() <= 100 && !text.chars().any(|c| c.is_control() || is_invisible(c))).then_some(text)
 }
 
 /// How a delete that ended well was answered.
@@ -566,12 +582,15 @@ struct Token(String);
 impl Token {
     fn parse(text: &str) -> Result<Token, String> {
         let t = text.trim();
-        if is_token(t) { Ok(Token(t.to_string())) } else { Err("That is not an API token. A token starts with dp_ and comes from the server's setup page.".into()) }
+        if is_token(t) { Ok(Token(t.to_string())) } else { Err(NOT_A_TOKEN.into()) }
     }
 }
 
+/// What a pasted text that is no token is told: the app's existing sentence.
+pub const NOT_A_TOKEN: &str = "That is not an API token. A token starts with dp_ and comes from the server's setup page.";
+
 /// Whether `text` is an API token as it is: `dp_` and 40 lowercase hex characters, nothing around it.
-fn is_token(text: &str) -> bool {
+pub fn is_token(text: &str) -> bool {
     text.len() == 43 && text.starts_with("dp_") && text[3..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -1004,10 +1023,13 @@ impl Client {
         let what = "Could not check the server";
         let reply = self.exchange(what, Method::Get, "/api/v1/me", None)?;
         let v = reply.json().ok_or_else(|| not_understood(what))?;
-        let name = v.get("workspace").and_then(Value::as_str).ok_or_else(|| not_understood(what))?.to_string();
+        let ws = v.get("workspace");
+        let name = ws.and_then(Value::as_str).or_else(|| ws.and_then(|w| w.get("name")).and_then(Value::as_str)).ok_or_else(|| not_understood(what))?.to_string();
         // A version is shown only when it looks like one; an older site sends none.
         let version = v.get("version").and_then(Value::as_str).filter(|s| is_version(s)).map(str::to_string);
-        Ok(Workspace { name, version })
+        let id = id_text(v.get("workspace_id")).or_else(|| id_text(ws.and_then(|w| w.get("id"))));
+        let account = id_text(v.get("account_id")).or_else(|| id_text(v.get("account").and_then(|a| a.get("id"))));
+        Ok(Workspace { name, version, id, account })
     }
 
     fn list_tours(&self) -> Result<Vec<RemoteTour>, String> {
@@ -4003,11 +4025,11 @@ pub(crate) mod tests {
     #[test]
     fn the_workspace_answer_gives_the_name_and_the_version_when_the_site_tells() {
         let s = stub(|_, _| reply(200, r#"{"workspace":"Acme","version":"0.1.1"}"#));
-        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: Some("0.1.1".into()) });
+        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: Some("0.1.1".into()), id: None, account: None });
         assert_eq!(s.lines(), ["GET /api/v1/me"]);
         // A site of version 0.1.0 does not say.
         let s = stub(platform);
-        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: None });
+        assert_eq!(workspace(&s.base, TOKEN).unwrap(), Workspace { name: "Acme".into(), version: None, id: None, account: None });
         // Something that is not a version is not shown as one.
         for odd in [r#""""#, r#""latest""#, r#""1.0 <b>""#, "7", r#""0.1.1-with-a-very-long-suffix""#, "null"] {
             let s = stub(move |_, _| reply(200, &format!(r#"{{"workspace":"Acme","version":{odd}}}"#)));

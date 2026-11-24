@@ -1,36 +1,41 @@
 //! Profiles: each one a name the user chose, a site address, and its own token in the OS
 //! credential store, in an entry of its own keyed by the profile's id ([`publish::profile_key`]).
 //! The settings file holds the list (id, name, address, the last account and workspace the site
-//! named, and whether the profile needs a new sign-in) and which one is active; never a token.
+//! named, the account's identity on the site, and whether the profile needs a new sign-in) and
+//! which one is active; never a token.
 //!
 //! Everything here works on a [`Book`] and a [`KeyStore`] that are handed in, so every step is
 //! tested with a fake store and no window: the app hands in the settings' list and the OS store.
 //!
 //! The rules this module keeps:
-//! - A profile is saved only after its sign-in passed the check: the site answered for the new
-//!   token with its workspace ([`checked`]). Until then the token is only in memory; a failed or
-//!   cancelled attempt leaves nothing behind, and a save that cannot be confirmed in the store is
-//!   undone ([`save_new`]).
-//! - One profile per site and account: a second sign-in into the same one is offered as
-//!   "Switch to it" ([`find_same`]).
+//! - A profile is saved only after its sign-in (or a pasted token) passed the check: the site
+//!   answered for the new token with its workspace ([`checked`]). Until then the token is only in
+//!   memory; a failed or cancelled attempt leaves nothing behind, and a save that cannot be
+//!   confirmed in the store is undone ([`save_new`]).
+//! - Each profile records who it is on the site ([`Identity`]: the workspace and the account, by
+//!   their ids when the site gives ids) at every check that passes with its own token. One
+//!   profile per site and identity: a second sign-in into the same one is offered as "Switch to
+//!   it" ([`find_same`]). A profile whose identity is not (fully) recorded is never matched that
+//!   way; only its own "Sign in again" renews it, and records the identity.
 //! - A profile whose token the site refused (401) is kept and marked [`State::SignInAgain`]; no
-//!   token of it is handed out until a new sign-in for the same account passed the check
-//!   ([`renew`]). A site that is only unreachable changes nothing.
+//!   token of it is handed out until a new sign-in for the same identity passed the check
+//!   ([`renew`]). A refusal counts only for the profile, and the lookup, its request was made
+//!   with ([`Live`]). A site that is only unreachable changes nothing.
 //! - A token is handed out only for its own profile's address ([`token_for`]).
 //! - The one connection of the versions before profiles becomes the first profile without a new
-//!   sign-in ([`migrate`]); its old credential entry goes only once the new one is confirmed and
-//!   the settings that name the profile were written ([`remove_legacy`]).
+//!   sign-in ([`migrate`]); its old credential entry goes once the settings that say so were
+//!   written ([`remove_legacy`]). Should the first profile turn out to be an account another
+//!   profile already has, it is joined to that one ([`twin_of`], [`attach`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::publish::connect::Secret;
-use crate::publish::{self, KeyStore, LEGACY_KEY, profile_key};
+use crate::publish::{self, KeyStore, LEGACY_KEY, Workspace, profile_key};
 use crate::settings::Settings;
 
-/// The id of the profile the one connection of earlier versions became. Recordings linked to a
-/// tour before profiles existed belong to it.
+/// The id of the profile the one connection of earlier versions became.
 pub const MIGRATED_ID: &str = "first";
 /// The longest profile name, in characters.
 pub const NAME_MAX: usize = 60;
@@ -47,17 +52,27 @@ pub const ADDRESS_HINT: &str = "Mythicshot checks the address first, then opens 
 pub const CANCEL: &str = "Cancel";
 pub const SAVE_PROFILE: &str = "Save profile";
 pub const PROFILE_NAME: &str = "Profile name";
+/// The first sentence of every failed add or sign-in again.
+pub const NOT_SAVED_LEAD: &str = "This profile was not saved.";
+/// What follows it when the site refused the new token.
+pub const NOT_ACCEPTED: &str = "The site did not accept the sign-in.";
 pub const NOT_SAVED: &str = "This profile was not saved. The site did not accept the sign-in.";
 pub const SWITCH_TO_IT: &str = "Switch to it";
 pub const REMOVE_PROFILE: &str = "Remove profile";
 pub const UPLOAD_AS_NEW: &str = "Upload as a new tour";
 pub const REMOVE: &str = "Remove";
 
+/// "This profile was not saved." and why, in the app's existing words for that failure.
+pub fn not_saved(why: &str) -> String {
+    let why = why.trim();
+    if why.is_empty() { NOT_SAVED_LEAD.to_string() } else { format!("{NOT_SAVED_LEAD} {why}") }
+}
+
 /// "Connected. Signed in as customer@mythicshot.test, workspace "customer1"."
 pub fn connected(account: Option<&str>, workspace: &str) -> String {
     match account {
         Some(account) => format!("Connected. Signed in as {account}, workspace \"{workspace}\"."),
-        // Not in the approved wording: an older site names no account.
+        // Not in the approved wording: an older site, or a pasted token, names no account.
         None => format!("Connected. Workspace \"{workspace}\"."),
     }
 }
@@ -107,6 +122,31 @@ pub enum State {
     SignInAgain,
 }
 
+/// Who a profile is on its site: the workspace and the account its token belongs to, each by
+/// the id the site gives (`id:…`), or by its name only when the site gives no id (`name:…`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub workspace: String,
+    /// None while the site has not named the account for this profile's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+impl Identity {
+    /// Both the workspace and the account are known: only then can it match another sign-in.
+    pub fn complete(&self) -> bool {
+        self.account.is_some()
+    }
+}
+
+fn key(id: Option<&str>, name: Option<&str>) -> Option<String> {
+    match (id, name.map(str::trim).filter(|n| !n.is_empty())) {
+        (Some(id), _) => Some(format!("id:{id}")),
+        (None, Some(name)) => Some(format!("name:{name}")),
+        (None, None) => None,
+    }
+}
+
 /// One profile as the settings file holds it. No secret is in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
@@ -115,12 +155,15 @@ pub struct Profile {
     pub name: String,
     /// The site address, as the address rule writes it. Its token is sent nowhere else.
     pub server: String,
-    /// The account the site named at the last sign-in, when it named one.
+    /// The account's name the site gave at the last sign-in, for the windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// The workspace the site named the last time it answered for the token.
+    /// The workspace's name the site gave the last time it answered, for the windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Who it is on the site, recorded at every check that passed with its own token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
     #[serde(default)]
     pub state: State,
     /// The name was chosen (or kept) by the user. Only the migrated profile starts without one:
@@ -140,21 +183,25 @@ impl Profile {
     }
 }
 
-/// The profiles and which one is active.
+/// The profiles, which one is active, and which one the connection of earlier versions became.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Book {
     pub list: Vec<Profile>,
     pub active: Option<String>,
+    /// The profile recordings linked before profiles belong to; None when there was no connection
+    /// to carry over (they then belong to nobody yet).
+    pub legacy: Option<String>,
 }
 
 impl Book {
     pub fn of(settings: &Settings) -> Book {
-        Book { list: settings.profiles.clone(), active: settings.active_profile.clone() }
+        Book { list: settings.profiles.clone(), active: settings.active_profile.clone(), legacy: settings.legacy_profile.clone() }
     }
 
     pub fn write_to(&self, settings: &mut Settings) {
         settings.profiles = self.list.clone();
         settings.active_profile = self.active.clone();
+        settings.legacy_profile = self.legacy.clone();
     }
 
     pub fn get(&self, id: &str) -> Option<&Profile> {
@@ -177,6 +224,13 @@ impl Book {
         }
         self.active = Some(id.to_string());
         true
+    }
+
+    /// The active one after `id` went: one that can be used first, else any, else none.
+    fn pick_active_after(&mut self, id: &str) {
+        if self.active.as_deref() == Some(id) || self.active().is_none() {
+            self.active = self.list.iter().find(|p| p.state == State::Ready).or(self.list.first()).map(|p| p.id.clone());
+        }
     }
 }
 
@@ -213,7 +267,7 @@ pub fn clean_name(name: &str) -> String {
     plain.chars().take(NAME_MAX).collect::<String>().trim_end().to_string()
 }
 
-fn same_site(a: &str, b: &str) -> bool {
+pub fn same_site(a: &str, b: &str) -> bool {
     matches!((publish::check_server(a), publish::check_server(b)), (Ok(a), Ok(b)) if a == b)
 }
 
@@ -223,21 +277,26 @@ fn same_site(a: &str, b: &str) -> bool {
 /// memory until [`save_new`] or [`renew`] stores it, and is wiped when this is dropped.
 pub struct Candidate {
     pub server: String,
+    /// The account's name, for the windows.
     pub account: Option<String>,
+    /// The workspace's name, for the windows.
     pub workspace: String,
+    pub identity: Identity,
     token: Secret,
 }
 
 impl std::fmt::Debug for Candidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Candidate").field("server", &self.server).field("account", &self.account).field("workspace", &self.workspace).finish_non_exhaustive()
+        f.debug_struct("Candidate").field("server", &self.server).field("account", &self.account).field("workspace", &self.workspace).field("identity", &self.identity).finish_non_exhaustive()
     }
 }
 
 impl Candidate {
+    /// A candidate whose identity uses the names (as an older site's would).
     #[cfg(test)]
     pub fn for_test(server: &str, account: Option<&str>, workspace: &str, token: &str) -> Candidate {
-        Candidate { server: server.to_string(), account: account.map(str::to_string), workspace: workspace.to_string(), token: Secret::new(token.to_string()) }
+        let identity = Identity { workspace: key(None, Some(workspace)).unwrap_or_default(), account: key(None, account) };
+        Candidate { server: server.to_string(), account: account.map(str::to_string), workspace: workspace.to_string(), identity, token: Secret::new(token.to_string()) }
     }
 
     /// The name this sign-in is offered under.
@@ -246,42 +305,38 @@ impl Candidate {
     }
 }
 
-/// The check every sign-in passes before anything is saved: the site at `server` is asked with
-/// the new token who it belongs to. Any failure is [`NOT_SAVED`]: nothing was stored, and the
-/// token goes when this returns.
-pub fn checked(server: &str, account: Option<String>, token: Secret) -> Result<Candidate, String> {
-    let server = publish::check_server(server).map_err(|_| NOT_SAVED.to_string())?;
+/// What the site named for the account at sign-in, beside the token: its name and its id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignedIn {
+    pub name: Option<String>,
+    pub id: Option<String>,
+}
+
+/// The check every sign-in and every pasted token passes before anything is saved: the site at
+/// `server` is asked with the new token who it belongs to. Nothing is stored here, and the token
+/// goes when this fails. The error is "This profile was not saved." and why, in the app's
+/// existing words: "The site did not accept the sign-in." only when the site refused the token.
+pub fn checked(server: &str, signed_in: SignedIn, token: Secret) -> Result<Candidate, String> {
+    let server = publish::check_server(server).map_err(|e| not_saved(&e))?;
     match publish::workspace(&server, token.expose()) {
         Ok(ws) => {
             let workspace = publish::share::plain_text(&ws.name);
-            let account = account.map(|a| publish::share::plain_text(&a)).filter(|a| !a.is_empty());
-            Ok(Candidate { server, account, workspace, token })
+            let account = signed_in.name.map(|a| publish::share::plain_text(&a)).filter(|a| !a.is_empty());
+            let identity = Identity {
+                workspace: key(ws.id.as_deref(), Some(&workspace)).unwrap_or_default(),
+                account: key(ws.account.as_deref().or(signed_in.id.as_deref()), account.as_deref()),
+            };
+            Ok(Candidate { server, account, workspace, identity, token })
         }
-        Err(_) => Err(NOT_SAVED.to_string()),
+        Err(e) if e == publish::REJECTED_TOKEN => Err(not_saved(NOT_ACCEPTED)),
+        Err(e) => Err(not_saved(&e)),
     }
 }
 
-/// Whether the sign-in `c` is the account of profile `p`: the same site, the same workspace when
-/// the profile knows it, and the same account when both name one. A profile that knows neither
-/// (the migrated one, before the site ever answered for it) takes the first that passes on its site.
-pub fn same_account(p: &Profile, c: &Candidate) -> bool {
-    if !same_site(&p.server, &c.server) {
-        return false;
-    }
-    if let Some(ws) = &p.workspace
-        && *ws != c.workspace
-    {
-        return false;
-    }
-    match (&p.account, &c.account) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    }
-}
-
-/// The profile this sign-in already has, if any.
+/// The profile this sign-in already has: same site and the same complete identity. A profile
+/// whose identity is not fully recorded is never matched.
 pub fn find_same<'a>(book: &'a Book, c: &Candidate) -> Option<&'a Profile> {
-    book.list.iter().find(|p| same_account(p, c))
+    book.list.iter().find(|p| same_site(&p.server, &c.server) && p.identity.as_ref().is_some_and(|i| i.complete() && *i == c.identity))
 }
 
 /// Store `token` in entry `key` and read it back: an error unless the store holds exactly it.
@@ -324,7 +379,7 @@ pub fn save_new(book: &mut Book, store: &dyn KeyStore, c: Candidate, name: &str)
         n if n.is_empty() => c.default_name(),
         n => n,
     };
-    book.list.push(Profile { id: id.clone(), name, server: c.server.clone(), account: c.account.clone(), workspace: Some(c.workspace.clone()), state: State::Ready, named: true });
+    book.list.push(Profile { id: id.clone(), name, server: c.server.clone(), account: c.account.clone(), workspace: Some(c.workspace.clone()), identity: Some(c.identity.clone()), state: State::Ready, named: true });
     book.active = Some(id.clone());
     Ok(id)
 }
@@ -339,10 +394,25 @@ pub enum Renewal {
     OtherAccount(Candidate),
 }
 
-/// "Sign in again" for profile `id`: only a sign-in for the same account replaces its token.
+/// Whether profile `p`'s own "Sign in again" may take sign-in `c`: same site; with a complete
+/// identity recorded, exactly that identity; with only the workspace recorded, that workspace;
+/// with none recorded, any (the identity is recorded then).
+fn renews(p: &Profile, c: &Candidate) -> bool {
+    if !same_site(&p.server, &c.server) {
+        return false;
+    }
+    match &p.identity {
+        None => true,
+        Some(i) if i.complete() => *i == c.identity,
+        Some(i) => i.workspace == c.identity.workspace,
+    }
+}
+
+/// "Sign in again" for profile `id`, from that profile's own action: only a sign-in for the same
+/// account replaces its token, and the identity is recorded.
 pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> Result<Renewal, String> {
     let Some(p) = book.get(id) else { return Ok(Renewal::OtherAccount(c)) };
-    if !same_account(p, &c) {
+    if !renews(p, &c) {
         return Ok(Renewal::OtherAccount(c));
     }
     write_confirmed(store, &profile_key(id), c.token.expose())?;
@@ -351,23 +421,34 @@ pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> R
         if c.account.is_some() {
             p.account = c.account.clone();
         }
-        note_workspace_in(p, &c.workspace);
+        p.identity = Some(c.identity.clone());
+        name_after(p, &c.workspace);
     }
     Ok(Renewal::Renewed)
 }
 
-/// The site answered for profile `id`'s token and named its workspace: kept as the profile's
-/// label, and a profile not named yet is named after it. True when anything changed.
-pub fn note_workspace(book: &mut Book, id: &str, workspace: &str) -> bool {
-    match book.get_mut(id) {
-        Some(p) => note_workspace_in(p, workspace),
-        None => false,
+/// A check of profile `id` with its own token, at `server`, passed: the site's answer is kept as
+/// its workspace label and its identity, and a profile not named yet is named after the
+/// workspace. An answer for another address than the profile's changes nothing. True when
+/// anything changed.
+pub fn note_check(book: &mut Book, id: &str, server: &str, ws: &Workspace) -> bool {
+    let Some(p) = book.get_mut(id) else { return false };
+    if !same_site(&p.server, server) {
+        return false;
     }
+    let before = p.clone();
+    let name = publish::share::plain_text(&ws.name);
+    if let Some(workspace) = key(ws.id.as_deref(), Some(&name)) {
+        // The account stays as recorded when this answer names none.
+        let account = key(ws.account.as_deref(), None).or_else(|| p.identity.as_ref().filter(|i| i.workspace == workspace).and_then(|i| i.account.clone()));
+        p.identity = Some(Identity { workspace, account });
+    }
+    name_after(p, &name);
+    *p != before
 }
 
-fn note_workspace_in(p: &mut Profile, workspace: &str) -> bool {
+fn name_after(p: &mut Profile, workspace: &str) {
     let ws = publish::share::plain_text(workspace);
-    let before = p.clone();
     if !ws.is_empty() {
         p.workspace = Some(ws.clone());
         if !p.named {
@@ -375,7 +456,6 @@ fn note_workspace_in(p: &mut Profile, workspace: &str) -> bool {
             p.named = true;
         }
     }
-    *p != before
 }
 
 /// The site refused profile `id`'s token (401): it needs a new sign-in. True when that is new.
@@ -401,22 +481,124 @@ pub fn sign_out(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), S
 /// was the active one, another becomes active (one that can be used first), or none.
 pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), String> {
     store.delete(&profile_key(id))?;
-    if id == MIGRATED_ID {
-        // What the migration left of the old entry, if a start was cut off before it went.
+    if book.legacy.as_deref() == Some(id) {
+        // What is left of the old entry, if a start was cut off before it went.
         let _ = store.delete(LEGACY_KEY);
     }
     book.list.retain(|p| p.id != id);
-    if book.active.as_deref() == Some(id) || book.active().is_none() {
-        book.active = book.list.iter().find(|p| p.state == State::Ready).or(book.list.first()).map(|p| p.id.clone());
+    book.pick_active_after(id);
+    Ok(())
+}
+
+/// Another profile on the same site with the same complete identity as profile `id`: the
+/// profile it is a second copy of.
+pub fn twin_of(book: &Book, id: &str) -> Option<String> {
+    let p = book.get(id)?;
+    let i = p.identity.as_ref().filter(|i| i.complete())?;
+    book.list.iter().find(|o| o.id != id && same_site(&o.server, &p.server) && o.identity.as_ref() == Some(i)).map(|o| o.id.clone())
+}
+
+/// Join profile `from` (the migrated one) to `to`, the same account: `from` and its token go,
+/// recordings linked before profiles belong to `to`, and `to` is active where `from` was.
+pub fn attach(book: &mut Book, store: &dyn KeyStore, from: &str, to: &str) -> Result<(), String> {
+    if book.get(to).is_none() || from == to {
+        return Ok(());
+    }
+    store.delete(&profile_key(from))?;
+    let _ = store.delete(LEGACY_KEY);
+    let was_active = book.active.as_deref() == Some(from);
+    book.list.retain(|p| p.id != from);
+    if book.legacy.as_deref() == Some(from) || book.legacy.is_none() {
+        book.legacy = Some(to.to_string());
+    }
+    if was_active {
+        book.active = Some(to.to_string());
     }
     Ok(())
+}
+
+// ---- Which token lookup a refusal belongs to ----
+
+/// The token looked up last: whose, by which lookup, and its fingerprint (never the token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Looked {
+    pub profile: String,
+    pub generation: u64,
+    pub fingerprint: String,
+}
+
+/// The active profile's token as the windows know it: each switch or change of the profiles
+/// starts a new lookup, and what was looked up before it no longer counts. A refusal is only
+/// ever put on the profile, and the lookup, its token was looked up for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Live {
+    pub generation: u64,
+    pub looked: Option<Looked>,
+}
+
+impl Live {
+    /// A new lookup for the active profile of `book`: the earlier one stops counting at once.
+    pub fn begin(&mut self, book: &Book) -> (u64, Option<String>) {
+        self.generation += 1;
+        self.looked = None;
+        (self.generation, book.active().map(|p| p.id.clone()))
+    }
+
+    /// The lookup `generation` for `profile` found a token with this fingerprint. A lookup an
+    /// newer one overtook is dropped; false then.
+    pub fn finish(&mut self, generation: u64, profile: Option<String>, fingerprint: Option<String>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.looked = profile.zip(fingerprint).map(|(profile, fingerprint)| Looked { profile, generation, fingerprint });
+        true
+    }
+
+    /// The site refused the looked-up token: its own profile needs a new sign-in. True when the
+    /// book changed.
+    pub fn attribute(&self, book: &mut Book, refused: &dyn Fn(&str) -> bool) -> bool {
+        match &self.looked {
+            Some(l) if l.generation == self.generation && refused(&l.fingerprint) => mark_refused(book, &l.profile),
+            _ => false,
+        }
+    }
+
+    /// Whether the active profile cannot be used now: it waits for a sign-in, or the site
+    /// refused its own looked-up token.
+    pub fn active_refused(&self, book: &Book, refused: &dyn Fn(&str) -> bool) -> bool {
+        let Some(active) = book.active() else { return false };
+        active.state == State::SignInAgain || self.looked.as_ref().is_some_and(|l| l.profile == active.id && l.generation == self.generation && refused(&l.fingerprint))
+    }
+}
+
+/// The book after a change that ran on a copy, `new`, made from `before`, while `current` may
+/// have been changed meanwhile (a switch, a refusal, a check): what the change did wins where it
+/// changed something, and what happened meanwhile is kept everywhere else.
+pub fn merge(before: &Book, current: &Book, new: &Book) -> Book {
+    let mut out = new.clone();
+    for p in out.list.iter_mut() {
+        let (was, now) = (before.get(&p.id), current.get(&p.id));
+        if let (Some(was), Some(now)) = (was, now)
+            && was == p
+            && now != was
+        {
+            *p = now.clone();
+        }
+    }
+    if new.active == before.active && current.active != before.active && current.active.as_deref().is_some_and(|id| out.get(id).is_some()) {
+        out.active = current.active.clone();
+    }
+    if new.legacy == before.legacy {
+        out.legacy = current.legacy.clone();
+    }
+    out
 }
 
 // ---- Which profile a job uses ----
 
 /// The profile a job was started with, and the address it sends to. A job keeps it to the end,
 /// whatever profile is switched to meanwhile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pin {
     pub profile: Option<String>,
     pub server: String,
@@ -426,17 +608,32 @@ pub struct Pin {
 /// any other address than the profile's own, for a profile that needs a new sign-in, and for one
 /// that is gone.
 pub fn token_for(book: &Book, store: &dyn KeyStore, pin: &Pin) -> Result<String, String> {
-    let Some(p) = pin.profile.as_deref().and_then(|id| book.get(id)) else { return Err(crate::publish_ui::ADD_SERVER_AND_TOKEN.to_string()) };
+    let p = usable(book, pin.profile.as_deref())?;
     if let Some(problem) = crate::publish_ui::binding_problem(Some(&p.server), &pin.server) {
         return Err(problem);
     }
     if !same_site(&p.server, &pin.server) {
         return Err(crate::publish_ui::ADD_SERVER_AND_TOKEN.to_string());
     }
+    publish::load_token_at(store, &profile_key(&p.id))?.ok_or_else(|| needs_sign_in(&p.name))
+}
+
+/// The debug builds' test hook: the profile's token for the hook's address `hook` only, and only
+/// while the profile can be used.
+pub fn token_for_hook(book: &Book, store: &dyn KeyStore, pin: &Pin, hook: &str) -> Result<String, String> {
+    if let Some(problem) = crate::publish_ui::binding_problem(publish::check_server(hook).ok().as_deref(), &pin.server) {
+        return Err(format!("{problem} {}", crate::publish_ui::FIX_ON_WORKSPACE));
+    }
+    let p = usable(book, pin.profile.as_deref())?;
+    publish::load_token_at(store, &profile_key(&p.id))?.ok_or_else(|| needs_sign_in(&p.name))
+}
+
+fn usable<'a>(book: &'a Book, id: Option<&str>) -> Result<&'a Profile, String> {
+    let p = id.and_then(|id| book.get(id)).ok_or_else(|| crate::publish_ui::ADD_SERVER_AND_TOKEN.to_string())?;
     if p.state == State::SignInAgain {
         return Err(needs_sign_in(&p.name));
     }
-    publish::load_token_at(store, &profile_key(&p.id))?.ok_or_else(|| needs_sign_in(&p.name))
+    Ok(p)
 }
 
 // ---- Which profile a recording's tour belongs to ----
@@ -450,14 +647,21 @@ pub enum Owner {
     Other { id: String, name: String },
     /// A profile that was removed: only a new tour.
     Removed,
+    /// Linked before profiles, with no connection carried over: nobody's yet. It is updated by
+    /// the active profile when the addresses match, and is that profile's from then on.
+    Unowned,
     /// No profile is active: as before profiles, when not connected.
     NoProfile,
 }
 
 /// Whose tour it is: `recorded` is the profile id the recording was saved with; an empty one
-/// (saved before profiles) is the migrated profile's.
+/// (saved before profiles) is the profile the old connection became, or nobody's.
 pub fn owner_of(book: &Book, recorded: &str) -> Owner {
-    let owner = if recorded.is_empty() { MIGRATED_ID } else { recorded };
+    let owner = match (recorded, &book.legacy) {
+        ("", Some(legacy)) => legacy.as_str(),
+        ("", None) => return if book.active().is_some() { Owner::Unowned } else { Owner::NoProfile },
+        (id, _) => id,
+    };
     match book.active() {
         None => Owner::NoProfile,
         Some(a) if a.id == owner => Owner::Active,
@@ -482,7 +686,8 @@ pub fn migrate(settings: &mut Settings, store: &dyn KeyStore) -> Result<Option<S
     }
     let server = settings.publish_saved_for.as_deref().filter(|s| !s.trim().is_empty()).and_then(|s| publish::check_server(s).ok());
     let Some(server) = server else {
-        // No address the token was tied to: there was no connection to carry over.
+        // No address the token was tied to: there was no connection to carry over, and an old
+        // entry can never be used; it goes once this is saved.
         settings.profiles_migrated = true;
         return Ok(None);
     };
@@ -502,27 +707,30 @@ pub fn migrate(settings: &mut Settings, store: &dyn KeyStore) -> Result<Option<S
     }
     let mut book = Book::of(settings);
     if book.get(MIGRATED_ID).is_none() {
-        book.list.insert(0, Profile { id: MIGRATED_ID.to_string(), name: name_host(&server), server, account: None, workspace: None, state: State::Ready, named: false });
+        book.list.insert(0, Profile { id: MIGRATED_ID.to_string(), name: name_host(&server), server, account: None, workspace: None, identity: None, state: State::Ready, named: false });
     }
     if book.active().is_none() {
         book.active = Some(MIGRATED_ID.to_string());
     }
+    book.legacy = Some(MIGRATED_ID.to_string());
     book.write_to(settings);
     settings.profiles_migrated = true;
     Ok(book.get(MIGRATED_ID).map(|p| p.name.clone()))
 }
 
-/// Remove the old credential entry, once the settings that name the migrated profile were saved
-/// and its own entry holds a token. True when it removed one. Run after every start's save: it
-/// finishes a migration a start cut off.
+/// Remove the old credential entry once the settings that say what became of it were saved: it
+/// was copied into a profile's own entry (and is confirmed there), that profile was removed or
+/// joined to another, or it could never be used (no address, or no copy to make). True when it
+/// removed one. Run after every start's save: it finishes a migration a start cut off.
 pub fn remove_legacy(settings: &Settings, store: &dyn KeyStore) -> Result<bool, String> {
-    if !settings.profiles_migrated || !settings.profiles.iter().any(|p| p.id == MIGRATED_ID) {
+    if !settings.profiles_migrated || store.get(LEGACY_KEY)?.is_none() {
         return Ok(false);
     }
-    if store.get(LEGACY_KEY)?.is_none() {
-        return Ok(false);
-    }
-    if publish::load_token_at(store, &profile_key(MIGRATED_ID))?.is_none() {
+    if let Some(id) = settings.legacy_profile.as_deref()
+        && settings.profiles.iter().any(|p| p.id == id)
+        && publish::load_token_at(store, &profile_key(id))?.is_none()
+    {
+        // Its copy is not confirmed: the old entry stays.
         return Ok(false);
     }
     store.delete(LEGACY_KEY)?;

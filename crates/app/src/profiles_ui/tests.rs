@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::profiles::tests::{FakeKeys, TOKEN_A, TOKEN_B};
+use crate::profiles::tests::{FakeKeys, TOKEN_A, TOKEN_B, named};
 use crate::profiles::{MIGRATED_ID, Profile};
 use crate::publish::tests::{Answer, Stub, reply, stub};
 use crate::sign_in_ui::Stage;
@@ -105,7 +105,7 @@ fn settle(f: &mut AddFlow) {
 }
 
 fn profile(id: &str, name: &str, server: &str, account: Option<&str>, workspace: Option<&str>, state: State) -> Profile {
-    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), state, named: true }
+    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), identity: workspace.map(|w| named(w, account)), state, named: true }
 }
 
 // ---- 2. The dropdown ----
@@ -113,6 +113,7 @@ fn profile(id: &str, name: &str, server: &str, account: Option<&str>, workspace:
 #[test]
 fn the_dropdown_lists_every_profile_with_its_state_and_the_active_one() {
     let book = Book {
+        legacy: None,
         list: vec![
             profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, Some("alex's workspace"), State::Ready),
             profile("pb", "Sandbox admin", "http://localhost:3000", None, Some("alex's workspace"), State::Ready),
@@ -192,17 +193,30 @@ fn save_profile_waits_for_the_check_and_a_good_sign_in_is_saved_only_then() {
 }
 
 #[test]
-fn a_failed_or_unanswered_sign_in_leaves_no_profile_and_no_token() {
+fn a_failed_or_unanswered_sign_in_leaves_no_profile_and_no_token_and_says_why() {
     let not_a_site = stub(|_, _| reply(404, "<html>"));
     let turned_down = site(|_| reply(410, r#"{"error":"expired_token"}"#), (200, r#"{"workspace":"customer1"}"#));
     let refused = site(|_| connected(ACCOUNT), (401, ""));
     let not_an_answer = site(|_| connected(ACCOUNT), (200, "<html>not a site</html>"));
-    for address in [not_a_site.base.clone(), turned_down.base.clone(), refused.base.clone(), not_an_answer.base.clone(), "http://127.0.0.1:1".to_string()] {
+    let lead = profiles::NOT_SAVED_LEAD;
+    let cases = [
+        (not_a_site.base.clone(), format!("{lead} {}", connect::NOT_OFFERED)),
+        (turned_down.base.clone(), format!("{lead} {}", connect::NOT_CONNECTED_TEXT)),
+        (refused.base.clone(), profiles::NOT_SAVED.to_string()),
+        (not_an_answer.base.clone(), format!("{lead} Could not check the server: the server's answer was not understood.")),
+        ("http://127.0.0.1:1".to_string(), format!("{lead} Could not sign in: ")),
+    ];
+    for (address, said) in cases {
         let shelf = TestShelf::with(Book::default(), FakeKeys::default());
         let mut f = flow(&shelf, Purpose::New, &address);
         sign_in(&mut f);
         match f.sign_in_dialog().map(|d| d.stage()) {
-            Some(Stage::Failed { text, retry }) => assert_eq!((text.as_str(), *retry), (profiles::NOT_SAVED, true), "{address}"),
+            Some(Stage::Failed { text, .. }) => {
+                assert!(text.starts_with(&said), "{address}: {text}");
+                // Only a refusal of the new token says the site did not accept it.
+                assert_eq!(text.contains(profiles::NOT_ACCEPTED), said == profiles::NOT_SAVED, "{address}: {text}");
+                assert!(!text.contains("dp_"));
+            }
             other => panic!("{address}: {other:?}"),
         }
         assert!(matches!(f.step(), Step::Address) && !f.can_save(), "{address}");
@@ -212,6 +226,63 @@ fn a_failed_or_unanswered_sign_in_leaves_no_profile_and_no_token() {
         assert!(!f.is_signing_in() && !f.can_save());
         assert!(shelf.keys().is_empty());
     }
+}
+
+/// Run the check of the pasted token until it ended.
+fn check_paste(f: &mut AddFlow, token: &str) {
+    f.begin_paste();
+    f.type_paste_for_test(token);
+    assert!(f.can_check_paste());
+    f.check_paste();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while f.is_checking_paste() {
+        assert!(Instant::now() < deadline, "the check did not end");
+        std::thread::sleep(Duration::from_millis(5));
+        f.poll();
+    }
+}
+
+fn me_stub_ok(workspace: &'static str) -> Stub {
+    stub(move |req, _| if req.line == "GET /api/v1/me" { reply(200, &format!(r#"{{"workspace":"{workspace}"}}"#)) } else { reply(404, "") })
+}
+
+#[test]
+fn a_pasted_token_for_a_site_without_sign_in_is_checked_before_anything_is_saved() {
+    // The site has no Sign in (404), and answers only for the token from its setup page.
+    let good = format!("Bearer {TOKEN_A}");
+    let s = stub(move |req, _| if req.line == "GET /api/v1/me" { if req.auth.as_deref() == Some(good.as_str()) { reply(200, r#"{"workspace":"Old site"}"#) } else { reply(401, "") } } else { reply(404, "") });
+    let shelf = TestShelf::with(Book::default(), FakeKeys::default());
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    // Not a token, a token the site refuses: said, and nothing is kept.
+    check_paste(&mut f, "hello");
+    assert_eq!(f.error.as_deref(), Some(format!("{} {}", profiles::NOT_SAVED_LEAD, publish::NOT_A_TOKEN).as_str()));
+    check_paste(&mut f, TOKEN_B);
+    assert_eq!(f.error.as_deref(), Some(profiles::NOT_SAVED));
+    assert!(!f.can_save() && shelf.keys().is_empty() && shelf.writes().is_empty());
+    assert!(s.requests().iter().all(|r| r.line == "GET /api/v1/me"), "nothing but the check is asked");
+    // The right one: checked, offered under its name, and saved only on Save profile.
+    check_paste(&mut f, TOKEN_A);
+    let Step::Checked { candidate, .. } = f.step() else { panic!("not checked: {:?}", f.error) };
+    assert_eq!((candidate.workspace.as_str(), candidate.account.as_deref()), ("Old site", None));
+    assert!(shelf.keys().is_empty());
+    f.save();
+    settle(&mut f);
+    assert!(f.is_finished());
+    let id = shelf.book().active.clone().unwrap();
+    assert_eq!(shelf.keys(), vec![(publish::profile_key(&id), TOKEN_A.to_string())]);
+}
+
+#[test]
+fn a_pasted_token_renews_only_its_own_profile() {
+    let s = me_stub_ok("Old site");
+    let book = Book { legacy: None, list: vec![profile("po", "Old", &s.base, None, Some("Old site"), State::SignInAgain)], active: Some("po".into()) };
+    let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-po", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::Renew("po".into()), &s.base);
+    check_paste(&mut f, TOKEN_A);
+    settle(&mut f);
+    assert!(f.is_finished());
+    assert_eq!(shelf.book().get("po").unwrap().state, State::Ready);
+    assert_eq!(shelf.keys(), vec![("profile-po".to_string(), TOKEN_A.to_string())]);
 }
 
 #[test]
@@ -244,6 +315,24 @@ fn cancelling_at_any_step_leaves_no_profile_and_no_token() {
 }
 
 #[test]
+fn cancel_waits_while_save_profile_runs() {
+    let s = working_site();
+    let shelf = TestShelf::with(Book::default(), FakeKeys::default());
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    // The save runs while the shelf is held: it cannot end before the test lets it.
+    let hold = lock(&shelf.inner);
+    f.save();
+    assert!(f.is_working() && !f.can_cancel());
+    f.cancel();
+    assert!(!f.is_finished(), "Cancel does nothing while the save runs");
+    drop(hold);
+    settle(&mut f);
+    assert!(f.is_finished());
+    assert_eq!(shelf.book().list.len(), 1, "the save went through, and nothing was left half-done");
+}
+
+#[test]
 fn a_save_the_store_cannot_confirm_says_why_and_leaves_nothing() {
     let s = working_site();
     let shelf = TestShelf::with(Book::default(), FakeKeys { garble: true, ..FakeKeys::default() });
@@ -259,7 +348,7 @@ fn a_save_the_store_cannot_confirm_says_why_and_leaves_nothing() {
 #[test]
 fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
     let s = working_site();
-    let book = Book { list: vec![profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready)], active: Some("pa".into()) };
+    let book = Book { legacy: None, list: vec![profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready)], active: Some("pa".into()) };
     let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::New, &s.base);
     sign_in(&mut f);
@@ -278,7 +367,7 @@ fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
 #[test]
 fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
     let s = working_site();
-    let book = Book { list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let book = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
     let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::New, &s.base);
     sign_in(&mut f);
@@ -294,7 +383,7 @@ fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
 #[test]
 fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
     let s = working_site();
-    let waiting = Book { list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let waiting = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
     let shelf = TestShelf::with(waiting, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
     sign_in(&mut f);
@@ -307,7 +396,7 @@ fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
     // Another account signs in: the old profile stays waiting with its token, and the new one
     // is offered under its own name.
     let other = site(|_| connected("intruder"), (200, r#"{"workspace":"customer1"}"#));
-    let book = Book { list: vec![profile("pc", "customer1 test", &other.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let book = Book { legacy: None, list: vec![profile("pc", "customer1 test", &other.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
     let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_A)]));
     let mut f = flow(&shelf, Purpose::Renew("pc".into()), &other.base);
     sign_in(&mut f);
@@ -323,7 +412,7 @@ fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
 
 #[test]
 fn remove_asks_first_and_takes_only_that_profile_and_its_token() {
-    let book = Book { list: vec![profile(MIGRATED_ID, "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pb", "Sandbox admin", "http://localhost:3000", None, None, State::Ready)], active: Some("pb".into()) };
+    let book = Book { legacy: None, list: vec![profile(MIGRATED_ID, "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pb", "Sandbox admin", "http://localhost:3000", None, None, State::Ready)], active: Some("pb".into()) };
     let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-first", TOKEN_A), ("profile-pb", TOKEN_B)]));
     let make_shelf: Arc<dyn Shelf> = shelf.clone();
     let mut panel = Panel::with(make_shelf, Arc::new(|_, _| panic!("no form here")));
@@ -348,7 +437,7 @@ fn remove_asks_first_and_takes_only_that_profile_and_its_token() {
 
 #[test]
 fn a_request_from_a_dialog_opens_the_form_or_the_list() {
-    let shelf = TestShelf::with(Book { list: vec![profile("pa", "A", "http://127.0.0.1:1", None, None, State::Ready)], active: Some("pa".into()) }, FakeKeys::default());
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![profile("pa", "A", "http://127.0.0.1:1", None, None, State::Ready)], active: Some("pa".into()) }, FakeKeys::default());
     let for_flow = shelf.clone();
     let make: Arc<dyn Fn(Purpose, String) -> AddFlow + Send + Sync> = Arc::new(move |purpose, address| flow(&for_flow, purpose, &address));
     let make_shelf: Arc<dyn Shelf> = shelf.clone();

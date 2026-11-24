@@ -61,8 +61,7 @@ const WHAT: &str = "Could not sign in";
 pub struct Secret(String);
 
 impl Secret {
-    /// A secret made from a token a test holds.
-    #[cfg(test)]
+    /// A secret made from a token typed or pasted by hand (or one a test holds); wiped when dropped.
     pub fn new(text: String) -> Secret {
         Secret(text)
     }
@@ -124,6 +123,8 @@ pub fn minutes_text(d: Duration) -> Option<String> {
 pub struct Connected {
     pub token: Secret,
     pub account: Option<String>,
+    /// The account's id, when the site named one (`account.id`).
+    pub account_id: Option<String>,
 }
 
 /// Why this computer was not connected.
@@ -368,7 +369,8 @@ fn wait_with(client: &Client, started: &Started, cancelled: &dyn Fn() -> bool, c
                         let token = take_secret(&mut v, "token", super::is_token).ok_or_else(|| ConnectError::Failed(not_understood()))?;
                         // A missing account, or one without a name, is no name: an older site still works.
                         let account = v.get("account").and_then(|a| a.get("username")).and_then(Value::as_str).map(share::plain_text).filter(|n| !n.is_empty());
-                        return Ok(Connected { token, account });
+                        let account_id = super::id_text(v.get("account").and_then(|a| a.get("id")));
+                        return Ok(Connected { token, account, account_id });
                     }
                     _ => return Err(ConnectError::Failed(not_understood())),
                 }

@@ -76,12 +76,22 @@ fn old_settings() -> Settings {
     s
 }
 
+/// The identity an older site's names give.
+pub(crate) fn named(workspace: &str, account: Option<&str>) -> Identity {
+    Identity { workspace: format!("name:{workspace}"), account: account.map(|a| format!("name:{a}")) }
+}
+
+/// A profile; its identity is recorded from the names when the workspace is given.
 fn profile(id: &str, name: &str, server: &str, account: Option<&str>, workspace: Option<&str>) -> Profile {
-    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), state: State::Ready, named: true }
+    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), identity: workspace.map(|w| named(w, account)), state: State::Ready, named: true }
 }
 
 fn book(list: Vec<Profile>, active: &str) -> Book {
-    Book { list, active: Some(active.into()) }
+    Book { list, active: Some(active.into()), legacy: None }
+}
+
+fn ws(name: &str, id: Option<&str>, account: Option<&str>) -> Workspace {
+    Workspace { name: name.into(), version: None, id: id.map(str::to_string), account: account.map(str::to_string) }
 }
 
 // ---- 5. The update that adds profiles ----
@@ -92,8 +102,8 @@ fn the_old_connection_becomes_the_first_profile_without_a_new_sign_in() {
     let mut s = old_settings();
     assert_eq!(migrate(&mut s, &store), Ok(Some("tours.example.com".into())));
     assert!(s.profiles_migrated);
-    assert_eq!(s.profiles, vec![Profile { id: MIGRATED_ID.into(), name: "tours.example.com".into(), server: SITE.into(), account: None, workspace: None, state: State::Ready, named: false }]);
-    assert_eq!(s.active_profile.as_deref(), Some(MIGRATED_ID));
+    assert_eq!(s.profiles, vec![Profile { id: MIGRATED_ID.into(), name: "tours.example.com".into(), server: SITE.into(), account: None, workspace: None, identity: None, state: State::Ready, named: false }]);
+    assert_eq!((s.active_profile.as_deref(), s.legacy_profile.as_deref()), (Some(MIGRATED_ID), Some(MIGRATED_ID)));
     assert_eq!(store.at(&first_key()).as_deref(), Some(OLD), "the token is in the profile's own entry");
     assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD), "the old entry stays until the settings are saved");
     // The app saved the settings: now the old entry goes, and only then.
@@ -156,27 +166,29 @@ fn a_migration_that_cannot_confirm_the_copy_changes_nothing_and_keeps_the_old_to
         assert!(!s.profiles_migrated && s.profiles.is_empty() && s.active_profile.is_none());
         assert_eq!(toml::to_string(&s).unwrap(), toml::to_string(&before).unwrap());
         assert_eq!(store.entries.borrow().get(LEGACY_KEY).map(String::as_str), Some(OLD), "the old token is never lost");
-        // The old entry is never removed while there is no confirmed copy.
+        // The old entry is never removed while the migration has not run.
         assert!(!remove_legacy(&s, &store).unwrap_or(false));
         assert_eq!(store.entries.borrow().get(LEGACY_KEY).map(String::as_str), Some(OLD));
     }
 }
 
 #[test]
-fn without_an_old_connection_the_migration_makes_no_profile() {
-    // No address the token was tied to: nothing to carry over, and the old entry is left alone.
+fn without_an_old_connection_no_profile_is_made_and_an_unusable_old_entry_goes() {
+    // No address the token was tied to: nothing to carry over, and the old entry, which can
+    // never be used, goes once the settings were saved.
     let store = FakeKeys::with(&[(LEGACY_KEY, OLD)]);
     let mut s = old_settings();
     s.publish_saved_for = Some(String::new());
     assert_eq!(migrate(&mut s, &store), Ok(None));
-    assert!(s.profiles_migrated && s.profiles.is_empty() && s.active_profile.is_none());
-    assert_eq!(remove_legacy(&s, &store), Ok(false));
-    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD));
+    assert!(s.profiles_migrated && s.profiles.is_empty() && s.active_profile.is_none() && s.legacy_profile.is_none());
+    assert_eq!(remove_legacy(&s, &store), Ok(true));
+    assert!(store.entries.borrow().is_empty());
     // An address, but no token.
     let store = FakeKeys::default();
     let mut s = old_settings();
     assert_eq!(migrate(&mut s, &store), Ok(None));
-    assert!(s.profiles_migrated && s.profiles.is_empty());
+    assert!(s.profiles_migrated && s.profiles.is_empty() && s.legacy_profile.is_none());
+    assert_eq!(remove_legacy(&s, &store), Ok(false));
     assert!(store.log.borrow().is_empty());
 }
 
@@ -196,7 +208,39 @@ fn the_settings_file_holds_the_profiles_and_no_token() {
     assert!(back.profiles_migrated);
     // A file from before profiles reads as not migrated, with none.
     let old: Settings = toml::from_str("publish_server = \"https://tours.example.com\"\n").unwrap();
-    assert!(!old.profiles_migrated && old.profiles.is_empty() && old.active_profile.is_none());
+    assert!(!old.profiles_migrated && old.profiles.is_empty() && old.active_profile.is_none() && old.legacy_profile.is_none());
+}
+
+// ---- 10. A migration that turns out to be an account another profile has ----
+
+#[test]
+fn the_first_profile_is_joined_to_a_profile_of_the_same_identity() {
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD), ("profile-pa", TOKEN_A)]);
+    let mut b = Book {
+        list: vec![
+            Profile { identity: None, workspace: None, named: false, ..profile(MIGRATED_ID, "tours.example.com", SITE, None, None) },
+            profile("pa", "Acme", SITE, Some("alex"), Some("Acme")),
+        ],
+        active: Some(MIGRATED_ID.into()),
+        legacy: Some(MIGRATED_ID.into()),
+    };
+    // Before its first check nothing can be said: no identity, no twin.
+    assert_eq!(twin_of(&b, MIGRATED_ID), None);
+    // An answer that names the workspace only: still not enough.
+    note_check(&mut b, MIGRATED_ID, SITE, &ws("Acme", None, None));
+    assert_eq!(twin_of(&b, MIGRATED_ID), None);
+    // One that names the same account: it is the same, and is joined to it.
+    let mut pa = b.get("pa").unwrap().clone();
+    pa.identity = Some(Identity { workspace: "name:Acme".into(), account: Some("id:42".into()) });
+    b.list[1] = pa;
+    note_check(&mut b, MIGRATED_ID, SITE, &ws("Acme", None, Some("42")));
+    assert_eq!(twin_of(&b, MIGRATED_ID).as_deref(), Some("pa"));
+    attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
+    assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"]);
+    assert_eq!((b.active.as_deref(), b.legacy.as_deref()), (Some("pa"), Some("pa")));
+    assert_eq!(store.keys(), vec!["profile-pa".to_string()], "the copy and the old entry go");
+    // Recordings linked before profiles belong to it now.
+    assert_eq!(owner_of(&b, ""), Owner::Active);
 }
 
 // ---- 3. Adding a profile ----
@@ -205,20 +249,47 @@ fn me_stub(status: u16, body: &'static str) -> Stub {
     stub(move |req, _| if req.line == "GET /api/v1/me" { reply(status, body) } else { reply(404, "") })
 }
 
+fn signed_in(name: &str) -> SignedIn {
+    SignedIn { name: Some(name.into()), id: None }
+}
+
 #[test]
-fn the_check_asks_the_site_with_the_new_token_and_any_failure_is_not_saved() {
+fn the_check_asks_the_site_with_the_new_token_and_says_why_it_failed() {
     let s = me_stub(200, r#"{"workspace":"customer1","version":"0.1.9"}"#);
-    let c = checked(&s.base, Some("customer@mythicshot.test".into()), Secret::new(TOKEN_A.into())).unwrap();
+    let c = checked(&s.base, signed_in("customer@mythicshot.test"), Secret::new(TOKEN_A.into())).unwrap();
     assert_eq!((c.server.as_str(), c.account.as_deref(), c.workspace.as_str()), (s.base.as_str(), Some("customer@mythicshot.test"), "customer1"));
+    assert_eq!(c.identity, named("customer1", Some("customer@mythicshot.test")), "without ids, the names");
     assert_eq!(s.requests()[0].auth.as_deref(), Some(format!("Bearer {TOKEN_A}").as_str()));
     assert!(!format!("{c:?}").contains(TOKEN_A), "the token is never in a Debug print");
-    // Refused, not a Mythicshot site, a web page, no answer at all, an address that is not one.
+    // Only a refusal says the site did not accept it.
     let refused = me_stub(401, "");
+    assert_eq!(checked(&refused.base, SignedIn::default(), Secret::new(TOKEN_A.into())).unwrap_err(), NOT_SAVED);
+    // Anything else says what the app says of that failure, after the first sentence.
     let not_a_site = me_stub(404, "<html>");
     let page = me_stub(200, "<html>hello</html>");
-    for server in [refused.base.as_str(), not_a_site.base.as_str(), page.base.as_str(), "http://127.0.0.1:1", "http://tours.example.com"] {
-        assert_eq!(checked(server, None, Secret::new(TOKEN_A.into())).unwrap_err(), NOT_SAVED, "{server}");
+    for (server, rest) in [
+        (not_a_site.base.as_str(), "Could not check the server: the server answered HTTP 404."),
+        (page.base.as_str(), "Could not check the server: the server's answer was not understood."),
+        ("http://tours.example.com", "The server address must start with https:// (http:// is only for localhost)."),
+    ] {
+        let e = checked(server, SignedIn::default(), Secret::new(TOKEN_A.into())).unwrap_err();
+        assert_eq!(e, format!("{NOT_SAVED_LEAD} {rest}"), "{server}");
+        assert!(!e.contains(NOT_ACCEPTED) && !e.contains("dp_"));
     }
+    let e = checked("http://127.0.0.1:1", SignedIn::default(), Secret::new(TOKEN_A.into())).unwrap_err();
+    assert!(e.starts_with(&format!("{NOT_SAVED_LEAD} Could not check the server: ")) && !e.contains(NOT_ACCEPTED), "{e}");
+}
+
+#[test]
+fn the_identity_is_the_sites_ids_when_it_gives_them() {
+    let s = me_stub(200, r#"{"workspace":{"id":"ws_1","name":"customer1"},"account":{"id":7,"username":"c"}}"#);
+    let c = checked(&s.base, signed_in("customer"), Secret::new(TOKEN_A.into())).unwrap();
+    assert_eq!(c.identity, Identity { workspace: "id:ws_1".into(), account: Some("id:7".into()) });
+    assert_eq!(c.workspace, "customer1");
+    // The account id of the sign-in's answer, when the check names none.
+    let s = me_stub(200, r#"{"workspace":"customer1","workspace_id":12}"#);
+    let c = checked(&s.base, SignedIn { name: Some("customer".into()), id: Some("u9".into()) }, Secret::new(TOKEN_A.into())).unwrap();
+    assert_eq!(c.identity, Identity { workspace: "id:12".into(), account: Some("id:u9".into()) });
 }
 
 #[test]
@@ -227,7 +298,7 @@ fn save_profile_stores_the_token_confirms_it_and_only_then_adds_the_profile() {
     let mut b = Book::default();
     let id = save_new(&mut b, &store, Candidate::for_test("http://localhost:3000", Some("customer"), "customer1", TOKEN_A), "  customer1 test ").unwrap();
     assert_eq!(b.active.as_deref(), Some(id.as_str()));
-    assert_eq!(b.list, vec![Profile { id: id.clone(), name: "customer1 test".into(), server: "http://localhost:3000".into(), account: Some("customer".into()), workspace: Some("customer1".into()), state: State::Ready, named: true }]);
+    assert_eq!(b.list, vec![Profile { id: id.clone(), name: "customer1 test".into(), server: "http://localhost:3000".into(), account: Some("customer".into()), workspace: Some("customer1".into()), identity: Some(named("customer1", Some("customer"))), state: State::Ready, named: true }]);
     assert_eq!(store.at(&profile_key(&id)).as_deref(), Some(TOKEN_A));
     assert!(id.starts_with('p') && id.len() == 17 && id != MIGRATED_ID);
     // An empty name is the default one.
@@ -267,6 +338,61 @@ fn a_second_profile_for_the_same_site_and_account_is_not_made() {
 }
 
 #[test]
+fn two_accounts_of_one_site_are_two_profiles() {
+    let store = FakeKeys::default();
+    let mut b = Book::default();
+    let a = save_new(&mut b, &store, Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A), "").unwrap();
+    let c = save_new(&mut b, &store, Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_B), "").unwrap();
+    assert_ne!(a, c);
+    assert_eq!(b.list.len(), 2);
+    assert_eq!((store.at(&profile_key(&a)).as_deref(), store.at(&profile_key(&c)).as_deref()), (Some(TOKEN_A), Some(TOKEN_B)));
+}
+
+#[test]
+fn a_profile_without_a_full_identity_is_never_matched_by_a_new_sign_in() {
+    let store = FakeKeys::with(&[(&first_key(), OLD)]);
+    // The migrated profile before any check, and one whose site never named the account.
+    for identity in [None, Some(named("Acme", None))] {
+        let mut b = book(vec![Profile { identity: identity.clone(), state: State::SignInAgain, ..profile(MIGRATED_ID, "Alex", SITE, None, None) }], MIGRATED_ID);
+        let c = Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A);
+        assert!(find_same(&b, &c).is_none(), "{identity:?}");
+        // "Add profile" makes a profile of its own; the waiting one keeps its token.
+        let id = save_new(&mut b, &store, c, "").unwrap();
+        assert_ne!(id, MIGRATED_ID);
+        assert_eq!(store.at(&first_key()).as_deref(), Some(OLD));
+        assert_eq!(b.get(MIGRATED_ID).unwrap().state, State::SignInAgain);
+    }
+    // Its own "Sign in again" renews it and records the identity.
+    let store = FakeKeys::with(&[(&first_key(), OLD)]);
+    let mut b = book(vec![Profile { identity: Some(named("Acme", None)), state: State::SignInAgain, ..profile(MIGRATED_ID, "Alex", SITE, None, None) }], MIGRATED_ID);
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert_eq!(b.get(MIGRATED_ID).unwrap().identity, Some(named("Acme", Some("alex"))));
+    // Only in its own workspace.
+    let mut b = book(vec![Profile { identity: Some(named("Acme", None)), state: State::SignInAgain, ..profile(MIGRATED_ID, "Alex", SITE, None, None) }], MIGRATED_ID);
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, Candidate::for_test(SITE, Some("alex"), "Other", TOKEN_A)).unwrap(), Renewal::OtherAccount(_)));
+}
+
+#[test]
+fn a_check_with_the_profiles_own_token_records_its_identity_and_only_for_that_profile() {
+    let mut b = book(vec![Profile { identity: None, workspace: None, named: false, ..profile(MIGRATED_ID, "mythicshot.com", "https://app.mythicshot.com", None, None) }, profile("pb", "B", "https://app.mythicshot.com", Some("b"), Some("B ws"))], "pb");
+    let pb = b.get("pb").unwrap().clone();
+    // The answer to a request made for the first profile, arriving while B is active.
+    assert!(note_check(&mut b, MIGRATED_ID, "https://app.mythicshot.com", &ws("Alex", Some("w1"), Some("a1"))));
+    let first = b.get(MIGRATED_ID).unwrap();
+    assert_eq!((first.name.as_str(), first.identity.clone()), ("Alex · mythicshot.com", Some(Identity { workspace: "id:w1".into(), account: Some("id:a1".into()) })));
+    assert_eq!(b.get("pb"), Some(&pb), "the active profile is not touched");
+    // An answer from another address than the profile's changes nothing.
+    assert!(!note_check(&mut b, "pb", "https://other.example.com", &ws("X", Some("x"), None)));
+    // A later answer without the account keeps the recorded one; another workspace drops it.
+    assert!(!note_check(&mut b, MIGRATED_ID, "https://app.mythicshot.com", &ws("Alex", Some("w1"), None)));
+    note_check(&mut b, MIGRATED_ID, "https://app.mythicshot.com", &ws("Alex", Some("w2"), None));
+    assert_eq!(b.get(MIGRATED_ID).unwrap().identity, Some(Identity { workspace: "id:w2".into(), account: None }));
+    // A name once given stays when the workspace is renamed.
+    note_check(&mut b, MIGRATED_ID, "https://app.mythicshot.com", &ws("Alex & co", Some("w2"), None));
+    assert_eq!(b.get(MIGRATED_ID).unwrap().name, "Alex · mythicshot.com");
+}
+
+#[test]
 fn a_default_name_is_the_workspace_and_the_site() {
     assert_eq!(default_name("customer1", "https://app.mythicshot.com"), "customer1 · mythicshot.com");
     assert_eq!(default_name("Acme", "https://www.acme.com/tours/"), "Acme · acme.com");
@@ -290,14 +416,14 @@ fn a_refused_profile_is_kept_until_a_sign_in_for_the_same_account_passes() {
     // Nothing of it is handed out meanwhile.
     let pin = Pin { profile: Some("pc".into()), server: "http://localhost:3000".into() };
     assert_eq!(token_for(&b, &store, &pin).unwrap_err(), needs_sign_in("customer1 test"));
-    // Another account: saved over nothing, the old profile stays as it was.
+    // Another account, even in the same workspace: saved over nothing.
     let other = Candidate::for_test("http://localhost:3000", Some("intruder"), "customer1", TOKEN_B);
     match renew(&mut b, &store, "pc", other).unwrap() {
         Renewal::OtherAccount(c) => assert_eq!(c.account.as_deref(), Some("intruder")),
         Renewal::Renewed => panic!("another account renewed the profile"),
     }
     assert_eq!((b.get("pc").unwrap().state, store.at("profile-pc").as_deref()), (State::SignInAgain, Some(OLD)));
-    // The same account: its new token is kept and the profile works again.
+    // Exactly the same identity: its new token is kept and the profile works again.
     let same = Candidate::for_test("http://localhost:3000/", Some("customer"), "customer1", TOKEN_A);
     assert!(matches!(renew(&mut b, &store, "pc", same).unwrap(), Renewal::Renewed));
     assert_eq!(b.get("pc").unwrap().state, State::Ready);
@@ -307,25 +433,9 @@ fn a_refused_profile_is_kept_until_a_sign_in_for_the_same_account_passes() {
 #[test]
 fn a_renewal_the_store_cannot_confirm_keeps_the_profile_waiting() {
     let store = FakeKeys { garble: true, ..FakeKeys::with(&[("profile-pc", OLD)]) };
-    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, None, Some("Acme")) }], "pc");
-    assert!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, None, "Acme", TOKEN_A)).is_err());
+    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, Some("a"), Some("Acme")) }], "pc");
+    assert!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("a"), "Acme", TOKEN_A)).is_err());
     assert_eq!(b.get("pc").unwrap().state, State::SignInAgain);
-}
-
-#[test]
-fn the_migrated_profile_takes_its_workspace_and_name_from_the_first_answer() {
-    let mut b = book(vec![Profile { id: MIGRATED_ID.into(), name: "mythicshot.com".into(), server: "https://app.mythicshot.com".into(), account: None, workspace: None, state: State::Ready, named: false }], MIGRATED_ID);
-    assert!(note_workspace(&mut b, MIGRATED_ID, "Alex"));
-    assert_eq!((b.active().unwrap().name.as_str(), b.active().unwrap().workspace.as_deref()), ("Alex · mythicshot.com", Some("Alex")));
-    assert!(!note_workspace(&mut b, MIGRATED_ID, "Alex"));
-    // A name once given stays when the workspace is renamed.
-    assert!(note_workspace(&mut b, MIGRATED_ID, "Alex & co"));
-    assert_eq!(b.active().unwrap().name, "Alex · mythicshot.com");
-    // Before the site ever answered, the first sign-in on its site is its account.
-    let mut fresh = book(vec![Profile { state: State::SignInAgain, ..profile(MIGRATED_ID, "tours.example.com", SITE, None, None) }], MIGRATED_ID);
-    let store = FakeKeys::default();
-    assert!(matches!(renew(&mut fresh, &store, MIGRATED_ID, Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
-    assert_eq!(fresh.active().unwrap().account.as_deref(), Some("alex"));
 }
 
 #[test]
@@ -335,6 +445,95 @@ fn sign_out_removes_the_token_and_keeps_the_profile_waiting_for_a_sign_in() {
     sign_out(&mut b, &store, "pa").unwrap();
     assert!(store.entries.borrow().is_empty());
     assert_eq!((b.list.len(), b.get("pa").unwrap().state), (1, State::SignInAgain));
+}
+
+// ---- 1. A refusal belongs to the profile its token was looked up for ----
+
+/// A and B, with A's token looked up and refused by the site.
+fn refused_a() -> (Book, Live, impl Fn(&str) -> bool) {
+    let b = book(vec![profile("pa", "A", SITE, Some("a"), Some("Acme")), profile("pb", "B", "http://localhost:3000", Some("b"), Some("Bee"))], "pa");
+    let mut live = Live::default();
+    let (generation, profile) = live.begin(&b);
+    assert!(live.finish(generation, profile, Some("fp-a".into())));
+    (b, live, |fp: &str| fp == "fp-a")
+}
+
+#[test]
+fn a_refusal_of_one_profiles_token_never_lands_on_the_profile_switched_to() {
+    let (mut b, mut live, refused) = refused_a();
+    assert!(live.active_refused(&b, &refused));
+    // The switch, and in the same frame the page asks whether the active profile is refused.
+    b.switch("pb");
+    live.begin(&b);
+    assert!(!live.active_refused(&b, &refused));
+    assert!(!live.attribute(&mut b, &refused));
+    assert_eq!(b.get("pb").unwrap().state, State::Ready);
+    // A lookup for A that ends after the switch is dropped, not taken for B's.
+    let (mut b2, mut live2, refused2) = refused_a();
+    let (old_generation, old_profile) = (live2.generation, Some("pa".to_string()));
+    b2.switch("pb");
+    let (generation, profile) = live2.begin(&b2);
+    assert!(!live2.finish(old_generation, old_profile, Some("fp-a".into())));
+    assert!(live2.finish(generation, profile, Some("fp-b".into())));
+    assert!(!live2.attribute(&mut b2, &refused2));
+    assert_eq!(b2.get("pb").unwrap().state, State::Ready);
+}
+
+#[test]
+fn a_refusal_lands_on_its_own_profile_only() {
+    let (mut b, live, refused) = refused_a();
+    assert!(live.attribute(&mut b, &refused));
+    assert_eq!((b.get("pa").unwrap().state, b.get("pb").unwrap().state), (State::SignInAgain, State::Ready));
+}
+
+#[test]
+fn a_change_of_the_profiles_starts_a_new_lookup_that_inherits_no_refusal() {
+    let (mut b, mut live, refused) = refused_a();
+    // A is removed while its refused fingerprint is still the last one looked up: B becomes active.
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_B)]);
+    remove(&mut b, &store, "pa").unwrap();
+    live.begin(&b);
+    assert!(!live.active_refused(&b, &refused));
+    assert!(!live.attribute(&mut b, &refused));
+    assert_eq!(b.get("pb").unwrap().state, State::Ready);
+}
+
+#[test]
+fn a_renewed_profile_is_not_marked_again_by_its_old_tokens_refusal() {
+    let (mut b, mut live, refused) = refused_a();
+    assert!(live.attribute(&mut b, &refused));
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A)]);
+    assert!(matches!(renew(&mut b, &store, "pa", Candidate::for_test(SITE, Some("a"), "Acme", TOKEN_B)).unwrap(), Renewal::Renewed));
+    // Before the new token is looked up, and after: the old refusal does not count.
+    let (generation, profile) = live.begin(&b);
+    assert!(!live.attribute(&mut b, &refused) && !live.active_refused(&b, &refused));
+    live.finish(generation, profile, Some("fp-new".into()));
+    assert!(!live.attribute(&mut b, &refused) && !live.active_refused(&b, &refused));
+    assert_eq!(b.get("pa").unwrap().state, State::Ready);
+}
+
+// ---- 8. A change made on a copy, outside the lock ----
+
+#[test]
+fn a_change_made_on_a_copy_keeps_what_happened_meanwhile() {
+    let before = book(vec![profile("pa", "A", SITE, None, Some("Acme")), profile("pb", "B", SITE, None, Some("Bee"))], "pa");
+    // Meanwhile: a switch to B and a refusal of A.
+    let mut current = before.clone();
+    current.switch("pb");
+    mark_refused(&mut current, "pa");
+    // The change: B's sign-out on the copy.
+    let mut new = before.clone();
+    mark_refused(&mut new, "pb");
+    let merged = merge(&before, &current, &new);
+    assert_eq!(merged.active.as_deref(), Some("pb"));
+    assert_eq!((merged.get("pa").unwrap().state, merged.get("pb").unwrap().state), (State::SignInAgain, State::SignInAgain));
+    // A removal on the copy wins, and an active one that is gone is not brought back.
+    let mut new = before.clone();
+    new.list.retain(|p| p.id != "pb");
+    new.active = Some("pa".into());
+    let merged = merge(&before, &current, &new);
+    assert_eq!(merged.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"]);
+    assert_eq!(merged.active.as_deref(), Some("pa"));
 }
 
 // ---- 7. Removing a profile ----
@@ -365,6 +564,7 @@ fn remove_deletes_only_that_profile_and_its_token_and_picks_another() {
 fn removing_the_migrated_profile_takes_what_is_left_of_the_old_entry_too() {
     let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
     let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
     remove(&mut b, &store, MIGRATED_ID).unwrap();
     assert!(store.entries.borrow().is_empty());
 }
@@ -394,6 +594,18 @@ fn a_token_is_handed_out_only_for_its_own_profiles_address() {
 }
 
 #[test]
+fn the_test_hook_respects_a_profile_that_needs_a_new_sign_in() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A)]);
+    let hook = "http://127.0.0.1:4000";
+    let mut b = book(vec![profile("pa", "A", "https://a.example.com", None, None)], "pa");
+    let pin = Pin { profile: Some("pa".into()), server: hook.into() };
+    assert_eq!(token_for_hook(&b, &store, &pin, hook).as_deref(), Ok(TOKEN_A));
+    assert!(token_for_hook(&b, &store, &Pin { server: "https://a.example.com".into(), ..pin.clone() }, hook).is_err(), "the hook's address only");
+    mark_refused(&mut b, "pa");
+    assert_eq!(token_for_hook(&b, &store, &pin, hook).unwrap_err(), needs_sign_in("A"));
+}
+
+#[test]
 fn a_job_pinned_to_one_profile_sends_its_token_to_that_site_only_after_a_switch() {
     let site_a = me_stub(200, r#"{"workspace":"A"}"#);
     let site_b = me_stub(200, r#"{"workspace":"B"}"#);
@@ -418,7 +630,8 @@ fn a_job_pinned_to_one_profile_sends_its_token_to_that_site_only_after_a_switch(
 
 #[test]
 fn a_recording_belongs_to_the_profile_it_was_uploaded_with_and_old_ones_to_the_first() {
-    let b = book(vec![profile(MIGRATED_ID, "Alex · mythicshot.com", SITE, None, None), profile("pb", "Sandbox admin", "http://localhost:3000", None, None)], "pb");
+    let mut b = book(vec![profile(MIGRATED_ID, "Alex · mythicshot.com", SITE, None, None), profile("pb", "Sandbox admin", "http://localhost:3000", None, None)], "pb");
+    b.legacy = Some(MIGRATED_ID.into());
     assert_eq!(owner_of(&b, "pb"), Owner::Active);
     assert_eq!(owner_of(&b, MIGRATED_ID), Owner::Other { id: MIGRATED_ID.into(), name: "Alex · mythicshot.com".into() });
     assert_eq!(owner_of(&b, ""), Owner::Other { id: MIGRATED_ID.into(), name: "Alex · mythicshot.com".into() }, "linked before profiles");
@@ -427,6 +640,18 @@ fn a_recording_belongs_to_the_profile_it_was_uploaded_with_and_old_ones_to_the_f
     first.switch(MIGRATED_ID);
     assert_eq!(owner_of(&first, ""), Owner::Active);
     assert_eq!(owner_of(&Book::default(), "pb"), Owner::NoProfile);
+    // The first profile was removed: old recordings say so.
+    let mut gone = b.clone();
+    gone.list.retain(|p| p.id != MIGRATED_ID);
+    assert_eq!(owner_of(&gone, ""), Owner::Removed);
+}
+
+#[test]
+fn without_a_carried_over_connection_old_recordings_belong_to_nobody_yet() {
+    let b = book(vec![profile("pb", "Sandbox admin", "http://localhost:3000", None, None)], "pb");
+    assert_eq!(b.legacy, None);
+    assert_eq!(owner_of(&b, ""), Owner::Unowned, "not \"removed\"");
+    assert_eq!(owner_of(&Book::default(), ""), Owner::NoProfile);
 }
 
 #[test]
@@ -438,4 +663,5 @@ fn the_sentences_are_the_approved_ones() {
     assert_eq!(switch_to("Sandbox admin"), "Switch to Sandbox admin");
     assert_eq!(remove_question("Sandbox admin"), "Remove \"Sandbox admin\" from this computer? Your tours and account on the site are not touched.");
     assert_eq!(migrated("Alex · mythicshot.com"), "Your existing connection is now the profile \"Alex · mythicshot.com\".");
+    assert_eq!(NOT_SAVED, format!("{NOT_SAVED_LEAD} {NOT_ACCEPTED}"));
 }

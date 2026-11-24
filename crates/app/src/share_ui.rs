@@ -536,9 +536,11 @@ impl ShareDialog {
         }
         self.asked = true;
         let (server, name, site) = (self.server.clone(), self.workspace.clone(), self.site.clone());
+        // Pinned to the window's profile, on this thread.
+        let pin = crate::profiles::Pin { profile: self.profile.clone(), server: server.clone() };
         // One request tells both the workspace's name and the site's version.
         std::thread::spawn(move || {
-            match publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token)) {
+            match publish_ui::token_for_pin(&pin).and_then(|token| publish::workspace(&server, &token)) {
                 Ok(ws) => {
                     if let Ok(mut s) = site.lock() {
                         *s = who::Site::of(ws.version.as_deref());

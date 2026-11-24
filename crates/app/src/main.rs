@@ -263,6 +263,7 @@ impl App {
         let migrated_before = settings.profiles_migrated;
         let made = profiles::migrate(&mut settings, &publish::OsKeys).unwrap_or_else(|e| {
             eprintln!("Profiles: the existing connection was not carried over this time: {e}");
+            publish_ui::set_migration_problem(Some(e));
             None
         });
         if settled || settings.profiles_migrated != migrated_before {
