@@ -864,13 +864,11 @@ fn logo_missing(origin: &Origin, edit: &Edit) -> bool {
     origin.logo_dropped && edit.tour_doc.logo_path.is_none()
 }
 
-/// Whether the active profile `active` may update `r`'s tour: it belongs to it, or it is a tour
+/// Whether the active profile of `book` may update `r`'s tour: it belongs to it, or it is a tour
 /// linked before profiles that nobody owns yet (then only at its own address, which the caller
 /// checks; the update's save stamps the profile on it). With no profile at all nothing is sent.
-fn owned_by(r: &Replaceable, active: Option<&str>) -> bool {
-    let book = publish_ui::book();
-    debug_assert!(active.is_none() || book.active.as_deref() == active || book.active.is_none());
-    matches!(profiles::owner_of(&book, &r.profile), Owner::Active | Owner::Unowned | Owner::NoProfile)
+fn owned_by(r: &Replaceable, book: &profiles::Book) -> bool {
+    matches!(profiles::owner_of(book, &r.profile), Owner::Active | Owner::Unowned | Owner::NoProfile)
 }
 
 /// Whether the project `key` belongs to the site at `server`: projects are tied to the exact
@@ -1834,15 +1832,20 @@ impl Editor {
     /// was opened from stays its origin. `target.tour_title` is the tour's title as the site
     /// has it now: the result screen shows it, and the saved project takes it over.
     fn start_update(&mut self, title: String, target: EditTarget, before: Before) {
+        self.start_update_with(title, target, before, publish_ui::pin(), &publish_ui::book(), Arc::new(publish_ui::token_for_pin));
+    }
+
+    /// [`Editor::start_update`] with the active profile's pin, the profiles and the token source
+    /// handed in, so a test runs the real path without the shared state.
+    fn start_update_with(&mut self, title: String, target: EditTarget, before: Before, pin: profiles::Pin, book: &profiles::Book, token: Arc<dyn Fn(&profiles::Pin) -> Result<String, String> + Send + Sync>) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
         let Some(r) = replaceable(v) else { return };
-        let pin = publish_ui::pin();
         let pin_kept = pin.clone();
         let server = pin.server.clone();
-        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) || !owned_by(&r, pin.profile.as_deref()) {
+        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) || !owned_by(&r, book) {
             return;
         }
         let state = PublishState { profile: pin.profile.clone().unwrap_or_default(), rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
@@ -1857,7 +1860,7 @@ impl Editor {
         let worker = run.clone();
         let tour_title = target.tour_title.clone();
         let job = EncodeJob::spawn(move |progress| {
-            let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || publish_ui::token_for_pin(&pin), &keeping, &worker, progress));
+            let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || token(&pin), &keeping, &worker, progress));
             drop(state);
             drop(open);
             result
@@ -4770,6 +4773,35 @@ mod tests {
         state.profile = "pb".into();
         update_to(&s, &state, &store, &Arc::new(Run::default())).unwrap();
         assert_eq!(store.list().into_iter().find(|i| i.key == key).unwrap().profile, "pb");
+    }
+
+    #[test]
+    fn update_tour_runs_for_a_recording_nobody_owns_yet_at_its_own_address() {
+        use crate::profiles::{Book, Pin};
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, _key, info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        assert!(info.profile.is_empty());
+        let book = Book { list: vec![on_site("pb", "Sandbox admin", &s.base)], active: Some("pb".into()), legacy: None };
+        let pin = Pin { profile: Some("pb".into()), server: s.base.clone() };
+        let asked: Arc<std::sync::Mutex<Vec<Pin>>> = Arc::default();
+        let record = asked.clone();
+        let token: Arc<dyn Fn(&Pin) -> Result<String, String> + Send + Sync> = Arc::new(move |p: &Pin| {
+            record.lock().unwrap().push(p.clone());
+            Ok(TOKEN.to_string())
+        });
+        // Another profile's tour (by its stamp) is refused on this path too.
+        ed.video.as_mut().unwrap().origin.as_mut().unwrap().profile = "pother".into();
+        ed.start_update_with(TITLE.into(), target(), Before::new_tour(), pin.clone(), &book, token.clone());
+        assert!(!ed.exporting());
+        // Nobody's yet: the active profile at the recording's own address updates it.
+        ed.video.as_mut().unwrap().origin.as_mut().unwrap().profile.clear();
+        ed.start_update_with(TITLE.into(), target(), Before::new_tour(), pin.clone(), &book, token);
+        assert!(ed.exporting(), "Update tour starts");
+        until_done(&mut ed);
+        assert_eq!(ed.video.as_ref().unwrap().job_pin.as_ref(), Some(&pin));
+        assert_eq!(*asked.lock().unwrap(), vec![pin]);
+        assert!(s.lines().iter().any(|l| l.ends_with("/commit")), "{:?}", s.lines());
     }
 
     #[test]

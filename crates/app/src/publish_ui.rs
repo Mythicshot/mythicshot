@@ -63,9 +63,9 @@ struct Config {
     /// and never written to the settings file.
     test_server: Option<String>,
     token: TokenStatus,
-    /// The lookups of the active profile's token: each switch or change starts a new one, and a
-    /// refusal counts only for the profile and the lookup it was made with.
-    live: Live,
+    /// The profiles, the lookups of the active profile's token, and whether the settings file is
+    /// behind: see [`Wired`].
+    wired: Wired,
     /// The site address the saved token belongs to (as the address rule writes it); None when it is tied to none.
     saved_for: Option<String>,
     /// A new value of `saved_for` the settings file does not hold yet ("" for none).
@@ -74,10 +74,6 @@ struct Config {
     keep_recordings: bool,
     /// The setting: how many GB the saved recordings may take before a publish says so; 0 for never.
     warn_gb: u32,
-    /// The profiles and the active one: `server`, `saved_for` and the token follow the active one.
-    book: Book,
-    /// The profiles changed and the settings file does not hold it yet.
-    book_change: bool,
     /// A page or a dialog asked for the add form or the list of profiles on the Workspace page.
     profiles_request: Option<ProfilesRequest>,
     /// The name the update that adds profiles gave the existing connection, said this run.
@@ -90,17 +86,66 @@ static CONFIG: Mutex<Config> = Mutex::new(Config {
     server: String::new(),
     test_server: None,
     token: TokenStatus::Checking,
-    live: Live { generation: 0, looked: None },
+    wired: Wired { book: Book { list: Vec::new(), active: None, legacy: None }, live: Live { generation: 0, looked: None }, changed: false },
     saved_for: None,
     saved_for_change: None,
     keep_recordings: true,
     warn_gb: 0,
-    book: Book { list: Vec::new(), active: None, legacy: None },
-    book_change: false,
     profiles_request: None,
     migrated: None,
     migration_problem: None,
 });
+
+/// The decisions about the profiles that the shared state takes, apart from it, so they are
+/// tested without the global: the profiles (`server`, `saved_for` and the token follow the
+/// active one), the lookups of the active profile's token (each switch or change starts a new
+/// one, and a refusal counts only for the profile and the lookup it was made with), and whether
+/// the settings file is behind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Wired {
+    pub book: Book,
+    pub live: Live,
+    pub changed: bool,
+}
+
+impl Wired {
+    /// A new lookup for the active profile: the one before stops counting.
+    pub fn begin(&mut self) -> (u64, Option<String>) {
+        self.live.begin(&self.book)
+    }
+
+    /// Make `id` active, and start its lookup; None for no such profile.
+    pub fn switch(&mut self, id: &str) -> Option<(u64, Option<String>)> {
+        if !self.book.switch(id) {
+            return None;
+        }
+        self.changed = true;
+        Some(self.begin())
+    }
+
+    /// Take a change made on a copy (`new`, from `before`), keeping what happened meanwhile, and
+    /// start a new lookup.
+    pub fn take_change(&mut self, before: &Book, new: &Book) -> (u64, Option<String>) {
+        let merged = profiles::merge(before, &self.book, new);
+        if merged != self.book {
+            self.book = merged;
+            self.changed = true;
+        }
+        self.begin()
+    }
+
+    /// A refusal of the token looked up last goes on the profile it was looked up for, only.
+    pub fn sync(&mut self, refused: &dyn Fn(&str) -> bool) {
+        if self.live.attribute(&mut self.book, refused) {
+            self.changed = true;
+        }
+    }
+
+    /// Whether the active profile cannot be used now.
+    pub fn refused(&self, refused: &dyn Fn(&str) -> bool) -> bool {
+        self.live.active_refused(&self.book, refused)
+    }
+}
 
 fn config() -> std::sync::MutexGuard<'static, Config> {
     CONFIG.lock().unwrap_or_else(|e| e.into_inner())
@@ -117,7 +162,7 @@ pub fn init(settings: &crate::settings::Settings) {
     }
     {
         let mut c = config();
-        c.book = Book::of(settings);
+        c.wired.book = Book::of(settings);
         follow_active(&mut c);
     }
     set_keep_recordings(settings.keep_published_recordings);
@@ -198,7 +243,7 @@ pub fn warn_gb() -> u32 {
 
 /// The address and the token's site follow the active profile; none without one.
 fn follow_active(c: &mut Config) {
-    let server = c.book.active().map(|p| p.server.clone());
+    let server = c.wired.book.active().map(|p| p.server.clone());
     c.server = server.clone().unwrap_or_default();
     c.saved_for = server.and_then(|s| publish::check_server(&s).ok());
 }
@@ -222,7 +267,7 @@ pub fn token_status() -> TokenStatus {
 /// each Save and Forget. What was read from the site with an earlier number may belong to
 /// another token, so the pages read it again.
 pub fn token_epoch() -> u64 {
-    config().live.generation
+    config().wired.live.generation
 }
 
 /// Look the token up on this thread; never call it on the UI thread.
@@ -235,8 +280,7 @@ pub fn refresh_token_now() {
 /// what was read from the site with the earlier number is read again.
 fn begin_refresh(c: &mut Config) -> (u64, Option<String>) {
     c.token = TokenStatus::Checking;
-    let Config { live, book, .. } = c;
-    live.begin(book)
+    c.wired.begin()
 }
 
 fn finish_refresh(generation: u64, profile: Option<String>) {
@@ -250,7 +294,7 @@ fn finish_refresh(generation: u64, profile: Option<String>) {
         Some(Err(e)) => (TokenStatus::Unavailable(e), None),
     };
     let mut c = config();
-    if c.live.finish(generation, profile, fingerprint) {
+    if c.wired.live.finish(generation, profile, fingerprint) {
         c.token = status;
     }
 }
@@ -262,17 +306,14 @@ fn finish_refresh(generation: u64, profile: Option<String>) {
 pub fn token_refused() -> bool {
     sync_profile_state();
     let c = config();
-    c.live.active_refused(&c.book, &publish::is_refused)
+    c.wired.refused(&publish::is_refused)
 }
 
 /// A refusal of the token looked up last makes the profile it was looked up for (and no other)
 /// need a new sign-in, and the settings file is told.
 pub fn sync_profile_state() {
     let mut c = config();
-    let Config { live, book, book_change, .. } = &mut *c;
-    if live.attribute(book, &publish::is_refused) {
-        *book_change = true;
-    }
+    c.wired.sync(&publish::is_refused);
 }
 
 /// What the windows add to [`publish::REJECTED_TOKEN`] for a token the site no longer takes.
@@ -280,7 +321,7 @@ pub const SIGN_IN_AGAIN: &str = "Sign in again on the Workspace page of the main
 
 /// The whole sentence for a token the site refused: with a profile, that it needs a new sign-in.
 pub fn refused_reason() -> String {
-    match config().book.active() {
+    match config().wired.book.active() {
         Some(p) => profiles::needs_sign_in(&p.name),
         None => format!("{} {SIGN_IN_AGAIN}", publish::REJECTED_TOKEN),
     }
@@ -376,7 +417,7 @@ pub fn pin_for(server: &str) -> Pin {
 /// The profile a job starting now uses, and the address it sends to.
 pub fn pin() -> Pin {
     let c = config();
-    Pin { profile: c.book.active().map(|p| p.id.clone()), server: c.test_server.clone().unwrap_or_else(|| c.server.clone()) }
+    Pin { profile: c.wired.book.active().map(|p| p.id.clone()), server: c.test_server.clone().unwrap_or_else(|| c.server.clone()) }
 }
 
 /// The token of the profile `pin` names, for `pin.server` only; see [`profiles::token_for`].
@@ -384,7 +425,7 @@ pub fn pin() -> Pin {
 pub fn token_for_pin(pin: &Pin) -> Result<String, String> {
     let (book, test) = {
         let c = config();
-        (c.book.clone(), c.test_server.clone())
+        (c.wired.book.clone(), c.test_server.clone())
     };
     match test {
         Some(test) => profiles::token_for_hook(&book, &publish::OsKeys, pin, &test),
@@ -403,7 +444,7 @@ pub enum ProfilesRequest {
 
 /// The profiles and the active one, as they are now.
 pub fn book() -> Book {
-    config().book.clone()
+    config().wired.book.clone()
 }
 
 /// Make `id` the active profile: the address, the token, the Tours page and every dialog that
@@ -412,12 +453,10 @@ pub fn book() -> Book {
 pub fn switch_profile(id: &str) -> bool {
     let (generation, key) = {
         let mut c = config();
-        if !c.book.switch(id) {
-            return false;
-        }
+        let Some(started) = c.wired.switch(id) else { return false };
+        c.token = TokenStatus::Checking;
         follow_active(&mut c);
-        c.book_change = true;
-        begin_refresh(&mut c)
+        started
     };
     std::thread::spawn(move || {
         finish_refresh(generation, key);
@@ -435,18 +474,15 @@ static CHANGING: Mutex<()> = Mutex::new(());
 /// profiles meanwhile (a switch, a refusal, a check) is kept ([`profiles::merge`]).
 pub fn change_profiles<T>(change: impl FnOnce(&mut Book, &dyn publish::KeyStore) -> T) -> T {
     let _one = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
-    let before = config().book.clone();
+    let before = config().wired.book.clone();
     let mut new = before.clone();
     let out = change(&mut new, &publish::OsKeys);
     let (generation, key) = {
         let mut c = config();
-        let merged = profiles::merge(&before, &c.book, &new);
-        if merged != c.book {
-            c.book = merged;
-            c.book_change = true;
-        }
+        c.token = TokenStatus::Checking;
+        let started = c.wired.take_change(&before, &new);
         follow_active(&mut c);
-        begin_refresh(&mut c)
+        started
     };
     finish_refresh(generation, key);
     out
@@ -464,7 +500,7 @@ pub fn check_active_profile() {
 /// (401) makes that profile need a new sign-in. A first profile that turns out to be the account
 /// of another profile is joined to it.
 pub fn check_profile(id: &str) {
-    let Some(server) = config().book.get(id).map(|p| p.server.clone()) else { return };
+    let Some(server) = config().wired.book.get(id).map(|p| p.server.clone()) else { return };
     let pin = Pin { profile: Some(id.to_string()), server };
     let Ok(mut token) = token_for_pin(&pin) else { return };
     let answer = publish::workspace(&pin.server, &token);
@@ -473,8 +509,8 @@ pub fn check_profile(id: &str) {
         Ok(ws) => note_check(id, &pin.server, &ws),
         Err(e) if e == publish::REJECTED_TOKEN => {
             let mut c = config();
-            if profiles::mark_refused(&mut c.book, id) {
-                c.book_change = true;
+            if profiles::mark_refused(&mut c.wired.book, id) {
+                c.wired.changed = true;
             }
         }
         Err(_) => {}
@@ -486,11 +522,11 @@ pub fn check_profile(id: &str) {
 pub fn note_check(id: &str, server: &str, ws: &publish::Workspace) {
     let twin = {
         let mut c = config();
-        if profiles::note_check(&mut c.book, id, server, ws) {
-            c.book_change = true;
+        if profiles::note_check(&mut c.wired.book, id, server, ws) {
+            c.wired.changed = true;
         }
-        let legacy = c.book.legacy.as_deref() == Some(id);
-        legacy.then(|| profiles::twin_of(&c.book, id)).flatten()
+        let legacy = c.wired.book.legacy.as_deref() == Some(id);
+        legacy.then(|| profiles::twin_of(&c.wired.book, id)).flatten()
     };
     if let Some(to) = twin {
         let from = id.to_string();
@@ -504,11 +540,11 @@ pub fn note_check(id: &str, server: &str, ws: &publish::Workspace) {
 /// The profiles as the settings file should now hold them, once after each change.
 pub fn take_book_change() -> Option<Book> {
     let mut c = config();
-    std::mem::take(&mut c.book_change).then(|| c.book.clone())
+    std::mem::take(&mut c.wired.changed).then(|| c.wired.book.clone())
 }
 
 pub fn has_book_change() -> bool {
-    config().book_change
+    config().wired.changed
 }
 
 /// Ask for the add form or the list of profiles on the Workspace page.
@@ -544,7 +580,7 @@ pub fn migration_problem() -> Option<String> {
 pub fn migrated_notice() -> Option<String> {
     let c = config();
     c.migrated.as_ref()?;
-    c.book.legacy.as_deref().and_then(|id| c.book.get(id)).map(|p| profiles::migrated(&p.name))
+    c.wired.book.legacy.as_deref().and_then(|id| c.wired.book.get(id)).map(|p| profiles::migrated(&p.name))
 }
 
 /// Sign out of the active profile: its token is removed from this computer and it waits for a
@@ -2418,6 +2454,61 @@ impl Picker {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn two_profiles(active: &str) -> Wired {
+        let p = |id: &str| profiles::Profile { id: id.into(), name: id.into(), server: "https://tours.example.com".into(), account: None, workspace: None, identity: None, state: profiles::State::Ready, named: true };
+        Wired { book: Book { list: vec![p("pa"), p("pb")], active: Some(active.into()), legacy: None }, ..Wired::default() }
+    }
+
+    #[test]
+    fn a_refusal_is_put_on_the_profile_its_token_was_looked_up_for_never_the_active_one() {
+        let refused = |fp: &str| fp == "fp-a";
+        // A's token was looked up (by this lookup), and B is the active profile.
+        let mut w = two_profiles("pb");
+        w.live.looked = Some(profiles::Looked { profile: "pa".into(), generation: w.live.generation, fingerprint: "fp-a".into() });
+        w.sync(&refused);
+        assert_eq!((w.book.get("pa").unwrap().state, w.book.get("pb").unwrap().state), (profiles::State::SignInAgain, profiles::State::Ready));
+        assert!(w.changed && !w.refused(&refused));
+    }
+
+    #[test]
+    fn after_a_switch_a_change_or_a_renewal_an_earlier_refusal_lands_nowhere_else() {
+        let refused = |fp: &str| fp == "fp-a";
+        let looked_up_a = |w: &mut Wired| {
+            let (generation, profile) = w.begin();
+            assert!(w.live.finish(generation, profile, Some("fp-a".into())));
+        };
+        // A switch.
+        let mut w = two_profiles("pa");
+        looked_up_a(&mut w);
+        w.switch("pb").unwrap();
+        w.sync(&refused);
+        assert!(!w.refused(&refused));
+        assert_eq!(w.book.get("pb").unwrap().state, profiles::State::Ready);
+        // A change of the profiles (A removed on a copy): B active, nothing inherited.
+        let mut w = two_profiles("pa");
+        looked_up_a(&mut w);
+        let before = w.book.clone();
+        let mut new = before.clone();
+        new.list.retain(|p| p.id != "pa");
+        new.active = Some("pb".into());
+        w.take_change(&before, &new);
+        w.sync(&refused);
+        assert!(!w.refused(&refused));
+        assert_eq!(w.book.get("pb").unwrap().state, profiles::State::Ready);
+        // A renewal of A: Ready again, and its old token's refusal does not take that back.
+        let mut w = two_profiles("pa");
+        looked_up_a(&mut w);
+        w.sync(&refused);
+        assert_eq!(w.book.get("pa").unwrap().state, profiles::State::SignInAgain);
+        let before = w.book.clone();
+        let mut new = before.clone();
+        new.list[0].state = profiles::State::Ready;
+        w.take_change(&before, &new);
+        w.sync(&refused);
+        assert!(!w.refused(&refused));
+        assert_eq!(w.book.get("pa").unwrap().state, profiles::State::Ready);
+    }
 
     /// `publish_blocked` with the token saved for the very address that is asked about.
     fn blocked(exporting: bool, has_steps: bool, server: &str, token: &TokenStatus) -> Option<Blocked> {

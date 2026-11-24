@@ -251,6 +251,9 @@ impl Check {
     }
 }
 
+/// Keeps a check's answer for a profile: its id, the address asked, and the answer.
+type Note = Arc<dyn Fn(&str, &str, &publish::Workspace) + Send + Sync>;
+
 /// Where a check gets the token for the address it is about to ask.
 type TokenSource = Arc<dyn Fn(&crate::profiles::Pin) -> Result<String, String> + Send + Sync>;
 /// Ties the saved token to an address (None: to none).
@@ -340,6 +343,8 @@ pub struct WorkspaceState {
     vault: Vault,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// Where a check's answer is kept: for the profile the check was pinned to.
+    note: Note,
     /// The page shows the active profile: its address cannot be edited here, and signing in
     /// (again) and the profile's token are the profiles panel's above (see `profiles_ui`).
     pub profile_mode: bool,
@@ -363,6 +368,7 @@ impl Default for WorkspaceState {
             vault: Vault::default(),
             open: Arc::new(sign_in_ui::open_in_browser),
             clock: Arc::new(connect::RealClock::new()),
+            note: Arc::new(publish_ui::note_check),
             profile_mode: false,
         }
     }
@@ -383,12 +389,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Ask the site for its name and version, then count its tours. A list that cannot be read
 /// leaves the count unknown; the connection itself still stands.
-fn ask(site: &Site, token: &str) -> Result<Info, String> {
+fn ask(site: &Site, token: &str, note: &Note) -> Result<Info, String> {
     let server = site.server.as_str();
     let ws = publish::workspace(server, token)?;
     // Kept for the profile the check was pinned to, whichever is active by now.
     if let Some(id) = &site.profile {
-        publish_ui::note_check(id, server, &ws);
+        note(id, server, &ws);
     }
     let tours = publish::list_tours(server, token).ok().map(|t| Counts::of(&t));
     Ok(Info { workspace: ws.name, version: ws.version, tours })
@@ -458,9 +464,9 @@ impl WorkspaceState {
     /// when this is a Test connection, whose result is also shown as a sentence.
     fn spawn_check(&self, site: Site, announce: Option<String>) {
         let generation = lock(&self.check).begin();
-        let (check, token) = (self.check.clone(), self.token.clone());
+        let (check, token, note) = (self.check.clone(), self.token.clone(), self.note.clone());
         let work = move || {
-            let result = token(&site.pin()).and_then(|token| ask(&site, &token));
+            let result = token(&site.pin()).and_then(|token| ask(&site, &token, &note));
             lock(&check).finish(generation, site, result.clone());
             result.map(|info| format!("Connected to workspace \"{}\"", info.workspace))
         };
@@ -1075,11 +1081,14 @@ mod tests {
         let s = site_stub(r#"{"workspace":"Acme"}"#);
         let asked: Arc<Mutex<Vec<crate::profiles::Pin>>> = Arc::default();
         let record = asked.clone();
+        let noted: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+        let note_record = noted.clone();
         let mut p = WorkspaceState {
             token: Arc::new(move |pin: &crate::profiles::Pin| {
                 record.lock().unwrap().push(pin.clone());
                 Ok(TOKEN.to_string())
             }),
+            note: Arc::new(move |id: &str, server: &str, ws: &publish::Workspace| note_record.lock().unwrap().push((id.into(), server.into(), ws.name.clone()))),
             ..page()
         };
         let c = Conn { profile: Some("pa".into()), ..bound_to(&s, TokenStatus::Saved) };
@@ -1087,6 +1096,8 @@ mod tests {
         let (ctx, mut server) = (crate::theme::test_context(), s.base.clone());
         until(&ctx, &mut p, &mut server, &c, connected);
         assert_eq!(*asked.lock().unwrap(), vec![crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() }]);
+        // The answer is kept for that profile, whatever is active (in a test run: none).
+        assert_eq!(*noted.lock().unwrap(), vec![("pa".to_string(), s.base.clone(), "Acme".to_string())]);
     }
 
     #[test]

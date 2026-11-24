@@ -242,9 +242,136 @@ fn the_first_profile_is_joined_to_a_profile_of_the_same_identity() {
     attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
     assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"]);
     assert_eq!((b.active.as_deref(), b.legacy.as_deref()), (Some("pa"), Some("pa")));
-    assert_eq!(store.keys(), vec!["profile-pa".to_string()], "the copy and the old entry go");
+    assert_eq!(store.at("profile-pa").as_deref(), Some(TOKEN_A), "the twin keeps its own working token");
+    assert_eq!(store.at(&first_key()), None, "the copy goes");
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD), "the old entry stays: no profile holds a copy of it");
     // Recordings linked before profiles belong to it now.
     assert_eq!(owner_of(&b, ""), Owner::Active);
+}
+
+/// The first profile, checked and found to be account 42 of workspace WS_ID, and its twin `pa`.
+fn twins(twin_state: State) -> Book {
+    Book {
+        list: vec![
+            Profile { identity: Some(ided(WS_ID, "42")), ..profile(MIGRATED_ID, "Acme · tours.example.com", SITE, None, Some("Acme")) },
+            Profile { identity: Some(ided(WS_ID, "42")), state: twin_state, ..profile("pa", "Acme", SITE, Some("alex"), Some("Acme")) },
+        ],
+        active: Some(MIGRATED_ID.into()),
+        legacy: Some(MIGRATED_ID.into()),
+    }
+}
+
+#[test]
+fn a_join_never_matches_without_ids_on_both_sides() {
+    // The same name-based identity (today's sites) is no proof of one account.
+    let store = FakeKeys::with(&[(&first_key(), OLD), ("profile-pa", TOKEN_A)]);
+    let mut b = twins(State::Ready);
+    for p in b.list.iter_mut() {
+        p.identity = Some(named("Acme"));
+    }
+    assert_eq!(twin_of(&b, MIGRATED_ID), None);
+    let before = b.clone();
+    attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
+    assert_eq!(b, before, "no join");
+    assert_eq!(store.keys(), vec![first_key(), "profile-pa".to_string()]);
+    // Ids on one side only: no join either.
+    let mut b = twins(State::Ready);
+    b.list[1].identity = Some(named("Acme"));
+    assert_eq!(twin_of(&b, MIGRATED_ID), None);
+    let before = b.clone();
+    attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
+    assert_eq!(b, before);
+}
+
+#[test]
+fn a_join_moves_the_working_token_into_a_twin_that_cannot_be_used() {
+    for (state, twin_token) in [(State::SignInAgain, Some(TOKEN_A)), (State::Ready, None), (State::SignInAgain, None)] {
+        let store = FakeKeys::with(&[(&first_key(), OLD)]);
+        if let Some(t) = twin_token {
+            store.entries.borrow_mut().insert("profile-pa".into(), t.into());
+        }
+        let mut b = twins(state);
+        attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
+        assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"], "{state:?} {twin_token:?}");
+        assert_eq!(b.get("pa").unwrap().state, State::Ready);
+        assert_eq!(store.at("profile-pa").as_deref(), Some(OLD), "the only working token is never lost");
+        assert_eq!(store.at(&first_key()), None);
+    }
+}
+
+#[test]
+fn a_join_that_cannot_confirm_the_moved_token_does_not_happen() {
+    let store = FakeKeys { garble: true, ..FakeKeys::with(&[(&first_key(), OLD)]) };
+    let mut b = twins(State::SignInAgain);
+    let before = b.clone();
+    let _ = attach(&mut b, &store, MIGRATED_ID, "pa");
+    assert_eq!(b, before, "no join");
+    assert_eq!(store.at(&first_key()).as_deref(), Some(OLD), "the working token stays where it was");
+}
+
+// ---- D. The old entry ----
+
+#[test]
+fn the_old_entry_goes_only_while_a_profile_holds_a_working_copy_of_it() {
+    let migrated = || {
+        let mut s = old_settings();
+        s.profiles_migrated = true;
+        s.legacy_profile = Some(MIGRATED_ID.into());
+        s.profiles = vec![profile(MIGRATED_ID, "A", SITE, None, None)];
+        s
+    };
+    // An older version wrote another token into the old entry meanwhile, and the first profile
+    // waits for a sign-in: the old entry is left as it is.
+    let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_B), (&first_key(), OLD)]);
+    let mut s = migrated();
+    s.profiles[0].state = State::SignInAgain;
+    assert_eq!(remove_legacy(&s, &store), Ok(false));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(TOKEN_B));
+    // The same with the profile usable: still no profile holds a copy of that token.
+    let s = migrated();
+    assert_eq!(remove_legacy(&s, &store), Ok(false));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(TOKEN_B));
+    // The first profile was removed and no other holds the token: kept.
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD)]);
+    let mut s = migrated();
+    s.profiles.clear();
+    assert_eq!(remove_legacy(&s, &store), Ok(false));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD));
+    // A profile holds exactly it: it goes.
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
+    assert_eq!(remove_legacy(&migrated(), &store), Ok(true));
+    assert_eq!(store.keys(), vec![first_key()]);
+}
+
+#[test]
+fn removing_the_first_profile_leaves_an_old_entry_that_is_another_token() {
+    let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_B), (&first_key(), OLD)]);
+    let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
+    remove(&mut b, &store, MIGRATED_ID).unwrap();
+    assert_eq!(store.keys(), vec![LEGACY_KEY.to_string()]);
+}
+
+#[test]
+fn a_change_on_a_copy_keeps_an_identity_and_a_refusal_recorded_meanwhile_on_the_same_profile() {
+    let before = book(vec![profile("pa", "A", SITE, None, Some("Acme"))], "pa");
+    // Meanwhile: the check recorded the ids, and a request was refused.
+    let mut current = before.clone();
+    current.list[0].identity = Some(ided(WS_ID, "acc-a"));
+    mark_refused(&mut current, "pa");
+    // The change on the copy touched the same profile otherwise (its display name).
+    let mut new = before.clone();
+    new.list[0].account = Some("alex".into());
+    let merged = merge(&before, &current, &new);
+    let pa = merged.get("pa").unwrap();
+    assert_eq!((pa.identity.clone(), pa.state, pa.account.as_deref()), (Some(ided(WS_ID, "acc-a")), State::SignInAgain, Some("alex")));
+    // A change that replaced the token (a renewal: Ready again, identity recorded) wins.
+    let mut renewed = before.clone();
+    renewed.list[0].identity = Some(ided(WS_ID, "acc-a"));
+    let mut waiting = before.clone();
+    mark_refused(&mut waiting, "pa");
+    let merged = merge(&waiting, &{ let mut c = waiting.clone(); c.list[0].workspace = Some("Acme 2".into()); c }, &renewed);
+    assert_eq!(merged.get("pa").unwrap().state, State::Ready);
 }
 
 // ---- 3. Adding a profile ----
@@ -416,10 +543,24 @@ fn todays_sites_renew_by_the_workspace_name_and_anything_else_is_another_account
     let mut b = waiting();
     assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Other", TOKEN_A)).unwrap(), Renewal::OtherAccount(_)));
     assert_eq!(store.at("profile-pc").as_deref(), Some(OLD));
-    // The same workspace name, whoever signs in (today's sites cannot say more): renewed.
+    // The same workspace name but another account name: another account, nothing stored.
     let mut b = waiting();
-    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("someone"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
-    assert_eq!(b.get("pc").unwrap().identity, Some(named("Acme")));
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("someone"), "Acme", TOKEN_A)).unwrap(), Renewal::OtherAccount(_)));
+    assert_eq!((b.get("pc").unwrap().state, store.at("profile-pc").as_deref()), (State::SignInAgain, Some(OLD)));
+    // The same workspace and account name: renewed, and the name is kept for next time.
+    let mut b = waiting();
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert_eq!((b.get("pc").unwrap().identity.clone(), b.get("pc").unwrap().account.as_deref()), (Some(named("Acme")), Some("customer")));
+    // A pasted token names no account: the workspace name decides.
+    let store = FakeKeys::with(&[("profile-pc", OLD)]);
+    let mut b = waiting();
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, None, "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("customer"), "a name once known is not forgotten");
+    // A profile that knew no account name records the first one it gets.
+    let store = FakeKeys::with(&[("profile-pc", OLD)]);
+    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, None, Some("Acme")) }], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("customer"));
 }
 
 #[test]

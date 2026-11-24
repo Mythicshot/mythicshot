@@ -294,6 +294,9 @@ pub enum Step {
     Checked { candidate: Candidate, name: String },
     /// A profile for this site and account is there already.
     Same { candidate: Candidate, id: String, name: String },
+    /// A sign-in for profile `id` passed the check and is that profile's account: what it is, and
+    /// "Save profile" to take it. Nothing is stored before.
+    Renew { candidate: Candidate, id: String },
     /// Saved, switched, renewed or cancelled: the form is done.
     Finished,
 }
@@ -395,7 +398,7 @@ impl AddFlow {
 
     /// Whether "Save profile" can be pressed: only once the sign-in passed the check.
     pub fn can_save(&self) -> bool {
-        matches!(self.step, Step::Checked { .. }) && !self.working
+        matches!(self.step, Step::Checked { .. } | Step::Renew { .. }) && !self.working
     }
 
     /// Sign in: the browser window for the address, after the address check.
@@ -430,17 +433,12 @@ impl AddFlow {
 
     fn accept(&mut self, candidate: Candidate) {
         match self.purpose.clone() {
-            Purpose::Renew(id) => {
-                self.working = true;
-                spawn_change(
-                    &self.shelf,
-                    &self.done,
-                    Box::new(move |book, store| match profiles::renew(book, store, &id, candidate) {
-                        Ok(profiles::Renewal::Renewed) => Done::Renewed(id),
-                        Ok(profiles::Renewal::OtherAccount(c)) => Done::Other(c),
-                        Err(e) => Done::Failed(e),
-                    }),
-                );
+            // The profile's account: confirmed by "Save profile" before anything is stored.
+            Purpose::Renew(id) if profiles::would_renew(&self.shelf.book(), &id, &candidate) => self.step = Step::Renew { candidate, id },
+            // Another account: offered as a profile of its own; the old one stays as it was.
+            Purpose::Renew(_) => {
+                self.purpose = Purpose::New;
+                self.offer(candidate);
             }
             Purpose::New => self.offer(candidate),
         }
@@ -472,7 +470,26 @@ impl AddFlow {
         if !self.can_save() {
             return;
         }
-        let Step::Checked { candidate, name } = std::mem::replace(&mut self.step, Step::Address) else { return };
+        let (candidate, name) = match std::mem::replace(&mut self.step, Step::Address) {
+            Step::Checked { candidate, name } => (candidate, name),
+            Step::Renew { candidate, id } => {
+                self.working = true;
+                spawn_change(
+                    &self.shelf,
+                    &self.done,
+                    Box::new(move |book, store| match profiles::renew(book, store, &id, candidate) {
+                        Ok(profiles::Renewal::Renewed) => Done::Renewed(id),
+                        Ok(profiles::Renewal::OtherAccount(c)) => Done::Other(c),
+                        Err(e) => Done::Failed(e),
+                    }),
+                );
+                return;
+            }
+            other => {
+                self.step = other;
+                return;
+            }
+        };
         self.working = true;
         spawn_change(
             &self.shelf,
@@ -668,6 +685,18 @@ impl AddFlow {
                 ui.add_space(6.0);
                 ui.label(RichText::new(profiles::PROFILE_NAME).strong().color(theme::MUTED));
                 ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(300.0));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
+                        pressed = Some(profiles::CANCEL);
+                    }
+                    if ui.add_enabled(!self.working, theme::primary_button(profiles::SAVE_PROFILE)).clicked() {
+                        pressed = Some(profiles::SAVE_PROFILE);
+                    }
+                });
+            }
+            Step::Renew { candidate, .. } => {
+                note(ui, Tone::Ok, &profiles::connected(candidate.account.as_deref(), &candidate.workspace));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {

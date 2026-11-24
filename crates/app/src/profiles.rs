@@ -417,7 +417,8 @@ pub enum Renewal {
 /// from `c` then. Same site, and:
 /// - none recorded: any;
 /// - recorded by the workspace's name (today's sites): the same workspace name, from the same
-///   answer that gives `c`'s ids if any (so a site that starts sending ids upgrades it here);
+///   answer that gives `c`'s ids if any (so a site that starts sending ids upgrades it here); and
+///   when the profile's account name and the sign-in's are both known, the same account name;
 /// - recorded by ids: the same workspace id, and the same account id when one is recorded. It
 ///   never matches by name: an answer without ids is another account.
 fn renews(p: &Profile, c: &Candidate) -> bool {
@@ -427,8 +428,13 @@ fn renews(p: &Profile, c: &Candidate) -> bool {
     match &p.identity {
         None => true,
         Some(i) if i.by_ids() => c.identity.workspace == i.workspace && (i.account.is_none() || c.identity.account == i.account),
-        Some(i) => i.workspace == format!("name:{}", c.workspace),
+        Some(i) => i.workspace == format!("name:{}", c.workspace) && !matches!((&p.account, &c.account), (Some(a), Some(b)) if a != b),
     }
+}
+
+/// Whether profile `id`'s own "Sign in again" would take sign-in `c` (see [`renew`]).
+pub fn would_renew(book: &Book, id: &str, c: &Candidate) -> bool {
+    book.get(id).is_some_and(|p| renews(p, c))
 }
 
 /// "Sign in again" for profile `id`, from that profile's own action: only a sign-in for the same
@@ -510,9 +516,10 @@ pub fn sign_out(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), S
 /// Remove profile `id` and its token from this computer; nothing is sent to the site. When it
 /// was the active one, another becomes active (one that can be used first), or none.
 pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), String> {
+    // What is left of the old entry goes with it only when it is this profile's own copy.
+    let legacy_is_its_copy = book.legacy.as_deref() == Some(id) && matches!((publish::load_token_at(store, LEGACY_KEY), publish::load_token_at(store, &profile_key(id))), (Ok(Some(a)), Ok(Some(b))) if a == b);
     store.delete(&profile_key(id))?;
-    if book.legacy.as_deref() == Some(id) {
-        // What is left of the old entry, if a start was cut off before it went.
+    if legacy_is_its_copy {
         let _ = store.delete(LEGACY_KEY);
     }
     book.list.retain(|p| p.id != id);
@@ -528,14 +535,29 @@ pub fn twin_of(book: &Book, id: &str) -> Option<String> {
     book.list.iter().find(|o| o.id != id && same_site(&o.server, &p.server) && o.identity.as_ref() == Some(i)).map(|o| o.id.clone())
 }
 
-/// Join profile `from` (the migrated one) to `to`, the same account: `from` and its token go,
-/// recordings linked before profiles belong to `to`, and `to` is active where `from` was.
+/// Join profile `from` (the migrated one) to `to`, the same account by complete id-based
+/// identities on both sides: recordings linked before profiles belong to `to`, and `to` is active
+/// where `from` was. The only working token is never lost: when `to` cannot be used (it waits for
+/// a sign-in, or has no token), `from`'s token is moved into it first (written, read back, and
+/// only then removed from `from`) and `to` is ready again; when that cannot be confirmed, nothing
+/// is joined. The old entry is left for [`remove_legacy`].
 pub fn attach(book: &mut Book, store: &dyn KeyStore, from: &str, to: &str) -> Result<(), String> {
-    if book.get(to).is_none() || from == to {
+    let (Some(f), Some(t)) = (book.get(from), book.get(to)) else { return Ok(()) };
+    let same = matches!((&f.identity, &t.identity), (Some(a), Some(b)) if a.complete() && b.complete() && a == b);
+    if from == to || !same || !same_site(&f.server, &t.server) {
         return Ok(());
     }
+    let usable = t.state == State::Ready && publish::load_token_at(store, &profile_key(to))?.is_some();
+    if !usable {
+        let Some(mut token) = publish::load_token_at(store, &profile_key(from))? else { return Ok(()) };
+        let moved = write_confirmed(store, &profile_key(to), &token);
+        crate::publish_ui::wipe(&mut token);
+        moved?;
+        if let Some(t) = book.get_mut(to) {
+            t.state = State::Ready;
+        }
+    }
     store.delete(&profile_key(from))?;
-    let _ = store.delete(LEGACY_KEY);
     let was_active = book.active.as_deref() == Some(from);
     book.list.retain(|p| p.id != from);
     if book.legacy.as_deref() == Some(from) || book.legacy.is_none() {
@@ -607,12 +629,13 @@ impl Live {
 pub fn merge(before: &Book, current: &Book, new: &Book) -> Book {
     let mut out = new.clone();
     for p in out.list.iter_mut() {
-        let (was, now) = (before.get(&p.id), current.get(&p.id));
-        if let (Some(was), Some(now)) = (was, now)
-            && was == p
-            && now != was
-        {
-            *p = now.clone();
+        // Field by field: what the change left alone takes what happened meanwhile (an identity
+        // recorded, a refusal); what the change set (a renewal's Ready, say) stays.
+        if let (Some(was), Some(now)) = (before.get(&p.id), current.get(&p.id)) {
+            macro_rules! keep {
+                ($($f:ident),*) => {$(if p.$f == was.$f { p.$f = now.$f.clone(); })*};
+            }
+            keep!(name, server, account, workspace, identity, state, named);
         }
     }
     if new.active == before.active && current.active != before.active && current.active.as_deref().is_some_and(|id| out.get(id).is_some()) {
@@ -748,19 +771,31 @@ pub fn migrate(settings: &mut Settings, store: &dyn KeyStore) -> Result<Option<S
     Ok(book.get(MIGRATED_ID).map(|p| p.name.clone()))
 }
 
-/// Remove the old credential entry once the settings that say what became of it were saved: it
-/// was copied into a profile's own entry (and is confirmed there), that profile was removed or
-/// joined to another, or it could never be used (no address, or no copy to make). True when it
-/// removed one. Run after every start's save: it finishes a migration a start cut off.
+/// Remove the old credential entry once the settings that say what became of it were saved, and
+/// only while a profile's own entry holds exactly the same token (a confirmed copy of it), or when
+/// it could never be used (there was no address to tie it to). Anything else (an entry an older
+/// version wrote again, another token, no copy left anywhere) is left untouched, silently. True
+/// when it removed one. Run after every start's save: it finishes a migration a start cut off.
 pub fn remove_legacy(settings: &Settings, store: &dyn KeyStore) -> Result<bool, String> {
     if !settings.profiles_migrated || store.get(LEGACY_KEY)?.is_none() {
         return Ok(false);
     }
-    if let Some(id) = settings.legacy_profile.as_deref()
-        && settings.profiles.iter().any(|p| p.id == id)
-        && publish::load_token_at(store, &profile_key(id))?.is_none()
-    {
-        // Its copy is not confirmed: the old entry stays.
+    let unusable = settings.legacy_profile.is_none() && settings.publish_saved_for.as_deref().is_none_or(|s| publish::check_server(s).is_err());
+    let copied = match publish::load_token_at(store, LEGACY_KEY) {
+        Ok(Some(mut old)) => {
+            let mut held = false;
+            for p in &settings.profiles {
+                if let Ok(Some(mut copy)) = publish::load_token_at(store, &profile_key(&p.id)) {
+                    held |= copy == old;
+                    crate::publish_ui::wipe(&mut copy);
+                }
+            }
+            crate::publish_ui::wipe(&mut old);
+            held
+        }
+        _ => false,
+    };
+    if !copied && !unusable {
         return Ok(false);
     }
     store.delete(LEGACY_KEY)?;

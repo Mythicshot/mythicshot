@@ -1550,6 +1550,13 @@ impl ToursState {
         Self { model: Arc::default(), tools }
     }
 
+    /// A page whose jobs get the token from `token`, which is handed the job's pin.
+    #[cfg(test)]
+    fn with_pinned_token(token: impl Fn(&crate::profiles::Pin) -> Result<String, String> + Send + Sync + 'static) -> Self {
+        let tools = Tools { token: Arc::new(token), unfinished: Unfinished::default(), projects: Arc::new(|| None), gone: Gone::default(), listed: Listed::default(), converting: Arc::new(|| None) };
+        Self { model: Arc::default(), tools }
+    }
+
     /// The same page with its saved recordings in `store`.
     #[cfg(test)]
     fn with_store(mut self, store: Store) -> Self {
@@ -2601,6 +2608,23 @@ pub(crate) mod tests {
 
     fn entry(server: &str, id: &str, title: &str) -> UnfinishedDelete {
         UnfinishedDelete { profile: String::new(), server: server.into(), tour_id: id.into(), title: title.into() }
+    }
+
+    #[test]
+    fn the_pages_lists_and_jobs_get_the_token_of_the_profile_they_were_pinned_to() {
+        let s = stub(|_, _| reply(200, r#"{"tours":[]}"#));
+        let pins: Arc<Mutex<Vec<crate::profiles::Pin>>> = Arc::default();
+        let record = pins.clone();
+        let state = ToursState::with_pinned_token(move |pin: &crate::profiles::Pin| {
+            record.lock().unwrap().push(pin.clone());
+            Ok(TOKEN.to_string())
+        });
+        let site = Site { profile: Some("pa".into()), server: s.base.clone(), epoch: 1 };
+        let _ = read_list(&state.tools, &site);
+        let started = Started { site: site.clone(), id: A.into(), title: "Customer onboarding".into(), job: Job::Rename("Renamed".into()), listed: true };
+        let _ = run_job(&state.model, &state.tools, &started);
+        let pa = crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() };
+        assert_eq!(*pins.lock().unwrap(), vec![pa.clone(), pa]);
     }
 
     #[test]

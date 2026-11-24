@@ -288,6 +288,10 @@ fn a_pasted_token_renews_only_its_own_profile() {
     let mut f = flow(&shelf, Purpose::Renew("po".into()), &s.base);
     check_paste(&mut f, TOKEN_A);
     settle(&mut f);
+    assert!(!f.is_finished() && f.can_save(), "the renewal waits for its confirmation");
+    assert_eq!(shelf.keys(), vec![("profile-po".to_string(), TOKEN_B.to_string())], "nothing stored before the confirmation");
+    f.save();
+    settle(&mut f);
     assert!(f.is_finished());
     assert_eq!(shelf.book().get("po").unwrap().state, State::Ready);
     assert_eq!(shelf.keys(), vec![("profile-po".to_string(), TOKEN_A.to_string())]);
@@ -383,6 +387,10 @@ fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
     sign_in(&mut f);
     f.switch_to_it();
     settle(&mut f);
+    assert!(!f.is_finished() && f.can_save(), "the renewal waits for its confirmation");
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())], "nothing stored before the confirmation");
+    f.save();
+    settle(&mut f);
     assert!(f.is_finished());
     assert_eq!(shelf.book().get("pc").unwrap().state, State::Ready);
     assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), NEW_TOKEN.to_string())]);
@@ -397,6 +405,10 @@ fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
     let shelf = TestShelf::with(waiting, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
     sign_in(&mut f);
+    settle(&mut f);
+    assert!(!f.is_finished() && f.can_save(), "the renewal waits for its confirmation");
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())], "nothing stored before the confirmation");
+    f.save();
     settle(&mut f);
     assert!(f.is_finished());
     assert_eq!(shelf.book().get("pc").unwrap().state, State::Ready);
@@ -417,6 +429,41 @@ fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
     assert_eq!(f.purpose, Purpose::New);
     assert_eq!(shelf.book(), book);
     assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_A.to_string())]);
+}
+
+#[test]
+fn cancel_at_the_renewal_confirmation_leaves_the_profile_as_it_was() {
+    let s = working_site();
+    let waiting = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let shelf = TestShelf::with(waiting.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    // What the confirmation shows: the approved line for the sign-in it would take.
+    let Step::Renew { candidate, .. } = f.step() else { panic!("no confirmation") };
+    assert_eq!(profiles::connected(candidate.account.as_deref(), &candidate.workspace), format!("Connected. Signed in as {ACCOUNT}, workspace \"customer1\"."));
+    f.cancel();
+    assert!(f.is_finished());
+    assert_eq!(shelf.book(), waiting);
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())]);
+    assert!(shelf.writes().is_empty());
+}
+
+#[test]
+fn a_profile_with_no_identity_is_renewed_after_the_confirmation_and_records_what_it_got() {
+    let s = working_site();
+    let bare = Profile { identity: None, workspace: None, account: None, ..profile("pf", "first", &s.base, None, None, State::SignInAgain) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![bare], active: Some("pf".into()) }, FakeKeys::with(&[("profile-pf", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::Renew("pf".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    assert!(!f.is_finished() && f.can_save());
+    assert_eq!(shelf.keys(), vec![("profile-pf".to_string(), TOKEN_B.to_string())]);
+    f.save();
+    settle(&mut f);
+    let p = shelf.book().get("pf").unwrap().clone();
+    assert_eq!((p.state, p.identity, p.account.as_deref()), (State::Ready, Some(named("customer1")), Some(ACCOUNT)));
+    assert_eq!(shelf.keys(), vec![("profile-pf".to_string(), NEW_TOKEN.to_string())]);
 }
 
 // ---- 7. Removing a profile ----
