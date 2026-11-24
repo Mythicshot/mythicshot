@@ -1793,7 +1793,12 @@ impl Editor {
         let starter: crate::share_ui::Starter = Box::new(move |server, title, access| {
             // The job keeps the profile it starts with, whatever is switched to meanwhile.
             let pin = publish_ui::pin_for(&server);
-            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, &access, || publish_ui::token_for_pin(&pin), r))
+            // Held until the job ends: its token is not ended at the site under it.
+            let held = publish_ui::hold(&pin);
+            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| {
+                let _held = held;
+                share_clip_job(&clip, &std::env::temp_dir(), &server, title, &access, || publish_ui::token_for_pin(&pin), r)
+            })
         });
         let server = publish_ui::server();
         let blocked = crate::share_ui::blocked_reason(&server);
@@ -1859,7 +1864,10 @@ impl Editor {
         let run = Run::begin();
         let worker = run.clone();
         let tour_title = target.tour_title.clone();
+        // Held until the job ends, however it ends: its token is not ended at the site under it.
+        let held = publish_ui::hold(&pin);
         let job = EncodeJob::spawn(move |progress| {
+            let _held = held;
             let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || token(&pin), &keeping, &worker, progress));
             drop(state);
             drop(open);
@@ -1891,7 +1899,10 @@ impl Editor {
         let worker = run.clone();
         let kept_as = tour_title.clone();
         let pending = Pending { profile: pin.profile.clone().unwrap_or_default(), server: server.clone(), chapter_title: title.clone() };
+        // Held until the job ends, however it ends: its token is not ended at the site under it.
+        let held = publish_ui::hold(&pin);
         let job = EncodeJob::spawn(move |progress| {
+            let _held = held;
             let result = guarded(&worker, || publish_job_as(&state, &title, &kept_as, &server, || publish_ui::token_for_pin(&pin), &target, mode == Mode::PublishNow, &access, &keeping, &worker, progress));
             // The addresses go with the job.
             drop(access);
@@ -1924,7 +1935,9 @@ impl Editor {
         let run = Run::begin();
         let worker = run.clone();
         worker.set_publishing(None);
+        let held = publish_ui::hold(&pin);
         let job = EncodeJob::spawn(move |progress| {
+            let _held = held;
             guarded(&worker, || {
                 progress(1.0);
                 let result = publish_ui::token_for_pin(&pin).and_then(|token| {
@@ -4802,6 +4815,29 @@ mod tests {
         assert_eq!(ed.video.as_ref().unwrap().job_pin.as_ref(), Some(&pin));
         assert_eq!(*asked.lock().unwrap(), vec![pin]);
         assert!(s.lines().iter().any(|l| l.ends_with("/commit")), "{:?}", s.lines());
+    }
+
+    #[test]
+    fn an_update_holds_its_profiles_token_from_before_it_reads_it_until_it_ends() {
+        use crate::profiles::{Book, Pin};
+        const ID: &str = "p-update-job-hold";
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, _key, _info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        let book = Book { list: vec![on_site(ID, "Sandbox admin", &s.base)], active: Some(ID.into()), legacy: None };
+        let pin = Pin { profile: Some(ID.into()), server: s.base.clone() };
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+        let record = seen.clone();
+        let token: Arc<dyn Fn(&Pin) -> Result<String, String> + Send + Sync> = Arc::new(move |_: &Pin| {
+            record.lock().unwrap().push(crate::profiles::holds::global().is_held(ID));
+            Ok(TOKEN.to_string())
+        });
+        ed.start_update_with(TITLE.into(), target(), Before::new_tour(), pin, &book, token);
+        assert!(ed.exporting(), "Update tour starts");
+        until_done(&mut ed);
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty() && seen.iter().all(|h| *h), "held whenever the token was read: {seen:?}");
+        assert!(!crate::profiles::holds::global().is_held(ID), "let go when the job ended");
     }
 
     #[test]

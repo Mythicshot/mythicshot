@@ -10,7 +10,7 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Mythicshot"
-           Manufacturer="Mythicshot"
+           Manufacturer="Mythicshot, LLC"
            Version="$(Version)"
            UpgradeCode="41EFFDDF-DEBA-4B83-A653-893B2EF06D69"
            Scope="perUser"

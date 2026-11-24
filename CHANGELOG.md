@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.34 (2026-11-24)
+
+- Profiles: removing a profile now also ends its connection on the site, so the computer no longer stays listed under Connections there. The profile is removed from this computer at once, whatever the site answers. When the site cannot be reached, or is an older one without this, one line says the computer is still listed there until you remove it.
+- Profiles: "Sign in again" ends the connection it replaces, once the new one is saved and checked. Nothing is shown for it.
+- A connection is ended only after any upload, share or tour change still running on that profile has finished, and never while another profile on this computer still uses it.
+- The installer names Mythicshot, LLC as the manufacturer.
+
 ## 0.2.33 (2026-11-24)
 
 - The region you select is marked by a glass band just outside it: a bright edge, a translucent band and a dark edge, eight pixels in all. It replaces the thin gold line of a screenshot selection and the red line of a recording selection, for a dragged region and for a window. The size label sits clear of it.

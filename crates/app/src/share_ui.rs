@@ -1098,7 +1098,10 @@ impl Editor {
         let starter: Starter = Box::new(move |server, title, access| {
             // The job keeps the profile it starts with, whatever is switched to meanwhile.
             let pin = publish_ui::pin_for(&server);
+            // Held until the job ends: its token is not ended at the site under it.
+            let held = publish_ui::hold(&pin);
             ShareJob::spawn(Kind::Image, move |r| {
+                let _held = held;
                 let png = encoded.lock().ok().and_then(|mut s| s.take()).and_then(Result::ok).ok_or_else(|| ShareError::Failed(NOT_ENCODED.to_string()))?;
                 let token = publish_ui::token_for_pin(&pin).map_err(ShareError::Failed)?;
                 let item = Item { media: MediaType::Png, data: png, width, height, duration_ms: None, title, preview: share::preview_of(&img) };

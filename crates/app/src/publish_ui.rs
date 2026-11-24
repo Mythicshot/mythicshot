@@ -488,6 +488,23 @@ pub fn change_profiles<T>(change: impl FnOnce(&mut Book, &dyn publish::KeyStore)
     out
 }
 
+/// Whether anything on this computer holds `ending`'s token now: asked just before it is ended,
+/// under the same lock as every change of the profiles, so a profile saved meanwhile with the
+/// same token is seen. Only the credential store is read; nothing is sent.
+pub fn still_held(ending: &profiles::Ending) -> bool {
+    let _one = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    let book = config().wired.book.clone();
+    ending.held_in(&book, &publish::OsKeys)
+}
+
+/// A hold on the token of the profile `pin` names, for a job that is about to read it and send
+/// it: a removal or a "Sign in again" ends that token at its site only once every such job let
+/// go ([`profiles::holds`]). Taken before the token is read, and kept (moved into the job) until
+/// the job ends; None for a job without a profile.
+pub fn hold(pin: &Pin) -> Option<profiles::holds::Hold> {
+    pin.profile.as_deref().map(|id| profiles::holds::global().hold(id))
+}
+
 /// Ask the site once who the active profile's token belongs to, on this thread.
 pub fn check_active_profile() {
     if let Some(id) = pin().profile {

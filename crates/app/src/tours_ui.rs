@@ -1491,6 +1491,9 @@ impl Drop for JobGuard {
 fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Done, Failure> {
     let (server, id) = (started.site.server.as_str(), started.id.as_str());
     let unfinished = &tools.unfinished;
+    // Taken before the token is read and held to the end of the job: a removal or a new sign-in
+    // ends this token at the site only after that.
+    let _held = publish_ui::hold(&started.site.pin());
     let token = (tools.token)(&started.site.pin()).map_err(Failure::Message)?;
     match &started.job {
         Job::Rename(title) => publish::rename_tour(server, &token, id, title).map(Done::Renamed).map_err(failure),
@@ -2625,6 +2628,28 @@ pub(crate) mod tests {
         let _ = run_job(&state.model, &state.tools, &started);
         let pa = crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() };
         assert_eq!(*pins.lock().unwrap(), vec![pa.clone(), pa]);
+    }
+
+    #[test]
+    fn a_job_holds_its_profiles_token_from_before_it_reads_it_until_it_ends() {
+        const ID: &str = "p-tours-job-hold";
+        let holds = crate::profiles::holds::global();
+        let s = stub(|_, _| reply(200, r#"{"title":"Renamed"}"#));
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let record = seen.clone();
+        let state = ToursState::with_pinned_token(move |_: &crate::profiles::Pin| {
+            record.lock().unwrap().push(crate::profiles::holds::global().is_held(ID));
+            Ok(TOKEN.to_string())
+        });
+        let site = Site { profile: Some(ID.into()), server: s.base.clone(), epoch: 1 };
+        let started = Started { site, id: A.into(), title: "Customer onboarding".into(), job: Job::Rename("Renamed".into()), listed: true };
+        let _ = run_job(&state.model, &state.tools, &started);
+        assert_eq!(*seen.lock().unwrap(), vec![true], "held when the token was read");
+        assert!(!holds.is_held(ID), "let go when the job ended");
+        // A job whose token cannot be had lets go too.
+        let state = ToursState::with_pinned_token(|_: &crate::profiles::Pin| Err("no token".into()));
+        let _ = run_job(&state.model, &state.tools, &started);
+        assert!(!holds.is_held(ID));
     }
 
     #[test]
