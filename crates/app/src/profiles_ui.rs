@@ -103,15 +103,37 @@ impl Shelf for AppShelf {
 /// site did not end the token.
 #[derive(Clone, Default)]
 struct Endings {
-    /// How many are still waiting for their site.
+    /// How many are not done yet: waiting for a running job, or for their site.
     busy: Arc<AtomicUsize>,
+    /// How many of those are being sent now (a wait for a job is not counted): only these keep
+    /// the page repainting, for at most the call's timeout.
+    sending: Arc<AtomicUsize>,
     /// Every line not yet shown, oldest first.
     notices: Arc<Mutex<Vec<String>>>,
+    /// Wakes the page that shows the lines, once per line.
+    waker: Arc<Mutex<Option<Waker>>>,
 }
 
+/// Asks for one repaint of the page.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 impl Endings {
+    #[cfg(test)]
     fn busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst) > 0
+    }
+
+    fn sending(&self) -> bool {
+        self.sending.load(Ordering::SeqCst) > 0
+    }
+
+    /// A line for the page, which is woken once for it.
+    fn say(&self, text: String) {
+        lock(&self.notices).push(text);
+        let waker = lock(&self.waker).clone();
+        if let Some(wake) = waker {
+            wake();
+        }
     }
 }
 
@@ -150,17 +172,19 @@ fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings
         let Some((ending, after)) = then_end else { return };
         // A job that started with this token runs to its end first.
         shelf.holds().wait_free(&ending.id);
+        let sending = Busy::new(&endings.sending);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
         match (after, outcome) {
             // Held here again meanwhile: nothing was sent, and nothing is said.
             (_, None) => {}
             (AfterEnd::Notice, Some(outcome)) => {
                 if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
-                    lock(&endings.notices).push(text);
+                    endings.say(text);
                 }
             }
             (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
         }
+        drop(sending);
         // The token's copy is wiped here.
         drop(ending);
         drop(busy);
@@ -981,6 +1005,16 @@ impl Panel {
         self.error.as_deref()
     }
 
+    /// What wakes the page when a removal's line arrives; the page sets its own when drawn.
+    pub fn set_waker(&mut self, waker: Waker) {
+        *lock(&self.endings.waker) = Some(waker);
+    }
+
+    /// Whether the page keeps repainting by itself: only while something it shows is changing.
+    pub fn wants_repaint(&self) -> bool {
+        self.working || self.endings.sending()
+    }
+
     /// Draw the panel under the page's heading. With no profile at all, the add form shows by itself.
     pub fn ui(&mut self, ui: &mut egui::Ui, request: Option<ProfilesRequest>) -> Below {
         self.poll(request);
@@ -988,8 +1022,11 @@ impl Panel {
         if book.list.is_empty() && !matches!(self.mode, Mode::Add(_)) {
             self.add();
         }
-        // Also while a removed profile's site is asked, so its line shows when it answers.
-        if self.working || self.endings.busy() {
+        // While a removal runs or its site is being asked; a line that arrives later wakes the
+        // page by itself, so a wait for a running job repaints nothing.
+        let ctx = ui.ctx().clone();
+        self.set_waker(Arc::new(move || ctx.request_repaint()));
+        if self.wants_repaint() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let mut pick = None;

@@ -28,12 +28,14 @@ fn a_site_under_a_path_is_asked_under_that_path() {
 
 #[test]
 fn each_answer_means_what_the_contract_says() {
-    let cases: [(u16, &str, Outcome); 9] = [
+    let cases: [(u16, &str, Outcome); 11] = [
         (204, "", Outcome::Ended),
         (401, r#"{"error":"unauthorized"}"#, Outcome::AlreadyEnded),
         (404, r#"{"error":"not_found"}"#, Outcome::SiteTooOld),
         (405, "", Outcome::SiteTooOld),
+        (409, r#"{"error":"not_a_connection"}"#, Outcome::NotAConnection),
         (200, r#"{"ok":true}"#, Outcome::NotReached("the site answered HTTP 200".into())),
+        (400, r#"{"error":"bad_request"}"#, Outcome::NotReached("the site answered HTTP 400".into())),
         (403, r#"{"error":"forbidden"}"#, Outcome::NotReached("the site answered HTTP 403".into())),
         (429, "", Outcome::NotReached("the site answered HTTP 429".into())),
         (500, "", Outcome::NotReached("the site answered HTTP 500".into())),

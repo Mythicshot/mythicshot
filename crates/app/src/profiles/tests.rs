@@ -1150,6 +1150,7 @@ fn what_a_removal_says_when_its_token_was_not_ended() {
     assert_eq!(not_ended("Sandbox admin"), "Removed \"Sandbox admin\" from this computer. The site could not be reached, so this computer is still listed under Connections there until you remove it.");
     assert_eq!(removal_notice("A", &Outcome::Ended), None);
     assert_eq!(removal_notice("A", &Outcome::AlreadyEnded), None);
+    assert_eq!(removal_notice("A", &Outcome::NotAConnection), None, "a setup token the site keeps on purpose: nothing is wrong");
     assert_eq!(removal_notice("A", &Outcome::SiteTooOld), Some(not_ended("A")));
     assert_eq!(removal_notice("A", &Outcome::NotReached("the server did not answer in time".into())), Some(not_ended("A")));
 }
@@ -1157,7 +1158,7 @@ fn what_a_removal_says_when_its_token_was_not_ended() {
 #[test]
 fn the_log_line_after_a_renewal_names_the_site_and_never_the_token() {
     use crate::publish::ending::Outcome;
-    let outcomes = [Outcome::Ended, Outcome::AlreadyEnded, Outcome::SiteTooOld, Outcome::NotReached("could not connect to the server".into())];
+    let outcomes = [Outcome::Ended, Outcome::AlreadyEnded, Outcome::SiteTooOld, Outcome::NotReached("could not connect to the server".into()), Outcome::NotAConnection];
     let lines: Vec<String> = outcomes.iter().map(|o| renewal_log_line(SITE, o)).collect();
     for line in &lines {
         assert!(line.starts_with("Profiles: ") && line.contains("tours.example.com"), "{line}");
@@ -1165,5 +1166,6 @@ fn the_log_line_after_a_renewal_names_the_site_and_never_the_token() {
         assert!(!line.contains(".."), "{line}");
     }
     assert!(lines[3].contains("could not connect to the server"));
-    assert_eq!(lines.iter().collect::<std::collections::BTreeSet<_>>().len(), 4, "each outcome its own line");
+    assert_eq!(lines.iter().collect::<std::collections::BTreeSet<_>>().len(), 5, "each outcome its own line");
+    assert!(lines[4].contains("keeps") && lines[4].contains("not a sign-in connection"), "{}", lines[4]);
 }
