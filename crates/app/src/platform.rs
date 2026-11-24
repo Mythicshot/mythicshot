@@ -485,15 +485,26 @@ mod band_native {
         unsafe { GetModuleHandleW(None) }.ok().map(|m| HINSTANCE(m.0))
     }
 
-    /// The strips' window class, registered once per process.
+    /// The strips' window class. Only a registration that worked is remembered: a failed one is
+    /// tried again at the next recording, and a class already registered counts as done.
     fn class() -> bool {
-        static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *REGISTERED.get_or_init(|| {
-            let class = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(strip_proc), hInstance: instance().unwrap_or_default(), lpszClassName: CLASS, ..Default::default() };
-            unsafe { RegisterClassExW(&class) != 0 }
-        })
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError};
+        static REGISTERED: AtomicBool = AtomicBool::new(false);
+        if REGISTERED.load(Ordering::Relaxed) {
+            return true;
+        }
+        let class = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(strip_proc), hInstance: instance().unwrap_or_default(), lpszClassName: CLASS, ..Default::default() };
+        let ok = unsafe { RegisterClassExW(&class) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS };
+        if ok {
+            REGISTERED.store(true, Ordering::Relaxed);
+        }
+        ok
     }
 
+    /// One strip, in this order, which is what keeps it from ever being shown blank: created
+    /// hidden and layered (never made layered later), kept out of capture, given its pixels with
+    /// `UpdateLayeredWindow` (see [`set_pixels`]), and only then shown topmost without activation.
     pub fn open_strip(s: &StripPixels) -> OpenedStrip {
         let failed = |note: String| OpenedStrip { window: None, note, pixels_set: false, excluded: false, visible: false };
         if !class() {
@@ -531,26 +542,37 @@ mod band_native {
         }
         unsafe {
             let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
             let mem = CreateCompatibleDC(Some(screen));
+            if mem.is_invalid() {
+                ReleaseDC(None, screen);
+                return false;
+            }
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: r.w as i32, biHeight: -(r.h as i32), biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
                 ..Default::default()
             };
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
             let ok = match CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
-                Ok(dib) if !bits.is_null() => {
-                    std::ptr::copy_nonoverlapping(s.pixels.as_ptr(), bits as *mut u8, s.pixels.len());
-                    let old = SelectObject(mem, HGDIOBJ(dib.0));
-                    let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-                    let at = POINT { x: r.x, y: r.y };
-                    let size = SIZE { cx: r.w as i32, cy: r.h as i32 };
-                    let from = POINT { x: 0, y: 0 };
-                    let ok = UpdateLayeredWindow(h, Some(screen), Some(&at), Some(&size), Some(mem), Some(&from), COLORREF(0), Some(&blend), ULW_ALPHA).is_ok();
-                    SelectObject(mem, old);
+                Ok(dib) => {
+                    let ok = !bits.is_null() && {
+                        std::ptr::copy_nonoverlapping(s.pixels.as_ptr(), bits as *mut u8, s.pixels.len());
+                        let old = SelectObject(mem, HGDIOBJ(dib.0));
+                        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                        let at = POINT { x: r.x, y: r.y };
+                        let size = SIZE { cx: r.w as i32, cy: r.h as i32 };
+                        let from = POINT { x: 0, y: 0 };
+                        let ok = UpdateLayeredWindow(h, Some(screen), Some(&at), Some(&size), Some(mem), Some(&from), COLORREF(0), Some(&blend), ULW_ALPHA).is_ok();
+                        SelectObject(mem, old);
+                        ok
+                    };
+                    // Deleted whether or not its bits came back.
                     let _ = DeleteObject(HGDIOBJ(dib.0));
                     ok
                 }
-                _ => false,
+                Err(_) => false,
             };
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);

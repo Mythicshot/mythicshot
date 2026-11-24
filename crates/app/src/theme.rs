@@ -433,15 +433,34 @@ pub fn selection_outline(painter: &egui::Painter, rect: egui::Rect, radius: f32,
     painter.rect_stroke(rect.expand(halo), radius + halo, Stroke::new(width, SELECTION_EDGE), egui::StrokeKind::Outside);
 }
 
-/// The glass band just outside `rect` (see [`GLASS_LAYERS`]), each layer as many pixels wide as
-/// the band around a recording, at `pixels_per_point`. The region selector marks the region with
-/// it in screenshot and in record mode alike.
-pub fn glass_band(painter: &egui::Painter, rect: egui::Rect, pixels_per_point: f32) {
-    let mut out = 0.0;
+/// The glass band's rectangles just outside `rect` (in points), each layer of [`GLASS_LAYERS`]
+/// as many whole physical pixels wide as the band around a recording, at `pixels_per_point`.
+/// `rect` is snapped to whole pixels first. Each layer is four rectangles that meet without
+/// overlapping (top and bottom take the corners), so no pixel is covered twice.
+pub fn glass_band_rects(rect: egui::Rect, pixels_per_point: f32) -> Vec<(egui::Rect, Color32)> {
+    let ppp = pixels_per_point;
+    let snap = |v: f32| (v * ppp).round();
+    let (l, t, r, b) = (snap(rect.min.x), snap(rect.min.y), snap(rect.max.x), snap(rect.max.y));
+    let pt = |x0: f32, y0: f32, x1: f32, y1: f32| egui::Rect::from_min_max(egui::pos2(x0 / ppp, y0 / ppp), egui::pos2(x1 / ppp, y1 / ppp));
+    let mut out = Vec::with_capacity(4 * GLASS_LAYERS.len());
+    let mut from = 0.0;
     for (px, colour) in GLASS_LAYERS {
-        let width = px as f32 / pixels_per_point;
-        painter.rect_stroke(rect.expand(out), 0.0, Stroke::new(width, colour), egui::StrokeKind::Outside);
-        out += width;
+        let to = from + px as f32;
+        out.push((pt(l - to, t - to, r + to, t - from), colour));
+        out.push((pt(l - to, b + from, r + to, b + to), colour));
+        out.push((pt(l - to, t - from, l - from, b + from), colour));
+        out.push((pt(r + from, t - from, r + to, b + from), colour));
+        from = to;
+    }
+    out
+}
+
+/// The glass band just outside `rect` (see [`glass_band_rects`]), filled on whole physical
+/// pixels so its 1 px edges are crisp and match the band around a recording. The region
+/// selector marks the region with it in screenshot and in record mode alike.
+pub fn glass_band(painter: &egui::Painter, rect: egui::Rect, pixels_per_point: f32) {
+    for (r, colour) in glass_band_rects(rect, pixels_per_point) {
+        painter.rect_filled(r, 0.0, colour);
     }
 }
 
@@ -644,6 +663,38 @@ pub mod checks {
             }
         }
         checked
+    }
+
+    /// The glass band around `hole` (in points, on whole pixels at `ppp`): twelve filled
+    /// rectangles in the band's colours, four per layer, on whole physical pixels, together
+    /// covering exactly each layer's ring of pixels around the hole, no pixel twice.
+    pub fn assert_glass_band(out: &egui::FullOutput, hole: Rect, ppp: f32, what: &str) {
+        let band: Vec<(Rect, Color32)> = fills(out).into_iter().filter(|(_, c, _)| GLASS_LAYERS.iter().any(|(_, g)| g == c)).map(|(r, c, _)| (r, c)).collect();
+        assert_eq!(band.len(), 12, "{what}: {band:?}");
+        let px = |r: Rect| [r.min.x * ppp, r.min.y * ppp, r.max.x * ppp, r.max.y * ppp];
+        for (r, _) in &band {
+            for v in px(*r) {
+                assert!((v - v.round()).abs() < 1e-3, "{what}: {r:?} is not on whole pixels at {ppp}");
+            }
+        }
+        let [l, t, r, b] = px(hole).map(|v| v.round() as i32);
+        let mut from = 0i32;
+        for (w, colour) in GLASS_LAYERS {
+            let to = from + w as i32;
+            let mut seen = std::collections::BTreeSet::new();
+            for (rect, _) in band.iter().filter(|(_, c)| *c == colour) {
+                let [x0, y0, x1, y1] = px(*rect).map(|v| v.round() as i32);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        assert!(seen.insert((x, y)), "{what}: {colour:?} covers {x},{y} twice");
+                    }
+                }
+            }
+            let within = |x: i32, y: i32, d: i32| x >= l - d && x < r + d && y >= t - d && y < b + d;
+            let ring: std::collections::BTreeSet<(i32, i32)> = (t - to..b + to).flat_map(|y| (l - to..r + to).map(move |x| (x, y))).filter(|&(x, y)| !within(x, y, from)).collect();
+            assert!(seen == ring, "{what}: the {colour:?} layer is not the ring {from}..{to} px around {l},{t} {r},{b}");
+            from = to;
+        }
     }
 
     /// A dialog's frame: the biggest fill with a dialog's corners is surface-raised and opaque.
@@ -859,35 +910,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// The selector's band, drawn at 100% and at 200%: three strokes just outside the region, in
-    /// the band's colours, each as many pixels wide as its layer, nothing drawn inside the region.
+    /// The selector's band, drawn at 100%, 125% and 200%: each layer filled on whole physical
+    /// pixels, its four rectangles covering exactly the ring of pixels it takes around the region,
+    /// none twice, nothing inside the region. Also around a region whose edges fall between pixels.
     #[test]
     fn the_glass_band_in_the_selector_lies_just_outside_the_region_in_whole_pixels() {
-        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(100.0, 60.0));
         for ppp in [1.0, 1.25, 2.0] {
+            // A region on whole pixels at this scale: 40,32 to 140,92 pixels, in points.
+            let rect = egui::Rect::from_min_max(egui::pos2(40.0 / ppp, 32.0 / ppp), egui::pos2(140.0 / ppp, 92.0 / ppp));
             let ctx = test_context();
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| glass_band(ui.painter(), rect, ppp));
             out.textures_delta.clear();
-            let mut strokes = Vec::new();
-            fn walk(s: &egui::Shape, into: &mut Vec<egui::epaint::RectShape>) {
-                match s {
-                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
-                    egui::Shape::Rect(r) => into.push(r.clone()),
-                    _ => {}
-                }
-            }
-            out.shapes.iter().for_each(|c| walk(&c.shape, &mut strokes));
-            assert_eq!(strokes.len(), 3, "{ppp}");
-            let mut out_by = 0.0;
-            for (r, (px, colour)) in strokes.iter().zip(GLASS_LAYERS) {
-                assert_eq!(r.stroke.color, colour, "{ppp}");
-                assert!((r.stroke.width * ppp - px as f32).abs() < 1e-4, "{ppp}: {} pixels", r.stroke.width * ppp);
-                assert_eq!(r.stroke_kind, egui::StrokeKind::Outside);
-                assert_eq!(r.fill, Color32::TRANSPARENT, "nothing is drawn over the region");
-                assert!((r.rect.min.x - (rect.min.x - out_by)).abs() < 1e-4 && (r.rect.max.y - (rect.max.y + out_by)).abs() < 1e-4, "{ppp}: {:?}", r.rect);
-                out_by += r.stroke.width;
-            }
-            assert!((out_by * ppp - GLASS_BAND_PX as f32).abs() < 1e-4);
+            checks::assert_glass_band(&out, rect, ppp, &format!("{ppp}"));
+            // A region off the pixel grid: the band goes round the pixels it snaps to.
+            let off = rect.translate(egui::vec2(0.3 / ppp, -0.2 / ppp));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| glass_band(ui.painter(), off, ppp));
+            out.textures_delta.clear();
+            checks::assert_glass_band(&out, rect, ppp, &format!("{ppp}, off the grid"));
         }
     }
 

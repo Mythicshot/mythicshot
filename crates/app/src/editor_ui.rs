@@ -2554,7 +2554,7 @@ impl EditorWindow {
 
 /// Make `ui` and everything drawn in it take no clicks, drags, scrolls, hovers or keys, as
 /// [`egui::Ui::disable`] does, but without its fading: every window of the app can be see-through
-/// (for the recording frame), so a faded background would show the desktop behind the window.
+/// (for the live draw window), so a faded background would show the desktop behind the window.
 /// Transparent-capable windows must never paint their background with reduced opacity.
 fn inert(ui: &mut egui::Ui) {
     let opacity = ui.opacity();

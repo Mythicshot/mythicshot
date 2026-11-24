@@ -202,7 +202,9 @@ impl Overlay {
         if let Some(sel) = hole {
             let r = to_pt(sel);
             let text = format!("{} × {} · at {}, {}", sel.w, sel.h, sel.x, sel.y);
-            let at = if r.min.y > 28.0 { r.left_top() - vec2(0.0, 6.0) } else { r.left_bottom() + vec2(0.0, 22.0) };
+            // Clear of the glass band: moved out by its thickness, above the region or below it.
+            let band = theme::GLASS_BAND_PX as f32 / ppp;
+            let at = if r.min.y > 28.0 + band { r.left_top() - vec2(0.0, 6.0 + band) } else { r.left_bottom() + vec2(0.0, 22.0 + band) };
             label(painter, at, Align2::LEFT_BOTTOM, &text);
         }
 
@@ -439,21 +441,54 @@ mod tests {
         all
     }
 
-    /// The selector's hole, marked with the glass band and nothing else: three strokes in the
-    /// band's colours just outside `hole` (in points), never the old red line or the gold outline.
+    /// The selector's hole, marked with the glass band and nothing else: the band's filled layers
+    /// just outside `hole` (in points), never the old red line or the gold outline.
     fn assert_glass_band(out: &egui::FullOutput, hole: Rect, ppp: f32, what: &str) {
-        let all = outlines(out);
-        let band: Vec<_> = all.iter().filter(|(_, _, c)| theme::GLASS_LAYERS.iter().any(|(_, g)| g == c)).collect();
-        assert_eq!(band.len(), 3, "{what}: {all:?}");
-        let mut out_by = 0.0;
-        for ((r, w, c), (px, colour)) in band.iter().zip(theme::GLASS_LAYERS) {
-            assert_eq!(*c, colour, "{what}");
-            assert!((w * ppp - px as f32).abs() < 1e-3, "{what}: {w} points at {ppp}");
-            assert!((r.min - (hole.min - vec2(out_by, out_by))).length() < 1e-3 && (r.max - (hole.max + vec2(out_by, out_by))).length() < 1e-3, "{what}: {r:?} around {hole:?}");
-            out_by += w;
+        theme::checks::assert_glass_band(out, hole, ppp, what);
+        for (r, _, c) in outlines(out) {
+            assert!(c != theme::RECORD && c != theme::SELECTION_EDGE && c != theme::SELECTION_HALO, "{what}: a {c:?} outline at {r:?}");
         }
-        for (r, _, c) in &all {
-            assert!(*c != theme::RECORD && *c != theme::SELECTION_EDGE && *c != theme::SELECTION_HALO, "{what}: a {c:?} outline at {r:?}");
+    }
+
+    /// The size label's box: the surface-raised fill under the text that gives the size.
+    fn size_label(out: &egui::FullOutput) -> Rect {
+        let mut text = None;
+        fn walk(s: &egui::Shape, text: &mut Option<Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, text)),
+                egui::Shape::Text(t) if t.galley.text().contains('\u{d7}') => *text = Some(t.visual_bounding_rect()),
+                _ => {}
+            }
+        }
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut text));
+        let text = text.expect("the size label is drawn");
+        theme::checks::fills(out).into_iter().filter(|(r, c, _)| *c == theme::RAISED && r.contains(text.center())).map(|(r, ..)| r).next().expect("its box")
+    }
+
+    /// The size label is moved clear of the band: above the region when there is room, below it
+    /// otherwise, its box never over any of the band's pixels.
+    #[test]
+    fn the_size_label_stays_clear_of_the_band() {
+        let bounds = PxRect::new(0, 0, 800, 400);
+        for ppp in [1.0, 1.25, 2.0] {
+            for (from, to, above) in [(pos2(20.0, 80.0), pos2(160.0, 140.0), true), (pos2(20.0, 4.0), pos2(160.0, 70.0), false)] {
+                // On whole pixels at this scale.
+                let snap = |p: Pos2| pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
+                let (from, to) = (snap(from), snap(to));
+                let ctx = egui::Context::default();
+                let mut ov = Overlay::new(desktop(bounds), false, false);
+                ov.os_cursor = || None;
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(from)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![button(from, true)]);
+                step(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to - vec2(1.0, 0.0))]);
+                let out = step_out(&ctx, &mut ov, ppp, bounds, vec![egui::Event::PointerMoved(to)]);
+                let hole = Rect::from_min_max(from, to);
+                let label = size_label(&out);
+                assert_eq!(label.max.y <= hole.min.y, above, "{ppp}: the label {label:?} against the region {hole:?}");
+                for (band, _) in theme::glass_band_rects(hole, ppp) {
+                    assert!(!label.intersect(band).is_positive(), "{ppp}, above {above}: the label {label:?} covers the band at {band:?}");
+                }
+            }
         }
     }
 

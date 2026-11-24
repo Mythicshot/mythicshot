@@ -189,7 +189,7 @@ pub fn finish_line(outcome: &str, sel_pt: Option<Rect>, sel_px: Option<PxRect>, 
     format!("finish: {outcome} · selection {} pt = {} px · crop {}", opt(sel_pt, pt), opt(sel_px, px), opt(crop, px))
 }
 
-/// One line per small window placed (toast, picker, recording frame, live draw, bar).
+/// One line per small window placed (toast, picker, live draw, bar).
 pub fn placed_line(time: &str, title: &str, target: PxRect, now: Option<WinState>, moves: u8, looks: u8, why: &str) -> String {
     format!("-- {time} \"{title}\" asked for {} · {} · {moves} moves, {looks} looks · {why}", px(target), win(now))
 }
