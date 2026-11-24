@@ -418,7 +418,8 @@ pub enum Renewal {
 /// - none recorded: any;
 /// - recorded by the workspace's name (today's sites): the same workspace name, from the same
 ///   answer that gives `c`'s ids if any (so a site that starts sending ids upgrades it here); and
-///   when the profile's account name and the sign-in's are both known, the same account name;
+///   when the profile's account name and the sign-in's are both known, the same account name,
+///   whatever its case (the newest spelling is kept);
 /// - recorded by ids: the same workspace id, and the same account id when one is recorded. It
 ///   never matches by name: an answer without ids is another account.
 fn renews(p: &Profile, c: &Candidate) -> bool {
@@ -428,7 +429,7 @@ fn renews(p: &Profile, c: &Candidate) -> bool {
     match &p.identity {
         None => true,
         Some(i) if i.by_ids() => c.identity.workspace == i.workspace && (i.account.is_none() || c.identity.account == i.account),
-        Some(i) => i.workspace == format!("name:{}", c.workspace) && !matches!((&p.account, &c.account), (Some(a), Some(b)) if a != b),
+        Some(i) => i.workspace == format!("name:{}", c.workspace) && !matches!((&p.account, &c.account), (Some(a), Some(b)) if a.to_lowercase() != b.to_lowercase()),
     }
 }
 
@@ -537,25 +538,22 @@ pub fn twin_of(book: &Book, id: &str) -> Option<String> {
 
 /// Join profile `from` (the migrated one) to `to`, the same account by complete id-based
 /// identities on both sides: recordings linked before profiles belong to `to`, and `to` is active
-/// where `from` was. The only working token is never lost: when `to` cannot be used (it waits for
-/// a sign-in, or has no token), `from`'s token is moved into it first (written, read back, and
-/// only then removed from `from`) and `to` is ready again; when that cannot be confirmed, nothing
-/// is joined. The old entry is left for [`remove_legacy`].
+/// where `from` was. `from`'s token is the one a passing check has just proved (a twin's token
+/// may be revoked however it looks), so it always moves into `to`: written, read back, and only
+/// then removed from `from`, and `to` is ready again. When that cannot be confirmed, nothing is
+/// joined. The old entry is left for [`remove_legacy`].
 pub fn attach(book: &mut Book, store: &dyn KeyStore, from: &str, to: &str) -> Result<(), String> {
     let (Some(f), Some(t)) = (book.get(from), book.get(to)) else { return Ok(()) };
     let same = matches!((&f.identity, &t.identity), (Some(a), Some(b)) if a.complete() && b.complete() && a == b);
     if from == to || !same || !same_site(&f.server, &t.server) {
         return Ok(());
     }
-    let usable = t.state == State::Ready && publish::load_token_at(store, &profile_key(to))?.is_some();
-    if !usable {
-        let Some(mut token) = publish::load_token_at(store, &profile_key(from))? else { return Ok(()) };
-        let moved = write_confirmed(store, &profile_key(to), &token);
-        crate::publish_ui::wipe(&mut token);
-        moved?;
-        if let Some(t) = book.get_mut(to) {
-            t.state = State::Ready;
-        }
+    let Some(mut token) = publish::load_token_at(store, &profile_key(from))? else { return Ok(()) };
+    let moved = write_confirmed(store, &profile_key(to), &token);
+    crate::publish_ui::wipe(&mut token);
+    moved?;
+    if let Some(t) = book.get_mut(to) {
+        t.state = State::Ready;
     }
     store.delete(&profile_key(from))?;
     let was_active = book.active.as_deref() == Some(from);
