@@ -122,20 +122,35 @@ pub enum State {
     SignInAgain,
 }
 
-/// Who a profile is on its site: the workspace and the account its token belongs to, each by
-/// the id the site gives (`id:…`), or by its name only when the site gives no id (`name:…`).
+/// Who a profile is on its site, from the site's answer to the check of a token (`GET /api/v1/me`):
+/// the workspace by its id (`id:ws_…`) when the site sends `workspace_id`, else by its name
+/// (`name:…`, today's sites); and the account by its id (`id:…`) only, when the site sends
+/// `account_id`. A user name is never part of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub workspace: String,
-    /// None while the site has not named the account for this profile's token.
+    /// The account's id; None while the site sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 }
 
 impl Identity {
-    /// Both the workspace and the account are known: only then can it match another sign-in.
+    /// From the site's ids: the workspace's, and the account's. Only such an identity matches
+    /// another sign-in, and only exactly.
     pub fn complete(&self) -> bool {
-        self.account.is_some()
+        self.by_ids() && self.account.is_some()
+    }
+
+    /// The workspace is known by its id (not only by its name).
+    pub fn by_ids(&self) -> bool {
+        self.workspace.starts_with("id:")
+    }
+
+    /// From an answer: the ids when it has them, else the workspace's name.
+    fn of(ws: &Workspace, name: &str) -> Option<Identity> {
+        let workspace = key(ws.id.as_deref(), Some(name))?;
+        let account = if ws.id.is_some() { ws.account.as_deref().map(|a| format!("id:{a}")) } else { None };
+        Some(Identity { workspace, account })
     }
 }
 
@@ -292,11 +307,18 @@ impl std::fmt::Debug for Candidate {
 }
 
 impl Candidate {
-    /// A candidate whose identity uses the names (as an older site's would).
+    /// A candidate as today's sites answer: the workspace by its name only.
     #[cfg(test)]
     pub fn for_test(server: &str, account: Option<&str>, workspace: &str, token: &str) -> Candidate {
-        let identity = Identity { workspace: key(None, Some(workspace)).unwrap_or_default(), account: key(None, account) };
+        let identity = Identity { workspace: format!("name:{workspace}"), account: None };
         Candidate { server: server.to_string(), account: account.map(str::to_string), workspace: workspace.to_string(), identity, token: Secret::new(token.to_string()) }
+    }
+
+    /// A candidate as a site that sends ids answers.
+    #[cfg(test)]
+    pub fn with_ids(server: &str, workspace: &str, workspace_id: &str, account_id: &str, token: &str) -> Candidate {
+        let identity = Identity { workspace: format!("id:{workspace_id}"), account: Some(format!("id:{account_id}")) };
+        Candidate { server: server.to_string(), account: None, workspace: workspace.to_string(), identity, token: Secret::new(token.to_string()) }
     }
 
     /// The name this sign-in is offered under.
@@ -305,11 +327,11 @@ impl Candidate {
     }
 }
 
-/// What the site named for the account at sign-in, beside the token: its name and its id.
+/// What the site named for the account at sign-in, beside the token: its user name, for the
+/// windows only (it is not part of the identity).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SignedIn {
     pub name: Option<String>,
-    pub id: Option<String>,
 }
 
 /// The check every sign-in and every pasted token passes before anything is saved: the site at
@@ -322,10 +344,7 @@ pub fn checked(server: &str, signed_in: SignedIn, token: Secret) -> Result<Candi
         Ok(ws) => {
             let workspace = publish::share::plain_text(&ws.name);
             let account = signed_in.name.map(|a| publish::share::plain_text(&a)).filter(|a| !a.is_empty());
-            let identity = Identity {
-                workspace: key(ws.id.as_deref(), Some(&workspace)).unwrap_or_default(),
-                account: key(ws.account.as_deref().or(signed_in.id.as_deref()), account.as_deref()),
-            };
+            let identity = Identity::of(&ws, &workspace).unwrap_or(Identity { workspace: String::new(), account: None });
             Ok(Candidate { server, account, workspace, identity, token })
         }
         Err(e) if e == publish::REJECTED_TOKEN => Err(not_saved(NOT_ACCEPTED)),
@@ -394,17 +413,21 @@ pub enum Renewal {
     OtherAccount(Candidate),
 }
 
-/// Whether profile `p`'s own "Sign in again" may take sign-in `c`: same site; with a complete
-/// identity recorded, exactly that identity; with only the workspace recorded, that workspace;
-/// with none recorded, any (the identity is recorded then).
+/// Whether profile `p`'s own "Sign in again" may take sign-in `c`, the identity being recorded
+/// from `c` then. Same site, and:
+/// - none recorded: any;
+/// - recorded by the workspace's name (today's sites): the same workspace name, from the same
+///   answer that gives `c`'s ids if any (so a site that starts sending ids upgrades it here);
+/// - recorded by ids: the same workspace id, and the same account id when one is recorded. It
+///   never matches by name: an answer without ids is another account.
 fn renews(p: &Profile, c: &Candidate) -> bool {
     if !same_site(&p.server, &c.server) {
         return false;
     }
     match &p.identity {
         None => true,
-        Some(i) if i.complete() => *i == c.identity,
-        Some(i) => i.workspace == c.identity.workspace,
+        Some(i) if i.by_ids() => c.identity.workspace == i.workspace && (i.account.is_none() || c.identity.account == i.account),
+        Some(i) => i.workspace == format!("name:{}", c.workspace),
     }
 }
 
@@ -438,10 +461,17 @@ pub fn note_check(book: &mut Book, id: &str, server: &str, ws: &Workspace) -> bo
     }
     let before = p.clone();
     let name = publish::share::plain_text(&ws.name);
-    if let Some(workspace) = key(ws.id.as_deref(), Some(&name)) {
-        // The account stays as recorded when this answer names none.
-        let account = key(ws.account.as_deref(), None).or_else(|| p.identity.as_ref().filter(|i| i.workspace == workspace).and_then(|i| i.account.clone()));
-        p.identity = Some(Identity { workspace, account });
+    // The profile's own token answered: what the answer says is the profile. Ids replace a
+    // name-based identity (a site that starts sending them); an answer without ids never takes
+    // the place of ids; an account id the answer leaves out stays as recorded.
+    if let Some(mut seen) = Identity::of(ws, &name) {
+        let stored = p.identity.clone();
+        match &stored {
+            Some(old) if old.by_ids() && !seen.by_ids() => seen = old.clone(),
+            Some(old) if old.workspace == seen.workspace && seen.account.is_none() => seen.account = old.account.clone(),
+            _ => {}
+        }
+        p.identity = Some(seen);
     }
     name_after(p, &name);
     *p != before

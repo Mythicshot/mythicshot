@@ -123,8 +123,6 @@ pub fn minutes_text(d: Duration) -> Option<String> {
 pub struct Connected {
     pub token: Secret,
     pub account: Option<String>,
-    /// The account's id, when the site named one (`account.id`).
-    pub account_id: Option<String>,
 }
 
 /// Why this computer was not connected.
@@ -369,8 +367,7 @@ fn wait_with(client: &Client, started: &Started, cancelled: &dyn Fn() -> bool, c
                         let token = take_secret(&mut v, "token", super::is_token).ok_or_else(|| ConnectError::Failed(not_understood()))?;
                         // A missing account, or one without a name, is no name: an older site still works.
                         let account = v.get("account").and_then(|a| a.get("username")).and_then(Value::as_str).map(share::plain_text).filter(|n| !n.is_empty());
-                        let account_id = super::id_text(v.get("account").and_then(|a| a.get("id")));
-                        return Ok(Connected { token, account, account_id });
+                        return Ok(Connected { token, account });
                     }
                     _ => return Err(ConnectError::Failed(not_understood())),
                 }

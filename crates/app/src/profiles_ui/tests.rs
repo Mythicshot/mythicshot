@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::profiles::tests::{FakeKeys, TOKEN_A, TOKEN_B, named};
+use crate::profiles::tests::{FakeKeys, TOKEN_A, TOKEN_B, ided, named};
 use crate::profiles::{MIGRATED_ID, Profile};
 use crate::publish::tests::{Answer, Stub, reply, stub};
 use crate::sign_in_ui::Stage;
@@ -72,6 +72,14 @@ fn connected(account: &str) -> Answer {
     reply(200, &format!(r#"{{"status":"connected","token":"{NEW_TOKEN}","workspace":{{"name":"customer1"}},"account":{{"username":"{account}"}}}}"#))
 }
 
+const WS_ID: &str = "ws_0123456789abcdef01234567";
+
+/// A site of the coming version: the check names the workspace and the account by their ids.
+fn ids_site(account_id: &'static str) -> Stub {
+    let me: &'static str = Box::leak(format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"{account_id}"}}"#).into_boxed_str());
+    site(|seen| if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) }, (200, me))
+}
+
 fn working_site() -> Stub {
     site(|seen| if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) }, (200, r#"{"workspace":"customer1"}"#))
 }
@@ -105,7 +113,7 @@ fn settle(f: &mut AddFlow) {
 }
 
 fn profile(id: &str, name: &str, server: &str, account: Option<&str>, workspace: Option<&str>, state: State) -> Profile {
-    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), identity: workspace.map(|w| named(w, account)), state, named: true }
+    Profile { id: id.into(), name: name.into(), server: server.into(), account: account.map(str::to_string), workspace: workspace.map(str::to_string), identity: workspace.map(named), state, named: true }
 }
 
 // ---- 2. The dropdown ----
@@ -347,8 +355,9 @@ fn a_save_the_store_cannot_confirm_says_why_and_leaves_nothing() {
 
 #[test]
 fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
-    let s = working_site();
-    let book = Book { legacy: None, list: vec![profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready)], active: Some("pa".into()) };
+    let s = ids_site("acc-c");
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let book = Book { legacy: None, list: vec![profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), pc], active: Some("pa".into()) };
     let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::New, &s.base);
     sign_in(&mut f);
@@ -366,8 +375,9 @@ fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
 
 #[test]
 fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
-    let s = working_site();
-    let book = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let s = ids_site("acc-c");
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain) };
+    let book = Book { legacy: None, list: vec![pc], active: Some("pc".into()) };
     let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::New, &s.base);
     sign_in(&mut f);
@@ -395,14 +405,15 @@ fn sign_in_again_renews_the_same_account_and_offers_another_as_a_new_profile() {
 
     // Another account signs in: the old profile stays waiting with its token, and the new one
     // is offered under its own name.
-    let other = site(|_| connected("intruder"), (200, r#"{"workspace":"customer1"}"#));
-    let book = Book { legacy: None, list: vec![profile("pc", "customer1 test", &other.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let other = ids_site("acc-intruder");
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &other.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain) };
+    let book = Book { legacy: None, list: vec![pc], active: Some("pc".into()) };
     let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_A)]));
     let mut f = flow(&shelf, Purpose::Renew("pc".into()), &other.base);
     sign_in(&mut f);
     settle(&mut f);
     let Step::Checked { candidate, .. } = f.step() else { panic!("not offered as a new profile") };
-    assert_eq!(candidate.account.as_deref(), Some("intruder"));
+    assert_eq!(candidate.identity, ided(WS_ID, "acc-intruder"));
     assert_eq!(f.purpose, Purpose::New);
     assert_eq!(shelf.book(), book);
     assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_A.to_string())]);

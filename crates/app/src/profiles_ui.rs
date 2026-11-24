@@ -316,7 +316,7 @@ pub fn add_work(server: String, slot: Arc<Mutex<Option<Candidate>>>, clock: Arc<
             return Err(ConnectError::Cancelled);
         }
         let account = connected.account.clone();
-        let signed_in = profiles::SignedIn { name: connected.account.clone(), id: connected.account_id.clone() };
+        let signed_in = profiles::SignedIn { name: connected.account.clone() };
         let candidate = profiles::checked(&started.server, signed_in, connected.token).map_err(ConnectError::Failed)?;
         // A cancel while the site was asked: the token goes with the candidate, unstored.
         if r.cancelled() {

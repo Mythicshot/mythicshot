@@ -141,10 +141,10 @@ impl RemoteTour {
 pub struct Workspace {
     pub name: String,
     pub version: Option<String>,
-    /// The workspace's id, when the site names one (`workspace_id`, or `workspace` as `{id, name}`).
+    /// The workspace's id (`workspace_id`), from a site version that sends it; today's sites do not.
     pub id: Option<String>,
-    /// The account the token belongs to, by its id, when the site names one (`account_id`, or
-    /// `account` as `{id, …}`).
+    /// The id of the account the token belongs to (`account_id`), from a site version that sends
+    /// it; today's sites do not.
     pub account: Option<String>,
 }
 
@@ -1023,12 +1023,11 @@ impl Client {
         let what = "Could not check the server";
         let reply = self.exchange(what, Method::Get, "/api/v1/me", None)?;
         let v = reply.json().ok_or_else(|| not_understood(what))?;
-        let ws = v.get("workspace");
-        let name = ws.and_then(Value::as_str).or_else(|| ws.and_then(|w| w.get("name")).and_then(Value::as_str)).ok_or_else(|| not_understood(what))?.to_string();
+        let name = v.get("workspace").and_then(Value::as_str).ok_or_else(|| not_understood(what))?.to_string();
         // A version is shown only when it looks like one; an older site sends none.
         let version = v.get("version").and_then(Value::as_str).filter(|s| is_version(s)).map(str::to_string);
-        let id = id_text(v.get("workspace_id")).or_else(|| id_text(ws.and_then(|w| w.get("id"))));
-        let account = id_text(v.get("account_id")).or_else(|| id_text(v.get("account").and_then(|a| a.get("id"))));
+        let id = id_text(v.get("workspace_id"));
+        let account = id_text(v.get("account_id"));
         Ok(Workspace { name, version, id, account })
     }
 
