@@ -8,13 +8,15 @@
 //! and the OS credential store outside tests, and a fake in them. Everything that uses the
 //! credential store or the site runs on a thread of its own.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use eframe::egui::{self, RichText};
 
-use crate::profiles::{self, Book, Candidate, Owner, Profile, State};
+use crate::profiles::{self, Book, Candidate, Ending, Owner, Profile, State};
 use crate::publish::connect::{self, Clock, ConnectError};
+use crate::publish::ending::Outcome;
 use crate::publish::{self, KeyStore};
 use crate::publish_ui::{self, ProfilesRequest};
 use crate::sign_in_ui::{self, Code, Opener, Reporter, SignInAction, SignInDialog, SignInJob};
@@ -38,6 +40,19 @@ pub enum Done {
     Removed,
     /// The store's sentence.
     Failed(String),
+    /// The change is done and came to `then`, and it let go of a token nothing else here holds:
+    /// that token is ended at its site afterwards, on the same background thread, once `then` was
+    /// handed over. Never handed over itself.
+    ThenEnd { then: Box<Done>, ending: Ending, after: AfterEnd },
+}
+
+/// What becomes of the site's answer to ending a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterEnd {
+    /// A removal: one line where profile messages show, unless the token was ended.
+    Notice,
+    /// A "Sign in again": silent for the person, one line in the app's log.
+    Log,
 }
 
 /// A change of the profiles, run on a background thread.
@@ -50,6 +65,8 @@ pub trait Shelf: Send + Sync {
     fn change(&self, change: Change) -> Done;
     /// Make `id` the active profile.
     fn switch(&self, id: &str) -> bool;
+    /// Ask the site to end a token a change let go of, on the calling thread (never the UI thread).
+    fn end(&self, ending: &Ending) -> Outcome;
 }
 
 /// The app's own profiles and the OS credential store.
@@ -65,14 +82,55 @@ impl Shelf for AppShelf {
     fn switch(&self, id: &str) -> bool {
         publish_ui::switch_profile(id)
     }
+    fn end(&self, ending: &Ending) -> Outcome {
+        ending.send()
+    }
 }
 
-/// Run `change` on a thread of its own; its end lands in `slot`.
-fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, change: Change) {
-    let (shelf, slot) = (shelf.clone(), slot.clone());
+/// The tokens being ended at their sites after a change, and the line a removal leaves when its
+/// site did not end the token.
+#[derive(Clone, Default)]
+struct Endings {
+    /// How many are still waiting for their site.
+    busy: Arc<AtomicUsize>,
+    notice: Arc<Mutex<Option<String>>>,
+}
+
+impl Endings {
+    fn busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// Run `change` on a thread of its own; its end lands in `slot`. A token the change let go of
+/// is ended at its site after that, on the same thread: the change's end does not wait for the
+/// site, and what the site said lands in `endings`.
+fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings: &Endings, change: Change) {
+    let (shelf, slot, endings) = (shelf.clone(), slot.clone(), endings.clone());
     std::thread::spawn(move || {
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shelf.change(change))).unwrap_or_else(|_| Done::Failed(profiles::NOT_SAVED.to_string()));
+        let (done, then_end) = match done {
+            Done::ThenEnd { then, ending, after } => (*then, Some((ending, after))),
+            done => (done, None),
+        };
+        // Counted before the change's end is handed over, so nobody sees it idle in between.
+        if then_end.is_some() {
+            endings.busy.fetch_add(1, Ordering::SeqCst);
+        }
         *lock(&slot) = Some(done);
+        let Some((ending, after)) = then_end else { return };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shelf.end(&ending))).unwrap_or_else(|_| Outcome::NotReached("the request failed".into()));
+        match after {
+            AfterEnd::Notice => {
+                if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
+                    *lock(&endings.notice) = Some(text);
+                }
+            }
+            AfterEnd::Log => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
+        }
+        // The token's copy is wiped here.
+        drop(ending);
+        endings.busy.fetch_sub(1, Ordering::SeqCst);
     });
 }
 
@@ -351,6 +409,8 @@ pub struct AddFlow {
     /// The check of a pasted token, running on its thread, and its end.
     pasted: Arc<Mutex<Option<Result<Candidate, String>>>>,
     checking_paste: bool,
+    /// The token a renewal replaced, being ended at its site.
+    endings: Endings,
     shelf: Arc<dyn Shelf>,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -364,7 +424,7 @@ impl Drop for AddFlow {
 
 impl AddFlow {
     pub fn new(purpose: Purpose, address: String, shelf: Arc<dyn Shelf>, open: Opener, clock: Arc<dyn Clock + Send + Sync>) -> AddFlow {
-        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, shelf, open, clock }
+        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, endings: Endings::default(), shelf, open, clock }
     }
 
     /// The form for the app's own profiles, the real browser and the real clock.
@@ -477,8 +537,11 @@ impl AddFlow {
                 spawn_change(
                     &self.shelf,
                     &self.done,
+                    &self.endings,
                     Box::new(move |book, store| match profiles::renew(book, store, &id, candidate) {
-                        Ok(profiles::Renewal::Renewed) => Done::Renewed(id),
+                        // The new token is stored and confirmed: only now is the old one ended.
+                        Ok(profiles::Renewal::Renewed(Some(ending))) => Done::ThenEnd { then: Box::new(Done::Renewed(id)), ending, after: AfterEnd::Log },
+                        Ok(profiles::Renewal::Renewed(None)) => Done::Renewed(id),
                         Ok(profiles::Renewal::OtherAccount(c)) => Done::Other(c),
                         Err(e) => Done::Failed(e),
                     }),
@@ -494,6 +557,7 @@ impl AddFlow {
         spawn_change(
             &self.shelf,
             &self.done,
+            &self.endings,
             Box::new(move |book, store| match profiles::save_new(book, store, candidate, &name) {
                 Ok(_) => Done::Saved,
                 Err(e) => Done::Failed(e),
@@ -595,10 +659,14 @@ impl AddFlow {
                 Err(e) => self.error = Some(e),
             }
         }
-        let Some(done) = lock(&self.done).take() else { return };
+        let Some(mut done) = lock(&self.done).take() else { return };
         self.working = false;
+        // Never handed over (see [`spawn_change`]); what it came to is all that counts here.
+        while let Done::ThenEnd { then, .. } = done {
+            done = *then;
+        }
         match done {
-            Done::Saved | Done::Removed => self.step = Step::Finished,
+            Done::Saved | Done::Removed | Done::ThenEnd { .. } => self.step = Step::Finished,
             Done::Renewed(id) => {
                 self.shelf.switch(&id);
                 self.step = Step::Finished;
@@ -619,6 +687,12 @@ impl AddFlow {
     #[cfg(test)]
     pub fn is_working(&self) -> bool {
         self.working
+    }
+
+    /// Whether the token a renewal replaced is still being ended at its site.
+    #[cfg(test)]
+    pub fn is_ending(&self) -> bool {
+        self.endings.busy()
     }
 
     /// Draw the form; the sign-in window over it while it is open.
@@ -753,6 +827,10 @@ pub struct Panel {
     done: Arc<Mutex<Option<Done>>>,
     /// Why the last Remove did not go through.
     error: Option<String>,
+    /// The tokens of removed profiles, being ended at their sites.
+    endings: Endings,
+    /// A removed profile's site did not end its token: the one line about it.
+    notice: Option<String>,
     shelf: Arc<dyn Shelf>,
     /// Makes the add form; tests hand in one with fakes.
     make: Arc<dyn Fn(Purpose, String) -> AddFlow + Send + Sync>,
@@ -760,7 +838,7 @@ pub struct Panel {
 
 impl Default for Panel {
     fn default() -> Self {
-        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app) }
+        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, endings: Endings::default(), notice: None, shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app) }
     }
 }
 
@@ -795,6 +873,7 @@ impl Panel {
     /// "Remove profile": the question first.
     pub fn ask_remove(&mut self, id: &str) {
         self.error = None;
+        self.notice = None;
         self.removing = Some(id.to_string());
     }
 
@@ -804,15 +883,18 @@ impl Panel {
         self.shelf.book().get(id).map(|p| profiles::remove_question(&p.name))
     }
 
-    /// "Remove": only that profile and its token go, on this computer.
+    /// "Remove": that profile and its token go from this computer, whatever the site says; then
+    /// its site is asked to end the token, unless anything else here still holds it.
     pub fn confirm_remove(&mut self) {
         let Some(id) = self.removing.take() else { return };
         self.working = true;
         spawn_change(
             &self.shelf,
             &self.done,
+            &self.endings,
             Box::new(move |book, store| match profiles::remove(book, store, &id) {
-                Ok(()) => Done::Removed,
+                Ok(Some(ending)) => Done::ThenEnd { then: Box::new(Done::Removed), ending, after: AfterEnd::Notice },
+                Ok(None) => Done::Removed,
                 Err(e) => Done::Failed(e),
             }),
         );
@@ -829,6 +911,9 @@ impl Panel {
             if let Done::Failed(e) = done {
                 self.error = Some(e);
             }
+        }
+        if let Some(text) = lock(&self.endings.notice).take() {
+            self.notice = Some(text);
         }
         match request {
             Some(ProfilesRequest::Add) => self.add(),
@@ -848,6 +933,23 @@ impl Panel {
         self.working
     }
 
+    /// Whether a removed profile's token is still being ended at its site.
+    #[cfg(test)]
+    pub fn is_ending(&self) -> bool {
+        self.endings.busy()
+    }
+
+    /// The line a removal left because its site did not end the token.
+    #[cfg(test)]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Draw the panel under the page's heading. With no profile at all, the add form shows by itself.
     pub fn ui(&mut self, ui: &mut egui::Ui, request: Option<ProfilesRequest>) -> Below {
         self.poll(request);
@@ -855,7 +957,8 @@ impl Panel {
         if book.list.is_empty() && !matches!(self.mode, Mode::Add(_)) {
             self.add();
         }
-        if self.working {
+        // Also while a removed profile's site is asked, so its line shows when it answers.
+        if self.working || self.endings.busy() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let mut pick = None;
@@ -877,6 +980,10 @@ impl Panel {
         }
         if let Some(e) = &self.error {
             note(ui, Tone::Bad, e);
+            ui.add_space(8.0);
+        }
+        if let Some(text) = &self.notice {
+            note(ui, Tone::Warn, text);
             ui.add_space(8.0);
         }
         // The update that adds profiles could not run at this start: the store's own sentence.

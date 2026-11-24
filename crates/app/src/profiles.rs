@@ -22,6 +22,10 @@
 //!   ([`renew`]). A refusal counts only for the profile, and the lookup, its request was made
 //!   with ([`Live`]). A site that is only unreachable changes nothing.
 //! - A token is handed out only for its own profile's address ([`token_for`]).
+//! - A token this computer lets go of, by a removal ([`remove`]) or a "Sign in again" that
+//!   replaced it ([`renew`]), is handed back to be ended at its own profile's site once the change
+//!   is done ([`Ending`]); never one that the old entry or another profile still holds
+//!   ([`held_elsewhere`]). No other change ends a token.
 //! - The one connection of the versions before profiles becomes the first profile without a new
 //!   sign-in ([`migrate`]); its old credential entry goes once the settings that say so were
 //!   written ([`remove_legacy`]). Should the first profile turn out to be an account another
@@ -32,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::publish::connect::Secret;
+use crate::publish::ending::Outcome;
 use crate::publish::{self, KeyStore, LEGACY_KEY, Workspace, profile_key};
 use crate::settings::Settings;
 
@@ -406,8 +411,9 @@ pub fn save_new(book: &mut Book, store: &dyn KeyStore, c: Candidate, name: &str)
 /// What a new sign-in for an existing profile came to.
 #[derive(Debug)]
 pub enum Renewal {
-    /// The same account: its new token is stored, and the profile can be used again.
-    Renewed,
+    /// The same account: its new token is stored, and the profile can be used again. The token it
+    /// replaced, to end at the profile's site, unless it is still held elsewhere or was the same.
+    Renewed(Option<Ending>),
     /// Another account: nothing was stored, and the old profile is as it was. The sign-in can be
     /// saved as a profile of its own.
     OtherAccount(Candidate),
@@ -439,12 +445,16 @@ pub fn would_renew(book: &Book, id: &str, c: &Candidate) -> bool {
 }
 
 /// "Sign in again" for profile `id`, from that profile's own action: only a sign-in for the same
-/// account replaces its token, and the identity is recorded.
+/// account replaces its token, and the identity is recorded. The token it replaced is handed
+/// back to end at the profile's site, only once the new one is stored and confirmed, and not
+/// when it is the new one or anything else here still holds it.
 pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> Result<Renewal, String> {
     let Some(p) = book.get(id) else { return Ok(Renewal::OtherAccount(c)) };
     if !renews(p, &c) {
         return Ok(Renewal::OtherAccount(c));
     }
+    // Read before it is overwritten; handed back only after the new one is confirmed.
+    let replaced = ending_of(book, store, id, Some(c.token.expose()));
     write_confirmed(store, &profile_key(id), c.token.expose())?;
     if let Some(p) = book.get_mut(id) {
         p.state = State::Ready;
@@ -454,7 +464,7 @@ pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> R
         p.identity = Some(c.identity.clone());
         name_after(p, &c.workspace);
     }
-    Ok(Renewal::Renewed)
+    Ok(Renewal::Renewed(replaced))
 }
 
 /// A check of profile `id` with its own token, at `server`, passed: the site's answer is kept as
@@ -514,9 +524,101 @@ pub fn sign_out(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), S
     Ok(())
 }
 
-/// Remove profile `id` and its token from this computer; nothing is sent to the site. When it
-/// was the active one, another becomes active (one that can be used first), or none.
-pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), String> {
+// ---- Ending a token at its site ----
+
+/// A token a change let go of, to end at its own site once that change is done: whose it was,
+/// the profile's own address (as the address rule writes it) and the token, wiped when this is
+/// dropped. Only [`remove`] and [`renew`] hand one over, and never for a token anything else on
+/// this computer still holds ([`held_elsewhere`]).
+pub struct Ending {
+    pub id: String,
+    pub name: String,
+    pub server: String,
+    token: Secret,
+}
+
+impl std::fmt::Debug for Ending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ending").field("id", &self.id).field("name", &self.name).field("server", &self.server).finish_non_exhaustive()
+    }
+}
+
+impl Ending {
+    pub fn token(&self) -> &str {
+        self.token.expose()
+    }
+
+    /// Ask the profile's own site to end the token, once. Blocks for at most
+    /// [`publish::ending::END_TIMEOUT`]: never on the UI thread.
+    pub fn send(&self) -> Outcome {
+        publish::ending::end_token(&self.server, self.token.expose())
+    }
+}
+
+/// Whether `token` is still held on this computer by anything but profile `id`'s own entry: the
+/// entry of the versions before profiles, or the entry of any other profile (a twin after a
+/// join, or any other whose token is byte for byte the same). An entry that cannot be read
+/// counts as holding it: a token is ended only when nothing else can still need it.
+pub fn held_elsewhere(book: &Book, store: &dyn KeyStore, id: &str, token: &str) -> bool {
+    let holds = |key: &str| match publish::load_token_at(store, key) {
+        Ok(Some(mut copy)) => {
+            let same = copy == token;
+            crate::publish_ui::wipe(&mut copy);
+            same
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    };
+    holds(LEGACY_KEY) || book.list.iter().filter(|p| p.id != id).any(|p| holds(&profile_key(&p.id)))
+}
+
+/// The token in profile `id`'s own entry, to end at the profile's own address, unless anything
+/// else here still holds it or is `except` (the token that replaces it). The address is the
+/// profile's, as the address rule writes it: a token is only ever sent to its own profile's
+/// site, as [`token_for`] hands it out.
+fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>) -> Option<Ending> {
+    let p = book.get(id)?;
+    let server = publish::check_server(&p.server).ok()?;
+    let token = Secret::new(publish::load_token_at(store, &profile_key(id)).ok()??);
+    if except == Some(token.expose()) || held_elsewhere(book, store, id, token.expose()) {
+        return None;
+    }
+    Some(Ending { id: p.id.clone(), name: p.name.clone(), server, token })
+}
+
+/// What a removal says when the site did not end its token; nothing when it did, or the token
+/// was not valid any more.
+pub fn removal_notice(name: &str, outcome: &Outcome) -> Option<String> {
+    match outcome {
+        Outcome::Ended | Outcome::AlreadyEnded => None,
+        Outcome::SiteTooOld | Outcome::NotReached(_) => Some(not_ended(name)),
+    }
+}
+
+/// Not yet in the approved wording: the profile was removed here, and its site did not end its
+/// token (an older site, or no answer).
+pub fn not_ended(name: &str) -> String {
+    format!("Removed \"{name}\" from this computer. The site could not be reached, so this computer is still listed under Connections there until you remove it.")
+}
+
+/// The app's log line for the end of the token a "Sign in again" replaced, at `server`. It never
+/// holds any of the token.
+pub fn renewal_log_line(server: &str, outcome: &Outcome) -> String {
+    let site = site_label(server);
+    match outcome {
+        Outcome::Ended => format!("Profiles: the token a new sign-in replaced was ended at {site}."),
+        Outcome::AlreadyEnded => format!("Profiles: the token a new sign-in replaced was no longer valid at {site}."),
+        Outcome::SiteTooOld => format!("Profiles: {site} cannot end the token a new sign-in replaced yet; it lapses there by itself."),
+        Outcome::NotReached(why) => format!("Profiles: the token a new sign-in replaced could not be ended at {site}: {why}."),
+    }
+}
+
+/// Remove profile `id` and its token from this computer; nothing is sent to the site here. When
+/// it was the active one, another becomes active (one that can be used first), or none. The
+/// token, read before its entry goes, is handed back to end at the profile's site once the
+/// removal is done ([`Ending`]); not when the old entry or any other profile still holds it.
+pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<Option<Ending>, String> {
+    let ending = ending_of(book, store, id, None);
     // What is left of the old entry goes with it only when it is this profile's own copy.
     let legacy_is_its_copy = book.legacy.as_deref() == Some(id) && matches!((publish::load_token_at(store, LEGACY_KEY), publish::load_token_at(store, &profile_key(id))), (Ok(Some(a)), Ok(Some(b))) if a == b);
     store.delete(&profile_key(id))?;
@@ -525,7 +627,7 @@ pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<(), Str
     }
     book.list.retain(|p| p.id != id);
     book.pick_active_after(id);
-    Ok(())
+    Ok(ending)
 }
 
 /// Another profile on the same site with the same complete identity as profile `id`: the

@@ -39,6 +39,7 @@
 
 pub mod access;
 pub mod connect;
+pub mod ending;
 pub mod share;
 
 use std::fmt;

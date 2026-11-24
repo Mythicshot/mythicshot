@@ -29,11 +29,13 @@ impl Clock for FakeClock {
 struct TestShelf {
     inner: Mutex<(Book, FakeKeys)>,
     switched: Mutex<Vec<String>>,
+    /// The sites a token was to be ended at, in order.
+    ended_at: Mutex<Vec<String>>,
 }
 
 impl TestShelf {
     fn with(book: Book, keys: FakeKeys) -> Arc<TestShelf> {
-        Arc::new(TestShelf { inner: Mutex::new((book, keys)), switched: Mutex::default() })
+        Arc::new(TestShelf { inner: Mutex::new((book, keys)), ..TestShelf::default() })
     }
     fn keys(&self) -> Vec<(String, String)> {
         lock(&self.inner).1.entries.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -55,6 +57,12 @@ impl Shelf for TestShelf {
     fn switch(&self, id: &str) -> bool {
         lock(&self.switched).push(id.to_string());
         lock(&self.inner).0.switch(id)
+    }
+    /// The real call, but only ever to a stand-in site on 127.0.0.1: a profile of a test that
+    /// names another address sends nothing.
+    fn end(&self, ending: &Ending) -> Outcome {
+        lock(&self.ended_at).push(ending.server.clone());
+        if ending.server.starts_with("http://127.0.0.1:") { ending.send() } else { Outcome::NotReached("not sent from a test".into()) }
     }
 }
 
@@ -507,4 +515,322 @@ fn a_request_from_a_dialog_opens_the_form_or_the_list() {
     // Sign in again opens the browser window for the profile's own address at once.
     panel.sign_in_again("pa");
     assert!(matches!(&panel.mode, Mode::Add(f) if f.purpose == Purpose::Renew("pa".into()) && f.address == "http://127.0.0.1:1" && f.is_signing_in()));
+}
+
+// ---- 9. Ending a token at its site ----
+
+const END: &str = "DELETE /api/v1/token";
+
+/// A site that answers the end of a token with `end`, and nothing else.
+fn ending_site(end: impl Fn() -> Answer + Send + 'static) -> Stub {
+    stub(move |req, _| if req.line == END { end() } else { reply(404, r#"{"error":"not_found"}"#) })
+}
+
+fn panel_for(shelf: &Arc<TestShelf>) -> Panel {
+    let shelf: Arc<dyn Shelf> = shelf.clone();
+    Panel::with(shelf, Arc::new(|_, _| panic!("no form here")))
+}
+
+/// Confirm the removal of `id` and wait for its local part; how long that took.
+fn remove_now(panel: &mut Panel, id: &str) -> Duration {
+    let started = Instant::now();
+    panel.ask_remove(id);
+    panel.confirm_remove();
+    panel.poll(None);
+    while panel.is_working() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the removal did not end");
+        std::thread::sleep(Duration::from_millis(5));
+        panel.poll(None);
+    }
+    started.elapsed()
+}
+
+/// Wait until the site was asked, or given up on, and what came of it was taken in.
+fn wait_ended(panel: &mut Panel) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while panel.is_ending() {
+        assert!(Instant::now() < deadline, "the site was never given up on");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panel.poll(None);
+}
+
+fn ends(s: &Stub) -> Vec<Option<String>> {
+    s.requests().into_iter().filter(|r| r.line == END).map(|r| r.auth).collect()
+}
+
+fn bearer(token: &str) -> Option<String> {
+    Some(format!("Bearer {token}"))
+}
+
+#[test]
+fn a_removal_ends_the_token_at_its_own_site_and_shows_nothing_more() {
+    let s = ending_site(|| reply(204, ""));
+    let book = Book { legacy: None, list: vec![profile("pa", "A", &s.base, None, None, State::Ready), profile("pb", "B", "http://127.0.0.1:1", None, None, State::Ready)], active: Some("pa".into()) };
+    let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_B)]));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    assert_eq!(shelf.book().list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pb"]);
+    assert_eq!(shelf.keys(), vec![("profile-pb".to_string(), TOKEN_B.to_string())]);
+    wait_ended(&mut panel);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)], "once, with its own token, at its own site");
+    assert_eq!(*lock(&shelf.ended_at), vec![s.base.clone()]);
+    assert_eq!(panel.notice(), None);
+    assert_eq!(panel.error(), None);
+}
+
+#[test]
+fn a_profile_waiting_for_a_sign_in_is_still_tried_once_and_already_ended_shows_nothing() {
+    let s = ending_site(|| reply(401, r#"{"error":"unauthorized"}"#));
+    let book = Book { legacy: None, list: vec![profile("pc", "C", &s.base, None, None, State::SignInAgain)], active: Some("pc".into()) };
+    let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pc", TOKEN_A)]));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pc");
+    wait_ended(&mut panel);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)]);
+    assert!(shelf.book().list.is_empty() && shelf.keys().is_empty());
+    assert_eq!(panel.notice(), None);
+}
+
+#[test]
+fn an_older_or_unreachable_site_gets_one_line_and_the_profile_still_goes() {
+    let answers: Vec<(&str, Box<dyn Fn() -> Answer + Send>)> = vec![
+        ("404", Box::new(|| reply(404, r#"{"error":"not_found"}"#))),
+        ("405", Box::new(|| reply(405, ""))),
+        ("500", Box::new(|| reply(500, ""))),
+        ("redirect", Box::new(|| Answer::Reply(302, String::new(), vec![("Location", "http://127.0.0.1:1/api/v1/token".into())]))),
+        ("dropped", Box::new(|| Answer::Drop)),
+    ];
+    for (what, answer) in answers {
+        let s = ending_site(answer);
+        let book = Book { legacy: None, list: vec![profile("pa", "Sandbox admin", &s.base, None, None, State::Ready)], active: Some("pa".into()) };
+        let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pa", TOKEN_A)]));
+        let mut panel = panel_for(&shelf);
+        remove_now(&mut panel, "pa");
+        wait_ended(&mut panel);
+        assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "{what}: removed locally all the same");
+        assert_eq!(ends(&s).len(), 1, "{what}: one call, no retry");
+        assert_eq!(panel.notice(), Some(profiles::not_ended("Sandbox admin").as_str()), "{what}");
+        assert_eq!(panel.error(), None, "{what}");
+        // The next Remove starts without it.
+        panel.ask_remove("gone");
+        assert_eq!(panel.notice(), None);
+    }
+    // Nothing listening at all.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let server = format!("http://127.0.0.1:{port}");
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![profile("pa", "A", &server, None, None, State::Ready)], active: Some("pa".into()) }, FakeKeys::with(&[("profile-pa", TOKEN_A)]));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    wait_ended(&mut panel);
+    assert_eq!(panel.notice(), Some(profiles::not_ended("A").as_str()));
+}
+
+#[test]
+fn a_slow_site_never_holds_up_the_local_removal() {
+    let s = ending_site(|| Answer::Hang);
+    let book = Book { legacy: None, list: vec![profile("pa", "A", &s.base, None, None, State::Ready)], active: Some("pa".into()) };
+    let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pa", TOKEN_A)]));
+    let mut panel = panel_for(&shelf);
+    let took = remove_now(&mut panel, "pa");
+    assert!(took < Duration::from_secs(2), "the removal waited for the site: {took:?}");
+    assert!(panel.is_ending(), "the site is still being asked");
+    assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "the list is updated already");
+    assert_eq!(panel.notice(), None);
+    let started = Instant::now();
+    wait_ended(&mut panel);
+    assert!(started.elapsed() < Duration::from_secs(7), "given up at the timeout: {:?}", started.elapsed());
+    assert_eq!(panel.notice(), Some(profiles::not_ended("A").as_str()));
+}
+
+#[test]
+fn a_removal_never_ends_a_token_another_profile_or_the_old_entry_still_holds() {
+    let s = ending_site(|| reply(204, ""));
+    // The migrated profile's copy of the old entry; another profile with the same token.
+    let first = profile(MIGRATED_ID, "first", &s.base, None, None, State::Ready);
+    let cases = [
+        (Book { legacy: Some(MIGRATED_ID.into()), list: vec![first.clone()], active: Some(MIGRATED_ID.into()) }, FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-first", TOKEN_A)]), MIGRATED_ID),
+        (Book { legacy: None, list: vec![profile("pa", "A", &s.base, None, None, State::Ready), profile("pb", "B", &s.base, None, None, State::Ready)], active: Some("pa".into()) }, FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_A)]), "pa"),
+        (
+            Book { legacy: None, list: vec![Profile { identity: Some(ided(WS_ID, "acc-a")), ..first.clone() }, Profile { identity: Some(ided(WS_ID, "acc-a")), ..profile("pa", "A", &s.base, None, None, State::Ready) }], active: Some("pa".into()) },
+            FakeKeys::with(&[("profile-first", TOKEN_A), ("profile-pa", TOKEN_A)]),
+            MIGRATED_ID,
+        ),
+    ];
+    for (book, keys, id) in cases {
+        let shelf = TestShelf::with(book, keys);
+        let mut panel = panel_for(&shelf);
+        remove_now(&mut panel, id);
+        wait_ended(&mut panel);
+        assert!(shelf.book().get(id).is_none(), "{id}: removed locally");
+        assert!(lock(&shelf.ended_at).is_empty(), "{id}: nothing to end");
+        assert_eq!(panel.notice(), None);
+    }
+    assert!(ends(&s).is_empty());
+}
+
+/// Wait until the end of a replaced token was sent, or given up on.
+fn wait_flow_ended(f: &AddFlow) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while f.is_ending() {
+        assert!(Instant::now() < deadline, "the site was never given up on");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn sign_in_again_ends_the_old_token_only_after_the_new_one_is_stored() {
+    // What the store held when the site was asked to end the old token.
+    let shelf_slot: Arc<std::sync::OnceLock<Arc<TestShelf>>> = Arc::default();
+    let held_then: Arc<Mutex<Vec<Vec<(String, String)>>>> = Arc::default();
+    let (slot, held) = (shelf_slot.clone(), held_then.clone());
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+        "GET /api/v1/me" => reply(200, r#"{"workspace":"customer1"}"#),
+        END => {
+            lock(&held).push(slot.get().map(|s| s.keys()).unwrap_or_default());
+            reply(204, "")
+        }
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let waiting = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let shelf = TestShelf::with(waiting, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let _ = shelf_slot.set(shelf.clone());
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    assert!(ends(&s).is_empty(), "nothing is ended before the confirmation");
+    f.save();
+    settle(&mut f);
+    assert!(f.is_finished(), "the form does not wait for the site");
+    wait_flow_ended(&f);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_B)], "once, with the old token");
+    assert_eq!(*lock(&held_then), vec![vec![("profile-pc".to_string(), NEW_TOKEN.to_string())]], "the new token was stored first");
+    assert_eq!(shelf.book().get("pc").unwrap().state, State::Ready);
+}
+
+#[test]
+fn sign_in_again_says_nothing_whatever_the_site_answers_about_the_old_token() {
+    for status in [401, 404, 500] {
+        let s = stub(move |req, seen| match req.line.as_str() {
+            "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+            "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+            "GET /api/v1/me" => reply(200, r#"{"workspace":"customer1"}"#),
+            _ => reply(status, ""),
+        });
+        let waiting = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+        let shelf = TestShelf::with(waiting, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+        let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+        sign_in(&mut f);
+        settle(&mut f);
+        f.save();
+        settle(&mut f);
+        wait_flow_ended(&f);
+        assert!(f.is_finished() && f.error.is_none(), "HTTP {status}");
+        assert_eq!(ends(&s), vec![bearer(TOKEN_B)], "HTTP {status}");
+        assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), NEW_TOKEN.to_string())]);
+    }
+}
+
+#[test]
+fn sign_in_again_ends_nothing_when_the_token_stays_or_the_save_fails() {
+    // The site handed back the very token the profile has.
+    let s = working_site();
+    let waiting = || Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain)], active: Some("pc".into()) };
+    let shelf = TestShelf::with(waiting(), FakeKeys::with(&[("profile-pc", NEW_TOKEN)]));
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    f.save();
+    settle(&mut f);
+    wait_flow_ended(&f);
+    assert!(f.is_finished());
+    // The store cannot take the new token: the old one stays, and is not ended.
+    let shelf2 = TestShelf::with(waiting(), FakeKeys { refuse_write: Some("profile-pc".into()), ..FakeKeys::with(&[("profile-pc", TOKEN_B)]) });
+    let mut f = flow(&shelf2, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    f.save();
+    settle(&mut f);
+    wait_flow_ended(&f);
+    assert!(f.error.is_some() && !f.is_finished());
+    assert_eq!(shelf2.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())]);
+    assert!(ends(&s).is_empty());
+    assert!(lock(&shelf.ended_at).is_empty() && lock(&shelf2.ended_at).is_empty());
+}
+
+#[test]
+fn no_other_path_ends_a_token() {
+    // One site for every path; it would answer the end of a token, and logs every request.
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+        "GET /api/v1/me" => reply(200, &format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-new"}}"#)),
+        END => reply(204, ""),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let refused = site(|_| connected(ACCOUNT), (401, ""));
+    let mut shelves = Vec::new();
+
+    // Another account at "Sign in again": offered as a new profile, the old one untouched.
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::SignInAgain) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc.clone()], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    assert!(matches!(f.step(), Step::Checked { .. }), "offered as a new profile");
+    // ...and its save fails: the store cannot take it.
+    let failing = TestShelf::with(Book { legacy: None, list: vec![pc.clone()], active: Some("pc".into()) }, FakeKeys { garble: true, ..FakeKeys::with(&[("profile-pc", TOKEN_B)]) });
+    let mut g = flow(&failing, Purpose::New, &s.base);
+    sign_in(&mut g);
+    settle(&mut g);
+    g.save();
+    settle(&mut g);
+    assert!(g.error.is_some(), "the save failed");
+    wait_flow_ended(&f);
+    wait_flow_ended(&g);
+    shelves.extend([shelf.clone(), failing.clone()]);
+
+    // A refused sign-in.
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc.clone()], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &refused.base);
+    sign_in(&mut f);
+    assert!(matches!(f.sign_in_dialog().map(|d| d.stage()), Some(Stage::Failed { .. })));
+    shelves.push(shelf);
+
+    // "Switch to it" for a profile that is there and ready, and a switch in the dropdown.
+    let ready = Profile { identity: Some(ided(WS_ID, "acc-new")), state: State::Ready, ..pc.clone() };
+    let other = profile("pd", "D", &s.base, None, None, State::Ready);
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![ready, other], active: Some("pd".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B), ("profile-pd", TOKEN_A)]));
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    f.switch_to_it();
+    assert!(f.is_finished());
+    assert!(shelf.switch("pd"));
+    shelves.push(shelf.clone());
+
+    // The update that adds profiles, the join of twins, and the old entry's cleanup.
+    let store = FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-pt", TOKEN_B)]);
+    let mut settings = crate::settings::Settings::default();
+    settings.publish_saved_for = Some(s.base.clone());
+    assert!(profiles::migrate(&mut settings, &store).unwrap().is_some());
+    let mut book = Book::of(&settings);
+    for p in book.list.iter_mut() {
+        p.identity = Some(ided(WS_ID, "acc-a"));
+    }
+    book.list.push(Profile { identity: Some(ided(WS_ID, "acc-a")), ..profile("pt", "Twin", &s.base, None, Some("customer1"), State::SignInAgain) });
+    assert_eq!(profiles::twin_of(&book, MIGRATED_ID).as_deref(), Some("pt"));
+    profiles::attach(&mut book, &store, MIGRATED_ID, "pt").unwrap();
+    book.write_to(&mut settings);
+    assert!(profiles::remove_legacy(&settings, &store).unwrap());
+    // Signing out of a profile only forgets its token here.
+    profiles::sign_out(&mut book, &store, "pt").unwrap();
+    assert!(store.entries.borrow().is_empty());
+
+    assert!(ends(&s).is_empty() && ends(&refused).is_empty(), "no token was ended");
+    for shelf in shelves {
+        assert!(lock(&shelf.ended_at).is_empty());
+    }
 }

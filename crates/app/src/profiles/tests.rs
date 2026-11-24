@@ -362,7 +362,7 @@ fn a_workspace_id_only_identity_upgrades_in_place_and_matches_nothing_meanwhile(
     let by_name_only = Candidate::for_test(&s.base, Some("alex"), "Acme", TOKEN_A);
     assert!(matches!(renew(&mut b, &store, &second, by_name_only).unwrap(), Renewal::OtherAccount(_)), "never by name");
     let same_ws = Candidate::with_ids(&s.base, "Acme", WS_ID, "acc-2", TOKEN_A);
-    assert!(matches!(renew(&mut b, &store, &second, same_ws).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, &second, same_ws).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get(&second).unwrap().identity, Some(ided(WS_ID, "acc-2")));
 }
 
@@ -370,7 +370,7 @@ fn a_workspace_id_only_identity_upgrades_in_place_and_matches_nothing_meanwhile(
 fn account_names_are_compared_without_regard_to_case_and_the_newest_spelling_is_kept() {
     let store = FakeKeys::with(&[("profile-pc", OLD)]);
     let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, Some("Ölaf.Customer"), Some("Acme")) }], "pc");
-    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("ölaf.customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("ölaf.customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("ölaf.customer"));
     // A different name in any case is still another account.
     mark_refused(&mut b, "pc");
@@ -586,7 +586,7 @@ fn a_profile_without_a_full_identity_is_never_matched_by_a_new_sign_in() {
     // Its own "Sign in again" renews it and records the identity.
     let store = FakeKeys::with(&[(&first_key(), OLD)]);
     let mut b = book(vec![Profile { identity: Some(named("Acme")), state: State::SignInAgain, ..profile(MIGRATED_ID, "Alex", SITE, None, None) }], MIGRATED_ID);
-    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, Candidate::for_test(SITE, Some("alex"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get(MIGRATED_ID).unwrap().identity, Some(named("Acme")));
     // Only in its own workspace.
     let mut b = book(vec![Profile { identity: Some(named("Acme")), state: State::SignInAgain, ..profile(MIGRATED_ID, "Alex", SITE, None, None) }], MIGRATED_ID);
@@ -627,17 +627,17 @@ fn todays_sites_renew_by_the_workspace_name_and_anything_else_is_another_account
     assert_eq!((b.get("pc").unwrap().state, store.at("profile-pc").as_deref()), (State::SignInAgain, Some(OLD)));
     // The same workspace and account name: renewed, and the name is kept for next time.
     let mut b = waiting();
-    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed(_)));
     assert_eq!((b.get("pc").unwrap().identity.clone(), b.get("pc").unwrap().account.as_deref()), (Some(named("Acme")), Some("customer")));
     // A pasted token names no account: the workspace name decides.
     let store = FakeKeys::with(&[("profile-pc", OLD)]);
     let mut b = waiting();
-    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, None, "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, None, "Acme", TOKEN_A)).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("customer"), "a name once known is not forgotten");
     // A profile that knew no account name records the first one it gets.
     let store = FakeKeys::with(&[("profile-pc", OLD)]);
     let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, None, Some("Acme")) }], "pc");
-    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("customer"));
 }
 
@@ -654,7 +654,7 @@ fn a_site_that_starts_sending_ids_upgrades_a_name_based_identity_in_place() {
     // and records the ids on a match.
     let store = FakeKeys::with(&[("profile-pb", OLD)]);
     mark_refused(&mut b, "pb");
-    assert!(matches!(renew(&mut b, &store, "pb", Candidate::with_ids(SITE, "Acme", WS_ID, "acc-bo", TOKEN_B)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pb", Candidate::with_ids(SITE, "Acme", WS_ID, "acc-bo", TOKEN_B)).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get("pb").unwrap().identity, Some(ided(WS_ID, "acc-bo")));
     let mut c = b.clone();
     mark_refused(&mut c, "pb");
@@ -704,14 +704,14 @@ fn a_refused_profile_is_kept_until_a_sign_in_for_the_same_account_passes() {
     let other = Candidate::with_ids("http://localhost:3000", "customer1", WS_ID, "acc-intruder", TOKEN_B);
     match renew(&mut b, &store, "pc", other).unwrap() {
         Renewal::OtherAccount(c) => assert_eq!(c.identity, ided(WS_ID, "acc-intruder")),
-        Renewal::Renewed => panic!("another account renewed the profile"),
+        Renewal::Renewed(_) => panic!("another account renewed the profile"),
     }
     // An answer without ids never matches ids by name.
     assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test("http://localhost:3000", Some("customer"), "customer1", TOKEN_B)).unwrap(), Renewal::OtherAccount(_)));
     assert_eq!((b.get("pc").unwrap().state, store.at("profile-pc").as_deref()), (State::SignInAgain, Some(OLD)));
     // Exactly the same identity: its new token is kept and the profile works again.
     let same = Candidate::with_ids("http://localhost:3000/", "customer1", WS_ID, "acc-customer", TOKEN_A);
-    assert!(matches!(renew(&mut b, &store, "pc", same).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pc", same).unwrap(), Renewal::Renewed(_)));
     assert_eq!(b.get("pc").unwrap().state, State::Ready);
     assert_eq!(token_for(&b, &store, &pin).as_deref(), Ok(TOKEN_A));
 }
@@ -789,7 +789,7 @@ fn a_renewed_profile_is_not_marked_again_by_its_old_tokens_refusal() {
     let (mut b, mut live, refused) = refused_a();
     assert!(live.attribute(&mut b, &refused));
     let store = FakeKeys::with(&[("profile-pa", TOKEN_A)]);
-    assert!(matches!(renew(&mut b, &store, "pa", Candidate::for_test(SITE, Some("a"), "Acme", TOKEN_B)).unwrap(), Renewal::Renewed));
+    assert!(matches!(renew(&mut b, &store, "pa", Candidate::for_test(SITE, Some("a"), "Acme", TOKEN_B)).unwrap(), Renewal::Renewed(_)));
     // Before the new token is looked up, and after: the old refusal does not count.
     let (generation, profile) = live.begin(&b);
     assert!(!live.attribute(&mut b, &refused) && !live.active_refused(&b, &refused));
@@ -950,4 +950,180 @@ fn the_sentences_are_the_approved_ones() {
     assert_eq!(remove_question("Sandbox admin"), "Remove \"Sandbox admin\" from this computer? Your tours and account on the site are not touched.");
     assert_eq!(migrated("Alex · mythicshot.com"), "Your existing connection is now the profile \"Alex · mythicshot.com\".");
     assert_eq!(NOT_SAVED, format!("{NOT_SAVED_LEAD} {NOT_ACCEPTED}"));
+}
+
+// ---- 9. Ending a token at its site ----
+
+const TOKEN_C: &str = "dp_cccccccccccccccccccccccccccccccccccccccc";
+
+/// What a removal or renewal hands over to end: the profile, its site and the token, or nothing.
+fn ending_of(e: &Option<Ending>) -> Option<(String, String, String, String)> {
+    e.as_ref().map(|e| (e.id.clone(), e.name.clone(), e.server.clone(), e.token().to_string()))
+}
+
+#[test]
+fn a_removal_hands_over_its_token_to_end_at_its_own_site_after_the_entry_went() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_B)]);
+    let mut b = book(vec![profile("pa", "A", "https://Tours.Example.com/", None, None), profile("pb", "B", "http://localhost:3000", None, None)], "pa");
+    let ending = remove(&mut b, &store, "pa").unwrap();
+    assert_eq!(ending_of(&ending), Some(("pa".into(), "A".into(), SITE.into(), TOKEN_A.into())), "the profile's own address, as the address rule writes it");
+    assert_eq!(store.keys(), vec!["profile-pb".to_string()], "removed locally as before");
+    assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pb"]);
+    // A profile without a token has nothing to end.
+    let store = FakeKeys::default();
+    let mut b = book(vec![profile("pa", "A", SITE, None, None)], "pa");
+    assert!(remove(&mut b, &store, "pa").unwrap().is_none());
+    assert!(b.list.is_empty());
+}
+
+#[test]
+fn a_profile_waiting_for_a_sign_in_still_hands_over_its_token() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A)]);
+    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pa", "A", SITE, None, None) }], "pa");
+    assert_eq!(ending_of(&remove(&mut b, &store, "pa").unwrap()).map(|e| e.3), Some(TOKEN_A.to_string()));
+}
+
+#[test]
+fn a_removal_that_fails_hands_over_nothing() {
+    let store = FakeKeys { refuse_delete: true, ..FakeKeys::with(&[("profile-pa", TOKEN_A)]) };
+    let mut b = book(vec![profile("pa", "A", SITE, None, None)], "pa");
+    assert!(remove(&mut b, &store, "pa").is_err());
+    let store = FakeKeys { locked: true, ..FakeKeys::with(&[("profile-pa", TOKEN_A)]) };
+    assert!(remove(&mut b, &store, "pa").is_err());
+    assert_eq!(b.list.len(), 1);
+}
+
+#[test]
+fn a_token_the_old_entry_still_holds_is_never_ended() {
+    // The migrated profile's own copy, before the old entry was cleaned up.
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
+    let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
+    assert!(remove(&mut b, &store, MIGRATED_ID).unwrap().is_none());
+    assert!(store.entries.borrow().is_empty(), "removed locally as before");
+    // The old entry holds it while it is not the profile's own copy by the book.
+    let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_A), ("profile-pa", TOKEN_A)]);
+    let mut b = book(vec![profile("pa", "A", SITE, None, None)], "pa");
+    assert!(remove(&mut b, &store, "pa").unwrap().is_none());
+    assert_eq!(store.keys(), vec![LEGACY_KEY.to_string()]);
+    // Another token in the old entry does not stop it.
+    let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_B), (&first_key(), OLD)]);
+    let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
+    assert_eq!(ending_of(&remove(&mut b, &store, MIGRATED_ID).unwrap()).map(|e| e.3), Some(OLD.to_string()));
+}
+
+#[test]
+fn a_token_a_twin_still_holds_after_a_join_is_never_ended() {
+    // A join that wrote the token into the twin, and could not delete the first profile's entry.
+    let first = Profile { identity: Some(ided(WS_ID, "acc-a")), ..profile(MIGRATED_ID, "first", SITE, None, Some("Acme")) };
+    let twin = Profile { identity: Some(ided(WS_ID, "acc-a")), ..profile("pa", "A", SITE, None, Some("Acme")) };
+    let store = FakeKeys::with(&[(&first_key(), TOKEN_A), ("profile-pa", TOKEN_A)]);
+    let mut b = book(vec![first, twin], "pa");
+    assert_eq!(twin_of(&b, MIGRATED_ID).as_deref(), Some("pa"));
+    assert!(remove(&mut b, &store, MIGRATED_ID).unwrap().is_none());
+    assert_eq!(store.at("profile-pa").as_deref(), Some(TOKEN_A), "the twin keeps its token");
+    // The twin is removed later: nobody else holds it any more, so it is ended then.
+    assert_eq!(ending_of(&remove(&mut b, &store, "pa").unwrap()).map(|e| e.3), Some(TOKEN_A.to_string()));
+}
+
+#[test]
+fn a_token_any_other_profile_holds_byte_for_byte_is_never_ended() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_A), ("profile-pc", TOKEN_C)]);
+    let mut b = book(vec![profile("pa", "A", SITE, None, None), profile("pb", "B", "http://localhost:3000", None, None), profile("pc", "C", SITE, None, None)], "pa");
+    assert!(remove(&mut b, &store, "pa").unwrap().is_none());
+    assert_eq!(store.at("profile-pb").as_deref(), Some(TOKEN_A));
+    assert_eq!(ending_of(&remove(&mut b, &store, "pc").unwrap()).map(|e| e.3), Some(TOKEN_C.to_string()), "another token is no reason");
+}
+
+#[test]
+fn an_entry_that_cannot_be_read_counts_as_holding_the_token() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", "not a token")]);
+    let b = book(vec![profile("pa", "A", SITE, None, None), profile("pb", "B", SITE, None, None)], "pa");
+    assert!(held_elsewhere(&b, &store, "pa", TOKEN_A));
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_B)]);
+    assert!(!held_elsewhere(&b, &store, "pa", TOKEN_A));
+    assert!(held_elsewhere(&b, &store, "pa", TOKEN_B));
+    assert!(!held_elsewhere(&b, &store, "pb", TOKEN_B), "its own entry does not count");
+}
+
+#[test]
+fn a_renewal_hands_over_the_old_token_only_after_the_new_one_is_stored_and_confirmed() {
+    let store = FakeKeys::with(&[("profile-pc", TOKEN_B)]);
+    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "C", SITE, Some("customer"), Some("Acme")) }], "pc");
+    let Renewal::Renewed(ending) = renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).unwrap() else { panic!("not renewed") };
+    assert_eq!(ending_of(&ending), Some(("pc".into(), "C".into(), SITE.into(), TOKEN_B.into())), "the old token, for the profile's own site");
+    assert_eq!(store.at("profile-pc").as_deref(), Some(TOKEN_A), "the new one is stored");
+    assert_eq!(b.get("pc").unwrap().state, State::Ready);
+}
+
+#[test]
+fn a_renewal_hands_over_nothing_when_the_old_token_stays_in_use() {
+    let candidate = || Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A);
+    let pc = || profile("pc", "C", SITE, Some("customer"), Some("Acme"));
+    // The same token again.
+    let store = FakeKeys::with(&[("profile-pc", TOKEN_A)]);
+    let mut b = book(vec![pc()], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", candidate()).unwrap(), Renewal::Renewed(None)));
+    // Another profile holds the old one.
+    let store = FakeKeys::with(&[("profile-pc", TOKEN_B), ("profile-pd", TOKEN_B)]);
+    let mut b = book(vec![pc(), profile("pd", "D", SITE, None, None)], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", candidate()).unwrap(), Renewal::Renewed(None)));
+    // The old entry still holds it: the migrated profile before the cleanup.
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
+    let mut b = book(vec![profile(MIGRATED_ID, "first", SITE, Some("customer"), Some("Acme"))], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap(), Renewal::Renewed(None)));
+    // No token was stored (signed out): nothing to end.
+    let store = FakeKeys::default();
+    let mut b = book(vec![pc()], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", candidate()).unwrap(), Renewal::Renewed(None)));
+}
+
+#[test]
+fn a_renewal_that_is_not_stored_or_is_another_account_hands_over_nothing() {
+    let pc = || profile("pc", "C", SITE, Some("customer"), Some("Acme"));
+    // The store cannot take the new token, or keeps something else: the old one stays, unended.
+    for store in [FakeKeys { refuse_write: Some("profile-pc".into()), ..FakeKeys::with(&[("profile-pc", TOKEN_B)]) }, FakeKeys { garble: true, ..FakeKeys::with(&[("profile-pc", TOKEN_B)]) }] {
+        let mut b = book(vec![pc()], "pc");
+        assert!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A)).is_err());
+    }
+    // Another account: nothing stored, nothing to end.
+    let store = FakeKeys::with(&[("profile-pc", TOKEN_B)]);
+    let mut b = book(vec![pc()], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("customer"), "Other", TOKEN_A)).unwrap(), Renewal::OtherAccount(_)));
+    assert_eq!(store.at("profile-pc").as_deref(), Some(TOKEN_B));
+}
+
+#[test]
+fn an_ending_never_shows_its_token() {
+    let store = FakeKeys::with(&[("profile-pa", TOKEN_A)]);
+    let mut b = book(vec![profile("pa", "A", SITE, None, None)], "pa");
+    let ending = remove(&mut b, &store, "pa").unwrap().unwrap();
+    let shown = format!("{ending:?}");
+    assert!(!shown.contains(TOKEN_A) && !shown.contains("aaaaaaaa"), "{shown}");
+}
+
+#[test]
+fn what_a_removal_says_when_its_token_was_not_ended() {
+    use crate::publish::ending::Outcome;
+    assert_eq!(not_ended("Sandbox admin"), "Removed \"Sandbox admin\" from this computer. The site could not be reached, so this computer is still listed under Connections there until you remove it.");
+    assert_eq!(removal_notice("A", &Outcome::Ended), None);
+    assert_eq!(removal_notice("A", &Outcome::AlreadyEnded), None);
+    assert_eq!(removal_notice("A", &Outcome::SiteTooOld), Some(not_ended("A")));
+    assert_eq!(removal_notice("A", &Outcome::NotReached("the server did not answer in time".into())), Some(not_ended("A")));
+}
+
+#[test]
+fn the_log_line_after_a_renewal_names_the_site_and_never_the_token() {
+    use crate::publish::ending::Outcome;
+    let outcomes = [Outcome::Ended, Outcome::AlreadyEnded, Outcome::SiteTooOld, Outcome::NotReached("could not connect to the server".into())];
+    let lines: Vec<String> = outcomes.iter().map(|o| renewal_log_line(SITE, o)).collect();
+    for line in &lines {
+        assert!(line.starts_with("Profiles: ") && line.contains("tours.example.com"), "{line}");
+        assert!(!line.contains("dp_") && !line.contains("Bearer"), "{line}");
+        assert!(!line.contains(".."), "{line}");
+    }
+    assert!(lines[3].contains("could not connect to the server"));
+    assert_eq!(lines.iter().collect::<std::collections::BTreeSet<_>>().len(), 4, "each outcome its own line");
 }
