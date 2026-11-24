@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.32 (2026-11-24)
+
+- Profiles: when the profile made from the earlier connection turns out to be the same account as another profile, the two are joined with the token that was just checked with the site, never with the other profile's, which may no longer work. If the token cannot be moved and read back, nothing is joined.
+- Profiles: a site that names the workspace's id but no account is handled: the profile is kept by its workspace id, never taken for another profile, and completed in place when the site later names the account.
+- Profiles: account names are compared without regard to capital letters when a profile is signed in again.
+
 ## 0.2.31 (2026-11-24)
 
 - Profiles: Mythicshot can stay signed in to several accounts, on one site or on several, each with its own name, address and token. A dropdown on the Tours page, the Workspace page and in the upload and share windows shows the active profile and switches between them; the Tours list, storage use, uploads and sharing follow it.

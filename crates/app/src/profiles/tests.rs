@@ -242,7 +242,7 @@ fn the_first_profile_is_joined_to_a_profile_of_the_same_identity() {
     attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
     assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"]);
     assert_eq!((b.active.as_deref(), b.legacy.as_deref()), (Some("pa"), Some("pa")));
-    assert_eq!(store.at("profile-pa").as_deref(), Some(TOKEN_A), "the twin keeps its own working token");
+    assert_eq!(store.at("profile-pa").as_deref(), Some(OLD), "the twin takes the token the check just proved");
     assert_eq!(store.at(&first_key()), None, "the copy goes");
     assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD), "the old entry stays: no profile holds a copy of it");
     // Recordings linked before profiles belong to it now.
@@ -297,6 +297,84 @@ fn a_join_moves_the_working_token_into_a_twin_that_cannot_be_used() {
         assert_eq!(store.at("profile-pa").as_deref(), Some(OLD), "the only working token is never lost");
         assert_eq!(store.at(&first_key()), None);
     }
+}
+
+#[test]
+fn a_join_into_a_ready_twin_with_a_revoked_token_gives_it_the_verified_token() {
+    // The twin looks usable (Ready, with an entry), but its token was revoked on the site.
+    let store = FakeKeys::with(&[(&first_key(), OLD), ("profile-pa", TOKEN_A)]);
+    let mut b = twins(State::Ready);
+    attach(&mut b, &store, MIGRATED_ID, "pa").unwrap();
+    assert_eq!(b.list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["pa"]);
+    assert_eq!(store.at("profile-pa").as_deref(), Some(OLD), "the first profile's just-verified token");
+    assert_eq!(store.at(&first_key()), None);
+    // And when that cannot be confirmed, nothing is joined: both stay as they were.
+    let store = FakeKeys { garble: true, ..FakeKeys::with(&[(&first_key(), OLD), ("profile-pa", TOKEN_A)]) };
+    let mut b = twins(State::Ready);
+    let before = b.clone();
+    let _ = attach(&mut b, &store, MIGRATED_ID, "pa");
+    assert_eq!(b, before);
+    assert_eq!(store.at(&first_key()).as_deref(), Some(OLD));
+}
+
+/// What the coming platform answers for a token made before the change: a workspace id, no account.
+const ACCOUNT_NULL: &str = r#"{"workspace":"Acme","version":"0.1.63","workspace_id":"ws_0123456789abcdef01234567","account_id":null}"#;
+
+fn ws_only() -> Identity {
+    Identity { workspace: format!("id:{WS_ID}"), account: None }
+}
+
+#[test]
+fn a_null_account_id_gives_a_workspace_id_only_identity() {
+    let s = me_stub(200, ACCOUNT_NULL);
+    let c = checked(&s.base, signed_in("alex"), Secret::new(TOKEN_A.into())).unwrap();
+    assert_eq!(c.identity, ws_only());
+    assert!(!c.identity.complete());
+    // The same answer with the account left out altogether.
+    let s = me_stub(200, r#"{"workspace":"Acme","version":"0.1.63","workspace_id":"ws_0123456789abcdef01234567"}"#);
+    assert_eq!(checked(&s.base, SignedIn::default(), Secret::new(TOKEN_A.into())).unwrap().identity, ws_only());
+}
+
+#[test]
+fn a_workspace_id_only_identity_upgrades_in_place_and_matches_nothing_meanwhile() {
+    let s = me_stub(200, ACCOUNT_NULL);
+    let c = checked(&s.base, signed_in("alex"), Secret::new(TOKEN_A.into())).unwrap();
+    let store = FakeKeys::default();
+    let mut b = Book::default();
+    let first = save_new(&mut b, &store, c, "").unwrap();
+    // (b) Add profile never matches it: the same answer again is another profile.
+    let again = checked(&s.base, signed_in("alex"), Secret::new(TOKEN_B.into())).unwrap();
+    assert!(find_same(&b, &again).is_none());
+    let second = save_new(&mut b, &store, again, "").unwrap();
+    // … and two such profiles are no twins.
+    b.legacy = Some(first.clone());
+    assert_eq!(twin_of(&b, &first), None);
+    // (a) A later answer for the same token carrying the account id upgrades it in place.
+    assert!(note_check(&mut b, &first, &s.base, &ws("Acme", Some(WS_ID), Some("acc-1"))));
+    assert_eq!(b.get(&first).unwrap().identity, Some(ided(WS_ID, "acc-1")));
+    // An answer with a null account again keeps the recorded one.
+    assert!(!note_check(&mut b, &first, &s.base, &ws("Acme", Some(WS_ID), None)));
+    assert_eq!(b.get(&first).unwrap().identity, Some(ided(WS_ID, "acc-1")));
+    // (c) It renews by the exact workspace id, whoever's account the new token names.
+    mark_refused(&mut b, &second);
+    let other_ws = Candidate::with_ids(&s.base, "Acme", "ws_ffffffffffffffffffffffff", "acc-2", TOKEN_A);
+    assert!(matches!(renew(&mut b, &store, &second, other_ws).unwrap(), Renewal::OtherAccount(_)));
+    let by_name_only = Candidate::for_test(&s.base, Some("alex"), "Acme", TOKEN_A);
+    assert!(matches!(renew(&mut b, &store, &second, by_name_only).unwrap(), Renewal::OtherAccount(_)), "never by name");
+    let same_ws = Candidate::with_ids(&s.base, "Acme", WS_ID, "acc-2", TOKEN_A);
+    assert!(matches!(renew(&mut b, &store, &second, same_ws).unwrap(), Renewal::Renewed));
+    assert_eq!(b.get(&second).unwrap().identity, Some(ided(WS_ID, "acc-2")));
+}
+
+#[test]
+fn account_names_are_compared_without_regard_to_case_and_the_newest_spelling_is_kept() {
+    let store = FakeKeys::with(&[("profile-pc", OLD)]);
+    let mut b = book(vec![Profile { state: State::SignInAgain, ..profile("pc", "c", SITE, Some("Ölaf.Customer"), Some("Acme")) }], "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("ölaf.customer"), "Acme", TOKEN_A)).unwrap(), Renewal::Renewed));
+    assert_eq!(b.get("pc").unwrap().account.as_deref(), Some("ölaf.customer"));
+    // A different name in any case is still another account.
+    mark_refused(&mut b, "pc");
+    assert!(matches!(renew(&mut b, &store, "pc", Candidate::for_test(SITE, Some("OLAF.CUSTOMER2"), "Acme", TOKEN_B)).unwrap(), Renewal::OtherAccount(_)));
 }
 
 #[test]
