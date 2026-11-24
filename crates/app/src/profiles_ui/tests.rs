@@ -722,7 +722,7 @@ fn sign_in_again_ends_the_old_token_only_after_the_new_one_is_stored() {
 
 #[test]
 fn sign_in_again_says_nothing_whatever_the_site_answers_about_the_old_token() {
-    for status in [401, 404, 500] {
+    for status in [401, 404, 409, 500] {
         let s = stub(move |req, seen| match req.line.as_str() {
             "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
             "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
@@ -1035,4 +1035,43 @@ fn removing_the_migrated_profile_ends_its_token_once_its_old_entry_copy_went_too
     wait_ended(&mut panel);
     assert!(shelf.keys().is_empty());
     assert_eq!(ends(&s), vec![bearer(TOKEN_A)]);
+}
+
+// ---- 11. A setup token the site keeps, and repaints ----
+
+#[test]
+fn a_setup_token_the_site_keeps_on_purpose_is_removed_here_and_nothing_is_said() {
+    let s = ending_site(|| reply(409, r#"{"error":"not_a_connection"}"#));
+    let book = Book { legacy: None, list: vec![profile("pa", "Pasted", &s.base, None, None, State::Ready)], active: Some("pa".into()) };
+    let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-pa", TOKEN_A)]));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    wait_ended(&mut panel);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)], "asked once");
+    assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "removed here as always");
+    assert!(panel.notices().is_empty(), "no line");
+    assert_eq!(panel.error(), None);
+}
+
+#[test]
+fn an_ending_that_waits_for_a_job_asks_for_no_repaint_and_wakes_the_page_once_for_its_line() {
+    let s = job_site(404);
+    let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A)]);
+    let held = shelf.holds.hold("pa");
+    let mut panel = panel_for(&shelf);
+    let woken = Arc::new(AtomicUsize::new(0));
+    let count = woken.clone();
+    panel.set_waker(Arc::new(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+    remove_now(&mut panel, "pa");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(panel.is_ending(), "still waiting for the job");
+    assert!(!panel.wants_repaint(), "an idle page does not repaint while only waiting");
+    assert_eq!(woken.load(Ordering::SeqCst), 0);
+    drop(held);
+    wait_ended(&mut panel);
+    assert_eq!(panel.notices(), [profiles::not_ended("A")]);
+    assert_eq!(woken.load(Ordering::SeqCst), 1, "woken once, when the line arrived");
+    assert!(!panel.wants_repaint());
 }

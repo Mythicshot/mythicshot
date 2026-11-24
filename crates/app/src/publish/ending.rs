@@ -4,8 +4,9 @@
 //!
 //! The call is `DELETE {server}/api/v1/token` with `Authorization: Bearer <the token to end>` and
 //! no body. 204: the token is ended. 401: it was not valid any more (ended, lapsed or unknown),
-//! which is as good. 404 or 405: an older site without the call. Anything else, or no answer:
-//! not done.
+//! which is as good. 404 or 405: an older site without the call. 409: a valid token that is no
+//! sign-in connection (a shared setup token), which the site keeps on purpose. Anything else, or
+//! no answer: not done.
 //!
 //! It is asked once, never again, with a short timeout ([`END_TIMEOUT`]): it must never hold
 //! anyone up. Like every other request it goes to the given site only and never follows a
@@ -29,6 +30,9 @@ pub enum Outcome {
     AlreadyEnded,
     /// 404 or 405: the site does not have the call yet.
     SiteTooOld,
+    /// 409: the token is valid but is no connection made by signing in (an installation's shared
+    /// setup token, as older profiles had pasted). The site keeps those on purpose.
+    NotAConnection,
     /// Anything else, or no answer: why, in a fixed sentence that never holds the token.
     NotReached(String),
 }
@@ -56,6 +60,7 @@ fn end_with(server: &str, token: &str, timeouts: Timeouts) -> Outcome {
             204 => Outcome::Ended,
             401 => Outcome::AlreadyEnded,
             404 | 405 => Outcome::SiteTooOld,
+            409 => Outcome::NotAConnection,
             s @ 300..=399 => Outcome::NotReached(format!("the site answered with a redirect (HTTP {s}), which is not followed")),
             s => Outcome::NotReached(format!("the site answered HTTP {s}")),
         },

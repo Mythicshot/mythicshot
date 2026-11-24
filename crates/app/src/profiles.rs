@@ -634,7 +634,7 @@ fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>, 
 /// was not valid any more.
 pub fn removal_notice(name: &str, outcome: &Outcome) -> Option<String> {
     match outcome {
-        Outcome::Ended | Outcome::AlreadyEnded => None,
+        Outcome::Ended | Outcome::AlreadyEnded | Outcome::NotAConnection => None,
         Outcome::SiteTooOld | Outcome::NotReached(_) => Some(not_ended(name)),
     }
 }
@@ -653,6 +653,7 @@ pub fn renewal_log_line(server: &str, outcome: &Outcome) -> String {
         Outcome::Ended => format!("Profiles: the token a new sign-in replaced was ended at {site}."),
         Outcome::AlreadyEnded => format!("Profiles: the token a new sign-in replaced was no longer valid at {site}."),
         Outcome::SiteTooOld => format!("Profiles: {site} cannot end the token a new sign-in replaced yet; it lapses there by itself."),
+        Outcome::NotAConnection => format!("Profiles: {site} keeps the token a new sign-in replaced, because it is not a sign-in connection."),
         Outcome::NotReached(why) => format!("Profiles: the token a new sign-in replaced could not be ended at {site}: {why}."),
     }
 }

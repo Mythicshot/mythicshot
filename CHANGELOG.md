@@ -7,6 +7,7 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 - Profiles: removing a profile now also ends its connection on the site, so the computer no longer stays listed under Connections there. The profile is removed from this computer at once, whatever the site answers. When the site cannot be reached, or is an older one without this, one line says the computer is still listed there until you remove it.
 - Profiles: "Sign in again" ends the connection it replaces, once the new one is saved and checked. Nothing is shown for it.
 - A connection is ended only after any upload, share or tour change still running on that profile has finished, and never while another profile on this computer still uses it.
+- A site keeps the shared token of its first setup on purpose: a profile that uses one is removed from this computer and nothing more is said.
 - The installer names Mythicshot, LLC as the manufacturer.
 
 ## 0.2.33 (2026-11-24)
