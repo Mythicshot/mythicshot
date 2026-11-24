@@ -40,6 +40,8 @@ use crate::publish::ending::Outcome;
 use crate::publish::{self, KeyStore, LEGACY_KEY, Workspace, profile_key};
 use crate::settings::Settings;
 
+pub mod holds;
+
 /// The id of the profile the one connection of earlier versions became.
 pub const MIGRATED_ID: &str = "first";
 /// The longest profile name, in characters.
@@ -453,8 +455,9 @@ pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> R
     if !renews(p, &c) {
         return Ok(Renewal::OtherAccount(c));
     }
-    // Read before it is overwritten; handed back only after the new one is confirmed.
-    let replaced = ending_of(book, store, id, Some(c.token.expose()));
+    // Read before it is overwritten; handed back only after the new one is confirmed. The old
+    // entry may still hold it for now: see below.
+    let old = ending_of(book, store, id, Some(c.token.expose()), true);
     write_confirmed(store, &profile_key(id), c.token.expose())?;
     if let Some(p) = book.get_mut(id) {
         p.state = State::Ready;
@@ -464,6 +467,14 @@ pub fn renew(book: &mut Book, store: &dyn KeyStore, id: &str, c: Candidate) -> R
         p.identity = Some(c.identity.clone());
         name_after(p, &c.workspace);
     }
+    // The old entry's copy of the replaced token (the first profile, before the cleanup) is
+    // stale now: no profile holds that token any more, and [`remove_legacy`] would never take
+    // it. It goes here, and only once it is gone is the token ended.
+    let replaced = old.filter(|e| match legacy_holds(store, e.token.expose()) {
+        Held::No => true,
+        Held::Yes => store.delete(LEGACY_KEY).is_ok(),
+        Held::Unknown => false,
+    });
     Ok(Renewal::Renewed(replaced))
 }
 
@@ -544,8 +555,15 @@ impl std::fmt::Debug for Ending {
 }
 
 impl Ending {
+    #[cfg(test)]
     pub fn token(&self) -> &str {
         self.token.expose()
+    }
+
+    /// Whether anything in `book` and `store` holds this token now, but the entry of the profile
+    /// it was let go of by ([`held_elsewhere`]).
+    pub fn held_in(&self, book: &Book, store: &dyn KeyStore) -> bool {
+        held_elsewhere(book, store, &self.id, self.token.expose())
     }
 
     /// Ask the profile's own site to end the token, once. Blocks for at most
@@ -560,28 +578,54 @@ impl Ending {
 /// join, or any other whose token is byte for byte the same). An entry that cannot be read
 /// counts as holding it: a token is ended only when nothing else can still need it.
 pub fn held_elsewhere(book: &Book, store: &dyn KeyStore, id: &str, token: &str) -> bool {
-    let holds = |key: &str| match publish::load_token_at(store, key) {
+    legacy_holds(store, token) != Held::No || held_by_other_profiles(book, store, id, token)
+}
+
+/// Whether an entry holds a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    No,
+    Yes,
+    /// The entry cannot be read: it may.
+    Unknown,
+}
+
+fn holds(store: &dyn KeyStore, key: &str, token: &str) -> Held {
+    match publish::load_token_at(store, key) {
         Ok(Some(mut copy)) => {
             let same = copy == token;
             crate::publish_ui::wipe(&mut copy);
-            same
+            if same { Held::Yes } else { Held::No }
         }
-        Ok(None) => false,
-        Err(_) => true,
-    };
-    holds(LEGACY_KEY) || book.list.iter().filter(|p| p.id != id).any(|p| holds(&profile_key(&p.id)))
+        Ok(None) => Held::No,
+        Err(_) => Held::Unknown,
+    }
 }
 
-/// The token in profile `id`'s own entry, to end at the profile's own address, unless anything
-/// else here still holds it or is `except` (the token that replaces it). The address is the
-/// profile's, as the address rule writes it: a token is only ever sent to its own profile's
-/// site, as [`token_for`] hands it out.
-fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>) -> Option<Ending> {
+fn legacy_holds(store: &dyn KeyStore, token: &str) -> Held {
+    holds(store, LEGACY_KEY, token)
+}
+
+fn held_by_other_profiles(book: &Book, store: &dyn KeyStore, id: &str, token: &str) -> bool {
+    book.list.iter().filter(|p| p.id != id).any(|p| holds(store, &profile_key(&p.id), token) != Held::No)
+}
+
+/// The token in profile `id`'s own entry, to end at the profile's own address, unless another
+/// profile still holds it, it is `except` (the token that replaces it), or the old entry holds
+/// it while `legacy_goes` is false (when it is true the caller removes that copy first, and ends
+/// the token only once it is gone). The address is the profile's, as the address rule writes
+/// it: a token is only ever sent to its own profile's site, as [`token_for`] hands it out.
+fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>, legacy_goes: bool) -> Option<Ending> {
     let p = book.get(id)?;
     let server = publish::check_server(&p.server).ok()?;
     let token = Secret::new(publish::load_token_at(store, &profile_key(id)).ok()??);
-    if except == Some(token.expose()) || held_elsewhere(book, store, id, token.expose()) {
+    if except == Some(token.expose()) || held_by_other_profiles(book, store, id, token.expose()) {
         return None;
+    }
+    match legacy_holds(store, token.expose()) {
+        Held::No => {}
+        Held::Yes if legacy_goes => {}
+        Held::Yes | Held::Unknown => return None,
     }
     Some(Ending { id: p.id.clone(), name: p.name.clone(), server, token })
 }
@@ -595,8 +639,8 @@ pub fn removal_notice(name: &str, outcome: &Outcome) -> Option<String> {
     }
 }
 
-/// Not yet in the approved wording: the profile was removed here, and its site did not end its
-/// token (an older site, or no answer).
+/// The approved line: the profile was removed here, and its site did not end its token (an
+/// older site, or no answer).
 pub fn not_ended(name: &str) -> String {
     format!("Removed \"{name}\" from this computer. The site could not be reached, so this computer is still listed under Connections there until you remove it.")
 }
@@ -618,12 +662,21 @@ pub fn renewal_log_line(server: &str, outcome: &Outcome) -> String {
 /// token, read before its entry goes, is handed back to end at the profile's site once the
 /// removal is done ([`Ending`]); not when the old entry or any other profile still holds it.
 pub fn remove(book: &mut Book, store: &dyn KeyStore, id: &str) -> Result<Option<Ending>, String> {
-    let ending = ending_of(book, store, id, None);
     // What is left of the old entry goes with it only when it is this profile's own copy.
-    let legacy_is_its_copy = book.legacy.as_deref() == Some(id) && matches!((publish::load_token_at(store, LEGACY_KEY), publish::load_token_at(store, &profile_key(id))), (Ok(Some(a)), Ok(Some(b))) if a == b);
+    let legacy_is_its_copy = book.legacy.as_deref() == Some(id)
+        && match publish::load_token_at(store, &profile_key(id)) {
+            Ok(Some(mut own)) => {
+                let same = legacy_holds(store, &own) == Held::Yes;
+                crate::publish_ui::wipe(&mut own);
+                same
+            }
+            _ => false,
+        };
+    let mut ending = ending_of(book, store, id, None, legacy_is_its_copy);
     store.delete(&profile_key(id))?;
-    if legacy_is_its_copy {
-        let _ = store.delete(LEGACY_KEY);
+    // The token is ended only when that copy went too.
+    if legacy_is_its_copy && store.delete(LEGACY_KEY).is_err() {
+        ending = None;
     }
     book.list.retain(|p| p.id != id);
     book.pick_active_after(id);

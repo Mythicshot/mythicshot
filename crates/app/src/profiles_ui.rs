@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, RichText};
 
+use crate::profiles::holds::Holds;
 use crate::profiles::{self, Book, Candidate, Ending, Owner, Profile, State};
 use crate::publish::connect::{self, Clock, ConnectError};
 use crate::publish::ending::Outcome;
@@ -67,6 +68,11 @@ pub trait Shelf: Send + Sync {
     fn switch(&self, id: &str) -> bool;
     /// Ask the site to end a token a change let go of, on the calling thread (never the UI thread).
     fn end(&self, ending: &Ending) -> Outcome;
+    /// Which profiles' tokens running jobs hold.
+    fn holds(&self) -> Holds;
+    /// Whether anything here holds `ending`'s token now (a profile saved meanwhile with the same
+    /// token, say): asked again just before it is ended, briefly, with no request sent.
+    fn held(&self, ending: &Ending) -> bool;
 }
 
 /// The app's own profiles and the OS credential store.
@@ -85,6 +91,12 @@ impl Shelf for AppShelf {
     fn end(&self, ending: &Ending) -> Outcome {
         ending.send()
     }
+    fn holds(&self) -> Holds {
+        profiles::holds::global().clone()
+    }
+    fn held(&self, ending: &Ending) -> bool {
+        publish_ui::still_held(ending)
+    }
 }
 
 /// The tokens being ended at their sites after a change, and the line a removal leaves when its
@@ -93,7 +105,8 @@ impl Shelf for AppShelf {
 struct Endings {
     /// How many are still waiting for their site.
     busy: Arc<AtomicUsize>,
-    notice: Arc<Mutex<Option<String>>>,
+    /// Every line not yet shown, oldest first.
+    notices: Arc<Mutex<Vec<String>>>,
 }
 
 impl Endings {
@@ -102,9 +115,27 @@ impl Endings {
     }
 }
 
+/// One token on its way to its site: counted while it is, whichever way the thread ends.
+struct Busy(Arc<AtomicUsize>);
+
+impl Busy {
+    fn new(count: &Arc<AtomicUsize>) -> Busy {
+        count.fetch_add(1, Ordering::SeqCst);
+        Busy(count.clone())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Run `change` on a thread of its own; its end lands in `slot`. A token the change let go of
 /// is ended at its site after that, on the same thread: the change's end does not wait for the
-/// site, and what the site said lands in `endings`.
+/// site, and what the site said lands in `endings`. The end waits until no running job holds
+/// the profile's token any more ([`Holds::wait_free`]); it is skipped, silently, when something
+/// here holds the token by then. Should the app close first, it is simply never sent.
 fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings: &Endings, change: Change) {
     let (shelf, slot, endings) = (shelf.clone(), slot.clone(), endings.clone());
     std::thread::spawn(move || {
@@ -114,23 +145,25 @@ fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings
             done => (done, None),
         };
         // Counted before the change's end is handed over, so nobody sees it idle in between.
-        if then_end.is_some() {
-            endings.busy.fetch_add(1, Ordering::SeqCst);
-        }
+        let busy = then_end.as_ref().map(|_| Busy::new(&endings.busy));
         *lock(&slot) = Some(done);
         let Some((ending, after)) = then_end else { return };
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shelf.end(&ending))).unwrap_or_else(|_| Outcome::NotReached("the request failed".into()));
-        match after {
-            AfterEnd::Notice => {
+        // A job that started with this token runs to its end first.
+        shelf.holds().wait_free(&ending.id);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
+        match (after, outcome) {
+            // Held here again meanwhile: nothing was sent, and nothing is said.
+            (_, None) => {}
+            (AfterEnd::Notice, Some(outcome)) => {
                 if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
-                    *lock(&endings.notice) = Some(text);
+                    lock(&endings.notices).push(text);
                 }
             }
-            AfterEnd::Log => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
+            (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
         }
         // The token's copy is wiped here.
         drop(ending);
-        endings.busy.fetch_sub(1, Ordering::SeqCst);
+        drop(busy);
     });
 }
 
@@ -829,8 +862,8 @@ pub struct Panel {
     error: Option<String>,
     /// The tokens of removed profiles, being ended at their sites.
     endings: Endings,
-    /// A removed profile's site did not end its token: the one line about it.
-    notice: Option<String>,
+    /// Removed profiles whose sites did not end their tokens: one line each, oldest first.
+    notices: Vec<String>,
     shelf: Arc<dyn Shelf>,
     /// Makes the add form; tests hand in one with fakes.
     make: Arc<dyn Fn(Purpose, String) -> AddFlow + Send + Sync>,
@@ -838,7 +871,7 @@ pub struct Panel {
 
 impl Default for Panel {
     fn default() -> Self {
-        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, endings: Endings::default(), notice: None, shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app) }
+        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, endings: Endings::default(), notices: Vec::new(), shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app) }
     }
 }
 
@@ -873,7 +906,7 @@ impl Panel {
     /// "Remove profile": the question first.
     pub fn ask_remove(&mut self, id: &str) {
         self.error = None;
-        self.notice = None;
+        self.notices.clear();
         self.removing = Some(id.to_string());
     }
 
@@ -912,9 +945,7 @@ impl Panel {
                 self.error = Some(e);
             }
         }
-        if let Some(text) = lock(&self.endings.notice).take() {
-            self.notice = Some(text);
-        }
+        self.notices.append(&mut lock(&self.endings.notices));
         match request {
             Some(ProfilesRequest::Add) => self.add(),
             Some(ProfilesRequest::Manage) => self.mode = Mode::Manage,
@@ -939,10 +970,10 @@ impl Panel {
         self.endings.busy()
     }
 
-    /// The line a removal left because its site did not end the token.
+    /// The lines removals left because their sites did not end the tokens, oldest first.
     #[cfg(test)]
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     #[cfg(test)]
@@ -982,7 +1013,7 @@ impl Panel {
             note(ui, Tone::Bad, e);
             ui.add_space(8.0);
         }
-        if let Some(text) = &self.notice {
+        for text in &self.notices {
             note(ui, Tone::Warn, text);
             ui.add_space(8.0);
         }

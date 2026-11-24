@@ -31,6 +31,8 @@ struct TestShelf {
     switched: Mutex<Vec<String>>,
     /// The sites a token was to be ended at, in order.
     ended_at: Mutex<Vec<String>>,
+    /// The jobs' holds on tokens, of this shelf only.
+    holds: Holds,
 }
 
 impl TestShelf {
@@ -63,6 +65,13 @@ impl Shelf for TestShelf {
     fn end(&self, ending: &Ending) -> Outcome {
         lock(&self.ended_at).push(ending.server.clone());
         if ending.server.starts_with("http://127.0.0.1:") { ending.send() } else { Outcome::NotReached("not sent from a test".into()) }
+    }
+    fn holds(&self) -> Holds {
+        self.holds.clone()
+    }
+    fn held(&self, ending: &Ending) -> bool {
+        let g = lock(&self.inner);
+        ending.held_in(&g.0, &g.1)
     }
 }
 
@@ -575,7 +584,7 @@ fn a_removal_ends_the_token_at_its_own_site_and_shows_nothing_more() {
     wait_ended(&mut panel);
     assert_eq!(ends(&s), vec![bearer(TOKEN_A)], "once, with its own token, at its own site");
     assert_eq!(*lock(&shelf.ended_at), vec![s.base.clone()]);
-    assert_eq!(panel.notice(), None);
+    assert!(panel.notices().is_empty());
     assert_eq!(panel.error(), None);
 }
 
@@ -589,7 +598,7 @@ fn a_profile_waiting_for_a_sign_in_is_still_tried_once_and_already_ended_shows_n
     wait_ended(&mut panel);
     assert_eq!(ends(&s), vec![bearer(TOKEN_A)]);
     assert!(shelf.book().list.is_empty() && shelf.keys().is_empty());
-    assert_eq!(panel.notice(), None);
+    assert!(panel.notices().is_empty());
 }
 
 #[test]
@@ -610,11 +619,11 @@ fn an_older_or_unreachable_site_gets_one_line_and_the_profile_still_goes() {
         wait_ended(&mut panel);
         assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "{what}: removed locally all the same");
         assert_eq!(ends(&s).len(), 1, "{what}: one call, no retry");
-        assert_eq!(panel.notice(), Some(profiles::not_ended("Sandbox admin").as_str()), "{what}");
+        assert_eq!(panel.notices(), [profiles::not_ended("Sandbox admin")], "{what}");
         assert_eq!(panel.error(), None, "{what}");
         // The next Remove starts without it.
         panel.ask_remove("gone");
-        assert_eq!(panel.notice(), None);
+        assert!(panel.notices().is_empty());
     }
     // Nothing listening at all.
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -623,7 +632,7 @@ fn an_older_or_unreachable_site_gets_one_line_and_the_profile_still_goes() {
     let mut panel = panel_for(&shelf);
     remove_now(&mut panel, "pa");
     wait_ended(&mut panel);
-    assert_eq!(panel.notice(), Some(profiles::not_ended("A").as_str()));
+    assert_eq!(panel.notices(), [profiles::not_ended("A")]);
 }
 
 #[test]
@@ -636,20 +645,21 @@ fn a_slow_site_never_holds_up_the_local_removal() {
     assert!(took < Duration::from_secs(2), "the removal waited for the site: {took:?}");
     assert!(panel.is_ending(), "the site is still being asked");
     assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "the list is updated already");
-    assert_eq!(panel.notice(), None);
+    assert!(panel.notices().is_empty());
     let started = Instant::now();
     wait_ended(&mut panel);
     assert!(started.elapsed() < Duration::from_secs(7), "given up at the timeout: {:?}", started.elapsed());
-    assert_eq!(panel.notice(), Some(profiles::not_ended("A").as_str()));
+    assert_eq!(panel.notices(), [profiles::not_ended("A")]);
 }
 
 #[test]
 fn a_removal_never_ends_a_token_another_profile_or_the_old_entry_still_holds() {
     let s = ending_site(|| reply(204, ""));
-    // The migrated profile's copy of the old entry; another profile with the same token.
+    // The old entry holds it (not as the profile's own copy); another profile with the same
+    // token; a twin after a join that could not delete the first profile's entry.
     let first = profile(MIGRATED_ID, "first", &s.base, None, None, State::Ready);
     let cases = [
-        (Book { legacy: Some(MIGRATED_ID.into()), list: vec![first.clone()], active: Some(MIGRATED_ID.into()) }, FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-first", TOKEN_A)]), MIGRATED_ID),
+        (Book { legacy: None, list: vec![first.clone()], active: Some(MIGRATED_ID.into()) }, FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-first", TOKEN_A)]), MIGRATED_ID),
         (Book { legacy: None, list: vec![profile("pa", "A", &s.base, None, None, State::Ready), profile("pb", "B", &s.base, None, None, State::Ready)], active: Some("pa".into()) }, FakeKeys::with(&[("profile-pa", TOKEN_A), ("profile-pb", TOKEN_A)]), "pa"),
         (
             Book { legacy: None, list: vec![Profile { identity: Some(ided(WS_ID, "acc-a")), ..first.clone() }, Profile { identity: Some(ided(WS_ID, "acc-a")), ..profile("pa", "A", &s.base, None, None, State::Ready) }], active: Some("pa".into()) },
@@ -664,7 +674,7 @@ fn a_removal_never_ends_a_token_another_profile_or_the_old_entry_still_holds() {
         wait_ended(&mut panel);
         assert!(shelf.book().get(id).is_none(), "{id}: removed locally");
         assert!(lock(&shelf.ended_at).is_empty(), "{id}: nothing to end");
-        assert_eq!(panel.notice(), None);
+        assert!(panel.notices().is_empty());
     }
     assert!(ends(&s).is_empty());
 }
@@ -811,7 +821,18 @@ fn no_other_path_ends_a_token() {
     assert!(shelf.switch("pd"));
     shelves.push(shelf.clone());
 
-    // The update that adds profiles, the join of twins, and the old entry's cleanup.
+    // The update that adds profiles, the join of twins, the old entry's cleanup and Sign out.
+    // The app runs these on the OS credential store (`main.rs` at start, and
+    // `publish_ui::note_check`, `publish_ui::forget_active_token` through `change_profiles`), so
+    // their own entry points cannot be driven here. What makes an end impossible on them is the
+    // type: a token is only ever ended by `spawn_change`, for a `Done::ThenEnd`, which is only
+    // made from the `Ending` that `profiles::remove` and `profiles::renew` hand back. These four
+    // return no `Ending`, and the lines below pin that: one of them returning one no longer
+    // compiles. They are run on the stub's address all the same, and the stub sees nothing.
+    let _: fn(&mut crate::settings::Settings, &dyn KeyStore) -> Result<Option<String>, String> = profiles::migrate;
+    let _: fn(&mut Book, &dyn KeyStore, &str, &str) -> Result<(), String> = profiles::attach;
+    let _: fn(&crate::settings::Settings, &dyn KeyStore) -> Result<bool, String> = profiles::remove_legacy;
+    let _: fn(&mut Book, &dyn KeyStore, &str) -> Result<(), String> = profiles::sign_out;
     let store = FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-pt", TOKEN_B)]);
     let mut settings = crate::settings::Settings::default();
     settings.publish_saved_for = Some(s.base.clone());
@@ -833,4 +854,185 @@ fn no_other_path_ends_a_token() {
     for shelf in shelves {
         assert!(lock(&shelf.ended_at).is_empty());
     }
+}
+
+// ---- 10. A token a running job holds ----
+
+/// A site whose `GET /api/v1/me` answers for TOKEN_A until it was asked to end it, and 401 after.
+fn job_site(end: u16) -> Stub {
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    stub(move |req, _| match req.line.as_str() {
+        END => {
+            ended.store(true, Ordering::SeqCst);
+            reply(end, "")
+        }
+        "GET /api/v1/me" if ended.load(Ordering::SeqCst) => reply(401, r#"{"error":"unauthorized"}"#),
+        "GET /api/v1/me" => reply(200, r#"{"workspace":"A"}"#),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    })
+}
+
+fn shelf_on(s: &Stub, ids: &[(&str, &str, &str)]) -> Arc<TestShelf> {
+    let list = ids.iter().map(|(id, name, _)| profile(id, name, &s.base, None, None, State::Ready)).collect();
+    let keys: Vec<(String, &str)> = ids.iter().map(|(id, _, token)| (publish::profile_key(id), *token)).collect();
+    let keys: Vec<(&str, &str)> = keys.iter().map(|(k, t)| (k.as_str(), *t)).collect();
+    TestShelf::with(Book { legacy: None, list, active: Some(ids[0].0.into()) }, FakeKeys::with(&keys))
+}
+
+/// Nothing more reaches the site for a while.
+fn still_no_end(s: &Stub, ending: bool) {
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(ends(s).is_empty(), "the token was ended under a running job");
+    assert!(ending);
+}
+
+#[test]
+fn a_job_in_flight_runs_to_its_end_before_its_token_is_ended() {
+    let s = job_site(204);
+    let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A)]);
+    // The job takes its hold and reads its token, as the app's jobs do, then waits for the go.
+    let held = shelf.holds.hold("pa");
+    let token = shelf.keys()[0].1.clone();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let base = s.base.clone();
+    let job = std::thread::spawn(move || {
+        let _held = held;
+        wait.recv().unwrap();
+        (0..3)
+            .map(|_| {
+                std::thread::sleep(Duration::from_millis(50));
+                publish::workspace(&base, &token).map(|w| w.name)
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut panel = panel_for(&shelf);
+    let took = remove_now(&mut panel, "pa");
+    assert!(took < Duration::from_secs(2), "the local removal waited: {took:?}");
+    assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "removed here at once");
+    still_no_end(&s, panel.is_ending());
+    go.send(()).unwrap();
+    let answers = job.join().unwrap();
+    assert_eq!(answers, vec![Ok("A".to_string()); 3], "every request of the job went through");
+    wait_ended(&mut panel);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)], "then exactly once");
+    assert_eq!(s.lines().last().map(String::as_str), Some(END), "after the job's last request");
+    assert!(panel.notices().is_empty());
+}
+
+#[test]
+fn a_job_that_fails_is_cancelled_or_panics_still_lets_go() {
+    for how in ["fails", "cancelled", "panics"] {
+        let s = job_site(204);
+        let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A)]);
+        let held = shelf.holds.hold("pa");
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let job = std::thread::spawn(move || -> Result<(), String> {
+            let _held = held;
+            wait.recv().unwrap();
+            match how {
+                "fails" => Err("Could not publish the tour: the server answered HTTP 500.".into()),
+                "cancelled" => Err(publish::CANCELLED.into()),
+                _ => panic!("the job broke"),
+            }
+        });
+        let mut panel = panel_for(&shelf);
+        remove_now(&mut panel, "pa");
+        still_no_end(&s, panel.is_ending());
+        go.send(()).unwrap();
+        let _ = job.join();
+        wait_ended(&mut panel);
+        assert_eq!(ends(&s), vec![bearer(TOKEN_A)], "{how}");
+    }
+}
+
+#[test]
+fn two_jobs_on_one_profile_both_run_to_their_end_first() {
+    let s = job_site(204);
+    let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A)]);
+    let (first, second) = (shelf.holds.hold("pa"), shelf.holds.hold("pa"));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    still_no_end(&s, panel.is_ending());
+    drop(first);
+    still_no_end(&s, panel.is_ending());
+    drop(second);
+    wait_ended(&mut panel);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)]);
+}
+
+#[test]
+fn sign_in_again_waits_for_a_job_holding_the_old_token_too() {
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+        "GET /api/v1/me" => reply(200, r#"{"workspace":"customer1"}"#),
+        END => reply(204, ""),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let ready = Book { legacy: None, list: vec![profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready)], active: Some("pc".into()) };
+    let shelf = TestShelf::with(ready, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let held = shelf.holds.hold("pc");
+    let mut f = flow(&shelf, Purpose::Renew("pc".into()), &s.base);
+    sign_in(&mut f);
+    settle(&mut f);
+    f.save();
+    settle(&mut f);
+    assert!(f.is_finished(), "the form does not wait for the job");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(ends(&s).is_empty() && f.is_ending());
+    drop(held);
+    wait_flow_ended(&f);
+    assert_eq!(ends(&s), vec![bearer(TOKEN_B)]);
+}
+
+#[test]
+fn a_token_a_profile_was_saved_with_meanwhile_is_not_ended() {
+    let s = job_site(204);
+    let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A)]);
+    let held = shelf.holds.hold("pa");
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    // Meanwhile the same token is pasted into a new profile.
+    {
+        let mut g = lock(&shelf.inner);
+        g.0.list.push(profile("pz", "Z", &s.base, None, None, State::Ready));
+        g.1.entries.borrow_mut().insert("profile-pz".into(), TOKEN_A.into());
+    }
+    drop(held);
+    wait_ended(&mut panel);
+    assert!(ends(&s).is_empty(), "held again: skipped");
+    assert!(lock(&shelf.ended_at).is_empty());
+    assert!(panel.notices().is_empty(), "silently");
+}
+
+#[test]
+fn two_removals_whose_sites_did_not_end_the_tokens_keep_both_lines() {
+    let s = job_site(404);
+    let shelf = shelf_on(&s, &[("pa", "A", TOKEN_A), ("pb", "B", TOKEN_B)]);
+    let (ha, hb) = (shelf.holds.hold("pa"), shelf.holds.hold("pb"));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, "pa");
+    remove_now(&mut panel, "pb");
+    drop(ha);
+    drop(hb);
+    wait_ended(&mut panel);
+    let mut lines = panel.notices().to_vec();
+    lines.sort();
+    assert_eq!(lines, vec![profiles::not_ended("A"), profiles::not_ended("B")]);
+    assert_eq!(ends(&s).len(), 2);
+    // Cleared as before: by the next Remove.
+    panel.ask_remove("gone");
+    assert!(panel.notices().is_empty());
+}
+
+#[test]
+fn removing_the_migrated_profile_ends_its_token_once_its_old_entry_copy_went_too() {
+    let s = job_site(204);
+    let first = profile(MIGRATED_ID, "first", &s.base, None, None, State::Ready);
+    let shelf = TestShelf::with(Book { legacy: Some(MIGRATED_ID.into()), list: vec![first], active: Some(MIGRATED_ID.into()) }, FakeKeys::with(&[(publish::LEGACY_KEY, TOKEN_A), ("profile-first", TOKEN_A)]));
+    let mut panel = panel_for(&shelf);
+    remove_now(&mut panel, MIGRATED_ID);
+    wait_ended(&mut panel);
+    assert!(shelf.keys().is_empty());
+    assert_eq!(ends(&s), vec![bearer(TOKEN_A)]);
 }

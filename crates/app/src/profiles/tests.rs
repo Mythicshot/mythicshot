@@ -17,6 +17,8 @@ pub(crate) struct FakeKeys {
     pub(crate) locked: bool,
     pub(crate) refuse_write: Option<String>,
     pub(crate) refuse_delete: bool,
+    /// Refuse to delete this one entry only.
+    pub(crate) refuse_delete_of: Option<String>,
     pub(crate) garble: bool,
     pub(crate) log: RefCell<Vec<String>>,
 }
@@ -56,7 +58,7 @@ impl KeyStore for FakeKeys {
         Ok(())
     }
     fn delete(&self, key: &str) -> Result<(), String> {
-        if self.locked || self.refuse_delete {
+        if self.locked || self.refuse_delete || self.refuse_delete_of.as_deref() == Some(key) {
             return Err(LOCKED.into());
         }
         self.log.borrow_mut().push(format!("delete {key}"));
@@ -994,13 +996,23 @@ fn a_removal_that_fails_hands_over_nothing() {
 }
 
 #[test]
-fn a_token_the_old_entry_still_holds_is_never_ended() {
-    // The migrated profile's own copy, before the old entry was cleaned up.
+fn the_migrated_profiles_own_copy_in_the_old_entry_goes_with_it_and_only_then_is_the_token_ended() {
     let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
     let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
     b.legacy = Some(MIGRATED_ID.into());
+    assert_eq!(ending_of(&remove(&mut b, &store, MIGRATED_ID).unwrap()).map(|e| e.3), Some(OLD.to_string()));
+    assert!(store.entries.borrow().is_empty(), "both entries went");
+    // The old entry cannot be deleted: the profile still goes, the copy stays, nothing is ended.
+    let store = FakeKeys { refuse_delete_of: Some(LEGACY_KEY.into()), ..FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]) };
+    let mut b = book(vec![profile(MIGRATED_ID, "A", SITE, None, None)], MIGRATED_ID);
+    b.legacy = Some(MIGRATED_ID.into());
     assert!(remove(&mut b, &store, MIGRATED_ID).unwrap().is_none());
-    assert!(store.entries.borrow().is_empty(), "removed locally as before");
+    assert_eq!(store.keys(), vec![LEGACY_KEY.to_string()]);
+    assert!(b.list.is_empty());
+}
+
+#[test]
+fn a_token_the_old_entry_still_holds_is_never_ended() {
     // The old entry holds it while it is not the profile's own copy by the book.
     let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_A), ("profile-pa", TOKEN_A)]);
     let mut b = book(vec![profile("pa", "A", SITE, None, None)], "pa");
@@ -1069,15 +1081,43 @@ fn a_renewal_hands_over_nothing_when_the_old_token_stays_in_use() {
     let store = FakeKeys::with(&[("profile-pc", TOKEN_B), ("profile-pd", TOKEN_B)]);
     let mut b = book(vec![pc(), profile("pd", "D", SITE, None, None)], "pc");
     assert!(matches!(renew(&mut b, &store, "pc", candidate()).unwrap(), Renewal::Renewed(None)));
-    // The old entry still holds it: the migrated profile before the cleanup.
-    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
-    let mut b = book(vec![profile(MIGRATED_ID, "first", SITE, Some("customer"), Some("Acme"))], MIGRATED_ID);
-    b.legacy = Some(MIGRATED_ID.into());
-    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap(), Renewal::Renewed(None)));
     // No token was stored (signed out): nothing to end.
     let store = FakeKeys::default();
     let mut b = book(vec![pc()], "pc");
     assert!(matches!(renew(&mut b, &store, "pc", candidate()).unwrap(), Renewal::Renewed(None)));
+}
+
+#[test]
+fn a_renewal_of_the_migrated_profile_takes_the_stale_old_entry_then_hands_over_the_old_token() {
+    let candidate = || Candidate::for_test(SITE, Some("customer"), "Acme", TOKEN_A);
+    let first = || {
+        let mut b = book(vec![profile(MIGRATED_ID, "first", SITE, Some("customer"), Some("Acme"))], MIGRATED_ID);
+        b.legacy = Some(MIGRATED_ID.into());
+        b
+    };
+    // Before the cleanup, the old entry holds the old token: it goes, then the token is ended.
+    let store = FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]);
+    let mut b = first();
+    let Renewal::Renewed(ending) = renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap() else { panic!("not renewed") };
+    assert_eq!(ending_of(&ending).map(|e| e.3), Some(OLD.to_string()));
+    assert_eq!(store.keys(), vec![first_key()], "the stale copy went");
+    assert_eq!(store.at(&first_key()).as_deref(), Some(TOKEN_A));
+    // It cannot be deleted: it stays, and the token it holds is not ended.
+    let store = FakeKeys { refuse_delete_of: Some(LEGACY_KEY.into()), ..FakeKeys::with(&[(LEGACY_KEY, OLD), (&first_key(), OLD)]) };
+    let mut b = first();
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap(), Renewal::Renewed(None)));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(OLD));
+    // It cannot be read: left alone, nothing ended.
+    let store = FakeKeys::with(&[(LEGACY_KEY, "not a token"), (&first_key(), OLD)]);
+    let mut b = first();
+    assert!(matches!(renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap(), Renewal::Renewed(None)));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some("not a token"));
+    // Another token in it is left alone, and does not stop the end.
+    let store = FakeKeys::with(&[(LEGACY_KEY, TOKEN_B), (&first_key(), OLD)]);
+    let mut b = first();
+    let Renewal::Renewed(ending) = renew(&mut b, &store, MIGRATED_ID, candidate()).unwrap() else { panic!("not renewed") };
+    assert_eq!(ending_of(&ending).map(|e| e.3), Some(OLD.to_string()));
+    assert_eq!(store.at(LEGACY_KEY).as_deref(), Some(TOKEN_B));
 }
 
 #[test]
