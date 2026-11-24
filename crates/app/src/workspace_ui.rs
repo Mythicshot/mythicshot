@@ -68,11 +68,14 @@ pub struct Conn {
     pub bound: Option<String>,
     /// The site refused the saved token the last time it was sent ([`publish_ui::token_refused`]).
     pub refused: bool,
+    /// The active profile when the frame was drawn: a check is pinned to it, and its answer is
+    /// kept for it alone.
+    pub profile: Option<String>,
 }
 
 impl Conn {
     pub fn current() -> Conn {
-        Conn { token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), test_server: publish_ui::test_server(), bound: publish_ui::token_site(), refused: publish_ui::token_refused() }
+        Conn { token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), test_server: publish_ui::test_server(), bound: publish_ui::token_site(), refused: publish_ui::token_refused(), profile: publish_ui::pin().profile }
     }
 
     /// Why the saved token may not go to `address`, when it may not.
@@ -88,7 +91,7 @@ impl Conn {
         if self.token != TokenStatus::Saved || self.binding_problem(address).is_some() {
             return None;
         }
-        Some(Site { server: publish::check_server(address).ok()?, epoch: self.epoch })
+        Some(Site { profile: self.profile.clone(), server: publish::check_server(address).ok()?, epoch: self.epoch })
     }
 }
 
@@ -248,8 +251,11 @@ impl Check {
     }
 }
 
+/// Keeps a check's answer for a profile: its id, the address asked, and the answer.
+type Note = Arc<dyn Fn(&str, &str, &publish::Workspace) + Send + Sync>;
+
 /// Where a check gets the token for the address it is about to ask.
-type TokenSource = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+type TokenSource = Arc<dyn Fn(&crate::profiles::Pin) -> Result<String, String> + Send + Sync>;
 /// Ties the saved token to an address (None: to none).
 type Bind = Arc<dyn Fn(Option<String>) + Send + Sync>;
 
@@ -269,7 +275,9 @@ pub struct Vault {
 
 impl Default for Vault {
     fn default() -> Self {
-        Vault { store: Arc::new(publish::store_token), forget: Arc::new(publish::forget_token), refresh: Arc::new(publish_ui::refresh_token_now) }
+        // A token is stored for a profile only through its check (the add form); Sign out signs
+        // out of the active profile, which then waits for a new sign-in.
+        Vault { store: Arc::new(publish_ui::store_without_check), forget: Arc::new(publish_ui::forget_active_token), refresh: Arc::new(publish_ui::refresh_token_now) }
     }
 }
 
@@ -335,6 +343,11 @@ pub struct WorkspaceState {
     vault: Vault,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// Where a check's answer is kept: for the profile the check was pinned to.
+    note: Note,
+    /// The page shows the active profile: its address cannot be edited here, and signing in
+    /// (again) and the profile's token are the profiles panel's above (see `profiles_ui`).
+    pub profile_mode: bool,
 }
 
 impl Default for WorkspaceState {
@@ -350,11 +363,13 @@ impl Default for WorkspaceState {
             auto: None,
             sign_in: None,
             account: None,
-            token: Arc::new(publish_ui::token_for),
+            token: Arc::new(publish_ui::token_for_pin),
             bind: Arc::new(publish_ui::bind_token),
             vault: Vault::default(),
             open: Arc::new(sign_in_ui::open_in_browser),
             clock: Arc::new(connect::RealClock::new()),
+            note: Arc::new(publish_ui::note_check),
+            profile_mode: false,
         }
     }
 }
@@ -374,8 +389,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Ask the site for its name and version, then count its tours. A list that cannot be read
 /// leaves the count unknown; the connection itself still stands.
-fn ask(server: &str, token: &str) -> Result<Info, String> {
+fn ask(site: &Site, token: &str, note: &Note) -> Result<Info, String> {
+    let server = site.server.as_str();
     let ws = publish::workspace(server, token)?;
+    // Kept for the profile the check was pinned to, whichever is active by now.
+    if let Some(id) = &site.profile {
+        note(id, server, &ws);
+    }
     let tours = publish::list_tours(server, token).ok().map(|t| Counts::of(&t));
     Ok(Info { workspace: ws.name, version: ws.version, tours })
 }
@@ -384,7 +404,7 @@ impl WorkspaceState {
     /// A page whose checks get the token from `token` instead of the credential store.
     #[cfg(test)]
     fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
-        Self { token: Arc::new(token), ..Default::default() }
+        Self { token: Arc::new(move |pin: &crate::profiles::Pin| token(&pin.server)), ..Default::default() }
     }
 
     fn is_busy(&self) -> bool {
@@ -444,9 +464,9 @@ impl WorkspaceState {
     /// when this is a Test connection, whose result is also shown as a sentence.
     fn spawn_check(&self, site: Site, announce: Option<String>) {
         let generation = lock(&self.check).begin();
-        let (check, token) = (self.check.clone(), self.token.clone());
+        let (check, token, note) = (self.check.clone(), self.token.clone(), self.note.clone());
         let work = move || {
-            let result = token(&site.server).and_then(|token| ask(&site.server, &token));
+            let result = token(&site.pin()).and_then(|token| ask(&site, &token, &note));
             lock(&check).finish(generation, site, result.clone());
             result.map(|info| format!("Connected to workspace \"{}\"", info.workspace))
         };
@@ -536,7 +556,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     let refused = conn.refused || lock(&p.check).rejected(site.as_ref());
     let info = info.filter(|_| !refused);
     let connected = info.is_some();
-    let rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    let mut rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    if p.profile_mode {
+        // A profile is signed in (again) only through its check, in the panel above.
+        rows.sign_in = false;
+    }
     // "Signed in as" belongs to the token the sign-in saved, and goes when it changes.
     if conn.token != TokenStatus::Checking
         && let Some((_, epoch)) = p.account.as_mut()
@@ -551,8 +575,10 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
-    ui.heading("Workspace");
-    ui.add_space(12.0);
+    if !p.profile_mode {
+        ui.heading("Workspace");
+        ui.add_space(12.0);
+    }
 
     let row = |ui: &mut egui::Ui, name: &str| {
         ui.label(RichText::new(name).color(theme::MUTED));
@@ -568,6 +594,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                     let mut shown = t.clone();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
                     ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(theme::MUTED).size(12.0));
+                }
+                None if p.profile_mode => {
+                    // The address is the profile's own.
+                    let mut shown = server.clone();
+                    ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
                 }
                 None => {
                     if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(340.0)).changed() {
@@ -630,7 +661,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             ui.end_row();
         }
 
-        if rows.sign_in || conn.token == TokenStatus::Checking {
+        if (rows.sign_in || conn.token == TokenStatus::Checking) && !p.profile_mode {
             row(ui, "Token");
             ui.vertical(|ui| token_ui(ui, p, conn, &effective, busy));
             ui.end_row();
@@ -648,7 +679,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     });
 
     // The token was saved for another address: say so, and send nothing until the user decides.
-    if let Some(problem) = &problem {
+    if let Some(problem) = problem.as_ref().filter(|_| !p.profile_mode) {
         ui.add_space(10.0);
         theme::caution_line(ui, problem.as_str(), theme::BODY_SIZE, theme::Fit::Wrap);
         ui.horizontal(|ui| {
@@ -667,7 +698,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             match publish::check_server(&tested) {
                 Ok(_) if problem.is_some() => *lock(&p.message) = Some(Outcome { text: problem.clone().unwrap_or_default(), ok: false, server: Some(tested) }),
                 Ok(checked) => {
-                    let site = Site { server: checked, epoch: conn.epoch };
+                    let site = Site { profile: conn.profile.clone(), server: checked, epoch: conn.epoch };
                     p.auto = Some(site.clone());
                     p.spawn_check(site, Some(tested));
                 }
@@ -697,7 +728,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     if rows.sign_in && conn.token != TokenStatus::Checking {
         ui.add(egui::Label::new(RichText::new(SIGN_IN_HINT).color(theme::MUTED).size(12.0)).wrap());
     }
-    if conn.token == TokenStatus::Saved || p.pasting {
+    if conn.token == TokenStatus::Saved || (p.pasting && !p.profile_mode) {
         ui.label(RichText::new(TOKEN_NOTE).color(theme::MUTED).size(12.0));
     }
 
@@ -889,12 +920,12 @@ mod tests {
     }
 
     fn site(server: &str) -> Site {
-        Site { server: server.into(), epoch: 1 }
+        Site { profile: None, server: server.into(), epoch: 1 }
     }
 
     /// A connection whose token belongs to whatever address the page holds: the tie is not what these tests are about.
     fn conn(token: TokenStatus) -> Conn {
-        Conn { token, epoch: 1, test_server: None, bound: None, refused: false }
+        Conn { token, epoch: 1, test_server: None, bound: None, refused: false, profile: None }
     }
 
     fn bound_to(stub: &Stub, token: TokenStatus) -> Conn {
@@ -1043,6 +1074,30 @@ mod tests {
             "GET /api/v1/tours" => reply(200, LIST),
             _ => reply(404, r#"{"error":"not_found"}"#),
         })
+    }
+
+    #[test]
+    fn a_check_is_pinned_to_the_profile_active_when_the_page_asked() {
+        let s = site_stub(r#"{"workspace":"Acme"}"#);
+        let asked: Arc<Mutex<Vec<crate::profiles::Pin>>> = Arc::default();
+        let record = asked.clone();
+        let noted: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+        let note_record = noted.clone();
+        let mut p = WorkspaceState {
+            token: Arc::new(move |pin: &crate::profiles::Pin| {
+                record.lock().unwrap().push(pin.clone());
+                Ok(TOKEN.to_string())
+            }),
+            note: Arc::new(move |id: &str, server: &str, ws: &publish::Workspace| note_record.lock().unwrap().push((id.into(), server.into(), ws.name.clone()))),
+            ..page()
+        };
+        let c = Conn { profile: Some("pa".into()), ..bound_to(&s, TokenStatus::Saved) };
+        assert_eq!(c.site(&s.base).map(|site| site.pin()), Some(crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() }));
+        let (ctx, mut server) = (crate::theme::test_context(), s.base.clone());
+        until(&ctx, &mut p, &mut server, &c, connected);
+        assert_eq!(*asked.lock().unwrap(), vec![crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() }]);
+        // The answer is kept for that profile, whatever is active (in a test run: none).
+        assert_eq!(*noted.lock().unwrap(), vec![("pa".to_string(), s.base.clone(), "Acme".to_string())]);
     }
 
     #[test]

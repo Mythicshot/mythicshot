@@ -250,7 +250,7 @@ mod tests {
 
     fn info(tour_title: &str, title: &str) -> ProjectInfo {
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), chapter_id: "chap_cccccccccccccccccccccccc".into() };
-        ProjectInfo { key, title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, frames_bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
+        ProjectInfo { key, profile: String::new(), title: title.into(), tour_title: tour_title.into(), saved_at: 1_763_424_000_000, bytes: 172 * MB, frames_bytes: 172 * MB, dir: std::path::PathBuf::from("chapter"), problem: None, form: Form::Frames, convert: ConvertState::NotTried }
     }
 
     #[test]

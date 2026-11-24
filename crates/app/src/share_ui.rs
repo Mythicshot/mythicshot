@@ -424,6 +424,9 @@ pub struct ShareDialog {
     clock: Box<dyn Fn() -> Instant + Send>,
     /// The last "Copy link" could not set the clipboard.
     copy_failed: bool,
+    /// The profile the window was opened or last switched to: the window follows a switch until
+    /// Publish is pressed, and the job keeps the profile it started with.
+    profile: Option<String>,
 }
 
 impl Drop for ShareDialog {
@@ -464,7 +467,30 @@ impl ShareDialog {
             copied_at: None,
             clock: Box::new(Instant::now),
             copy_failed: false,
+            profile: publish_ui::pin().profile,
         }
+    }
+
+    /// Before anything is sent, the window follows a switch of profile: the new one's address,
+    /// workspace and who-can-view. Later stages keep the profile they started with.
+    pub fn follow_profile(&mut self, pin: &crate::profiles::Pin) {
+        if self.profile == pin.profile && self.server == pin.server {
+            return;
+        }
+        if !self.can_switch() {
+            return;
+        }
+        self.profile = pin.profile.clone();
+        self.server = pin.server.clone();
+        self.workspace = Arc::new(Mutex::new(None));
+        self.site = Arc::new(Mutex::new(who::Site::Unknown));
+        self.asked = false;
+        self.ask_site();
+    }
+
+    /// Whether the profile can be switched from this window: not once Publish was pressed.
+    pub fn can_switch(&self) -> bool {
+        matches!(self.stage, Stage::Form | Stage::Blocked(_)) && self.job.is_none()
     }
 
     /// The window as the editors open it: it asks the site for the workspace's name, off the UI thread, once the form shows.
@@ -510,9 +536,11 @@ impl ShareDialog {
         }
         self.asked = true;
         let (server, name, site) = (self.server.clone(), self.workspace.clone(), self.site.clone());
+        // Pinned to the window's profile, on this thread.
+        let pin = crate::profiles::Pin { profile: self.profile.clone(), server: server.clone() };
         // One request tells both the workspace's name and the site's version.
         std::thread::spawn(move || {
-            match publish_ui::token_for(&server).and_then(|token| publish::workspace(&server, &token)) {
+            match publish_ui::token_for_pin(&pin).and_then(|token| publish::workspace(&server, &token)) {
                 Ok(ws) => {
                     if let Ok(mut s) = site.lock() {
                         *s = who::Site::of(ws.version.as_deref());
@@ -783,9 +811,15 @@ impl ShareDialog {
         let mut pressed = if escape || enter { self.key_button(escape).filter(|b| self.view().disabled != Some(*b)) } else { None };
         let view = self.view();
         let online = matches!(self.stage, Stage::Online { .. });
+        let can_switch = self.can_switch();
         modal(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
             ui.set_width(WINDOW_WIDTH);
-            ui.label(RichText::new(view.caption).color(theme::MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(view.caption).color(theme::MUTED).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::profiles_ui::dropdown(ui, "share-window", can_switch);
+                });
+            });
             ui.add_space(4.0);
             heading_label(ui, &view.heading);
             for line in &view.lines {
@@ -1062,9 +1096,11 @@ impl Editor {
             })
         });
         let starter: Starter = Box::new(move |server, title, access| {
+            // The job keeps the profile it starts with, whatever is switched to meanwhile.
+            let pin = publish_ui::pin_for(&server);
             ShareJob::spawn(Kind::Image, move |r| {
                 let png = encoded.lock().ok().and_then(|mut s| s.take()).and_then(Result::ok).ok_or_else(|| ShareError::Failed(NOT_ENCODED.to_string()))?;
-                let token = publish_ui::token_for(&server).map_err(ShareError::Failed)?;
+                let token = publish_ui::token_for_pin(&pin).map_err(ShareError::Failed)?;
                 let item = Item { media: MediaType::Png, data: png, width, height, duration_ms: None, title, preview: share::preview_of(&img) };
                 share::share(&server, &token, &item, &access, |sent, total| r.uploading(sent, total))
             })
@@ -1075,6 +1111,7 @@ impl Editor {
     /// The share window, while it is open: draw it and do what it asks.
     pub(crate) fn share_window(&mut self, ctx: &egui::Context) {
         let Some(d) = self.share.as_mut() else { return };
+        d.follow_profile(&publish_ui::pin());
         d.update_blocked(blocked_reason(d.server()));
         match d.show(ctx, &mut copy_to_clipboard) {
             None => {}

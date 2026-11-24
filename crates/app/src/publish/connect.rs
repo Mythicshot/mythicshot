@@ -61,6 +61,11 @@ const WHAT: &str = "Could not sign in";
 pub struct Secret(String);
 
 impl Secret {
+    /// A secret made from a token typed or pasted by hand (or one a test holds); wiped when dropped.
+    pub fn new(text: String) -> Secret {
+        Secret(text)
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }

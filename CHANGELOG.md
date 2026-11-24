@@ -2,6 +2,15 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.31 (2026-11-24)
+
+- Profiles: Mythicshot can stay signed in to several accounts, on one site or on several, each with its own name, address and token. A dropdown on the Tours page, the Workspace page and in the upload and share windows shows the active profile and switches between them; the Tours list, storage use, uploads and sharing follow it.
+- "Add profile" saves nothing until the sign-in has finished and the site has answered with the account and workspace. A failed or cancelled attempt leaves no profile and no token. For a site without browser sign-in, "Paste a token instead" runs the same check first.
+- A profile whose token the site refuses is kept and marked "Sign in again"; it cannot be used until a new sign-in is confirmed. Every "Sign in again" shows who signed in before the token is stored. Sign out now leaves the profile in place, waiting for a sign-in.
+- The connection Mythicshot already had becomes the first profile, with no new sign-in. Each recording remembers which profile its tour belongs to: updating it under another profile is refused, with the choice to switch profile or upload as a new tour.
+- A token is only ever sent to its own profile's address, and an upload, update or share that is running stays with the profile it started on.
+- Removing a profile deletes only its token on this computer. Nothing on the site is touched.
+
 ## 0.2.30 (2026-11-23)
 
 - "Properties", at the right end of the toolbar, and Edit › Properties now open a Properties panel in the image editor and in the Timeline view too, at the right of the picture. The toolbar keeps every control it had; the panel is a second place for the same settings, and a change in one shows in the other at once.

@@ -300,6 +300,8 @@ pub fn work_message(work: Work) -> String {
 /// saved, and a number that changes whenever the token is saved, replaced or forgotten.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conn {
+    /// The active profile, when the frame was drawn: every list and job of the page is pinned to it.
+    pub profile: Option<String>,
     pub server: String,
     pub token: TokenStatus,
     pub epoch: u64,
@@ -309,7 +311,8 @@ pub struct Conn {
 
 impl Conn {
     pub fn current() -> Conn {
-        Conn { server: publish_ui::server(), token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), bound: publish_ui::token_site() }
+        let pin = publish_ui::pin();
+        Conn { profile: pin.profile, server: pin.server, token: publish_ui::token_status(), epoch: publish_ui::token_epoch(), bound: publish_ui::token_site() }
     }
 
     /// Why the saved token may not go to the configured address, when it may not.
@@ -325,13 +328,30 @@ impl Conn {
         if self.token != TokenStatus::Saved || self.binding_problem().is_some() {
             return None;
         }
-        Some(Site { server: publish::check_server(&self.server).ok()?, epoch: self.epoch })
+        Some(Site { profile: self.profile.clone(), server: publish::check_server(&self.server).ok()?, epoch: self.epoch })
+    }
+}
+
+/// Whether the unfinished delete `entry` was made with the profile of `site` (one noted before
+/// profiles, with none, goes with any profile of its address): "Finish deleting" is offered, and
+/// sent, only with that profile's token.
+pub fn belongs_to(entry: &UnfinishedDelete, site: &Site) -> bool {
+    entry.profile.is_empty() || site.profile.as_deref() == Some(entry.profile.as_str())
+}
+
+impl Site {
+    /// The profile and address a job of this site uses.
+    pub fn pin(&self) -> crate::profiles::Pin {
+        crate::profiles::Pin { profile: self.profile.clone(), server: self.server.clone() }
     }
 }
 
 /// A site and token the list was read with. A list or a job belongs to exactly one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Site {
+    /// The profile whose token the list was read and the jobs run with, pinned on the page's
+    /// thread when the frame was drawn: a switch meanwhile changes nothing for them.
+    pub profile: Option<String>,
     pub server: String,
     pub epoch: u64,
 }
@@ -964,7 +984,7 @@ impl Model {
     pub fn finish_delete(&mut self, entry: &UnfinishedDelete) -> Option<Started> {
         let site = self.site.clone()?;
         let id = entry.tour_id.as_str();
-        if entry.server != site.server || !publish::is_tour_id(id) || self.tour(id).is_some() || self.working.contains_key(id) {
+        if entry.server != site.server || !belongs_to(entry, &site) || !publish::is_tour_id(id) || self.tour(id).is_some() || self.working.contains_key(id) {
             return None;
         }
         self.working.insert(id.to_string(), Work::Deleting(None));
@@ -1171,13 +1191,18 @@ impl Unfinished {
     /// Note that a delete of this tour on `server` (an address as the address rule writes it)
     /// is about to be sent, and write the note to the settings file before returning.
     pub fn add(&self, server: &str, tour_id: &str, title: &str) -> Noted {
+        self.add_in("", server, tour_id, title)
+    }
+
+    /// [`Unfinished::add`] for a delete made with profile `profile`: "Finish deleting" uses it again.
+    pub fn add_in(&self, profile: &str, server: &str, tour_id: &str, title: &str) -> Noted {
         let mut l = self.lock();
         if l.list.iter().any(|e| e.server == server && e.tour_id == tour_id) {
             return Noted::Before;
         }
         let title = if title.trim().is_empty() { "Untitled tour".to_string() } else { title.chars().take(TITLE_MAX).collect() };
         let mut list = l.list.clone();
-        list.push(UnfinishedDelete { server: server.to_string(), tour_id: tour_id.to_string(), title });
+        list.push(UnfinishedDelete { profile: profile.to_string(), server: server.to_string(), tour_id: tour_id.to_string(), title });
         let extra = list.len().saturating_sub(MAX_UNFINISHED);
         list.drain(..extra);
         // Written while the list is held, so the app's own save cannot come between with an older list.
@@ -1249,7 +1274,7 @@ impl Unfinished {
 // ---- Running it ----
 
 /// Where a job gets the token for the site address it is about to use.
-type TokenSource = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+type TokenSource = Arc<dyn Fn(&crate::profiles::Pin) -> Result<String, String> + Send + Sync>;
 
 /// Where the recordings saved on this computer are. None: this user has no folder for them, so
 /// none is saved. Asked on a background thread only.
@@ -1336,7 +1361,7 @@ pub struct ToursState {
 
 impl Default for ToursState {
     fn default() -> Self {
-        let tools = Tools { token: Arc::new(publish_ui::token_for), unfinished: Unfinished::default(), projects: Arc::new(|| Store::default_root().map(Store::at)), gone: Gone::default(), listed: Listed::default(), converting: Arc::new(project::converting_now) };
+        let tools = Tools { token: Arc::new(publish_ui::token_for_pin), unfinished: Unfinished::default(), projects: Arc::new(|| Store::default_root().map(Store::at)), gone: Gone::default(), listed: Listed::default(), converting: Arc::new(project::converting_now) };
         Self { model: Arc::default(), tools }
     }
 }
@@ -1387,7 +1412,7 @@ fn read_saved(tools: &Tools, server: &str) -> (u64, Vec<ProjectInfo>, Option<Pat
 /// said to be gone before the saved recordings are looked at, and a recording of it is kept.
 /// Never call it on the window's thread.
 fn read_list(tools: &Tools, site: &Site) -> (u64, Vec<ProjectInfo>, Option<PathBuf>, Result<Vec<RemoteTour>, String>) {
-    let result = (tools.token)(&site.server).and_then(|token| publish::list_tours(&site.server, &token));
+    let result = (tools.token)(&site.pin()).and_then(|token| publish::list_tours(&site.server, &token));
     if let Ok(tours) = &result {
         tools.gone.listed(&site.server, tours.iter().map(|t| t.id.as_str()));
     }
@@ -1466,7 +1491,7 @@ impl Drop for JobGuard {
 fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Done, Failure> {
     let (server, id) = (started.site.server.as_str(), started.id.as_str());
     let unfinished = &tools.unfinished;
-    let token = (tools.token)(server).map_err(Failure::Message)?;
+    let token = (tools.token)(&started.site.pin()).map_err(Failure::Message)?;
     match &started.job {
         Job::Rename(title) => publish::rename_tour(server, &token, id, title).map(Done::Renamed).map_err(failure),
         Job::Unpublish => publish::unpublish_tour(server, &token, id).map(|()| Done::Unpublished).map_err(failure),
@@ -1477,7 +1502,7 @@ fn run_job(model: &Mutex<Model>, tools: &Tools, started: &Started) -> Result<Don
         .map(|live| Done::Published(live.url))
         .map_err(failure),
         Job::Delete => {
-            let noted_here = match unfinished.add(server, id, &started.title) {
+            let noted_here = match unfinished.add_in(started.site.profile.as_deref().unwrap_or(""), server, id, &started.title) {
                 Noted::Now => true,
                 Noted::Before => false,
                 Noted::NotSaved => return Err(Failure::Message(NOTE_NOT_SAVED.to_string())),
@@ -1521,6 +1546,13 @@ impl ToursState {
     /// With no folder for saved recordings, so a test never looks at this computer's own.
     #[cfg(test)]
     fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
+        let tools = Tools { token: Arc::new(move |pin: &crate::profiles::Pin| token(&pin.server)), unfinished: Unfinished::default(), projects: Arc::new(|| None), gone: Gone::default(), listed: Listed::default(), converting: Arc::new(|| None) };
+        Self { model: Arc::default(), tools }
+    }
+
+    /// A page whose jobs get the token from `token`, which is handed the job's pin.
+    #[cfg(test)]
+    fn with_pinned_token(token: impl Fn(&crate::profiles::Pin) -> Result<String, String> + Send + Sync + 'static) -> Self {
         let tools = Tools { token: Arc::new(token), unfinished: Unfinished::default(), projects: Arc::new(|| None), gone: Gone::default(), listed: Listed::default(), converting: Arc::new(|| None) };
         Self { model: Arc::default(), tools }
     }
@@ -1826,6 +1858,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 
     ui.horizontal(|ui| {
         ui.heading("Tours");
+        ui.add_space(8.0);
+        // The profile the list, the storage use and every action here belong to.
+        if crate::profiles_ui::dropdown(ui, "tours", true) {
+            ui.ctx().request_repaint();
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.add(theme::primary_button(RECORD_A_TOUR)).on_hover_text("Go to Home, where a recording starts").clicked() {
                 clicks.push(Click::RecordTour);
@@ -1841,12 +1878,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     });
     ui.add_space(10.0);
 
+    if let Some(text) = publish_ui::migrated_notice() {
+        crate::profiles_ui::note(ui, crate::profiles_ui::Tone::Ok, &text);
+        ui.add_space(8.0);
+    }
+    if let Some(problem) = publish_ui::migration_problem() {
+        theme::caution_line(ui, problem, theme::BODY_SIZE, theme::Fit::Wrap);
+        ui.add_space(8.0);
+    }
     if let Some(notice) = m.notice().cloned() {
         notice_ui(ui, &notice, &mut clicks);
     }
     // Deletes that did not finish on this site: always shown, whatever else the page says.
     if let Some(site) = m.site.clone() {
-        for entry in state.tools.unfinished.for_site(&site.server).into_iter().filter(|e| m.shows_unfinished(e)) {
+        for entry in state.tools.unfinished.for_site(&site.server).into_iter().filter(|e| belongs_to(e, &site) && m.shows_unfinished(e)) {
             unfinished_ui(ui, &entry, m.work(&entry.tour_id), &mut clicks);
         }
     }
@@ -2176,11 +2221,11 @@ pub(crate) mod tests {
     }
 
     fn site() -> Site {
-        Site { server: "https://tours.example.com".into(), epoch: 1 }
+        Site { profile: None, server: "https://tours.example.com".into(), epoch: 1 }
     }
 
     pub(crate) fn conn(token: TokenStatus) -> Conn {
-        Conn { server: "https://tours.example.com".into(), token, epoch: 1, bound: Some("https://tours.example.com".into()) }
+        Conn { profile: None, server: "https://tours.example.com".into(), token, epoch: 1, bound: Some("https://tours.example.com".into()) }
     }
 
     /// A model with a loaded list.
@@ -2285,8 +2330,8 @@ pub(crate) mod tests {
         assert_eq!(m.view(&conn(TokenStatus::Unavailable("The credential store is locked.".into()))), View::NotConnected("The credential store is locked.".into()));
         assert!(!m.wants_load(Instant::now()) && m.begin_load().is_none(), "nothing is asked of a site that is not set up");
         // A connection with a bad address or no token is no site.
-        assert_eq!(Conn { server: "http://tours.example.com".into(), ..conn(TokenStatus::Saved) }.site(), None);
-        assert_eq!(Conn { server: String::new(), ..conn(TokenStatus::Saved) }.site(), None);
+        assert_eq!(Conn { profile: None, server: "http://tours.example.com".into(), ..conn(TokenStatus::Saved) }.site(), None);
+        assert_eq!(Conn { profile: None, server: String::new(), ..conn(TokenStatus::Saved) }.site(), None);
         assert_eq!(conn(TokenStatus::Missing).site(), None);
         assert_eq!(conn(TokenStatus::Saved).site(), Some(site()));
 
@@ -2338,7 +2383,7 @@ pub(crate) mod tests {
         let mut m = loaded(two());
         let (old, _) = m.begin_load().unwrap();
         // The site changes while the request is out.
-        m.set_site(Some(Site { server: "https://other.example.com".into(), epoch: 1 }));
+        m.set_site(Some(Site { profile: None, server: "https://other.example.com".into(), epoch: 1 }));
         m.finish_load(old, Ok(two()), Instant::now());
         assert!(m.tours().is_empty(), "the other site's tours are not shown");
         assert_eq!(m.view(&conn(TokenStatus::Saved)), View::Loading);
@@ -2562,7 +2607,43 @@ pub(crate) mod tests {
     }
 
     fn entry(server: &str, id: &str, title: &str) -> UnfinishedDelete {
-        UnfinishedDelete { server: server.into(), tour_id: id.into(), title: title.into() }
+        UnfinishedDelete { profile: String::new(), server: server.into(), tour_id: id.into(), title: title.into() }
+    }
+
+    #[test]
+    fn the_pages_lists_and_jobs_get_the_token_of_the_profile_they_were_pinned_to() {
+        let s = stub(|_, _| reply(200, r#"{"tours":[]}"#));
+        let pins: Arc<Mutex<Vec<crate::profiles::Pin>>> = Arc::default();
+        let record = pins.clone();
+        let state = ToursState::with_pinned_token(move |pin: &crate::profiles::Pin| {
+            record.lock().unwrap().push(pin.clone());
+            Ok(TOKEN.to_string())
+        });
+        let site = Site { profile: Some("pa".into()), server: s.base.clone(), epoch: 1 };
+        let _ = read_list(&state.tools, &site);
+        let started = Started { site: site.clone(), id: A.into(), title: "Customer onboarding".into(), job: Job::Rename("Renamed".into()), listed: true };
+        let _ = run_job(&state.model, &state.tools, &started);
+        let pa = crate::profiles::Pin { profile: Some("pa".into()), server: s.base.clone() };
+        assert_eq!(*pins.lock().unwrap(), vec![pa.clone(), pa]);
+    }
+
+    #[test]
+    fn finish_deleting_goes_with_the_profile_the_delete_was_made_with() {
+        let mut m = loaded(two());
+        m.set_site(Some(Site { profile: Some("pa".into()), ..site() }));
+        let made_with = |profile: &str| UnfinishedDelete { profile: profile.into(), ..entry(&site().server, C, "Elsewhere") };
+        // Another profile's delete is neither shown nor sent with this profile's token.
+        assert!(!belongs_to(&made_with("pb"), m.site.as_ref().unwrap()));
+        assert_eq!(m.finish_delete(&made_with("pb")), None);
+        // Its own, or one noted before profiles, is; and the job is pinned to this profile.
+        assert!(belongs_to(&made_with(""), m.site.as_ref().unwrap()));
+        let job = m.finish_delete(&made_with("pa")).unwrap();
+        assert_eq!(job.site.pin(), crate::profiles::Pin { profile: Some("pa".into()), server: site().server });
+        // A delete noted while a profile was active remembers it.
+        let u = Unfinished::default();
+        u.save_with(|_| true);
+        assert_eq!(u.add_in("pa", &site().server, B, "Testing"), Noted::Now);
+        assert_eq!(u.for_site(&site().server).first().map(|e| e.profile.as_str()), Some("pa"));
     }
 
     #[test]
@@ -2617,7 +2698,7 @@ pub(crate) mod tests {
         m.finish_load(generation, Err("Could not list the tours: the server answered HTTP 503.".into()), Instant::now());
         assert!(m.shows_unfinished(&here));
         // Another site, then this one again (a token saved anew counts as that).
-        m.set_site(Some(Site { server: "https://other.example.com".into(), epoch: 1 }));
+        m.set_site(Some(Site { profile: None, server: "https://other.example.com".into(), epoch: 1 }));
         assert!(!m.shows_unfinished(&here));
         m.set_site(Some(Site { epoch: 2, ..site() }));
         assert!(m.shows_unfinished(&here));
@@ -2791,10 +2872,10 @@ pub(crate) mod tests {
         assert_eq!(unbound.site(), None);
         assert!(matches!(m.view(&unbound), View::NotConnected(why) if why.starts_with("The saved token is not tied to a site address yet")));
         // The same address written another way is the same site.
-        let same = Conn { server: " https://Tours.Example.com/ ".into(), ..conn(TokenStatus::Saved) };
+        let same = Conn { profile: None, server: " https://Tours.Example.com/ ".into(), ..conn(TokenStatus::Saved) };
         assert_eq!(same.site(), Some(site()));
         // Without a token the plain sentence stands.
-        assert_eq!(m.view(&Conn { server: "https://tours.example.co".into(), ..conn(TokenStatus::Missing) }), View::NotConnected(NOT_CONNECTED.into()));
+        assert_eq!(m.view(&Conn { profile: None, server: "https://tours.example.co".into(), ..conn(TokenStatus::Missing) }), View::NotConnected(NOT_CONNECTED.into()));
     }
 
     #[test]
@@ -2854,7 +2935,7 @@ pub(crate) mod tests {
     }
 
     fn stub_conn(stub: &Stub) -> Conn {
-        Conn { server: stub.base.clone(), token: TokenStatus::Saved, epoch: 1, bound: Some(stub.base.clone()) }
+        Conn { profile: None, server: stub.base.clone(), token: TokenStatus::Saved, epoch: 1, bound: Some(stub.base.clone()) }
     }
 
     /// Every piece of text one frame of the page draws.
@@ -3071,7 +3152,7 @@ pub(crate) mod tests {
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.notice().is_none());
         assert!(text.replace('\n', " ").contains(&sentence) && has_line(&text, FINISH_DELETING), "{text}");
         // With another site configured it is not offered, and it stays stored.
-        let elsewhere = Conn { server: "https://other.example.com".into(), bound: Some("https://other.example.com".into()), ..conn.clone() };
+        let elsewhere = Conn { profile: None, server: "https://other.example.com".into(), bound: Some("https://other.example.com".into()), ..conn.clone() };
         lock(&state.model).set_site(elsewhere.site());
         let shown = lock(&state.model).shows_unfinished(&store.for_site(&s.base)[0]);
         assert!(!shown);
@@ -3104,8 +3185,8 @@ pub(crate) mod tests {
         let (ctx, mut state, conn) = (crate::theme::test_context(), page(), stub_conn(&s));
         let store = state.unfinished();
         store.load(vec![
-            UnfinishedDelete { server: s.base.clone(), tour_id: B.into(), title: "Testing".into() },
-            UnfinishedDelete { server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() },
+            UnfinishedDelete { profile: String::new(), server: s.base.clone(), tour_id: B.into(), title: "Testing".into() },
+            UnfinishedDelete { profile: String::new(), server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() },
         ]);
         let text = until(&ctx, &mut state, &conn, |m, _| !m.is_loading() && m.tours().len() == 1);
         let flat = text.replace('\n', " ");
@@ -3117,7 +3198,7 @@ pub(crate) mod tests {
         let text = until(&ctx, &mut state, &conn, |m, _| m.work(B).is_none() && !m.is_loading());
         assert!(!text.contains("did not finish"), "{text}");
         // The other site's entry is still stored.
-        assert_eq!(store.take_changed(), Some(vec![UnfinishedDelete { server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() }]));
+        assert_eq!(store.take_changed(), Some(vec![UnfinishedDelete { profile: String::new(), server: "https://other.example.com".into(), tour_id: C.into(), title: "Elsewhere".into() }]));
     }
 
     const DELETE_B: &str = "DELETE /api/v1/tours/tour_bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -3431,7 +3512,7 @@ pub(crate) mod tests {
 
     /// What the store's list says of a saved chapter of a tour on the test site, with no disk behind it.
     fn info(tour: &str, chapter: &str, title: &str, bytes: u64, problem: Option<Problem>) -> ProjectInfo {
-        ProjectInfo { key: key(&site().server, tour, chapter), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, frames_bytes: bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
+        ProjectInfo { key: key(&site().server, tour, chapter), profile: String::new(), title: title.into(), tour_title: "Customer onboarding".into(), saved_at: 1_763_424_000_000, bytes, frames_bytes: bytes, dir: std::path::PathBuf::from(chapter), problem, form: project::Form::Frames, convert: project::ConvertState::NotTried }
     }
 
     /// A model with a loaded list and these saved recordings.
@@ -3455,7 +3536,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir_in(&recordings).unwrap().keep();
         let rec = mythicshot_recording::Recording::synthetic_in(&dir, 64, 48, &[0, 500, 1000], 1500).unwrap();
         let edit = crate::video::Edit::new(&rec, Default::default());
-        let snap = project::Snapshot { rec: &rec, title, tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &[], items: &[] };
+        let snap = project::Snapshot { profile: "", rec: &rec, title, tour_title: "Customer onboarding", steps: 2, edit: &edit, events: &[], items: &[] };
         store.save(&key(server, tour, chapter), &snap).unwrap().info
     }
 
@@ -3694,7 +3775,7 @@ pub(crate) mod tests {
         m.apply_saved(&site(), 2, theirs.clone(), None);
         assert!(m.saved(A).is_empty());
         // With the old address set again it is back; a read for the address before is dropped.
-        let old_site = Site { server: old.into(), epoch: 1 };
+        let old_site = Site { profile: None, server: old.into(), epoch: 1 };
         m.set_site(Some(old_site.clone()));
         assert!(m.saved(A).is_empty(), "what was read for the other address went with the list");
         let (generation, _) = m.begin_load().unwrap();
@@ -4146,7 +4227,7 @@ pub(crate) mod tests {
     /// A page on the stub's site with its saved recordings in `store`, the list read: A, and B when `with_b`.
     fn listed_page(s: &Stub, store: &Store, epoch: u64, with_b: bool) -> (ToursState, Site) {
         let state = page().with_store(store.clone());
-        let site = Site { server: s.base.clone(), epoch };
+        let site = Site { profile: None, server: s.base.clone(), epoch };
         read_into(&state, &site, with_b);
         (state, site)
     }
@@ -4309,7 +4390,7 @@ pub(crate) mod tests {
         });
         let (_tmp, store) = temp_store();
         let state = page().with_store(store.clone());
-        let site = Site { server: s.base.clone(), epoch: 1 };
+        let site = Site { profile: None, server: s.base.clone(), epoch: 1 };
         state.tools.gone.add(&s.base, B);
         state.tools.gone.add(&s.base, C);
         // While the site's list does not hold it, a recording that shows up for it is removed.
@@ -4336,7 +4417,7 @@ pub(crate) mod tests {
         let state = page().with_store(store.clone());
         state.tools.gone.add(&s.base, B);
         let late = save_project(&store, &s.base, B, CH1, "Testing");
-        let (_, saved, _, result) = read_list(&state.tools, &Site { server: s.base.clone(), epoch: 1 });
+        let (_, saved, _, result) = read_list(&state.tools, &Site { profile: None, server: s.base.clone(), epoch: 1 });
         assert!(result.is_err());
         assert!(!late.dir.exists() && saved.is_empty(), "the tour is still known to be gone");
         assert_eq!(state.tools.gone.of(&s.base, [B].into_iter()), BTreeSet::from([B.to_string()]));
@@ -4789,14 +4870,14 @@ pub(crate) mod tests {
         m.apply_saved(&site(), 1, one.to_vec(), Some(dir.clone()));
         assert_eq!(m.converting(), Some(dir.as_path()));
         // A read for another site, and one older than what the page holds, change nothing.
-        m.apply_saved(&Site { server: "https://other.example.com".into(), epoch: 1 }, 2, vec![], None);
+        m.apply_saved(&Site { profile: None, server: "https://other.example.com".into(), epoch: 1 }, 2, vec![], None);
         m.apply_saved(&site(), 0, vec![], None);
         assert_eq!((m.converting(), m.saved(A).len()), (Some(dir.as_path()), 1));
         m.finish_saved(&site(), 2, one.to_vec(), None);
         assert_eq!(m.converting(), None);
         // Another site's page holds none of it.
         m.apply_saved(&site(), 3, one.to_vec(), Some(dir.clone()));
-        m.set_site(Some(Site { server: "https://other.example.com".into(), epoch: 1 }));
+        m.set_site(Some(Site { profile: None, server: "https://other.example.com".into(), epoch: 1 }));
         assert_eq!(m.converting(), None);
 
         // The read itself asks which project is being compressed, on its own thread, once.
@@ -4809,7 +4890,7 @@ pub(crate) mod tests {
             Some(being.clone())
         });
         assert_eq!(read_saved(&state.tools, &site().server).2, Some(dir.clone()));
-        let (_, _, converting, _) = read_list(&state.tools, &Site { server: "http://127.0.0.1:9".into(), epoch: 1 });
+        let (_, _, converting, _) = read_list(&state.tools, &Site { profile: None, server: "http://127.0.0.1:9".into(), epoch: 1 });
         assert_eq!((converting, asked.load(Ordering::SeqCst)), (Some(dir), 2));
     }
 
@@ -5026,7 +5107,7 @@ pub(crate) mod tests {
         // Another site's page shows none of it, and the open runs on there too.
         let mut m = loaded_with(three(), vec![video.clone()]);
         assert!(m.begin_open(&video.key, cancel.clone()));
-        m.set_site(Some(Site { server: "https://other.example.com".into(), epoch: 1 }));
+        m.set_site(Some(Site { profile: None, server: "https://other.example.com".into(), epoch: 1 }));
         assert_eq!(m.work(B), None);
         assert!(m.is_opening() && !cancel.load(Ordering::SeqCst));
         m.open_ended(&video.key);
@@ -5387,7 +5468,7 @@ pub(crate) mod tests {
         m.start_rename(B);
         assert_eq!((m.edit(), m.error(B)), (&Edit::None, None));
         // The page belongs to another site for a while, with a tour of the same id: not its recording.
-        let other = Site { server: "https://other.example.com".into(), epoch: 1 };
+        let other = Site { profile: None, server: "https://other.example.com".into(), epoch: 1 };
         m.set_site(Some(other));
         let (generation, _) = m.begin_load().unwrap();
         m.finish_load(generation, Ok(three()), Instant::now());

@@ -20,6 +20,8 @@ use crate::editor_ui::{Editor, Place, applied, in_row, row_label, switch};
 use crate::icons::{self, Icon};
 use crate::project::{Loaded, OpenGuard, ProjectKey, Restored, Saved, Snapshot, Store, Totals};
 use crate::publish::{Published, Target, access::Access, share};
+use crate::profiles::{self, Owner};
+use crate::profiles_ui::{OwnerChoice, OwnerPrompt};
 use crate::publish_ui::{self, Before, EditTarget, Kept, Mode, Picker, PickerOutcome, PublishDone, ResultAction, ResultDialog, Run};
 use crate::recorder_ui::{EncodeJob, ExportSpec};
 use crate::site::{self, SiteSummary};
@@ -348,6 +350,8 @@ fn over_after(store: &Store, saved: &Saved, limit: &Limit<'_>) -> Option<(u64, u
 
 /// The editor's state as it was when a publish started: what is uploaded, and what is kept.
 pub(crate) struct PublishState {
+    /// The profile the upload goes with: the kept recording is linked to its tour in it.
+    pub(crate) profile: String,
     pub(crate) rec: Arc<Recording>,
     pub(crate) items: Vec<mythicshot_editor::Item>,
     pub(crate) events: Vec<InputEvent>,
@@ -373,7 +377,7 @@ fn keep_recording(keeping: &Keeping, save: &SaveFn<'_>, limit: Option<&Limit<'_>
         // The address was good enough to upload to, so this never fails.
         let server = crate::publish::check_server(server).map_err(|_| publish_ui::KEEPING_BROKE_OFF.to_string())?;
         let key = ProjectKey { server, tour_id: up.tour_id.clone(), chapter_id: up.chapter_id.clone() };
-        let snap = Snapshot { rec: &state.rec, title, tour_title, steps: u32::try_from(up.steps).unwrap_or(u32::MAX), edit: &state.edit, events: &state.events, items: &state.items };
+        let snap = Snapshot { profile: &state.profile, rec: &state.rec, title, tour_title, steps: u32::try_from(up.steps).unwrap_or(u32::MAX), edit: &state.edit, events: &state.events, items: &state.items };
         save(store, &key, &snap, keep_going)
     }));
     match saved {
@@ -728,6 +732,8 @@ fn prepare_and_share(clip: &ClipSpec, dir: &Path, server: &str, title: String, a
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Remembered {
     pub(crate) key: ProjectKey,
+    /// The profile the upload went with: the tour belongs to it.
+    pub(crate) profile: String,
     /// The chapter's title as it was uploaded: a replace sends it again, so it is not renamed.
     pub(crate) chapter_title: String,
     pub(crate) tour_title: String,
@@ -739,6 +745,8 @@ pub(crate) struct Remembered {
 /// What a publish started from this editor goes to, until it has ended.
 #[derive(Debug, Clone, PartialEq)]
 struct Pending {
+    /// The profile the publish goes with.
+    profile: String,
     server: String,
     chapter_title: String,
 }
@@ -754,13 +762,15 @@ fn remember_upload(pending: &Pending, tour_title: &str, done: &PublishDone, left
     }
     let server = crate::publish::check_server(&pending.server).unwrap_or_else(|_| pending.server.clone());
     let key = ProjectKey { server, tour_id: f.tour_id.clone(), chapter_id: f.chapter_id.clone() };
-    Some(Remembered { key, chapter_title: pending.chapter_title.clone(), tour_title: tour_title.to_string(), kept: matches!(done.kept, Kept::Saved { .. }) })
+    Some(Remembered { profile: pending.profile.clone(), key, chapter_title: pending.chapter_title.clone(), tour_title: tour_title.to_string(), kept: matches!(done.kept, Kept::Saved { .. }) })
 }
 
 /// The tour and chapter an editor's Publish dialog replaces, and how.
 #[derive(Debug, Clone, PartialEq)]
 struct Replaceable {
     key: ProjectKey,
+    /// The profile the tour belongs to, as recorded (empty: linked before profiles).
+    profile: String,
     target: EditTarget,
     /// The chapter's title to send; None for the editor's own title (an opened project's).
     chapter_title: Option<String>,
@@ -779,11 +789,11 @@ fn replaceable(v: &VideoState) -> Option<Replaceable> {
         let target = EditTarget { tour_id: r.key.tour_id.clone(), chapter_id: r.key.chapter_id.clone(), tour_title: r.tour_title.clone() };
         // Its upload went without the logo if it had none: replacing it takes nothing away.
         let gone = v.chapter_gone.as_ref() == Some(&r.key);
-        return Some(Replaceable { key: r.key.clone(), target, chapter_title: Some(r.chapter_title.clone()), keep_always: r.kept, logo_missing: false, gone });
+        return Some(Replaceable { key: r.key.clone(), profile: r.profile.clone(), target, chapter_title: Some(r.chapter_title.clone()), keep_always: r.kept, logo_missing: false, gone });
     }
     let origin = v.origin.as_ref()?;
     let gone = v.chapter_gone.as_ref() == Some(&origin.key);
-    Some(Replaceable { key: origin.key.clone(), target: edit_target(origin), chapter_title: None, keep_always: true, logo_missing: logo_missing(origin, &v.edit), gone })
+    Some(Replaceable { key: origin.key.clone(), profile: origin.profile.clone(), target: edit_target(origin), chapter_title: None, keep_always: true, logo_missing: logo_missing(origin, &v.edit), gone })
 }
 
 /// The chapter to stop offering to replace after an update of `r` failed with `error`: only
@@ -822,10 +832,24 @@ enum Dialog {
     ChapterGone { title: String, target: EditTarget },
     /// The same, for a chapter of another site address than the one configured: no Replace.
     Elsewhere { title: String, target: EditTarget },
+    /// The tour belongs to another profile than the active one, or to one that was removed:
+    /// the update is refused with the question, before any dialog.
+    OtherProfile { owner: Owner, title: String },
 }
 
 /// The Publish dialog of `v` for the site at `server`; `title` is the editor's.
 fn dialog_for(v: &VideoState, server: &str, title: String) -> Dialog {
+    dialog_in(v, server, title, &publish_ui::book())
+}
+
+/// [`dialog_for`] with the profiles given: a tour of another profile than the active one is
+/// never updated from here, whatever its address.
+fn dialog_in(v: &VideoState, server: &str, title: String, book: &profiles::Book) -> Dialog {
+    if let Some(r) = replaceable(v)
+        && let owner @ (Owner::Other { .. } | Owner::Removed) = profiles::owner_of(book, &r.profile)
+    {
+        return Dialog::OtherProfile { owner, title };
+    }
     match replaceable(v) {
         None => Dialog::New(title),
         Some(r) if r.gone && on_this_site(&r.key, server) => Dialog::ChapterGone { title: r.chapter_title.unwrap_or(title), target: r.target },
@@ -838,6 +862,13 @@ fn dialog_for(v: &VideoState, server: &str, title: String) -> Dialog {
 /// opened without its logo, and the tour's cover has not been given one since.
 fn logo_missing(origin: &Origin, edit: &Edit) -> bool {
     origin.logo_dropped && edit.tour_doc.logo_path.is_none()
+}
+
+/// Whether the active profile of `book` may update `r`'s tour: it belongs to it, or it is a tour
+/// linked before profiles that nobody owns yet (then only at its own address, which the caller
+/// checks; the update's save stamps the profile on it). With no profile at all nothing is sent.
+fn owned_by(r: &Replaceable, book: &profiles::Book) -> bool {
+    matches!(profiles::owner_of(book, &r.profile), Owner::Active | Owner::Unowned | Owner::NoProfile)
 }
 
 /// Whether the project `key` belongs to the site at `server`: projects are tied to the exact
@@ -902,6 +933,8 @@ fn outlived_message(result: &Result<Exported, String>, update_title: Option<&str
 /// The saved project an editor was opened from.
 pub struct Origin {
     pub key: ProjectKey,
+    /// The profile the tour belongs to, as the project says (empty: saved before profiles).
+    pub profile: String,
     /// The tour's title: as saved with the recording, and after an update as the site had it then.
     pub tour_title: String,
     /// The cover logo saved with the recording could not be opened with it.
@@ -1033,6 +1066,13 @@ pub struct VideoState {
     job: Option<ExportJob>,
     /// The "Publish tour" dialog, while it is open.
     picker: Option<Picker>,
+    /// The question an update of another profile's tour is refused with, while it is open.
+    owner_prompt: Option<OwnerPrompt>,
+    /// The profile the open dialog was made for: a switch while it is open makes it again.
+    picker_for: Option<Option<String>>,
+    /// The profile and address the last publish or update of this editor went with: "Try again"
+    /// publishes there, whatever profile is active by then.
+    job_pin: Option<crate::profiles::Pin>,
     /// The "Publish tour" dialog as the user left it when the running publish or update was
     /// started from it: it comes back like that when the site has no room for the tour.
     picker_left: Option<Picker>,
@@ -1159,6 +1199,9 @@ impl Editor {
             share_waiter: None,
             job: None,
             picker: None,
+            owner_prompt: None,
+            picker_for: None,
+            job_pin: None,
             picker_left: None,
             publish_result: None,
             site_dialog: None,
@@ -1217,7 +1260,7 @@ impl Editor {
             // The close question says the recording is deleted, which is untrue here.
             v.exported = true;
             let logo_dropped = dropped.iter().any(|d| d == crate::project::COVER_LOGO);
-            v.origin = Some(Origin { key: info.key, tour_title: info.tour_title, logo_dropped, open: Arc::new(open) });
+            v.origin = Some(Origin { key: info.key, profile: info.profile, tour_title: info.tour_title, logo_dropped, open: Arc::new(open) });
         }
         // The moved pulses it was saved with are where undo starts from.
         editor.init_pulse_history();
@@ -1311,6 +1354,28 @@ impl Editor {
                 ctx.request_repaint();
             }
         }
+        // An update of another profile's tour: the question first.
+        let mut reopen = false;
+        if let Some(choice) = v.owner_prompt.as_ref().and_then(|p| p.show(ctx)) {
+            let title = v.owner_prompt.take().map(|p| p.title).unwrap_or_default();
+            match choice {
+                OwnerChoice::Switch(id) => reopen = publish_ui::switch_profile(&id),
+                OwnerChoice::NewTour => {
+                    v.picker = Some(Picker::open(publish_ui::server(), title));
+                    v.picker_for = Some(publish_ui::pin().profile);
+                }
+                OwnerChoice::Cancel => {}
+            }
+        }
+        // A switch of profile while the dialog is open: it is made again for the new one.
+        if v.picker.is_some() && v.job.is_none() && v.picker_for.as_ref().is_some_and(|p| *p != publish_ui::pin().profile) {
+            v.picker = None;
+            reopen = true;
+        }
+        if reopen {
+            self.open_publish_picker();
+        }
+        let Some(v) = self.video.as_mut() else { return };
         // The "Publish tour" dialog. "Publish" or "Upload draft" either starts the upload or
         // keeps the dialog open with the reason it cannot.
         match v.picker.as_mut().and_then(|p| p.show(ctx)) {
@@ -1676,7 +1741,7 @@ impl Editor {
 
     /// The "Publish tour" dialog is open: the editor takes no shortcuts or canvas input.
     pub(crate) fn publish_picker_open(&self) -> bool {
-        self.video.as_ref().is_some_and(|v| v.picker.is_some() || v.publish_result.is_some())
+        self.video.as_ref().is_some_and(|v| v.picker.is_some() || v.owner_prompt.is_some() || v.publish_result.is_some())
     }
 
     /// "Publish tour…" can be used now: what makes the export panel's button usable.
@@ -1689,7 +1754,7 @@ impl Editor {
     pub(crate) fn open_publish_picker(&mut self) {
         let title = self.title().to_string();
         let Some(v) = self.video.as_mut() else { return };
-        if v.job.is_some() || v.picker.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
+        if v.job.is_some() || v.picker.is_some() || v.owner_prompt.is_some() || v.publish_result.is_some() || v.site_dialog.is_some() {
             return;
         }
         let server = publish_ui::server();
@@ -1698,7 +1763,12 @@ impl Editor {
             Dialog::Replace { title, target, logo_missing } => Picker::open_for_edit(server, title, target).with_logo_missing(logo_missing),
             Dialog::Elsewhere { title, target } => Picker::open_for_edit_elsewhere(server, title, target),
             Dialog::ChapterGone { title, target } => Picker::open_for_edit_chapter_gone(server, title, target),
+            Dialog::OtherProfile { owner, title } => {
+                v.owner_prompt = Some(OwnerPrompt { owner, title });
+                return;
+            }
         });
+        v.picker_for = Some(publish_ui::pin().profile);
     }
 
     /// "Publish to…" in the Export menu: share the clip with a link. It is prepared with the
@@ -1721,7 +1791,9 @@ impl Editor {
         let duration_ms = clip_duration_ms(&frames, end_ms);
         let clip = ClipSpec { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone(), media, quality: v.quality, fps: v.fps };
         let starter: crate::share_ui::Starter = Box::new(move |server, title, access| {
-            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, &access, || publish_ui::token_for(&server), r))
+            // The job keeps the profile it starts with, whatever is switched to meanwhile.
+            let pin = publish_ui::pin_for(&server);
+            crate::share_ui::ShareJob::spawn(share::Kind::Clip, move |r| share_clip_job(&clip, &std::env::temp_dir(), &server, title, &access, || publish_ui::token_for_pin(&pin), r))
         });
         let server = publish_ui::server();
         let blocked = crate::share_ui::blocked_reason(&server);
@@ -1760,16 +1832,23 @@ impl Editor {
     /// was opened from stays its origin. `target.tour_title` is the tour's title as the site
     /// has it now: the result screen shows it, and the saved project takes it over.
     fn start_update(&mut self, title: String, target: EditTarget, before: Before) {
+        self.start_update_with(title, target, before, publish_ui::pin(), &publish_ui::book(), Arc::new(publish_ui::token_for_pin));
+    }
+
+    /// [`Editor::start_update`] with the active profile's pin, the profiles and the token source
+    /// handed in, so a test runs the real path without the shared state.
+    fn start_update_with(&mut self, title: String, target: EditTarget, before: Before, pin: profiles::Pin, book: &profiles::Book, token: Arc<dyn Fn(&profiles::Pin) -> Result<String, String> + Send + Sync>) {
         let Some(v) = self.video.as_ref() else { return };
         if v.job.is_some() {
             return;
         }
         let Some(r) = replaceable(v) else { return };
-        let server = publish_ui::server();
-        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) {
+        let pin_kept = pin.clone();
+        let server = pin.server.clone();
+        if r.gone || !on_this_site(&r.key, &server) || !is_chapter(&target, &r.key) || !owned_by(&r, book) {
             return;
         }
-        let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
+        let state = PublishState { profile: pin.profile.clone().unwrap_or_default(), rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
         // A recording opened from a project is read from the project's folder, and may be saved
         // over it in place: the job holds the project open for as long as it runs, also past
         // this editor.
@@ -1781,13 +1860,14 @@ impl Editor {
         let worker = run.clone();
         let tour_title = target.tour_title.clone();
         let job = EncodeJob::spawn(move |progress| {
-            let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || publish_ui::token_for(&server), &keeping, &worker, progress));
+            let result = guarded_as(&worker, "Updating failed because of an internal error.", || update_job(&state, &title, &target, &server, || token(&pin), &keeping, &worker, progress));
             drop(state);
             drop(open);
             result
         });
         if let Some(v) = self.video.as_mut() {
             v.job = Some(ExportJob::Publish(job, run, tour_title, before, true));
+            v.job_pin = Some(pin_kept);
         }
         self.notify("Updating tour… 0%");
     }
@@ -1799,17 +1879,20 @@ impl Editor {
         if v.job.is_some() {
             return;
         }
-        let server = publish_ui::server();
-        let state = PublishState { rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
+        // The job keeps the profile it starts with, whatever is switched to meanwhile.
+        let pin = publish_ui::pin();
+        let pin_kept = pin.clone();
+        let server = pin.server.clone();
+        let state = PublishState { profile: pin.profile.clone().unwrap_or_default(), rec: v.rec.clone(), items: self.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() };
         // A recording opened from a saved project is read from that project's folder.
         let open = v.origin.as_ref().map(|o| o.open.clone());
         let keeping = keeping_now();
         let run = Run::begin();
         let worker = run.clone();
         let kept_as = tour_title.clone();
-        let pending = Pending { server: server.clone(), chapter_title: title.clone() };
+        let pending = Pending { profile: pin.profile.clone().unwrap_or_default(), server: server.clone(), chapter_title: title.clone() };
         let job = EncodeJob::spawn(move |progress| {
-            let result = guarded(&worker, || publish_job_as(&state, &title, &kept_as, &server, || publish_ui::token_for(&server), &target, mode == Mode::PublishNow, &access, &keeping, &worker, progress));
+            let result = guarded(&worker, || publish_job_as(&state, &title, &kept_as, &server, || publish_ui::token_for_pin(&pin), &target, mode == Mode::PublishNow, &access, &keeping, &worker, progress));
             // The addresses go with the job.
             drop(access);
             // The recording is let go of before the project it may have been opened from.
@@ -1819,6 +1902,7 @@ impl Editor {
         });
         if let Some(v) = self.video.as_mut() {
             v.job = Some(ExportJob::Publish(job, run, tour_title, before, false));
+            v.job_pin = Some(pin_kept);
             v.publishing_to = Some(pending);
         }
         self.notify("Publishing tour… 0%");
@@ -1833,14 +1917,17 @@ impl Editor {
             return;
         }
         let (tour_title, before, update) = (retry.title.clone(), retry.before.clone(), retry.update);
-        let server = publish_ui::server();
+        // The tour is on the site of the profile the first publish went with, whatever is active now.
+        let pin = v.job_pin.clone().unwrap_or_else(publish_ui::pin);
+        let pin_kept = pin.clone();
+        let server = pin.server.clone();
         let run = Run::begin();
         let worker = run.clone();
         worker.set_publishing(None);
         let job = EncodeJob::spawn(move |progress| {
             guarded(&worker, || {
                 progress(1.0);
-                let result = publish_ui::token_for(&server).and_then(|token| {
+                let result = publish_ui::token_for_pin(&pin).and_then(|token| {
                     crate::publish::publish_tour(&server, &token, &retry.tour_id, |images| {
                         worker.set_publishing(images);
                         !worker.is_cancelled()
@@ -1851,6 +1938,7 @@ impl Editor {
         });
         if let Some(v) = self.video.as_mut() {
             v.job = Some(ExportJob::Publish(job, run, tour_title, before, update));
+            v.job_pin = Some(pin_kept);
         }
         self.notify(publish_ui::publishing_message(None));
     }
@@ -2616,7 +2704,7 @@ mod tests {
             Item { id: 1, shape: Shape::Rect(Bounds::new(pt(30.0, 20.0), pt(90.0, 70.0))), style: Style::default(), frames: Some((1, 3)), pin: None },
             Item { id: 2, shape: Shape::Text { at: pt(40.0, 80.0), text: "Mind the gap".into() }, style: Style::default(), frames: None, pin: Some(steps[0].src as u32) },
         ];
-        PublishState { rec, items, events, edit }
+        PublishState { profile: String::new(), rec, items, events, edit }
     }
 
     fn store_in(root: &Path) -> Store {
@@ -3586,7 +3674,7 @@ mod tests {
         st.edit.tour_doc.steps.entry(steps[0].src).or_default().pulse = Some(crate::tour::Point { x: 100.0, y: 100.0 });
         let store = store_in(tmp.path());
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
-        let snap = Snapshot { rec: &st.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &st.edit, events: &st.events, items: &st.items };
+        let snap = Snapshot { profile: "", rec: &st.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &st.edit, events: &st.events, items: &st.items };
         store.save(&key, &snap).unwrap();
         let mut ed = reopened(&store, &key);
         let at = |ed: &Editor| ed.video.as_ref().unwrap().edit.tour_doc.steps.get(&steps[0].src).and_then(|s| s.pulse.clone());
@@ -3918,7 +4006,7 @@ mod tests {
         // The job saves the recording once it is told to; until then it is "still saving".
         let (saving, to_key) = (store.clone(), key.clone());
         let (job, go, run) = waiting_job(move || {
-            let snap = Snapshot { rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
+            let snap = Snapshot { profile: "", rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
             match saving.save(&to_key, &snap) {
                 Ok(saved) => Kept::Saved { left_out: saved.left_out, over: None },
                 Err(why) => Kept::Failed(why),
@@ -4311,7 +4399,7 @@ mod tests {
     /// What an update started now in `ed` would send and save, as `start_update` takes it.
     fn state_of(ed: &Editor) -> PublishState {
         let v = ed.video.as_ref().unwrap();
-        PublishState { rec: v.rec.clone(), items: ed.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() }
+        PublishState { profile: String::new(), rec: v.rec.clone(), items: ed.doc.items().to_vec(), events: v.events.clone(), edit: v.edit.clone() }
     }
 
     /// Run the update job against `stub`, as the editor's job thread does, with the test token.
@@ -4609,7 +4697,7 @@ mod tests {
     // ---- Publishing again from the editor that published: replace the chapter it uploaded ----
 
     fn pending(server: &str) -> Pending {
-        Pending { server: server.into(), chapter_title: "Typed chapter".into() }
+        Pending { profile: String::new(), server: server.into(), chapter_title: "Typed chapter".into() }
     }
 
     #[test]
@@ -4618,7 +4706,7 @@ mod tests {
         let saved = Kept::Saved { left_out: vec![], over: None };
         // The address in the form the address rule writes, as `keep_recording` keys the project.
         let r = remember_upload(&pending(" https://tours.example.com/ "), TOUR_TITLE, &done(saved.clone(), Outcome::Draft), None).unwrap();
-        assert_eq!(r, Remembered { key: ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() }, chapter_title: "Typed chapter".into(), tour_title: TOUR_TITLE.into(), kept: true });
+        assert_eq!(r, Remembered { profile: String::new(), key: ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() }, chapter_title: "Typed chapter".into(), tour_title: TOUR_TITLE.into(), kept: true });
         // Published, or uploaded and not published: the chapter is on the site either way.
         for outcome in [Outcome::Public { url: None }, Outcome::NotPublic { cancelled: true, error: String::new() }] {
             assert!(remember_upload(&pending("https://tours.example.com"), TOUR_TITLE, &done(Kept::Off, outcome), None).is_some_and(|r| !r.kept));
@@ -4628,6 +4716,116 @@ mod tests {
         let mut no_chapter = done(saved, Outcome::Draft);
         no_chapter.finished.chapter_id.clear();
         assert_eq!(remember_upload(&pending("https://tours.example.com"), TOUR_TITLE, &no_chapter, None), None);
+    }
+
+    /// A profile on the test site.
+    fn on_site(id: &str, name: &str, server: &str) -> crate::profiles::Profile {
+        crate::profiles::Profile { id: id.into(), name: name.into(), server: server.into(), account: None, workspace: None, identity: None, state: crate::profiles::State::Ready, named: true }
+    }
+
+    #[test]
+    fn an_update_belongs_to_the_profile_the_tour_was_uploaded_with() {
+        use crate::profiles::{Book, MIGRATED_ID};
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let mut ed = editor_of(&st);
+        let server = "https://tours.example.com";
+        // Two profiles on the same site: the address alone does not decide.
+        let book = |active: &str| Book { list: vec![on_site(MIGRATED_ID, "Alex · mythicshot.com", server), on_site("pb", "Sandbox admin", server)], active: Some(active.into()), legacy: Some(MIGRATED_ID.into()) };
+        let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
+        let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
+        let replace = Dialog::Replace { title: "Typed chapter".into(), target: target.clone(), logo_missing: false };
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { profile: "pb".into(), key, chapter_title: "Typed chapter".into(), tour_title: TOUR_TITLE.into(), kept: true });
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(dialog_in(v, server, TITLE.into(), &book("pb")), replace);
+        // Another profile is active: refused with the question, before any dialog.
+        assert_eq!(dialog_in(v, server, TITLE.into(), &book(MIGRATED_ID)), Dialog::OtherProfile { owner: Owner::Other { id: "pb".into(), name: "Sandbox admin".into() }, title: TITLE.into() });
+        // Its profile was removed: said so, and only a new tour.
+        let mut gone = book(MIGRATED_ID);
+        gone.list.retain(|p| p.id != "pb");
+        assert_eq!(dialog_in(v, server, TITLE.into(), &gone), Dialog::OtherProfile { owner: Owner::Removed, title: TITLE.into() });
+        // Linked before profiles: the first profile's tour.
+        ed.video.as_mut().unwrap().remembered.as_mut().unwrap().profile.clear();
+        let v = ed.video.as_ref().unwrap();
+        assert_eq!(dialog_in(v, server, TITLE.into(), &book(MIGRATED_ID)), replace);
+        assert!(matches!(dialog_in(v, server, TITLE.into(), &book("pb")), Dialog::OtherProfile { owner: Owner::Other { .. }, .. }));
+        // No profile at all: as before profiles (and nothing can be sent anyway).
+        assert_eq!(dialog_in(v, server, TITLE.into(), &Book::default()), replace);
+        // A new recording belongs to nobody yet.
+        let fresh = editor_of(&state(&tmp.path().join("fresh")));
+        assert_eq!(dialog_in(fresh.video.as_ref().unwrap(), server, TITLE.into(), &book(MIGRATED_ID)), Dialog::New(TITLE.into()));
+    }
+
+    #[test]
+    fn an_update_of_a_recording_nobody_owns_yet_goes_by_its_address_and_stamps_the_profile() {
+        use crate::profiles::Book;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (store, key, info, ed) = reopened_and_changed(tmp.path(), &s);
+        assert!(info.profile.is_empty(), "kept before profiles");
+        // No connection was carried over: the recording is nobody's, not a removed profile's.
+        let book = |server: &str| Book { list: vec![on_site("pb", "Sandbox admin", server)], active: Some("pb".into()), legacy: None };
+        let v = ed.video.as_ref().unwrap();
+        assert!(matches!(dialog_in(v, &s.base, TITLE.into(), &book(&s.base)), Dialog::Replace { .. }), "the active profile at its own address may update it");
+        assert!(matches!(dialog_in(v, "https://other.example.com", TITLE.into(), &book("https://other.example.com")), Dialog::Elsewhere { .. }), "at another address only a new tour or chapter");
+        // The update's save stamps the profile it went with.
+        let mut state = state_of(&ed);
+        state.profile = "pb".into();
+        update_to(&s, &state, &store, &Arc::new(Run::default())).unwrap();
+        assert_eq!(store.list().into_iter().find(|i| i.key == key).unwrap().profile, "pb");
+    }
+
+    #[test]
+    fn update_tour_runs_for_a_recording_nobody_owns_yet_at_its_own_address() {
+        use crate::profiles::{Book, Pin};
+        let tmp = tempfile::tempdir().unwrap();
+        let s = working_site("ready");
+        let (_store, _key, info, mut ed) = reopened_and_changed(tmp.path(), &s);
+        assert!(info.profile.is_empty());
+        let book = Book { list: vec![on_site("pb", "Sandbox admin", &s.base)], active: Some("pb".into()), legacy: None };
+        let pin = Pin { profile: Some("pb".into()), server: s.base.clone() };
+        let asked: Arc<std::sync::Mutex<Vec<Pin>>> = Arc::default();
+        let record = asked.clone();
+        let token: Arc<dyn Fn(&Pin) -> Result<String, String> + Send + Sync> = Arc::new(move |p: &Pin| {
+            record.lock().unwrap().push(p.clone());
+            Ok(TOKEN.to_string())
+        });
+        // Another profile's tour (by its stamp) is refused on this path too.
+        ed.video.as_mut().unwrap().origin.as_mut().unwrap().profile = "pother".into();
+        ed.start_update_with(TITLE.into(), target(), Before::new_tour(), pin.clone(), &book, token.clone());
+        assert!(!ed.exporting());
+        // Nobody's yet: the active profile at the recording's own address updates it.
+        ed.video.as_mut().unwrap().origin.as_mut().unwrap().profile.clear();
+        ed.start_update_with(TITLE.into(), target(), Before::new_tour(), pin.clone(), &book, token);
+        assert!(ed.exporting(), "Update tour starts");
+        until_done(&mut ed);
+        assert_eq!(ed.video.as_ref().unwrap().job_pin.as_ref(), Some(&pin));
+        assert_eq!(*asked.lock().unwrap(), vec![pin]);
+        assert!(s.lines().iter().any(|l| l.ends_with("/commit")), "{:?}", s.lines());
+    }
+
+    #[test]
+    fn a_kept_recording_is_linked_to_its_tour_in_the_profile_it_was_uploaded_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = stub(platform);
+        let store = store_in(tmp.path());
+        let mut st = state(tmp.path());
+        st.profile = "pb".into();
+        assert!(matches!(publish_to(&s, &st, false, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved { .. }));
+        let info = store.list().remove(0);
+        assert_eq!(info.profile, "pb");
+        assert!(project_text(&info).contains("\"profile\": \"pb\""), "{}", project_text(&info));
+        // Opened again through Edit, the editor knows whose tour it is.
+        let ed = reopened(&store, &info.key);
+        assert_eq!(ed.video.as_ref().unwrap().origin.as_ref().unwrap().profile, "pb");
+        assert_eq!(replaceable(ed.video.as_ref().unwrap()).unwrap().profile, "pb");
+        // A recording kept before profiles has no profile in its file at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let s = stub(platform);
+        assert!(matches!(publish_to(&s, &state(tmp.path()), false, &Keeping::In(store.clone())).unwrap().kept, Kept::Saved { .. }));
+        let info = store.list().remove(0);
+        assert!(info.profile.is_empty() && !project_text(&info).contains("\"profile\""));
     }
 
     /// Run `ed`'s frames until its job has ended.
@@ -4696,7 +4894,7 @@ mod tests {
         let job = EncodeJob::spawn(|_| Ok(PublishDone { finished: Finished { tour_id: OTHER_TOUR.into(), chapter_id: CH.into(), steps: 2, outcome: Outcome::Draft }, kept: Kept::Off }));
         let v = ed.video.as_mut().unwrap();
         v.job = Some(ExportJob::Publish(job, Arc::new(Run::default()), "A second tour".into(), Before::new_tour(), false));
-        v.publishing_to = Some(Pending { server: s.base.clone(), chapter_title: "A second tour".into() });
+        v.publishing_to = Some(Pending { profile: String::new(), server: s.base.clone(), chapter_title: "A second tour".into() });
         until_done(&mut ed);
         let v = ed.video.as_ref().unwrap();
         let r = replaceable(v).unwrap();
@@ -4713,7 +4911,7 @@ mod tests {
         let mut ed = editor_of(&st);
         let server = "https://tours.example.com";
         let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
-        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: key.clone(), chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { profile: String::new(), key: key.clone(), chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
         let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
         // Only the site saying the chapter is gone counts: a gone tour shows in every new
         // dialog's list, and anything else may work the next time.
@@ -4737,7 +4935,7 @@ mod tests {
         assert!(!ed.exporting());
         // A new upload from this editor is a chapter the site has: Replace is offered for it.
         let other = ProjectKey { chapter_id: "ch_bbbbbbbbbbbbbbbbbbbbbbbb".into(), ..key };
-        ed.video.as_mut().unwrap().remembered = Some(Remembered { key: other, chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
+        ed.video.as_mut().unwrap().remembered = Some(Remembered { profile: String::new(), key: other, chapter_title: TITLE.into(), tour_title: TOUR_TITLE.into(), kept: true });
         assert!(matches!(dialog_for(ed.video.as_ref().unwrap(), server, TITLE.into()), Dialog::Replace { .. }));
     }
 
@@ -4748,7 +4946,7 @@ mod tests {
         let store = store_in(tmp.path());
         let first = state(tmp.path());
         let done = publish_to(&s, &first, false, &Keeping::In(store.clone())).unwrap();
-        let r = remember_upload(&Pending { server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
+        let r = remember_upload(&Pending { profile: String::new(), server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
         assert_eq!(r.key, key_at(&s), "keyed as the saved project is");
         let mut ed = editor_of(&first);
         ed.video.as_mut().unwrap().edit = first.edit.clone();
@@ -4774,7 +4972,7 @@ mod tests {
         let store = store_in(tmp.path());
         let first = state(tmp.path());
         let done = publish_to(&s, &first, false, &Keeping::In(store.clone())).unwrap();
-        let r = remember_upload(&Pending { server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
+        let r = remember_upload(&Pending { profile: String::new(), server: s.base.clone(), chapter_title: TITLE.into() }, TOUR_TITLE, &done, None).unwrap();
         let mut ed = editor_of(&first);
         ed.video.as_mut().unwrap().remembered = Some(r.clone());
         ed.add_item(Shape::Text { at: pt(60.0, 100.0), text: NOTE.into() });
@@ -5037,7 +5235,7 @@ mod tests {
         state.edit.tour_doc.logo_path = Some(logo.clone());
         let store = store_in(tmp.path());
         let key = ProjectKey { server: "https://tours.example.com".into(), tour_id: TOUR.into(), chapter_id: CH.into() };
-        let snap = Snapshot { rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
+        let snap = Snapshot { profile: "", rec: &state.rec, title: TITLE, tour_title: TOUR_TITLE, steps: 2, edit: &state.edit, events: &state.events, items: &state.items };
         let saved = store.save(&key, &snap).unwrap();
         assert_eq!(saved.left_out, Vec::<String>::new());
         drop(state);

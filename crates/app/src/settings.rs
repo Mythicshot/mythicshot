@@ -102,6 +102,17 @@ pub struct Settings {
     /// Tours whose delete removed the tour but not yet all of its files. Kept until the site
     /// says nothing is left, so the delete can be finished after a restart.
     pub unfinished_deletes: Vec<UnfinishedDelete>,
+    /// The profiles: a name, a site address and (in the credential store, never here) a token
+    /// each. See `profiles`.
+    pub profiles: Vec<crate::profiles::Profile>,
+    /// The id of the profile uploads, sharing and the Tours page use; None for none.
+    pub active_profile: Option<String>,
+    /// The one connection of the versions before profiles was looked at, and made the first
+    /// profile when there was one. Files from before profiles have no such key: false.
+    pub profiles_migrated: bool,
+    /// The profile the one connection of earlier versions became (recordings linked before
+    /// profiles belong to it); None when there was none to carry over.
+    pub legacy_profile: Option<String>,
     /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
     #[serde(skip)]
     pub load_problem: Option<LoadProblem>,
@@ -131,6 +142,9 @@ fn warn_gb<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 /// A delete to finish: which site, which tour, and the title to show for it. No secret is in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnfinishedDelete {
+    /// The profile the delete was sent with; empty for one noted before profiles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
     pub server: String,
     pub tour_id: String,
     pub title: String,
@@ -381,6 +395,10 @@ impl Default for Settings {
             store_recordings_as_video: true,
             saved_recordings_warn_gb: DEFAULT_WARN_GB,
             unfinished_deletes: Vec::new(),
+            profiles: Vec::new(),
+            active_profile: None,
+            profiles_migrated: false,
+            legacy_profile: None,
             load_problem: None,
             open_editor: None,
             save_to_file: None,
@@ -719,6 +737,10 @@ impl Settings {
             publish_saved_for: _,
             publish_binding_settled: _,
             unfinished_deletes: _,
+            profiles: _,
+            active_profile: _,
+            profiles_migrated: _,
+            legacy_profile: _,
             load_problem: _,
             open_editor: _,
             save_to_file: _,
@@ -1260,7 +1282,7 @@ publish_server = \"https://tours.example.com\"
         let mut s = load_at(&path);
         s.magnifier = true;
         s.save_to(&path).unwrap();
-        assert!(Settings::patch_unfinished_deletes(&path, &[UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() }]));
+        assert!(Settings::patch_unfinished_deletes(&path, &[UnfinishedDelete { profile: String::new(), server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() }]));
         let read = load_at(&path);
         assert!(read.magnifier && read.unfinished_deletes.len() == 1 && read.load_problem.is_none());
         assert_eq!(names(tmp.path()), ["settings.toml"]);
@@ -1455,7 +1477,7 @@ publish_server = \"https://tours.example.com\"
     fn a_temporary_file_left_by_a_crash_is_written_over_and_never_read() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.toml");
-        let note = UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() };
+        let note = UnfinishedDelete { profile: String::new(), server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing".into() };
         std::fs::write(&path, "magnifier = false\n").unwrap();
         // The app stopped half-way through a save: part of a file, longer than the next one.
         let stale = format!("magnifier = true\npublish_server = \"https://tours.exa{}", "x".repeat(4000));
@@ -1497,7 +1519,7 @@ publish_server = \"https://tours.example.com\"
     fn a_note_written_at_once_changes_only_the_unfinished_deletes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.toml");
-        let note = UnfinishedDelete { server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing \"quoted\" · café".into() };
+        let note = UnfinishedDelete { profile: String::new(), server: "https://tours.example.com".into(), tour_id: "tour_bbbbbbbbbbbbbbbbbbbbbbbb".into(), title: "Testing \"quoted\" · café".into() };
         // Into an existing file: every other value stays, a key of a newer version included.
         let mut s = Settings { publish_server: "https://tours.example.com".into(), publish_saved_for: Some("https://tours.example.com".into()), publish_binding_settled: true, ..Settings::default() };
         s.hotkeys.insert(Action::CaptureWindow, "alt+KeyW".into());

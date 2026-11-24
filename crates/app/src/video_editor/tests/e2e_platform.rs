@@ -332,12 +332,12 @@ fn recording_of(root: &Path, name: &str, cards: &[&str]) -> PublishState {
         let card = Card { title: format!("Step {}", n + 1), body: body.into(), next_label: "Next".into(), anchor: Default::default(), point: None, placement: Default::default() };
         edit.tour_doc.steps.insert(step.src, StepExtras { card: Some(card), ..Default::default() });
     }
-    PublishState { rec, items: Vec::new(), events, edit }
+    PublishState { profile: String::new(), rec, items: Vec::new(), events, edit }
 }
 
 /// What an editor opened from the saved project would send: the project as loaded.
 fn state_from(loaded: &crate::project::Loaded) -> PublishState {
-    PublishState { rec: loaded.rec.clone(), items: loaded.restored.items.clone(), events: loaded.restored.events.clone(), edit: loaded.restored.edit.clone() }
+    PublishState { profile: String::new(), rec: loaded.rec.clone(), items: loaded.restored.items.clone(), events: loaded.restored.events.clone(), edit: loaded.restored.edit.clone() }
 }
 
 fn card_body(state: &PublishState, src: usize) -> &str {
