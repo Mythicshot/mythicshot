@@ -604,43 +604,53 @@ fn roomy_renders_update_done() {
     }
 }
 
-/// The popup fits the window at its smallest size at every scale: its words fit their places,
-/// nothing overlaps, and nothing leaves the window.
+/// The popup fits the window at its usual and smallest sizes at every scale: its words fit their
+/// places, nothing overlaps, nothing leaves the window, and each line of its text stays one line
+/// (the did-not-finish popup's two sentences are two lines, never three).
 #[test]
 fn the_update_popup_fits_the_smallest_window_at_every_scale() {
     use crate::update::pending::AfterUpdate;
     let v = |s: &str| crate::update::Version::parse(s).unwrap();
     let tours_conn = crate::tours_ui::tests::conn(TokenStatus::Saved);
-    let size = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
-    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-    for ppp in [1.0, 1.25, 2.0] {
-        for after in [AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }, AfterUpdate::NotFinished { from: v("0.2.38") }] {
-            let what = format!("{after:?} at {ppp}");
-            let ctx = crate::theme::test_context();
-            ctx.set_pixels_per_point(ppp);
-            let mut f = fixture(Kind::Add);
-            f.s.nav.close();
-            f.s.nav.apply(notice_request(None).0);
-            assert_eq!(f.s.nav.page(), Page::Home, "{what}");
-            f.s.update.set_notice(after, true);
-            let mut last = None;
-            for _ in 0..3 {
-                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), ..Default::default() }, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
-                out.textures_delta.clear();
-                last = Some(out);
+    for (name, size) in SIZES {
+        let size = egui::vec2(size[0], size[1]);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for ppp in [1.0, 1.25, 2.0] {
+            for after in [AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }, AfterUpdate::NotFinished { from: v("0.2.38") }] {
+                let what = format!("{after:?} at {name} {ppp}");
+                let ctx = crate::theme::test_context();
+                ctx.set_pixels_per_point(ppp);
+                let mut f = fixture(Kind::Add);
+                f.s.nav.close();
+                f.s.nav.apply(notice_request(None).0);
+                assert_eq!(f.s.nav.page(), Page::Home, "{what}");
+                f.s.update.set_notice(after, true);
+                let mut last = None;
+                for _ in 0..3 {
+                    let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), ..Default::default() }, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
+                    out.textures_delta.clear();
+                    last = Some(out);
+                }
+                let out = last.unwrap();
+                // The popup's own shapes, from its frame on.
+                let title = text_rect(&out, crate::update_ui::notice_view(after).0).unwrap_or_else(|| panic!("{what}: the title"));
+                // The nearest filled rectangle under the title, drawn before it: the popup's frame.
+                let at_title = out.shapes.iter().rposition(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == crate::update_ui::notice_view(after).0)).unwrap();
+                let frame = out.shapes[..at_title].iter().rposition(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.fill.a() > 0 && r.rect.contains(title.center()) && r.rect.width() > title.width() + theme::DIALOG_PAD)).unwrap_or_else(|| panic!("{what}: the popup's frame"));
+                let egui::Shape::Rect(box_) = &out.shapes[frame].shape else { unreachable!() };
+                assert!((box_.rect.width() - (theme::DIALOG_WIDTH + 2.0 * theme::DIALOG_PAD)).abs() <= 2.5, "{what}: a dialog's width: {:?}", box_.rect);
+                let popup = egui::FullOutput { shapes: out.shapes[frame..].to_vec(), ..Default::default() };
+                theme::checks::assert_no_overlaps(&popup, &what);
+                assert!(theme::checks::assert_texts_fit(&popup, &what) >= 3, "{what}");
+                assert_inside_across(&popup, window, &what);
+                // The line under the title: as many rows as it has lines, so nothing wrapped.
+                let body = crate::update_ui::notice_view(after).1;
+                let rows = shapes_of(&popup).into_iter().find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text() == body => Some(t.galley.rows.len()),
+                    _ => None,
+                });
+                assert_eq!(rows, Some(body.lines().count()), "{what}: {body:?}");
             }
-            let out = last.unwrap();
-            // The popup's own shapes, from its frame on.
-            let title = text_rect(&out, crate::update_ui::notice_view(after).0).unwrap_or_else(|| panic!("{what}: the title"));
-            // The nearest filled rectangle under the title, drawn before it: the popup's frame.
-            let at_title = out.shapes.iter().rposition(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == crate::update_ui::notice_view(after).0)).unwrap();
-            let frame = out.shapes[..at_title].iter().rposition(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.fill.a() > 0 && r.rect.contains(title.center()) && r.rect.width() > title.width() + theme::DIALOG_PAD)).unwrap_or_else(|| panic!("{what}: the popup's frame"));
-            let egui::Shape::Rect(box_) = &out.shapes[frame].shape else { unreachable!() };
-            assert!((box_.rect.width() - (theme::DIALOG_WIDTH + 2.0 * theme::DIALOG_PAD)).abs() <= 2.5, "{what}: a dialog's width: {:?}", box_.rect);
-            let popup = egui::FullOutput { shapes: out.shapes[frame..].to_vec(), ..Default::default() };
-            theme::checks::assert_no_overlaps(&popup, &what);
-            assert!(theme::checks::assert_texts_fit(&popup, &what) >= 3, "{what}");
-            assert_inside_across(&popup, window, &what);
         }
     }
 }

@@ -202,16 +202,28 @@ fn something_else_at_the_notes_place_never_stops_the_start() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "needs the symlink right or Developer Mode"]
 fn a_link_at_the_notes_place_is_never_followed() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("elsewhere.toml");
     write(&target, note("0.2.38", "0.2.39")).unwrap();
     let at = dir.path().join(FILE_NAME);
-    // Making a link needs a right not every account has: without it there is nothing to test.
-    if std::os::windows::fs::symlink_file(&target, &at).is_err() {
-        return;
-    }
+    std::os::windows::fs::symlink_file(&target, &at).expect("making a link needs the symlink right or Developer Mode");
     assert_eq!(take(&at, SystemTime::now(), v("0.2.39")), None, "a note reached through a link is not the app's");
     assert!(std::fs::symlink_metadata(&at).is_err(), "the link is removed");
     assert!(target.exists(), "what it pointed to is left alone");
+}
+
+/// A hard link is another name of the same plain file, not a link that leads elsewhere: it is read
+/// as the note on purpose. Only the person's own account can make one in the settings folder.
+#[test]
+fn a_hard_link_at_the_notes_place_is_read_as_a_plain_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("other-name.toml");
+    write(&other, note("0.2.38", "0.2.39")).unwrap();
+    let at = dir.path().join(FILE_NAME);
+    std::fs::hard_link(&other, &at).unwrap();
+    assert_eq!(take(&at, SystemTime::now(), v("0.2.39")), Some(AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }));
+    assert!(!at.exists(), "the note's name is removed");
+    assert!(other.exists(), "the other name is left alone");
 }

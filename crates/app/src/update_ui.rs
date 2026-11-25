@@ -104,9 +104,10 @@ pub fn updated_text(from: Version, to: Version) -> String {
     format!("Updated from {from} to {to}.")
 }
 
-/// Approved: the popup's line when the update did not finish, naming where Check now is.
+/// Approved: the popup's lines when the update did not finish, naming where Check now is. The
+/// second sentence stands on a line of its own, so "Preferences › Updates" is never split.
 pub fn not_finished_text(from: Version) -> String {
-    format!("Mythicshot is still {from}. You can try again from Preferences › Updates.")
+    format!("Mythicshot is still {from}.\nYou can try again from Preferences › Updates.")
 }
 
 /// The popup's buttons, each with its approved label.

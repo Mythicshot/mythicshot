@@ -435,14 +435,15 @@ fn the_popups_words_are_the_owners() {
     assert_eq!(UPDATED_TITLE, "Mythicshot is up to date");
     assert_eq!(updated_text(v("0.2.38"), v("0.2.39")), "Updated from 0.2.38 to 0.2.39.");
     assert_eq!(NOT_FINISHED_TITLE, "The update did not finish");
-    assert_eq!(not_finished_text(v("0.2.38")), "Mythicshot is still 0.2.38. You can try again from Preferences \u{203A} Updates.");
+    // The approved words, the space between the two sentences a line break.
+    assert_eq!(not_finished_text(v("0.2.38")), "Mythicshot is still 0.2.38.\nYou can try again from Preferences \u{203A} Updates.");
     assert!(not_finished_text(v("0.2.38")).contains(" › "), "one character, U+203A, a space each side");
     assert_eq!(NoticeButton::WhatsNew.label(), "What's new");
     assert_eq!(NoticeButton::Ok.label(), "OK");
     assert_eq!(update::CHANGES_PAGE, "https://mythicshot.com/changes/");
     // Each popup and its buttons, OK last (the primary).
     assert_eq!(notice_view(updated()), (UPDATED_TITLE, "Updated from 0.2.38 to 0.2.39.".to_string(), &[NoticeButton::WhatsNew, NoticeButton::Ok][..]));
-    assert_eq!(notice_view(not_finished()), (NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38. You can try again from Preferences › Updates.".to_string(), &[NoticeButton::Ok][..]));
+    assert_eq!(notice_view(not_finished()), (NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.\nYou can try again from Preferences › Updates.".to_string(), &[NoticeButton::Ok][..]));
 }
 
 #[test]
@@ -524,7 +525,7 @@ fn each_popup_shows_its_title_its_line_and_its_buttons() {
     u.set_notice(not_finished(), false);
     let (out, _) = notice_frames(&mut u, vec![]);
     let texts = texts_of(&out);
-    for want in [NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38. You can try again from Preferences › Updates.", "OK"] {
+    for want in [NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.\nYou can try again from Preferences › Updates.", "OK"] {
         assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
     }
     assert!(!texts.iter().any(|t| t == "What's new"), "no other button: {texts:?}");
