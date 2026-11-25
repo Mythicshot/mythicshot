@@ -25,8 +25,10 @@ function readTourData() {
 "#;
 
 /// Rules a site's page needs beyond the preview's: the link back to the index, which sits where the
-/// preview's label does and looks like it.
-const SITE_CSS: &str = "\n  a.tag { text-decoration: none; white-space: nowrap; }\n  a.tag:hover { color: #d8dbe2; border-color: #5a6378; }\n  #needs-script { display: block; max-width: 34em; margin: 0; padding: 32px 24px; line-height: 1.5; color: #d8dbe2; white-space: normal; }\n";
+/// preview's label does and looks like it. Its colours are the player's chrome, by name (see the chrome
+/// block at the top of `tour_preview.html`); a hovered link brightens its border to muted text, as the
+/// app's hovered controls do.
+const SITE_CSS: &str = "\n  a.tag { text-decoration: none; white-space: nowrap; }\n  a.tag:hover { color: var(--chrome-text); border-color: var(--chrome-muted); }\n  #needs-script { display: block; max-width: 34em; margin: 0; padding: 32px 24px; line-height: 1.5; color: var(--chrome-text); white-space: normal; }\n";
 
 /// Shown inside the stage until the player starts, so a page whose script a browser blocks is not just empty.
 pub const NEEDS_SCRIPT: &str = "This tour needs scripts enabled. If you opened it from a folder and it stays empty, put the site on a web server.";
@@ -241,6 +243,57 @@ mod tests {
         assert!(INDEX_TEMPLATE.contains("aspect-ratio: 16 / 10") && INDEX_TEMPLATE.contains("prefers-color-scheme: dark"));
         // The tour page's title is the preview's, which ends long titles with an ellipsis.
         assert!(tour::player_css().contains("header h1 { flex: 1; margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"));
+    }
+
+    /// A site's own rules take the player's chrome colours by name and type none of their own.
+    #[test]
+    fn a_site_page_uses_the_player_chrome() {
+        assert!(!SITE_CSS.contains(": #") && !SITE_CSS.contains("rgb") && !SITE_CSS.contains("hsl"), "{SITE_CSS}");
+        assert!(SITE_CSS.contains("a.tag:hover { color: var(--chrome-text); border-color: var(--chrome-muted); }"), "{SITE_CSS}");
+        assert!(SITE_CSS.contains("color: var(--chrome-text); white-space: normal;"), "{SITE_CSS}");
+        let css = assets().css;
+        for name in ["chrome-text", "chrome-muted"] {
+            assert!(css.contains(&format!("--{name}:")), "{name} is defined in the shared stylesheet");
+        }
+        for old in tour::brand_css::OLD_SLATE_CHROME {
+            assert!(!css.contains(old), "old chrome colour {old}");
+        }
+    }
+
+    /// The index follows the system theme, so it copies both values of each neutral token: the light ones
+    /// from `tokens.json`, the dark ones from the app's palette, which is the same file's dark theme.
+    #[test]
+    fn the_index_chrome_is_the_brand_in_both_themes() {
+        use crate::theme::{DARK, contrast};
+        use crate::tour::brand_css::{colour, hex, var};
+        let (light, dark) = INDEX_TEMPLATE.split_once("@media (prefers-color-scheme: dark)").unwrap();
+        let tokens = [
+            ("bg", "#f7f5fb", DARK.ground),    // ground
+            ("card", "#fdfcff", DARK.surface), // surface
+            ("line", "#ddd7ea", DARK.border),  // border
+            ("shade", "#ddd7ea", DARK.border), // border, as the fill behind a picture still loading
+            ("fg", "#1d1828", DARK.text),      // text
+            ("muted", "#5c5470", DARK.muted),  // text-muted
+            ("focus", "#8a5a00", DARK.focus),  // focus
+        ];
+        for (name, l, d) in tokens {
+            assert_eq!(var(light, name), l, "light --{name}");
+            assert_eq!(var(dark, name), hex(d), "dark --{name}");
+        }
+        assert!(INDEX_TEMPLATE.contains(".tour:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }"));
+        assert!(!INDEX_TEMPLATE.contains("outline: none") && !INDEX_TEMPLATE.contains("outline: 0"));
+        for theme in [light, dark] {
+            let (bg, card) = (colour(var(theme, "bg")), colour(var(theme, "card")));
+            for (what, fg, min) in [("text", "fg", 4.5), ("muted text", "muted", 4.5), ("focus ring", "focus", 3.0)] {
+                for (on, ground) in [("ground", bg), ("surface", card)] {
+                    let c = contrast(colour(var(theme, fg)), ground);
+                    assert!(c >= min, "{what} on {on}: {c:.2}");
+                }
+            }
+        }
+        for old in ["#f5f6f8", "#1b2029", "#5b6474", "#e6e9ee", "#2f6fdb", "#14161b", "#e6e9ef", "#9aa3b5", "#1c2028", "#262b35", "#8ab4ff", "rgba("] {
+            assert!(!INDEX_TEMPLATE.contains(old), "old index colour {old}");
+        }
     }
 
     #[test]

@@ -6,13 +6,32 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Tour preview</title>
 <style>/*PLAYER_CSS_BEGIN*/
+  /* The player's own chrome: bars, buttons, labels, the focus ring and the older players' hotspot and end card.
+     Each is a copy of the brand token named beside it (tokens.json, dark values: the player is always dark),
+     the same values as the app's palette in theme.rs, so a brand change is this block. A tour's accent, card
+     style, backdrop and logo are the author's and are not here. */
+  /*CHROME_BEGIN*/:root {
+    --chrome-ground: #16121c;                     /* ground */
+    --chrome-surface: #1e1928;                    /* surface */
+    --chrome-border: #3a3250;                     /* border */
+    --chrome-border-strong: #7c7399;              /* border-strong */
+    --chrome-text: #ede8f5;                       /* text */
+    --chrome-muted: #b2a8c6;                      /* text-muted */
+    --chrome-gold: #f5b841;                       /* gold */
+    --chrome-gold-soft: rgba(245, 184, 65, .18);  /* gold, as the older players' hotspot fill */
+    --chrome-gold-pulse: rgba(245, 184, 65, .6);  /* gold, where that hotspot's pulse starts */
+    --chrome-gold-gone: rgba(245, 184, 65, 0);    /* gold, where it ends */
+    --chrome-gold-text: #f5b841;                  /* accent-text */
+    --chrome-focus: #f5b841;                      /* focus */
+    --chrome-end-scrim: rgba(22, 18, 28, .72);    /* ground, behind the older players' end card */
+  }/*CHROME_END*/
   :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse; the editor's Tour view uses the same as PULSE_PERIOD in tour_view.rs. */ --pulse-period: 1.9s; }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
-  body { display: flex; flex-direction: column; background: #16181d; color: #d8dbe2; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid #262a33; }
+  body { display: flex; flex-direction: column; background: var(--chrome-ground); color: var(--chrome-text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--chrome-border); }
   header h1 { flex: 1; margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tag { padding: 2px 8px; border: 1px solid #3a4152; border-radius: 999px; color: #9aa3b5; font-size: 12px; }
+  .tag { padding: 2px 8px; border: 1px solid var(--chrome-border-strong); border-radius: 999px; color: var(--chrome-muted); font-size: 12px; }
   main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
   #stage { position: relative; display: inline-block; line-height: 0; }
   #frame, #view { position: relative; }
@@ -25,15 +44,15 @@
   #layer svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .note { position: absolute; white-space: pre; }
   .bubble-text { position: absolute; display: flex; align-items: center; padding: .45em .6em; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
-  #ring { position: absolute; z-index: 3; width: 36px; height: 36px; margin: -18px 0 0 -18px; padding: 0; border: 3px solid #f2b84b; border-radius: 50%; background: rgba(242, 184, 75, .18); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
+  #ring { position: absolute; z-index: 3; width: 36px; height: 36px; margin: -18px 0 0 -18px; padding: 0; border: 3px solid var(--chrome-gold); border-radius: 50%; background: var(--chrome-gold-soft); cursor: pointer; animation: pulse 1.4s ease-out infinite; }
   #ring[hidden] { display: none; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(242, 184, 75, .6); } 100% { box-shadow: 0 0 0 20px rgba(242, 184, 75, 0); } }
-  #end { display: none; position: absolute; inset: 0; z-index: 4; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(22, 24, 29, .72); border-radius: 6px; line-height: 1.4; font-size: 18px; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 var(--chrome-gold-pulse); } 100% { box-shadow: 0 0 0 20px var(--chrome-gold-gone); } }
+  #end { display: none; position: absolute; inset: 0; z-index: 4; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: var(--chrome-end-scrim); border-radius: 6px; line-height: 1.4; font-size: 18px; }
   #end.on { display: flex; }
-  #restart { color: #f2b84b; }
-  :focus-visible { outline: 3px solid #8ab4ff; outline-offset: 3px; }
-  footer { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 10px 16px; border-top: 1px solid #262a33; }
-  button { padding: 6px 14px; border: 1px solid #3a4152; border-radius: 6px; background: #20242d; color: inherit; font: inherit; cursor: pointer; }
+  #restart { color: var(--chrome-gold-text); }
+  :focus-visible { outline: 2px solid var(--chrome-focus); outline-offset: 2px; }
+  footer { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 10px 16px; border-top: 1px solid var(--chrome-border); }
+  button { padding: 6px 14px; border: 1px solid var(--chrome-border-strong); border-radius: 6px; background: var(--chrome-surface); color: inherit; font: inherit; cursor: pointer; }
   button:disabled { opacity: .4; cursor: default; }
   [hidden] { display: none !important; }
   .sr { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -110,8 +129,8 @@
   .p-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px; }
   #card .p-actions > * { display: inline-block; }
   #autoplay { min-width: 76px; }
-  #missing { display: flex; align-items: center; justify-content: center; padding: 16px; background: #1b1f27 repeating-linear-gradient(135deg, rgba(255, 255, 255, .03) 0 14px, transparent 14px 28px); color: #8e97a8; font-size: 13px; line-height: 1.4; text-align: center; }
-  .empty { margin: 0; color: #9aa3b5; font-size: 15px; line-height: 1.4; }
+  #missing { display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--chrome-surface) repeating-linear-gradient(135deg, rgba(255, 255, 255, .03) 0 14px, transparent 14px 28px); color: var(--chrome-muted); font-size: 13px; line-height: 1.4; text-align: center; }
+  .empty { margin: 0; color: var(--chrome-muted); font-size: 15px; line-height: 1.4; }
   .v3 #end { border-radius: 0; }
   .v3 #restart { color: var(--accent); }
 
