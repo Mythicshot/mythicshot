@@ -361,7 +361,7 @@ pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
     }
 }
 
-/// The host name for the "Connected to" line: the saved server's, when a token is saved too.
+/// The host name for the "Signed in to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
 /// `bound` is the address the token was saved for: with another address set, the token is not
 /// used there, so that is not a connection. Nor is a token the site refused the last time it
@@ -444,12 +444,24 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
     if s.update.banner().is_some() {
         egui::Panel::top("update-line").resizable(false).frame(egui::Frame::new()).show(ui, |ui| crate::update_ui::banner_ui(ui, &mut s.update));
     }
-    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
+    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), workspace, &mut out));
     egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| theme::page(ui, |ui| page_ui(ui, s, tours_conn, workspace, &mut out)));
     s.take(out);
 }
 
-fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
+/// The lines at the foot of the left menu: "Signed in to" and the host when this computer holds
+/// a saved connection for the active address (no site is asked), else "Not connected".
+pub fn nav_footer(host: Option<&str>) -> Vec<String> {
+    match host {
+        Some(host) => vec![SIGNED_IN_TO.to_string(), host.to_string()],
+        None => vec![workspace_ui::NOT_CONNECTED.to_string()],
+    }
+}
+
+/// What the foot of the left menu says above the host of a saved connection.
+pub const SIGNED_IN_TO: &str = "Signed in to";
+
+fn nav_ui(ui: &mut egui::Ui, current: Page, given: Option<&WorkspaceGiven>, out: &mut PageOut) {
     theme::roomy(ui);
     ui.add_space(theme::ITEM_GAP);
     ui.spacing_mut().item_spacing.y = theme::GRID;
@@ -459,20 +471,28 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
         }
     }
     // Whether a site is set up, at the bottom of the menu.
-    let token = publish_ui::token_status();
-    if token == TokenStatus::Checking {
-        ui.ctx().request_repaint_after(Duration::from_millis(200));
-    }
-    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref(), publish_ui::token_refused());
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-        ui.add_space(8.0);
-        match host {
-            Some(host) => {
-                ui.add(egui::Label::new(RichText::new(host).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
-                ui.label(RichText::new("Connected to").size(theme::SMALL_SIZE).color(theme::MUTED));
+    let host = match given {
+        // A test's own profile and connection.
+        Some((active, conn)) => active.as_ref().and_then(|a| connected_host(&a.server, &conn.token, conn.bound.as_deref(), conn.refused)),
+        None => {
+            let token = publish_ui::token_status();
+            if token == TokenStatus::Checking {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
-            None => {
-                ui.label(RichText::new("Not connected").size(theme::SMALL_SIZE).color(theme::MUTED));
+            connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref(), publish_ui::token_refused())
+        }
+    };
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+        ui.add_space(theme::ITEM_GAP);
+        // Laid out from the bottom: the last line first.
+        let lines = nav_footer(host.as_deref());
+        for (i, line) in lines.iter().enumerate().rev() {
+            let text = RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED);
+            if i + 1 == lines.len() && lines.len() > 1 {
+                // The host: cut short with "…" when it does not fit.
+                ui.add(egui::Label::new(text).truncate());
+            } else {
+                ui.label(text);
             }
         }
     });

@@ -543,3 +543,17 @@ fn the_profile_card_stays_when_no_profile_is_active() {
         }
     }
 }
+
+/// The foot of the left menu says this computer holds a saved connection, "Signed in to" the
+/// host, without claiming the site answered; with none, "Not connected" as before.
+#[test]
+fn the_left_menu_says_signed_in_to_the_host_of_a_saved_connection() {
+    assert_eq!(super::super::nav_footer(Some("tours.example.com")), vec!["Signed in to".to_string(), "tours.example.com".to_string()]);
+    assert_eq!(super::super::nav_footer(None), vec![workspace_ui::NOT_CONNECTED.to_string()]);
+    let (_ctx, f, out) = settled(Kind::Connected, egui::vec2(SIZE[0], SIZE[1]), 1.0);
+    let t = texts(&out);
+    let host = crate::publish::host_of(&f._site.base).unwrap();
+    let (label, shown) = (text_rect(&out, "Signed in to").expect("Signed in to"), text_rect(&out, &host).expect("the host"));
+    assert!(label.right() <= NAV_WIDTH && shown.right() <= NAV_WIDTH && label.bottom() <= shown.top() + 0.5, "{t:?}");
+    assert!(!t.iter().any(|x| x == "Connected to"), "{t:?}");
+}
