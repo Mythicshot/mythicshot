@@ -153,31 +153,70 @@ fn open_disk_file(path: &Path) -> Result<File, ImageError> {
     Ok(file)
 }
 
-/// One picture file read at a time, off the window's thread: a request while one is being read
-/// is ignored (the first one opens; the person can ask again once it has).
-#[derive(Debug, Default)]
-pub struct LoadGate {
-    loading: bool,
+/// The most picture reads that may run at once, each on a thread of its own. A read stuck on a
+/// share that does not answer keeps its thread, so this bounds how many such threads there are.
+pub const MAX_READS: usize = 2;
+
+/// A read to start: its generation and the file.
+pub type ReadJob = (u64, PathBuf);
+
+/// What became of a read that has ended.
+#[derive(Debug)]
+pub enum Settled {
+    /// The newest request's picture: open it in an editor with this title.
+    Open(RgbaImage, String),
+    /// The newest request's file could not be opened: say this sentence.
+    Failed(String),
+    /// A newer request came after it: its picture is dropped and nothing is said.
+    Superseded,
 }
 
-impl LoadGate {
-    /// Whether a read may start now; when it may, it counts as started.
-    pub fn begin(&mut self) -> bool {
-        !std::mem::replace(&mut self.loading, true)
+/// The picture reads off the window's thread, the newest request winning: every request (the
+/// tile, the tray's dialog, a drop) is numbered, a result is used only when it is the newest's,
+/// and an older read that ends later is dropped. At most [`MAX_READS`] run at once; a request
+/// beyond that waits until one ends, and only the newest waiting request is kept.
+#[derive(Debug, Default)]
+pub struct ImageLoads {
+    newest: u64,
+    running: usize,
+    waiting: Option<ReadJob>,
+}
+
+impl ImageLoads {
+    /// A new request for `path`: the read to start now, or none when [`MAX_READS`] run already
+    /// (it starts when one ends, unless a newer request replaces it first).
+    pub fn request(&mut self, path: PathBuf) -> Option<ReadJob> {
+        self.newest += 1;
+        if self.running < MAX_READS {
+            self.running += 1;
+            Some((self.newest, path))
+        } else {
+            self.waiting = Some((self.newest, path));
+            None
+        }
     }
 
-    /// The read has ended, opened or not.
-    pub fn end(&mut self) {
-        self.loading = false;
-    }
-
-    pub fn is_loading(&self) -> bool {
-        self.loading
+    /// The read numbered `generation` of `path` has ended with `result`: what to do with it, and
+    /// a waiting read to start now.
+    pub fn finished(&mut self, generation: u64, path: &Path, result: Result<RgbaImage, ImageError>) -> (Settled, Option<ReadJob>) {
+        self.running = self.running.saturating_sub(1);
+        let next = if self.running < MAX_READS { self.waiting.take() } else { None };
+        if next.is_some() {
+            self.running += 1;
+        }
+        if generation != self.newest {
+            return (Settled::Superseded, next);
+        }
+        let settled = match result {
+            Ok(img) => Settled::Open(img, path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            Err(e) => Settled::Failed(could_not_open(path, &e)),
+        };
+        (settled, next)
     }
 }
 
 /// Read the picture at `path` on a thread of its own and hand the result to `done` there. A
-/// panic anywhere in the read still ends in a result, so the gate is always let go.
+/// panic anywhere in the read still ends in a result, so the read is always counted as ended.
 pub fn spawn_load(path: PathBuf, done: impl FnOnce(PathBuf, Result<RgbaImage, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path))).unwrap_or_else(|_| Err(not_a_picture()));

@@ -262,12 +262,7 @@ fn a_file_with_a_cloud_reparse_attribute_still_opens() {
 }
 
 #[test]
-fn one_picture_is_read_at_a_time_off_the_calling_thread() {
-    let mut gate = LoadGate::default();
-    assert!(gate.begin() && gate.is_loading());
-    assert!(!gate.begin(), "a second request while one is read is ignored");
-    gate.end();
-    assert!(gate.begin());
+fn a_picture_is_read_off_the_calling_thread_and_always_reports() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("a.png");
     std::fs::write(&path, png(&RgbaImage::new(3, 2))).unwrap();
@@ -277,10 +272,59 @@ fn one_picture_is_read_at_a_time_off_the_calling_thread() {
     let (p, dims, on) = rx.recv().unwrap();
     assert_eq!((p, dims), (path, Some((3, 2))));
     assert_ne!(on, caller, "read on a thread of its own");
-    // A file that cannot be opened still reports, so the gate is let go.
+    // A file that cannot be opened still reports, so the read is counted as ended.
     let (tx, rx) = std::sync::mpsc::channel();
     spawn_load(tmp.path().join("gone.png"), move |_, result| tx.send(result.is_err()).unwrap()).join().unwrap();
     assert!(rx.recv().unwrap());
+}
+
+fn gone() -> ImageError {
+    ImageError::IoError(std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[test]
+fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
+    let (a, b) = (PathBuf::from("C:/p/a.png"), PathBuf::from("C:/p/b.png"));
+    let mut loads = ImageLoads::default();
+    let (ga, _) = loads.request(a.clone()).expect("starts at once");
+    let (gb, _) = loads.request(b.clone()).expect("a second read runs beside the first");
+    // The newer one ends first and opens.
+    let (settled, next) = loads.finished(gb, &b, Ok(RgbaImage::new(4, 4)));
+    assert!(matches!(settled, Settled::Open(ref img, ref title) if img.dimensions() == (4, 4) && title == "b.png"), "{settled:?}");
+    assert!(next.is_none());
+    // The older one ends later: dropped, picture and all, nothing said.
+    let (settled, _) = loads.finished(ga, &a, Ok(RgbaImage::new(2, 2)));
+    assert!(matches!(settled, Settled::Superseded));
+    // A superseded read that fails says nothing either.
+    let (gc, _) = loads.request(a.clone()).unwrap();
+    let (gd, _) = loads.request(b.clone()).unwrap();
+    assert!(matches!(loads.finished(gc, &a, Err(gone())).0, Settled::Superseded));
+    // The newest failing says the usual sentence.
+    let (settled, _) = loads.finished(gd, &b, Err(gone()));
+    match settled {
+        Settled::Failed(sentence) => assert_eq!(sentence, could_not_open(&b, &gone())),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn at_most_two_reads_run_and_only_the_newest_waiting_request_is_kept() {
+    let mut loads = ImageLoads::default();
+    let p = |n: &str| PathBuf::from(format!("C:/p/{n}.png"));
+    let (g1, _) = loads.request(p("1")).unwrap();
+    let (g2, _) = loads.request(p("2")).unwrap();
+    assert!(loads.request(p("3")).is_none(), "a third waits");
+    assert!(loads.request(p("4")).is_none(), "and a fourth replaces it");
+    // One ends: the newest waiting request starts, the replaced one never does.
+    let (settled, next) = loads.finished(g1, &p("1"), Ok(RgbaImage::new(1, 1)));
+    assert!(matches!(settled, Settled::Superseded));
+    let (g4, path) = next.expect("the waiting request starts");
+    assert_eq!(path, p("4"));
+    // The other old one ends: nothing waits, nothing starts.
+    let (settled, next) = loads.finished(g2, &p("2"), Err(gone()));
+    assert!(matches!(settled, Settled::Superseded) && next.is_none());
+    let (settled, _) = loads.finished(g4, &p("4"), Ok(RgbaImage::new(1, 1)));
+    assert!(matches!(settled, Settled::Open(..)));
 }
 
 #[test]

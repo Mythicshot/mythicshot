@@ -87,7 +87,7 @@ enum AppEvent {
     /// to open, and the recording ready for an editor or why there is none.
     ProjectOpened(Box<(project::ProjectKey, Result<project::Loaded, project::LoadError>)>),
     /// The thread that read a picture file has ended: the file, and its picture or why there is none.
-    ImageLoaded(Box<(PathBuf, Result<image::RgbaImage, image::ImageError>)>),
+    ImageLoaded(Box<(u64, PathBuf, Result<image::RgbaImage, image::ImageError>)>),
 }
 
 /// A recording kept as a video that is being expanded for an editor, on a thread of its own.
@@ -223,8 +223,8 @@ struct App {
     draw_when_live: bool,
     /// The recording kept as a video that is being expanded for an editor.
     opening: Option<Opening>,
-    /// A picture file being read for an editor, on a thread of its own; one at a time.
-    image_gate: open_image::LoadGate,
+    /// The picture files being read for an editor, on threads of their own; the newest request wins.
+    images: open_image::ImageLoads,
     /// Quit asked the editors that would lose something, and waits for their answers.
     quitting: bool,
     /// The capture waiting in `hide_then_run` came from an editor's menu bar, for the capture log.
@@ -375,7 +375,7 @@ impl App {
             started: Instant::now(),
             draw_when_live: false,
             opening: None,
-            image_gate: open_image::LoadGate::default(),
+            images: open_image::ImageLoads::default(),
             quitting: false,
             menu_capture: false,
             update_started: false,
@@ -446,8 +446,8 @@ impl App {
                     self.project_opened(key, result);
                 }
                 AppEvent::ImageLoaded(done) => {
-                    let (path, result) = *done;
-                    self.image_loaded(&path, result);
+                    let (generation, path, result) = *done;
+                    self.image_loaded(ctx, generation, &path, result);
                 }
                 AppEvent::Input(ev) => {
                     if self.session.is_some() {
@@ -1101,38 +1101,39 @@ impl App {
     }
 
     fn open_file(&mut self, ctx: &egui::Context) {
-        // A picture still being read: this request is ignored, the dialog included.
-        if self.image_gate.is_loading() {
-            return;
-        }
         let Some(path) = open_image::pick(&self.settings.output_dir) else { return };
         self.open_image_file(ctx, path);
     }
 
     /// Read the picture file at `path` within [`open_image::load`]'s limits on a thread of its
     /// own, so the windows stay responsive; [`AppEvent::ImageLoaded`] brings it back, and the
-    /// editor is made here, on the app's thread. A request while another picture is being read
-    /// is ignored.
+    /// editor is made here, on the app's thread. A request while others are being read is taken
+    /// too: the newest wins ([`open_image::ImageLoads`]).
     fn open_image_file(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if !self.image_gate.begin() {
-            return;
+        if let Some(job) = self.images.request(path) {
+            self.start_image_read(ctx, job);
         }
+    }
+
+    fn start_image_read(&mut self, ctx: &egui::Context, (generation, path): open_image::ReadJob) {
         let (tx, wake) = (self.tx.clone(), ctx.clone());
         open_image::spawn_load(path, move |path, result| {
-            let _ = tx.send(AppEvent::ImageLoaded(Box::new((path, result))));
+            let _ = tx.send(AppEvent::ImageLoaded(Box::new((generation, path, result))));
             wake.request_repaint();
         });
     }
 
-    /// A picture file has been read: open it in an editor, or say it could not be opened.
-    fn image_loaded(&mut self, path: &Path, result: Result<image::RgbaImage, image::ImageError>) {
-        self.image_gate.end();
-        match result {
-            Ok(img) => {
-                let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.open_editor(img, title);
-            }
-            Err(e) => self.notify(open_image::could_not_open(path, &e)),
+    /// A picture file has been read: open it in an editor or say it could not be opened, when it
+    /// is the newest request's; an older one is dropped without a word.
+    fn image_loaded(&mut self, ctx: &egui::Context, generation: u64, path: &Path, result: Result<image::RgbaImage, image::ImageError>) {
+        let (settled, next) = self.images.finished(generation, path, result);
+        if let Some(job) = next {
+            self.start_image_read(ctx, job);
+        }
+        match settled {
+            open_image::Settled::Open(img, title) => self.open_editor(img, title),
+            open_image::Settled::Failed(sentence) => self.notify(sentence),
+            open_image::Settled::Superseded => {}
         }
     }
 
