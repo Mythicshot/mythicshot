@@ -371,22 +371,24 @@ impl Shared {
     }
 
     /// The opening of the window that is opening now: the saved size, or the default, fitted to
-    /// the work area. Worked out once per opening.
-    fn opening(&mut self) -> opening::Opening {
+    /// the work area, with egui's zoom at `zoom`. Worked out once per opening.
+    fn opening(&mut self, zoom: f32) -> opening::Opening {
         if let Some(o) = self.opening.filter(|_| self.size_memory.is_open()) {
             return o;
         }
-        let o = opening::opening(self.prefs.settings.main_window_size, (self.work_area)());
+        let o = opening::opening(self.prefs.settings.main_window_size, (self.work_area)(), zoom);
         self.opening = Some(o);
-        self.size_memory.open(o.size);
+        self.size_memory.open(o.window);
         self.normal_size.forget();
         o
     }
 
-    /// The app is quitting: a size the user gave the window by hand that the app has not taken
-    /// yet, or that has not settled yet, so that it is saved before the app is gone.
+    /// The app is quitting: a size the user gave the window by hand that has not settled yet
+    /// (the newest), else one that settled and the app has not taken yet, so that it is saved
+    /// before the app is gone.
     pub fn size_at_exit(&mut self) -> Option<[f32; 2]> {
-        self.size_to_save.take().or_else(|| self.size_memory.unsettled().map(|v| [v.x, v.y]))
+        let queued = self.size_to_save.take();
+        self.size_memory.unsettled().map(|v| [v.x, v.y]).or(queued)
     }
 }
 
@@ -505,7 +507,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
             s.title_dark = false;
             return;
         }
-        (!std::mem::replace(&mut s.title_dark, true), s.opening())
+        (!std::mem::replace(&mut s.title_dark, true), s.opening(ctx.zoom_factor()))
     };
     let builder = builder(icon, opening);
     let shared = shared.clone();
@@ -1687,6 +1689,6 @@ pub(crate) mod tests {
     /// The main window's viewport takes dropped files, said outright rather than left to the platform.
     #[test]
     fn the_main_windows_viewport_takes_dropped_files() {
-        assert_eq!(builder(Arc::new(egui::IconData::default()), opening::opening(None, None)).drag_and_drop, Some(true));
+        assert_eq!(builder(Arc::new(egui::IconData::default()), opening::opening(None, None, 1.0)).drag_and_drop, Some(true));
     }
 }

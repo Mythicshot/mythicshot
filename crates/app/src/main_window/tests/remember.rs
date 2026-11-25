@@ -1,8 +1,11 @@
 //! The main window opens at the size the user last gave it, fitted to the monitor, and only a
 //! resize by hand is saved. The window is driven the way the app drives it ([`show`] for the
-//! opening, [`viewport_ui`] for its frames, with the size on screen in its viewport info), and the
-//! window's normal size, which the app reads from Windows, comes from a stand-in the test sets.
-//! The app's part (taking `size_to_save` into the settings) is done by hand.
+//! opening, [`viewport_ui`] for its frames, with the size on screen in its viewport info). The
+//! size the app reads from Windows (the window's size in its normal state, nothing while it is
+//! maximized, minimized or snapped: see `platform::normal_state_client` and its tests) comes from
+//! a stand-in the test sets, so these tests prove what the window does with what it is handed,
+//! not what Windows hands it. The app's part (taking `size_to_save` into the settings) is done
+//! by hand.
 
 use std::sync::{Arc, Mutex};
 
@@ -66,19 +69,24 @@ impl Run {
         }
     }
 
-    /// The size the open window was opened at.
+    /// The size the open window was opened at, in egui's points (as the builder has it).
     fn opened_at(&self) -> egui::Vec2 {
-        self.shared.lock().unwrap().opening.expect("the window is open").size
+        self.opening().size
     }
 
-    /// `n` frames of the window's own viewport: `screen` on screen (maximized when the two
-    /// differ), and `normal` as its normal size.
-    fn window_frames(&mut self, n: usize, screen: egui::Vec2, normal: egui::Vec2, events: Vec<egui::Event>) {
-        *self.normal.lock().unwrap() = Some(normal);
+    fn opening(&self) -> opening::Opening {
+        self.shared.lock().unwrap().opening.expect("the window is open")
+    }
+
+    /// `n` frames of the window's own viewport: `screen` on screen (maximized when it is not
+    /// what is read), and `read` as what the app reads from Windows.
+    fn window_frames(&mut self, n: usize, screen: egui::Vec2, read: Option<egui::Vec2>, events: Vec<egui::Event>) {
+        let normal = read;
+        *self.normal.lock().unwrap() = normal;
         for i in 0..n {
             self.t += 1.0 / 60.0;
             let mut input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), time: Some(self.t), events: if i == 0 { events.clone() } else { Vec::new() }, ..Default::default() };
-            input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), maximized: Some(screen != normal), minimized: Some(false), ..Default::default() });
+            input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), maximized: Some(Some(screen) != normal), minimized: Some(false), ..Default::default() });
             let mut s = self.shared.lock().unwrap();
             let mut out = self.ctx.run_ui(input, |ui| viewport_ui(ui, &mut s));
             out.textures_delta.clear();
@@ -89,7 +97,7 @@ impl Run {
 
     /// Frames of a window in its normal state at `size`.
     fn normal_frames(&mut self, n: usize, size: egui::Vec2) {
-        self.window_frames(n, size, size, vec![]);
+        self.window_frames(n, size, Some(size), vec![]);
     }
 
     fn close(&mut self) {
@@ -170,10 +178,11 @@ fn a_size_saved_on_a_large_monitor_opens_fitted_on_a_small_one_and_stays_saved()
     }
 }
 
-/// Maximized, the window shows the whole work area while Windows keeps its normal size; that
-/// normal size is what is saved and what it reopens at, never maximized.
+/// While the window is maximized the app reads nothing (the stand-in hands nothing, as Windows'
+/// placement says maximized); the window shows the work area meanwhile. It reopens at the size it
+/// had before, never maximized.
 #[test]
-fn a_maximized_window_reopens_at_its_last_normal_size_not_maximized() {
+fn while_maximized_nothing_is_read_and_it_reopens_at_the_size_from_before() {
     take_saves();
     let full = egui::vec2(2560.0, 1392.0);
     // Resized to A, maximized, closed: reopens at A, not maximized.
@@ -181,7 +190,7 @@ fn a_maximized_window_reopens_at_its_last_normal_size_not_maximized() {
     r.app_frame(Some(Request::Open));
     let a = egui::vec2(1000.0, 780.0);
     r.normal_frames(60, a);
-    r.window_frames(60, full, a, vec![]);
+    r.window_frames(60, full, None, vec![]);
     r.close();
     assert_eq!(r.saved(), Some([a.x, a.y]));
     r.app_frame(Some(Request::Open));
@@ -195,44 +204,123 @@ fn a_maximized_window_reopens_at_its_last_normal_size_not_maximized() {
     let mut r = Run::new(work_4k_at_150, None);
     r.app_frame(Some(Request::Open));
     r.normal_frames(1, a);
-    r.window_frames(5, full, a, vec![]);
+    r.window_frames(5, full, None, vec![]);
     r.close();
     assert_eq!(r.saved(), Some([a.x, a.y]));
+    // Maximized, then the app quits: what was saved before stays, nothing new to save.
+    let mut r = Run::new(work_4k_at_150, Some([a.x, a.y]));
+    r.app_frame(Some(Request::Open));
+    r.window_frames(60, full, None, vec![]);
+    assert_eq!(r.shared.lock().unwrap().size_at_exit(), None);
     // Maximized without ever being resized: reopens at the default, nothing saved.
     take_saves();
     let mut r = Run::new(work_4k_at_150, None);
     r.app_frame(Some(Request::Open));
-    r.window_frames(60, full, v(SIZE), vec![]);
+    r.window_frames(60, full, None, vec![]);
     r.normal_frames(30, v(SIZE));
-    r.window_frames(30, full, v(SIZE), vec![]);
+    r.window_frames(30, full, None, vec![]);
     r.close();
     assert_eq!((r.saved(), take_saves()), (None, vec![]));
     r.app_frame(Some(Request::Open));
     assert_eq!(r.opened_at(), v(SIZE));
 }
 
-/// Snapped to half the screen (or given a size by Windows the same way), the window's normal
-/// size stays the one from before the snap: that is what it reopens at.
+/// While the window is snapped the app reads nothing either (the stand-in hands nothing, as when
+/// Windows' window rectangle is not its restore rectangle). A size made by hand before the snap is
+/// kept: saved when it settles, when the window closes, or when the app quits, whichever comes
+/// first; dragged out of the snap, the window is back at that size and it settles then.
 #[test]
-fn a_snapped_window_reopens_at_its_size_from_before_the_snap() {
+fn while_snapped_nothing_is_read_and_a_size_made_before_is_kept() {
     take_saves();
     let half = egui::vec2(1280.0, 1392.0);
     let a = egui::vec2(1000.0, 780.0);
+    // Resized to A, settled, snapped, closed: A, saved once, before the snap.
     let mut r = Run::new(work_4k_at_150, None);
     r.app_frame(Some(Request::Open));
     r.normal_frames(60, a);
-    r.window_frames(90, half, a, vec![]);
+    r.window_frames(90, half, None, vec![]);
     r.close();
-    assert_eq!((r.saved(), take_saves()), (Some([a.x, a.y]), vec![[a.x, a.y]]), "A, saved once, before the snap");
+    assert_eq!((r.saved(), take_saves()), (Some([a.x, a.y]), vec![[a.x, a.y]]));
     r.app_frame(Some(Request::Open));
     assert_eq!(r.opened_at(), a);
     r.close();
+    // Resized to A and snapped before it settled, then closed: A.
+    let mut r = Run::new(work_4k_at_150, None);
+    r.app_frame(Some(Request::Open));
+    r.normal_frames(10, a);
+    r.window_frames(90, half, None, vec![]);
+    assert!(take_saves().is_empty(), "not saved while snapped");
+    r.close();
+    assert_eq!((r.saved(), take_saves()), (Some([a.x, a.y]), vec![[a.x, a.y]]));
+    // Resized to A, snapped before it settled, and the app quits: A is what it saves.
+    let mut r = Run::new(work_4k_at_150, None);
+    r.app_frame(Some(Request::Open));
+    r.normal_frames(10, a);
+    r.window_frames(90, half, None, vec![]);
+    assert_eq!(r.shared.lock().unwrap().size_at_exit(), Some([a.x, a.y]));
+    // Resized to A, snapped, dragged out of the snap by its title bar: back at A, which settles.
+    let mut r = Run::new(work_4k_at_150, None);
+    r.app_frame(Some(Request::Open));
+    r.normal_frames(10, a);
+    r.window_frames(90, half, None, vec![]);
+    r.normal_frames(60, a);
+    assert_eq!(take_saves(), vec![[a.x, a.y]]);
+    r.close();
+    assert!(take_saves().is_empty());
     // Snapped without a resize before: nothing saved, the default again.
     let mut r = Run::new(work_4k_at_150, None);
     r.app_frame(Some(Request::Open));
-    r.window_frames(90, half, v(SIZE), vec![]);
+    r.window_frames(90, half, None, vec![]);
     r.close();
     assert_eq!((r.saved(), take_saves()), (None, vec![]));
+}
+
+/// The size the window shows on screen (egui's viewport info) is never what is saved: only what
+/// is read from Windows is.
+#[test]
+fn the_size_on_screen_is_never_what_is_saved() {
+    take_saves();
+    let mut r = Run::new(work_4k_at_150, None);
+    r.app_frame(Some(Request::Open));
+    r.window_frames(90, egui::vec2(1500.0, 1100.0), Some(v(SIZE)), vec![]);
+    r.close();
+    assert_eq!((r.saved(), take_saves()), (None, vec![]));
+}
+
+/// With egui's zoom at 1.1 (Ctrl+= in any window), the window opens at the same size on screen
+/// each time and opening and closing it saves nothing: it does not grow at each opening. A size
+/// made by hand at that zoom opens again at the same size on screen at another zoom.
+#[test]
+fn an_egui_zoom_never_makes_the_window_grow() {
+    take_saves();
+    let mut r = Run::new(work_4k_at_150, None);
+    r.ctx.set_zoom_factor(1.1);
+    for _ in 0..4 {
+        r.app_frame(Some(Request::Open));
+        let o = r.opening();
+        assert!((o.size * 1.1 - o.window).length() < 0.01, "{o:?}");
+        assert!((o.size - v(SIZE)).length() < 0.01, "the pages at that zoom get the default: {o:?}");
+        // On screen: egui reports the size it asked for; Windows the same size in its points.
+        r.window_frames(60, o.size, Some(o.window), vec![]);
+        r.close();
+        assert_eq!((r.saved(), take_saves()), (None, vec![]), "nothing saved, so the next opening is the same");
+    }
+    // Resized by hand to A on screen, at that zoom.
+    r.app_frame(Some(Request::Open));
+    let a = egui::vec2(1210.0, 880.0);
+    r.window_frames(60, a / 1.1, Some(a), vec![]);
+    r.close();
+    assert_eq!(r.saved(), Some([a.x, a.y]));
+    take_saves();
+    for zoom in [1.1, 1.0, 1.25] {
+        r.ctx.set_zoom_factor(zoom);
+        r.app_frame(Some(Request::Open));
+        let o = r.opening();
+        assert!((o.window - a).length() < 0.01 && (o.size * zoom - a).length() < 0.01, "{zoom}: {o:?}");
+        r.window_frames(30, o.size, Some(o.window), vec![]);
+        r.close();
+        assert_eq!((r.saved(), take_saves()), (Some([a.x, a.y]), vec![]), "{zoom}");
+    }
 }
 
 #[test]
@@ -252,7 +340,7 @@ fn the_window_opened_only_for_the_popup_after_an_update_saves_nothing() {
     let off = at + egui::vec2(0.7, -0.7);
     r.normal_frames(60, off);
     let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
-    r.window_frames(1, off, off, vec![enter]);
+    r.window_frames(1, off, Some(off), vec![enter]);
     assert!(!r.shared.lock().unwrap().nav.is_open(), "OK closed the window opened for the popup");
     r.app_frame(None);
     assert_eq!((r.saved(), take_saves()), (Some([1800.0, 1000.0]), vec![]), "nothing saved by itself");
@@ -281,6 +369,13 @@ fn quitting_right_after_a_resize_keeps_the_size() {
     r.shared.lock().unwrap().size_to_save = Some([a.x, a.y]);
     assert_eq!(r.shared.lock().unwrap().size_at_exit(), Some([a.x, a.y]));
     assert_eq!(r.shared.lock().unwrap().size_at_exit(), None, "taken once");
+    // Queued at A, then dragged on to B, still settling, when the app quits: B, the newer.
+    let b = egui::vec2(1100.0, 820.0);
+    let mut r = Run::new(work_4k_at_150, None);
+    r.app_frame(Some(Request::Open));
+    r.normal_frames(10, b);
+    r.shared.lock().unwrap().size_to_save = Some([a.x, a.y]);
+    assert_eq!(r.shared.lock().unwrap().size_at_exit(), Some([b.x, b.y]));
     // Nothing made by hand: nothing to save, and a size already saved is not saved again.
     let mut r = Run::new(work_4k_at_150, Some([a.x, a.y]));
     r.app_frame(Some(Request::Open));

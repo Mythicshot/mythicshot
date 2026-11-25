@@ -231,35 +231,65 @@ pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
     None
 }
 
-/// A window's normal inner size in pixels and its DPI: the size Windows restores it to from
-/// maximized, minimized or snapped (the restore rectangle, `rcNormalPosition` of
-/// `GetWindowPlacement`), less the frame its own styles get at its own DPI
-/// (`AdjustWindowRectExForDpi`, as winit works out the frame when it gives a window its inner
-/// size). Nothing is guessed about the frame, and the window's state does not change the answer.
+/// The client size to take as a window's size, from what Windows says about it, or None when the
+/// window is not in its normal state: maximized or minimized (`show_cmd` is not
+/// `SW_SHOWNORMAL`, or `iconic`), or snapped or otherwise arranged (its window rectangle is not
+/// the size of its restore rectangle, `rcNormalPosition`). In the normal state the restore
+/// rectangle is the window rectangle, at the window's current DPI, so its client size is its
+/// size; in any other state nothing is taken.
+pub fn normal_state_client(show_cmd: u32, iconic: bool, window: (i32, i32), restore: (i32, i32), client: (i32, i32)) -> Option<(i32, i32)> {
+    const SW_SHOWNORMAL: u32 = 1;
+    (show_cmd == SW_SHOWNORMAL && !iconic && window == restore && client.0 > 0 && client.1 > 0).then_some(client)
+}
+
+/// A window's client size in pixels and its DPI, when it is in its normal state (see
+/// [`normal_state_client`]); None when it is maximized, minimized, snapped, or cannot be read.
 #[cfg(windows)]
-pub fn normal_inner_px(hwnd: WindowId) -> Option<(i32, i32, u32)> {
+pub fn normal_client_px(hwnd: WindowId) -> Option<(i32, i32, u32)> {
     use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-    use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowPlacement, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT};
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowPlacement, GetWindowRect, IsIconic, WINDOWPLACEMENT};
     let h = HWND(hwnd as *mut _);
     let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
     unsafe { GetWindowPlacement(h, &mut placement) }.ok()?;
+    let (mut window, mut client) = (RECT::default(), RECT::default());
+    unsafe { GetWindowRect(h, &mut window) }.ok()?;
+    unsafe { GetClientRect(h, &mut client) }.ok()?;
     let dpi = unsafe { GetDpiForWindow(h) };
     if dpi == 0 {
         return None;
     }
-    let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32);
-    let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32);
-    let mut frame = RECT::default();
-    unsafe { AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, dpi) }.ok()?;
-    let r = placement.rcNormalPosition;
-    let (w, h) = ((r.right - r.left) - (frame.right - frame.left), (r.bottom - r.top) - (frame.bottom - frame.top));
-    (w > 0 && h > 0).then_some((w, h, dpi))
+    let size = |r: RECT| (r.right - r.left, r.bottom - r.top);
+    let iconic = unsafe { IsIconic(h) }.as_bool();
+    let (w, h) = normal_state_client(placement.showCmd, iconic, size(window), size(placement.rcNormalPosition), size(client))?;
+    Some((w, h, dpi))
 }
 
 #[cfg(not(windows))]
-pub fn normal_inner_px(_hwnd: WindowId) -> Option<(i32, i32, u32)> {
+pub fn normal_client_px(_hwnd: WindowId) -> Option<(i32, i32, u32)> {
     None
+}
+
+/// Whether `hwnd` is still a window of this process with exactly this title: a handle kept from
+/// earlier may have gone, and Windows may have given its number to another window since.
+#[cfg(windows)]
+pub fn is_own_window_titled(hwnd: WindowId, title: &str) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
+    let h = HWND(hwnd as *mut _);
+    let mut pid = 0u32;
+    if unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) } == 0 || pid != unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetWindowTextW(h, &mut buf) };
+    n >= 0 && String::from_utf16_lossy(&buf[..n as usize]) == title
+}
+
+#[cfg(not(windows))]
+pub fn is_own_window_titled(_hwnd: WindowId, _title: &str) -> bool {
+    false
 }
 
 /// This process's visible top-level window with this exact title whose client area is `client`
@@ -917,34 +947,55 @@ mod tests {
         assert_eq!(open_arg(Path::new(r"D:\Führung & Co\演示.html")), r#""D:\Führung & Co\演示.html""#);
     }
 
-    /// The normal inner size, worked out from the restore rectangle and the frame for the
-    /// window's styles at its DPI, is the window's client size when it is neither maximized,
-    /// minimized nor snapped. Checked on a real window that is never shown (created hidden, in
-    /// this thread, aware of each monitor's DPI as the app is), at a few sizes, then destroyed.
+    /// Only a window in its normal state gives a size: not maximized, not minimized, and with its
+    /// window rectangle the size of its restore rectangle (a snapped window's is not).
+    #[test]
+    fn only_a_window_in_its_normal_state_gives_its_size() {
+        let (normal, maximized, minimized) = (1, 3, 2);
+        let rect = (936, 779);
+        assert_eq!(normal_state_client(normal, false, rect, rect, (920, 740)), Some((920, 740)));
+        assert_eq!(normal_state_client(maximized, false, (2576, 1408), rect, (2560, 1369)), None, "maximized");
+        assert_eq!(normal_state_client(minimized, true, (160, 28), rect, (0, 0)), None, "minimized");
+        assert_eq!(normal_state_client(normal, true, rect, rect, (920, 740)), None, "iconic whatever the placement says");
+        assert_eq!(normal_state_client(normal, false, (1296, 1408), rect, (1280, 1369)), None, "snapped: the window is not its restore rectangle");
+        assert_eq!(normal_state_client(normal, false, rect, rect, (0, 740)), None, "no client area");
+    }
+
+    /// On a real window that is never shown (created hidden, in this thread, aware of each
+    /// monitor's DPI as the app is), at a few sizes: in its normal state it gives its client size
+    /// and its DPI; it is a window of this process with its title; and, hidden, the lookup for the
+    /// main window passes it over, as it passes over the app's hidden root window of the same
+    /// title. Destroyed, nothing is read from its handle. (A visible window, and a snapped or
+    /// maximized one, cannot be made here without showing it.)
     #[cfg(windows)]
     #[test]
-    fn the_normal_inner_size_of_a_normal_window_is_its_client_size() {
+    fn a_hidden_normal_window_gives_its_client_size_and_is_passed_over_by_the_lookup() {
         use windows::Win32::Foundation::{HWND, RECT};
         use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
         use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, GetClientRect, IsWindowVisible, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW};
         use windows::core::w;
+        const TITLE: &str = "Mythicshot normal size test";
         let before = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         // A plain window of a system class, far off every monitor, without WS_VISIBLE.
         let h: HWND = unsafe { CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Mythicshot normal size test"), WS_OVERLAPPEDWINDOW, -32000, -32000, 900, 700, None, None, None, None) }.expect("a hidden window");
         let id = h.0 as WindowId;
+        assert!(is_own_window_titled(id, TITLE));
+        assert!(!is_own_window_titled(id, "Mythicshot"), "the exact title only");
+        assert_eq!(find_window(TITLE), Some(id), "found by its title when hidden ones count");
         for (w, hgt) in [(900, 700), (1380, 1110), (643, 421), (2001, 1501)] {
             unsafe { SetWindowPos(h, None, 0, 0, w, hgt, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW) }.unwrap();
             assert!(!unsafe { IsWindowVisible(h) }.as_bool(), "never shown");
             let mut client = RECT::default();
             unsafe { GetClientRect(h, &mut client) }.unwrap();
-            let (nw, nh, dpi) = normal_inner_px(id).expect("readable");
+            let client = (client.right - client.left, client.bottom - client.top);
+            let (nw, nh, dpi) = normal_client_px(id).expect("readable");
             assert!(dpi >= 96, "{dpi}");
-            assert_eq!((nw, nh), (client.right - client.left, client.bottom - client.top), "{w}x{hgt} at {dpi} DPI");
+            assert_eq!((nw, nh), client, "{w}x{hgt} at {dpi} DPI");
+            assert_eq!(find_visible_own_window(TITLE, client, 2), None, "{w}x{hgt}: hidden, so not the main window");
         }
-        // Gone: nothing can be read, and nothing is found by its title.
         unsafe { DestroyWindow(h) }.unwrap();
-        assert_eq!(normal_inner_px(id), None);
-        assert_eq!(find_visible_own_window("Mythicshot normal size test", (900, 700), 2), None);
+        assert_eq!(normal_client_px(id), None);
+        assert!(!is_own_window_titled(id, TITLE), "gone");
         if !before.is_invalid() {
             unsafe { SetThreadDpiAwarenessContext(before) };
         }

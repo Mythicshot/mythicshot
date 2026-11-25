@@ -1603,6 +1603,12 @@ impl eframe::App for App {
     /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A size the main window was given by hand in the last moments is saved first, before
+        // the waits below.
+        let window_size = self.window.lock().ok().and_then(|mut s| s.size_at_exit());
+        if main_window::size_changes(&mut self.settings, window_size) {
+            self.save_settings();
+        }
         // A recording that is being expanded for an editor stops at its next frame, and the
         // folder it was expanded into is removed.
         if let Some(opening) = self.opening.take() {
@@ -1612,11 +1618,6 @@ impl eframe::App for App {
         // its next frame and is given a moment, so that no ffmpeg runs on after the app.
         project::shutdown(Duration::from_secs(3));
         publish_ui::shutdown(std::time::Duration::from_secs(5));
-        // A size the main window was given by hand in the last moments is kept too.
-        let window_size = self.window.lock().ok().and_then(|mut s| s.size_at_exit());
-        if main_window::size_changes(&mut self.settings, window_size) {
-            self.save_settings();
-        }
         // A delete that was noted as unfinished in the last moments is on disk before the app is gone,
         // and so is a change whose save failed earlier, if the file can be written by now.
         self.save_publish_state(true);
