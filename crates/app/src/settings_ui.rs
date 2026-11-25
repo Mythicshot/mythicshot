@@ -2066,12 +2066,13 @@ mod tests {
 
     /// The page's width in the main window at its default size, and at its smallest: the
     /// window less the navigation and the margins of the panel the page stands in.
-    const PAGE_WIDTH: f32 = 760.0 - 170.0 - 16.0;
-    const PAGE_WIDTH_MIN: f32 = 640.0 - 170.0 - 16.0;
+    const PAGE_WIDTH: f32 = crate::main_window::SIZE[0] - 170.0 - 16.0;
+    const PAGE_WIDTH_MIN: f32 = crate::main_window::MIN_SIZE[0] - 170.0 - 16.0;
 
     #[test]
     fn the_page_draws_the_switches_the_bar_and_the_list_at_the_default_window_size() {
-        assert_eq!((crate::main_window::SIZE[0], PAGE_WIDTH, PAGE_WIDTH_MIN), (760.0, 574.0, 454.0));
+        assert_eq!((crate::main_window::SIZE[0], PAGE_WIDTH, PAGE_WIDTH_MIN), (920.0, 734.0, 454.0));
+        assert!(PAGE_WIDTH < 900.0, "the wide case below is wider than the default window's page");
         let projects = vec![
             info(SITE, "tour_a", "chap_a", "Customer onboarding for the whole support team", "Invite your team and give everybody a role", ms("2026-11-18T09:30:00+00:00"), 172 * MB),
             info(SITE, "tour_a", "chap_b", "Customer onboarding for the whole support team", "Add a domain", ms("2026-11-02T09:30:00+00:00"), 33 * MB),
@@ -2281,26 +2282,29 @@ mod tests {
 
     #[test]
     fn the_section_fits_the_default_window_without_the_list_pushing_the_page_out() {
-        // The page as the default window shows it: 590 wide and about 470 tall beside the navigation.
-        let projects = (0..40).map(|i| info(SITE, &format!("tour_{i}"), "chap_a", &format!("Tour {i}"), "Chapter", 1_000 + i, 20 * MB)).collect();
-        let mut page = Page::showing(listed(projects));
-        page.screen = vec2(PAGE_WIDTH, 470.0);
-        let out = page.settled();
-        // Whatever is drawn is inside the window.
-        for (text, rect) in drawn(&out) {
-            assert!(rect.right() <= PAGE_WIDTH + 0.5 && rect.top() >= -0.5, "{text}: {rect:?}");
-        }
-        // Scrolled to its end, the page shows the section whole: the list's height is bounded.
-        let at = egui::pos2(300.0, 100.0);
-        page.frame(vec![egui::Event::PointerMoved(at)]);
-        for _ in 0..40 {
-            page.frame(vec![wheel_down()]);
-        }
-        let out = page.settled();
-        let texts = texts_of(&out);
-        for text in [STORE_AS_VIDEO, WARN_WHEN, OPEN_FOLDER, "40 saved recordings · 800 MB of 5 GB", "Tour 39"] {
-            let rect = rect_of(&out, text).unwrap_or_else(|| panic!("{text} is on the page: {texts:?}"));
-            assert!(rect.top() >= 0.0 && rect.bottom() <= 470.0, "{text}: {rect:?}");
+        // The page as the default window shows it beside the navigation, under the menu bar: also
+        // as the earlier, smaller default showed it, about 470 tall, as one cut to a low monitor is.
+        for height in [470.0, crate::main_window::SIZE[1] - 50.0] {
+            let projects = (0..40).map(|i| info(SITE, &format!("tour_{i}"), "chap_a", &format!("Tour {i}"), "Chapter", 1_000 + i, 20 * MB)).collect();
+            let mut page = Page::showing(listed(projects));
+            page.screen = vec2(PAGE_WIDTH, height);
+            let out = page.settled();
+            // Whatever is drawn is inside the window.
+            for (text, rect) in drawn(&out) {
+                assert!(rect.right() <= PAGE_WIDTH + 0.5 && rect.top() >= -0.5, "{text}: {rect:?}");
+            }
+            // Scrolled to its end, the page shows the section whole: the list's height is bounded.
+            let at = egui::pos2(300.0, 100.0);
+            page.frame(vec![egui::Event::PointerMoved(at)]);
+            for _ in 0..40 {
+                page.frame(vec![wheel_down()]);
+            }
+            let out = page.settled();
+            let texts = texts_of(&out);
+            for text in [STORE_AS_VIDEO, WARN_WHEN, OPEN_FOLDER, "40 saved recordings · 800 MB of 5 GB", "Tour 39"] {
+                let rect = rect_of(&out, text).unwrap_or_else(|| panic!("{text} is on the page: {texts:?}"));
+                assert!(rect.top() >= 0.0 && rect.bottom() <= height, "{height}: {text}: {rect:?}");
+            }
         }
     }
 

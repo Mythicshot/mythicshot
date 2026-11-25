@@ -25,8 +25,14 @@ use crate::workspace_ui::{self, WorkspaceState};
 use crate::tray::Command;
 
 
+mod opening;
+
 pub const TITLE: &str = "Mythicshot";
-pub const SIZE: [f32; 2] = [760.0, 520.0];
+/// The size the window opens at when the user has not given it one, in points: every page shows
+/// whole beside the menu except Preferences' Output and Hotkeys tabs, which scroll, and the
+/// Workspace page of a connected profile has about 150 points free under its last row. Cut down
+/// to fit a smaller work area, see [`opening`].
+pub const SIZE: [f32; 2] = [920.0, 740.0];
 pub(crate) const MIN_SIZE: [f32; 2] = [640.0, 420.0];
 const NAV_WIDTH: f32 = 170.0;
 
@@ -234,11 +240,27 @@ pub struct Shared {
     pub update: crate::update_ui::Updater,
     /// The open window's title bar was told to be dark; a closed window is made anew, so it is told again.
     title_dark: bool,
+    /// Where and how big the open window was opened, worked out once when it opened: the
+    /// viewport builder must stay the same while it is open, or egui would move and size the
+    /// window to it again.
+    opening: Option<opening::Opening>,
+    /// Watches the open window's size for a resize by hand.
+    size_memory: opening::SizeMemory,
+    /// A size the user gave the window by hand, for the app to save (as `main_window_size`).
+    pub size_to_save: Option<[f32; 2]>,
+    /// The work area of the monitor the window opens on, in points; tests give their own.
+    work_area: fn() -> Option<egui::Rect>,
+}
+
+/// The primary monitor's work area in points, as Windows reports it now.
+fn primary_work_area() -> Option<egui::Rect> {
+    let (r, dpi) = crate::platform::primary_work_area()?;
+    opening::work_area_points(r.x, r.y, r.w, r.h, dpi)
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false, opening: None, size_memory: opening::SizeMemory::default(), size_to_save: None, work_area: primary_work_area }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -336,6 +358,26 @@ impl Shared {
         if self.nav.take_left_workspace() {
             self.workspace.leave(ctx);
         }
+        // A closed window: a size made by hand that had not settled yet is saved now, and the
+        // next opening is worked out afresh.
+        if !self.nav.is_open() && self.size_memory.is_open() {
+            if let Some(size) = self.size_memory.close() {
+                self.size_to_save = Some([size.x, size.y]);
+            }
+            self.opening = None;
+        }
+    }
+
+    /// The opening of the window that is opening now: the saved size, or the default, fitted to
+    /// the work area. Worked out once per opening.
+    fn opening(&mut self) -> opening::Opening {
+        if let Some(o) = self.opening.filter(|_| self.size_memory.is_open()) {
+            return o;
+        }
+        let o = opening::opening(self.prefs.settings.main_window_size, (self.work_area)());
+        self.opening = Some(o);
+        self.size_memory.open(o.size);
+        o
     }
 }
 
@@ -432,7 +474,7 @@ pub fn viewport_id() -> egui::ViewportId {
 /// [`Request`] for which page it shows). Without a request, an open window is kept drawn and a
 /// closed one stays closed.
 pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::IconData>, request: Option<Request>) {
-    let dark_title = {
+    let (dark_title, opening) = {
         let mut s = shared.lock().expect("main window state");
         if let Some(request) = request {
             s.apply_request(request);
@@ -442,16 +484,16 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
             s.title_dark = false;
             return;
         }
-        !std::mem::replace(&mut s.title_dark, true)
+        (!std::mem::replace(&mut s.title_dark, true), s.opening())
     };
-    let builder = builder(icon);
+    let builder = builder(icon, opening);
     let shared = shared.clone();
     ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
         let mut guard = shared.lock().expect("main window state");
         let s = &mut *guard;
         viewport_ui(ui, s);
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || s.open_image.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || s.open_image.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() || s.size_to_save.is_some() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -473,14 +515,35 @@ fn viewport_ui(ui: &mut egui::Ui, s: &mut Shared) {
         s.close_window();
     }
     window_ui(ui, s);
+    watch_size(ui.ctx(), s);
     s.settle(ui.ctx());
+}
+
+/// A size the user gave the window by hand is queued for the app to save once it has settled.
+fn watch_size(ctx: &egui::Context, s: &mut Shared) {
+    if !s.nav.is_open() {
+        return;
+    }
+    let (seen, now) = ctx.input(|i| (opening::Seen::from_info(i.viewport()), i.time));
+    if let Some(size) = s.size_memory.observe(seen, now) {
+        s.size_to_save = Some([size.x, size.y]);
+    }
+    if s.size_memory.is_waiting() {
+        // Drawn again when it may have settled, even with nothing else going on.
+        ctx.request_repaint_after(Duration::from_secs_f64(opening::SETTLE / 2.0));
+    }
 }
 
 /// The window's viewport. It takes files dropped on it (a picture opens in the editor). Windows
 /// lets every window of the app take drops already, as the platform default; it is said here so
 /// this window does not depend on that, and no other window is changed.
-fn builder(icon: Arc<egui::IconData>) -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default().with_title(TITLE).with_inner_size(SIZE).with_min_inner_size(MIN_SIZE).with_icon(icon).with_drag_and_drop(true)
+/// It opens at `opening`'s size and place, never maximized.
+fn builder(icon: Arc<egui::IconData>, opening: opening::Opening) -> egui::ViewportBuilder {
+    let b = egui::ViewportBuilder::default().with_title(TITLE).with_inner_size(opening.size).with_min_inner_size(MIN_SIZE).with_icon(icon).with_drag_and_drop(true);
+    match opening.pos {
+        Some(pos) => b.with_position(pos),
+        None => b,
+    }
 }
 
 /// The window's contents: the menu on the left, the selected page beside it.
@@ -625,6 +688,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::settings::Settings;
 
+    mod remember;
     mod roomy;
 
     #[test]
@@ -1601,6 +1665,6 @@ pub(crate) mod tests {
     /// The main window's viewport takes dropped files, said outright rather than left to the platform.
     #[test]
     fn the_main_windows_viewport_takes_dropped_files() {
-        assert_eq!(builder(Arc::new(egui::IconData::default())).drag_and_drop, Some(true));
+        assert_eq!(builder(Arc::new(egui::IconData::default()), opening::opening(None, None)).drag_and_drop, Some(true));
     }
 }

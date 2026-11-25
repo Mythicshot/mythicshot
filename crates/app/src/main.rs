@@ -1478,13 +1478,20 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture, edit_project, requests, open) = {
+        let (actions, edited, tab, capture, edit_project, requests, open, window_size) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take())
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take(), s.size_to_save.take())
         };
+        // The user gave the main window a size by hand: it opens at that size from now on.
+        if let Some(size) = window_size
+            && self.settings.main_window_size != Some(size)
+        {
+            self.settings.main_window_size = Some(size);
+            self.save_settings();
+        }
         // The Open image tile: exactly what the tray's "Open image from file…" runs. A picture
         // dropped on the window opens the same way as one picked there. The window stays.
         match open {

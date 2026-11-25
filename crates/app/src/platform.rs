@@ -207,6 +207,30 @@ pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
     out
 }
 
+/// The primary monitor's work area (the monitor less the taskbar and docked bars) in desktop
+/// pixels, and its effective DPI, from `MonitorFromPoint`, `GetMonitorInfoW` and
+/// `GetDpiForMonitor`, as [`monitor_layout`] reads them. The primary monitor is where Windows
+/// creates a new window that is given no monitor of its own, as the main window is.
+#[cfg(windows)]
+pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let (mut dx, mut dy) = (0u32, 0u32);
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() || unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_err() || dx == 0 {
+        return None;
+    }
+    let r = info.rcWork;
+    Some((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx))
+}
+
+#[cfg(not(windows))]
+pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
+    None
+}
+
 #[cfg(not(windows))]
 pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
     mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect()
