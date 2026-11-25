@@ -991,6 +991,42 @@ fn the_parts_of_a_row_stand_on_one_line() {
 }
 
 
+/// Where the window cannot be tall enough for the Workspace page (1080p at 200%: 437 points high),
+/// the page scrolls, and scrolled to its end it shows the Sign out row whole inside the window,
+/// with the page's own margin under it and nothing overlapping.
+#[test]
+fn the_workspace_page_scrolls_to_sign_out_where_the_window_is_too_low() {
+    let ppp = 2.0;
+    let size = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, ppp))).size;
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    let (ctx, mut f, out) = settled(Kind::Connected, size, ppp);
+    assert!(text_rect(&out, workspace_ui::SIGN_OUT).is_none_or(|r| !window.contains_rect(r)), "{size:?}: Sign out needs scrolling to");
+    let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -200.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+    let over_page = egui::pos2(NAV_WIDTH + 200.0, size.y / 2.0);
+    let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+    let mut draw = |events: Vec<egui::Event>| {
+        let input = egui::RawInput { screen_rect: Some(window), events, time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
+        out.textures_delta.clear();
+        out
+    };
+    draw(vec![egui::Event::PointerMoved(over_page)]);
+    for _ in 0..10 {
+        draw(vec![wheel.clone()]);
+    }
+    draw(vec![]);
+    let out = draw(vec![]);
+    let button = holder(&out, workspace_ui::SIGN_OUT);
+    assert!(window.contains_rect(button), "{size:?}: {button:?}");
+    assert!(size.y - button.bottom() >= theme::PAGE_PAD - 0.5, "{size:?}: {} points under {button:?}", size.y - button.bottom());
+    assert!(button.contains_rect(text_rect(&out, workspace_ui::SIGN_OUT).unwrap()));
+    // Its row's note too, at the left.
+    let note = text_rect(&out, workspace_ui::TOKEN_NOTE).unwrap();
+    assert!(window.contains_rect(note) && (note.center().y - button.center().y).abs() < 2.0, "{note:?}");
+    theme::checks::assert_no_overlaps(&out, "Workspace scrolled at 1080p 200%");
+    assert_inside_across(&out, window, "Workspace scrolled at 1080p 200%");
+}
+
 /// The lowest thing drawn on the page beside the menu: text, or a box, a line or a control.
 fn page_bottom(out: &egui::FullOutput) -> f32 {
     let mut low = 0.0f32;
@@ -1077,6 +1113,7 @@ fn the_workspace_page_shows_sign_out_whole_at_the_opening_size_on_1080p_and_4k()
             assert_inside_across(&out, window, &what);
             let sign_out = text_rect(&out, workspace_ui::SIGN_OUT).filter(|r| window.contains_rect(*r));
             if name == "1080p" && ppp == 2.0 {
+                // Too low to show the page whole: see the test below, which scrolls to Sign out.
                 assert!(size.y < 589.0, "{what}: too low to show the page whole");
                 continue;
             }

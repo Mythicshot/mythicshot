@@ -231,6 +231,70 @@ pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
     None
 }
 
+/// A window's normal inner size in pixels and its DPI: the size Windows restores it to from
+/// maximized, minimized or snapped (the restore rectangle, `rcNormalPosition` of
+/// `GetWindowPlacement`), less the frame its own styles get at its own DPI
+/// (`AdjustWindowRectExForDpi`, as winit works out the frame when it gives a window its inner
+/// size). Nothing is guessed about the frame, and the window's state does not change the answer.
+#[cfg(windows)]
+pub fn normal_inner_px(hwnd: WindowId) -> Option<(i32, i32, u32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowPlacement, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT};
+    let h = HWND(hwnd as *mut _);
+    let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(h, &mut placement) }.ok()?;
+    let dpi = unsafe { GetDpiForWindow(h) };
+    if dpi == 0 {
+        return None;
+    }
+    let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32);
+    let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32);
+    let mut frame = RECT::default();
+    unsafe { AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, dpi) }.ok()?;
+    let r = placement.rcNormalPosition;
+    let (w, h) = ((r.right - r.left) - (frame.right - frame.left), (r.bottom - r.top) - (frame.bottom - frame.top));
+    (w > 0 && h > 0).then_some((w, h, dpi))
+}
+
+#[cfg(not(windows))]
+pub fn normal_inner_px(_hwnd: WindowId) -> Option<(i32, i32, u32)> {
+    None
+}
+
+/// This process's visible top-level window with this exact title whose client area is `client`
+/// pixels, give or take `tolerance`: one window of several with the same title (the app's
+/// hidden root window has it too, and an editor may), told apart by being shown and by its size.
+#[cfg(windows)]
+pub fn find_visible_own_window(title: &str, client: (i32, i32), tolerance: i32) -> Option<WindowId> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetClientRect, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut after: Option<HWND> = None;
+    // A bound on the windows looked at, in case the list changes while it is walked.
+    for _ in 0..64 {
+        let h = unsafe { FindWindowExW(None, after, PCWSTR::null(), PCWSTR(wide.as_ptr())) }.ok()?;
+        after = Some(h);
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if pid != unsafe { GetCurrentProcessId() } || !unsafe { IsWindowVisible(h) }.as_bool() {
+            continue;
+        }
+        let mut r = RECT::default();
+        if unsafe { GetClientRect(h, &mut r) }.is_ok() && ((r.right - r.left) - client.0).abs() <= tolerance && ((r.bottom - r.top) - client.1).abs() <= tolerance {
+            return Some(h.0 as WindowId);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn find_visible_own_window(_title: &str, _client: (i32, i32), _tolerance: i32) -> Option<WindowId> {
+    None
+}
+
 #[cfg(not(windows))]
 pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
     mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect()
@@ -851,5 +915,38 @@ mod tests {
     fn the_file_to_open_is_quoted_whole() {
         assert_eq!(open_arg(Path::new(r"C:\Users\me\Raid guides, v2\index.html")), r#""C:\Users\me\Raid guides, v2\index.html""#);
         assert_eq!(open_arg(Path::new(r"D:\Führung & Co\演示.html")), r#""D:\Führung & Co\演示.html""#);
+    }
+
+    /// The normal inner size, worked out from the restore rectangle and the frame for the
+    /// window's styles at its DPI, is the window's client size when it is neither maximized,
+    /// minimized nor snapped. Checked on a real window that is never shown (created hidden, in
+    /// this thread, aware of each monitor's DPI as the app is), at a few sizes, then destroyed.
+    #[cfg(windows)]
+    #[test]
+    fn the_normal_inner_size_of_a_normal_window_is_its_client_size() {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, GetClientRect, IsWindowVisible, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW};
+        use windows::core::w;
+        let before = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // A plain window of a system class, far off every monitor, without WS_VISIBLE.
+        let h: HWND = unsafe { CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Mythicshot normal size test"), WS_OVERLAPPEDWINDOW, -32000, -32000, 900, 700, None, None, None, None) }.expect("a hidden window");
+        let id = h.0 as WindowId;
+        for (w, hgt) in [(900, 700), (1380, 1110), (643, 421), (2001, 1501)] {
+            unsafe { SetWindowPos(h, None, 0, 0, w, hgt, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW) }.unwrap();
+            assert!(!unsafe { IsWindowVisible(h) }.as_bool(), "never shown");
+            let mut client = RECT::default();
+            unsafe { GetClientRect(h, &mut client) }.unwrap();
+            let (nw, nh, dpi) = normal_inner_px(id).expect("readable");
+            assert!(dpi >= 96, "{dpi}");
+            assert_eq!((nw, nh), (client.right - client.left, client.bottom - client.top), "{w}x{hgt} at {dpi} DPI");
+        }
+        // Gone: nothing can be read, and nothing is found by its title.
+        unsafe { DestroyWindow(h) }.unwrap();
+        assert_eq!(normal_inner_px(id), None);
+        assert_eq!(find_visible_own_window("Mythicshot normal size test", (900, 700), 2), None);
+        if !before.is_invalid() {
+            unsafe { SetThreadDpiAwarenessContext(before) };
+        }
     }
 }

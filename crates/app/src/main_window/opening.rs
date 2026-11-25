@@ -10,8 +10,12 @@
 //! a size saved on a large monitor opens fitted on a small one, and is still the size saved.
 //! Only a size that differs from the size the window opened at (or was last saved at) counts as
 //! a resize by hand; it is saved once it has stayed the same for [`SETTLE`], or when the window
-//! closes, never on every frame of a drag. A maximized or minimized window's size is never saved,
-//! and the window never opens maximized.
+//! closes, never on every frame of a drag.
+//!
+//! The size watched is the window's normal size: the one Windows restores it to, read from
+//! Windows (see [`NormalSize`]), not the size it has on screen. A maximized, minimized or snapped
+//! window keeps the normal size it had before, so none of those is ever saved, and the window
+//! never opens maximized or snapped.
 
 use eframe::egui;
 
@@ -42,10 +46,6 @@ pub const MAX_REMEMBERED: f32 = 16384.0;
 
 /// How long a size made by hand stays the same before it is saved, in seconds.
 pub const SETTLE: f64 = 0.5;
-
-/// A resize from maximized back to normal, or to maximized, arrives over a frame or two; a size
-/// seen for less than this just before the window was maximized is taken for that, not kept.
-pub const TRANSITION: f64 = 0.15;
 
 /// Within this many points of the size the window opened at (or was last saved at), a size is
 /// that size: what Windows reports back differs from what was asked by the rounding to whole
@@ -109,23 +109,52 @@ pub fn opening(saved: Option<[f32; 2]>, work: Option<egui::Rect>) -> Opening {
     }
 }
 
-/// What the window reported about itself in one frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Seen {
-    /// Its inner size in points, when known.
-    pub size: Option<egui::Vec2>,
-    /// Maximized, minimized or full screen: no size of its own.
-    pub not_normal: bool,
+/// Where the window's normal size comes from: the size, inner and in points, that Windows
+/// restores the window to from maximized, minimized or snapped, and that is its size on screen
+/// when it is none of those. The app reads it from Windows ([`WindowsNormalSize`]); tests give
+/// their own.
+pub trait NormalSize: Send {
+    /// The normal size now, for the window egui describes in `info` at `ppp` pixels per point;
+    /// None when it cannot be read.
+    fn read(&mut self, info: &egui::ViewportInfo, ppp: f32) -> Option<egui::Vec2>;
+    /// The window is about to be made anew: anything known about the old one is dropped.
+    fn forget(&mut self) {}
 }
 
-impl Seen {
-    pub fn from_info(info: &egui::ViewportInfo) -> Self {
-        let not_normal = info.maximized == Some(true) || info.minimized == Some(true) || info.fullscreen == Some(true);
-        Seen { size: info.inner_rect.map(|r| r.size()), not_normal }
+/// The normal size as Windows keeps it: the window's restore rectangle (`rcNormalPosition` of
+/// `GetWindowPlacement`), less its frame for its own styles at its own DPI
+/// (`AdjustWindowRectExForDpi`, which winit uses the other way round to give the window its
+/// inner size), in points at that DPI. The window is this process's visible window titled
+/// [`super::TITLE`] whose client area is the size egui reports for the viewport, found once per
+/// opening.
+#[derive(Debug, Default)]
+pub struct WindowsNormalSize {
+    window: Option<crate::platform::WindowId>,
+}
+
+impl NormalSize for WindowsNormalSize {
+    fn read(&mut self, info: &egui::ViewportInfo, ppp: f32) -> Option<egui::Vec2> {
+        if let Some(w) = self.window
+            && let Some(n) = crate::platform::normal_inner_px(w)
+        {
+            return points(n);
+        }
+        let client = info.inner_rect?.size() * ppp;
+        self.window = crate::platform::find_visible_own_window(super::TITLE, (client.x.round() as i32, client.y.round() as i32), 2);
+        points(crate::platform::normal_inner_px(self.window?)?)
+    }
+
+    fn forget(&mut self) {
+        self.window = None;
     }
 }
 
-/// Watches the open window's size and says when a size made by hand is to be saved.
+/// A size in pixels at a DPI (96 is 100%), in points.
+pub fn points((w, h, dpi): (i32, i32, u32)) -> Option<egui::Vec2> {
+    (dpi > 0 && w > 0 && h > 0).then(|| egui::vec2(w as f32, h as f32) * 96.0 / dpi as f32)
+}
+
+/// Watches the open window's normal size and says when a size made by hand is to be saved.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SizeMemory {
     /// The size the window opened at, or was last saved at: a size near it is not a resize.
@@ -133,9 +162,6 @@ pub struct SizeMemory {
     baseline: Option<egui::Vec2>,
     /// A size made by hand that is not saved yet, and when it was first seen at that size.
     pending: Option<(egui::Vec2, f64)>,
-    /// The last size made by hand that stayed at least [`TRANSITION`] before the pending one
-    /// took its place: what is kept when the pending one turns out to be the resize to maximized.
-    steady: Option<egui::Vec2>,
 }
 
 fn same(a: egui::Vec2, b: egui::Vec2) -> bool {
@@ -145,7 +171,7 @@ fn same(a: egui::Vec2, b: egui::Vec2) -> bool {
 impl SizeMemory {
     /// The window opens at `size`.
     pub fn open(&mut self, size: egui::Vec2) {
-        *self = SizeMemory { baseline: Some(size), pending: None, steady: None };
+        *self = SizeMemory { baseline: Some(size), pending: None };
     }
 
     pub fn is_open(&self) -> bool {
@@ -157,46 +183,34 @@ impl SizeMemory {
         self.pending.is_some()
     }
 
-    /// One frame at time `now` (seconds): the size to save, once a size made by hand has settled.
-    pub fn observe(&mut self, seen: Seen, now: f64) -> Option<egui::Vec2> {
+    /// One frame at time `now` (seconds), with the window's normal size as read (None when it
+    /// could not be): the size to save, once a size made by hand has settled.
+    pub fn observe(&mut self, normal: Option<egui::Vec2>, now: f64) -> Option<egui::Vec2> {
         let baseline = self.baseline?;
-        if seen.not_normal {
-            // Maximizing: a size seen only for a moment before it was the resize to maximized,
-            // so the size held before that one is kept instead.
-            let kept = match self.pending.take() {
-                Some((size, since)) if now - since >= TRANSITION => Some(size),
-                _ => self.steady.take(),
-            };
-            self.steady = None;
-            return kept.map(|size| self.saved(size));
-        }
-        let size = seen.size.filter(|s| s.x.is_finite() && s.y.is_finite() && s.x > 0.0 && s.y > 0.0)?;
+        let size = normal.filter(|s| s.x.is_finite() && s.y.is_finite() && s.x > 0.0 && s.y > 0.0)?;
         match self.pending {
             _ if same(size, baseline) => {
                 self.pending = None;
-                self.steady = None;
                 None
             }
             // Still: saved once it has stayed so for the settle time. Any change at all, however
             // small, is the drag going on, and the time starts again.
             Some((p, since)) if size == p => (now - since >= SETTLE).then(|| self.saved(p)),
-            Some((p, since)) => {
-                if now - since >= TRANSITION {
-                    self.steady = Some(p);
-                }
-                self.pending = Some((size, now));
-                None
-            }
-            None => {
+            _ => {
                 self.pending = Some((size, now));
                 None
             }
         }
     }
 
+    /// The size made by hand that has not settled yet, if any, leaving the window open.
+    pub fn unsettled(&self) -> Option<egui::Vec2> {
+        self.pending.map(|(p, _)| p)
+    }
+
     /// The window closes: the size made by hand that had not settled yet, if any.
     pub fn close(&mut self) -> Option<egui::Vec2> {
-        let pending = self.pending.take().map(|(p, _)| p);
+        let pending = self.unsettled();
         *self = SizeMemory::default();
         pending
     }
@@ -204,7 +218,6 @@ impl SizeMemory {
     fn saved(&mut self, size: egui::Vec2) -> egui::Vec2 {
         self.baseline = Some(size);
         self.pending = None;
-        self.steady = None;
         size
     }
 }
@@ -321,44 +334,43 @@ pub(crate) mod tests {
         }
     }
 
-    fn normal(w: f32, h: f32) -> Seen {
-        Seen { size: Some(egui::vec2(w, h)), not_normal: false }
-    }
-
-    fn maximized(w: f32, h: f32) -> Seen {
-        Seen { size: Some(egui::vec2(w, h)), not_normal: true }
-    }
-
-    /// Frames 1/60 s apart from `t`, each seeing `seen`; what each said to save.
-    fn frames(m: &mut SizeMemory, t: &mut f64, n: usize, seen: Seen) -> Vec<egui::Vec2> {
+    /// Frames 1/60 s apart from `t`, each reading the normal size `normal`; what each said to save.
+    fn frames(m: &mut SizeMemory, t: &mut f64, n: usize, normal: Option<egui::Vec2>) -> Vec<egui::Vec2> {
         (0..n)
             .filter_map(|_| {
                 *t += 1.0 / 60.0;
-                m.observe(seen, *t)
+                m.observe(normal, *t)
             })
             .collect()
+    }
+
+    fn sz(w: f32, h: f32) -> Option<egui::Vec2> {
+        Some(egui::vec2(w, h))
     }
 
     #[test]
     fn a_drag_saves_once_when_the_size_settles_not_on_every_frame() {
         let mut m = SizeMemory::default();
         let mut t = 0.0;
-        assert_eq!(m.observe(normal(900.0, 700.0), 0.0), None, "a closed window saves nothing");
+        assert_eq!(m.observe(sz(900.0, 700.0), 0.0), None, "a closed window saves nothing");
         m.open(default());
         // The size Windows reports back, a pixel off what was asked: not a resize.
-        assert!(frames(&mut m, &mut t, 120, normal(SIZE[0] + 0.8, SIZE[1] - 0.6)).is_empty());
+        assert!(frames(&mut m, &mut t, 120, sz(SIZE[0] + 0.8, SIZE[1] - 0.6)).is_empty());
         // A drag over two seconds, one size a frame.
         let mut saved = Vec::new();
         for i in 0..120 {
             t += 1.0 / 60.0;
-            saved.extend(m.observe(normal(SIZE[0] + 2.0 * i as f32, SIZE[1] + i as f32), t));
+            saved.extend(m.observe(sz(SIZE[0] + 2.0 * i as f32, SIZE[1] + i as f32), t));
         }
         assert!(saved.is_empty(), "nothing while it moves: {saved:?}");
         // Let go: saved once, after it has stayed for the settle time.
-        let end = normal(SIZE[0] + 238.0, SIZE[1] + 119.0);
-        let saved = frames(&mut m, &mut t, 120, end);
-        assert_eq!(saved, vec![end.size.unwrap()]);
+        let end = sz(SIZE[0] + 238.0, SIZE[1] + 119.0);
+        assert_eq!(frames(&mut m, &mut t, 120, end), vec![end.unwrap()]);
         assert!(!m.is_waiting());
+        // A drag that stops at C for a third of a second and goes on to B: only B is saved.
+        let (c, b) = (sz(1000.0, 800.0), sz(1100.0, 820.0));
+        assert!(frames(&mut m, &mut t, 20, c).is_empty());
+        assert_eq!(frames(&mut m, &mut t, 60, b), vec![b.unwrap()]);
         // Closed afterwards: nothing more.
         assert_eq!(m.close(), None);
         assert!(!m.is_open());
@@ -368,14 +380,15 @@ pub(crate) mod tests {
     fn a_size_not_settled_yet_is_saved_when_the_window_closes() {
         let mut m = SizeMemory::default();
         m.open(default());
-        assert_eq!(m.observe(normal(1000.0, 760.0), 1.0), None);
+        assert_eq!(m.observe(sz(1000.0, 760.0), 1.0), None);
         assert!(m.is_waiting());
+        assert_eq!(m.unsettled(), Some(egui::vec2(1000.0, 760.0)), "what the app saves if it quits now");
         assert_eq!(m.close(), Some(egui::vec2(1000.0, 760.0)));
         // Dragged back to where it opened before closing: nothing to save.
         m.open(default());
-        m.observe(normal(1000.0, 760.0), 1.0);
-        m.observe(normal(SIZE[0], SIZE[1]), 1.1);
-        assert_eq!(m.close(), None);
+        m.observe(sz(1000.0, 760.0), 1.0);
+        m.observe(sz(SIZE[0], SIZE[1]), 1.1);
+        assert_eq!((m.unsettled(), m.close()), (None, None));
     }
 
     #[test]
@@ -385,42 +398,40 @@ pub(crate) mod tests {
         let mut m = SizeMemory::default();
         m.open(o.size);
         let mut t = 0.0;
-        assert!(frames(&mut m, &mut t, 120, normal(o.size.x, o.size.y)).is_empty(), "the fitted size is not the user's");
+        assert!(frames(&mut m, &mut t, 120, Some(o.size)).is_empty(), "the fitted size is not the user's");
         assert_eq!(m.close(), None);
     }
 
+    /// Maximized, minimized or snapped, the window's normal size stays what it was before, so
+    /// whatever it shows on screen meanwhile never reaches the decision; a normal size that cannot
+    /// be read saves nothing and drops nothing.
     #[test]
-    fn a_maximized_size_is_never_saved() {
-        let a = egui::vec2(1000.0, 760.0);
-        let full = (1920.0, 1032.0);
-        // Resized to A (settled), maximized, closed: A was saved and nothing after it.
+    fn only_the_normal_size_counts() {
+        let a = sz(1000.0, 760.0);
         let mut m = SizeMemory::default();
         m.open(default());
         let mut t = 0.0;
-        assert_eq!(frames(&mut m, &mut t, 60, normal(a.x, a.y)), vec![a]);
-        // The resize to maximized may arrive a frame before Windows says it is maximized.
-        assert!(frames(&mut m, &mut t, 1, normal(full.0, full.1)).is_empty());
-        assert!(frames(&mut m, &mut t, 60, maximized(full.0, full.1)).is_empty());
-        assert_eq!(m.close(), None, "closed maximized: nothing");
-        // Resized to A and maximized at once, closed maximized: A, not the maximized size.
-        m.open(default());
-        t = 0.0;
-        assert!(frames(&mut m, &mut t, 12, normal(a.x, a.y)).is_empty());
-        assert!(frames(&mut m, &mut t, 1, normal(full.0, full.1)).is_empty());
-        let saved = frames(&mut m, &mut t, 60, maximized(full.0, full.1));
-        assert_eq!(saved, vec![a]);
+        // Resized to A and maximized or snapped a frame later: the normal size stays A.
+        assert_eq!(frames(&mut m, &mut t, 61, a), vec![a.unwrap()]);
         assert_eq!(m.close(), None);
-        // Maximized and restored without a resize: nothing, before or at close.
+        // Never resized, maximized and restored: the normal size never left the opening's.
         m.open(default());
-        t = 0.0;
-        assert!(frames(&mut m, &mut t, 1, normal(full.0, full.1)).is_empty());
-        assert!(frames(&mut m, &mut t, 60, maximized(full.0, full.1)).is_empty());
-        assert!(frames(&mut m, &mut t, 60, normal(SIZE[0], SIZE[1])).is_empty());
+        assert!(frames(&mut m, &mut t, 120, Some(default())).is_empty());
         assert_eq!(m.close(), None);
-        // Minimized: Windows may say its size is tiny; never saved.
+        // Unreadable: nothing, and what was pending stays pending.
         m.open(default());
-        assert!(frames(&mut m, &mut t, 60, Seen { size: Some(egui::vec2(160.0, 28.0)), not_normal: true }).is_empty());
-        assert!(frames(&mut m, &mut t, 60, Seen { size: None, not_normal: false }).is_empty());
-        assert_eq!(m.close(), None);
+        m.observe(a, t);
+        assert!(frames(&mut m, &mut t, 60, None).is_empty());
+        assert_eq!(m.close(), a);
+    }
+
+    #[test]
+    fn a_normal_size_in_pixels_is_turned_into_points_at_its_dpi() {
+        assert_eq!(points((1380, 1110, 144)), Some(egui::vec2(920.0, 740.0)));
+        assert_eq!(points((920, 740, 96)), Some(egui::vec2(920.0, 740.0)));
+        assert_eq!(points((1840, 1480, 192)), Some(egui::vec2(920.0, 740.0)));
+        for bad in [(0, 740, 96), (920, -1, 96), (920, 740, 0)] {
+            assert_eq!(points(bad), None, "{bad:?}");
+        }
     }
 }

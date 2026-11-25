@@ -250,6 +250,8 @@ pub struct Shared {
     pub size_to_save: Option<[f32; 2]>,
     /// The work area of the monitor the window opens on, in points; tests give their own.
     work_area: fn() -> Option<egui::Rect>,
+    /// Where the open window's normal size is read from; tests give their own.
+    normal_size: Box<dyn opening::NormalSize>,
 }
 
 /// The primary monitor's work area in points, as Windows reports it now.
@@ -260,7 +262,7 @@ fn primary_work_area() -> Option<egui::Rect> {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false, opening: None, size_memory: opening::SizeMemory::default(), size_to_save: None, work_area: primary_work_area }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false, opening: None, size_memory: opening::SizeMemory::default(), size_to_save: None, work_area: primary_work_area, normal_size: Box::new(opening::WindowsNormalSize::default()) }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -377,7 +379,14 @@ impl Shared {
         let o = opening::opening(self.prefs.settings.main_window_size, (self.work_area)());
         self.opening = Some(o);
         self.size_memory.open(o.size);
+        self.normal_size.forget();
         o
+    }
+
+    /// The app is quitting: a size the user gave the window by hand that the app has not taken
+    /// yet, or that has not settled yet, so that it is saved before the app is gone.
+    pub fn size_at_exit(&mut self) -> Option<[f32; 2]> {
+        self.size_to_save.take().or_else(|| self.size_memory.unsettled().map(|v| [v.x, v.y]))
     }
 }
 
@@ -466,6 +475,18 @@ pub fn connected_host(server: &str, token: &TokenStatus, bound: Option<&str>, re
     crate::publish::host_of(server)
 }
 
+/// Take a size the user gave the window by hand into `settings`: true when that changed them,
+/// so they are to be saved.
+pub fn size_changes(settings: &mut crate::settings::Settings, size: Option<[f32; 2]>) -> bool {
+    match size {
+        Some(size) if settings.main_window_size != Some(size) => {
+            settings.main_window_size = Some(size);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("main-window")
 }
@@ -524,8 +545,9 @@ fn watch_size(ctx: &egui::Context, s: &mut Shared) {
     if !s.nav.is_open() {
         return;
     }
-    let (seen, now) = ctx.input(|i| (opening::Seen::from_info(i.viewport()), i.time));
-    if let Some(size) = s.size_memory.observe(seen, now) {
+    let (info, ppp, now) = ctx.input(|i| (i.viewport().clone(), i.pixels_per_point, i.time));
+    let normal = s.normal_size.read(&info, ppp);
+    if let Some(size) = s.size_memory.observe(normal, now) {
         s.size_to_save = Some([size.x, size.y]);
     }
     if s.size_memory.is_waiting() {

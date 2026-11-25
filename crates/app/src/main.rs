@@ -1486,10 +1486,7 @@ impl App {
             (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take(), s.size_to_save.take())
         };
         // The user gave the main window a size by hand: it opens at that size from now on.
-        if let Some(size) = window_size
-            && self.settings.main_window_size != Some(size)
-        {
-            self.settings.main_window_size = Some(size);
+        if main_window::size_changes(&mut self.settings, window_size) {
             self.save_settings();
         }
         // The Open image tile: exactly what the tray's "Open image from file…" runs. A picture
@@ -1615,6 +1612,11 @@ impl eframe::App for App {
         // its next frame and is given a moment, so that no ffmpeg runs on after the app.
         project::shutdown(Duration::from_secs(3));
         publish_ui::shutdown(std::time::Duration::from_secs(5));
+        // A size the main window was given by hand in the last moments is kept too.
+        let window_size = self.window.lock().ok().and_then(|mut s| s.size_at_exit());
+        if main_window::size_changes(&mut self.settings, window_size) {
+            self.save_settings();
+        }
         // A delete that was noted as unfinished in the last moments is on disk before the app is gone,
         // and so is a change whose save failed earlier, if the file can be written by now.
         self.save_publish_state(true);
