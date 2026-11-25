@@ -997,7 +997,7 @@ fn the_parts_of_a_row_stand_on_one_line() {
 #[test]
 fn the_workspace_page_scrolls_to_sign_out_where_the_window_is_too_low() {
     let ppp = 2.0;
-    let size = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, ppp))).size;
+    let size = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, ppp)), 1.0).size;
     let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     let (ctx, mut f, out) = settled(Kind::Connected, size, ppp);
     assert!(text_rect(&out, workspace_ui::SIGN_OUT).is_none_or(|r| !window.contains_rect(r)), "{size:?}: Sign out needs scrolling to");
@@ -1105,7 +1105,7 @@ fn the_workspace_page_shows_sign_out_whole_at_the_opening_size_on_1080p_and_4k()
     for ppp in [1.0f32, 1.25, 1.5, 2.0] {
         for (name, w, h) in [("1080p", 1920u32, 1080u32), ("4K", 3840, 2160)] {
             let work = super::super::opening::tests::work(w, h, ppp);
-            let size = super::super::opening::opening(None, Some(work)).size;
+            let size = super::super::opening::opening(None, Some(work), 1.0).size;
             let what = format!("{name} at {ppp}: {size:?}");
             let (_ctx, _f, out) = settled(Kind::Connected, size, ppp);
             let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
@@ -1134,7 +1134,7 @@ fn the_workspace_page_shows_sign_out_whole_at_the_opening_size_on_1080p_and_4k()
 #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
 fn window_size_renders() {
     let default = egui::vec2(SIZE[0], SIZE[1]);
-    let fitted = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, 1.5))).size;
+    let fitted = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, 1.5)), 1.0).size;
     let missing = crate::tours_ui::tests::conn(TokenStatus::Missing);
     for (label, size, ppp) in [("size-workspace-default-1x", default, 1.0f32), ("size-workspace-1080p-150", fitted, 1.5)] {
         let (_ctx, mut f, _) = settled(Kind::Connected, size, ppp);
