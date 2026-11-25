@@ -1049,6 +1049,26 @@ fn row(rows: &mut theme::CardRows<'_>, state: &mut SettingsState, view: &View<'_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Hotkeys page lists the editor's Picture tool by name, with no key until one is picked.
+    #[test]
+    fn the_hotkeys_page_has_a_row_for_the_picture_tool_with_no_key() {
+        let ctx = crate::theme::test_context();
+        let mut settings = Settings::default();
+        assert_eq!(settings.editor_binding(EditorAction::Picture), "");
+        let mut state = SettingsState { tab: Tab::Hotkeys, ..SettingsState::default() };
+        let errors = HashMap::new();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 4000.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let view = View { settings: &mut settings, errors: &errors, snipping_tool: None, autostart: false, updates: None };
+            let mut actions = Vec::new();
+            hotkeys_tab(ui, &mut state, view, &mut actions);
+        });
+        out.textures_delta.clear();
+        let texts: Vec<String> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect();
+        assert!(texts.iter().any(|t| t == "Picture tool"), "{texts:?}");
+        assert_eq!(Bind::Editor(EditorAction::Picture).label(), "Picture tool");
+    }
     use crate::project::{Problem, ProjectKey};
     use std::sync::mpsc::channel;
 

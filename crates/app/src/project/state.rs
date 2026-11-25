@@ -1256,6 +1256,27 @@ pub(super) mod tests {
         assert!(!to_text(&build(&rec, &edit, &[], &[]).0).unwrap().contains("\"pulse\": "));
     }
 
+    /// A picture placed from a file (made ready by the placing code: scaled to fit, resampled)
+    /// is saved with the project and comes back the same, pixels and place.
+    #[test]
+    fn a_picture_placed_from_a_file_round_trips() {
+        let rec = rec();
+        let capture = (rec.width, rec.height);
+        let img = RgbaImage::from_fn(300, 120, |x, y| image::Rgba([x as u8, y as u8, 7, if x < 30 { 0 } else { 255 }]));
+        let image = crate::place_picture::prepare(img, capture);
+        assert_eq!((image.width(), image.height()), (90, 36), "stored at the size it is shown");
+        let rect = crate::place_picture::placed_rect((90.0, 36.0), pt(95.0, 10.0), capture);
+        assert_eq!(rect, b(10.0, 0.0, 100.0, 36.0), "moved inside the capture");
+        let items = vec![Item { id: 1, shape: Shape::Image { rect, image }, style: Style::default(), frames: Some((0, 9)), pin: None }];
+        let (file, blobs) = build(&rec, &Edit::new(&rec, OverlayStyle::default()), &[], &items);
+        assert_eq!(blobs.len(), 1);
+        let project = tempfile::tempdir().unwrap();
+        write_blobs(project.path(), &blobs);
+        let back = from_file(parse(&to_text(&file).unwrap()).unwrap(), project.path(), &rec);
+        assert_eq!(back.dropped, Vec::<String>::new());
+        assert_same_items(&back.items, &items);
+    }
+
     #[test]
     fn two_items_with_the_same_picture_share_one_file() {
         let rec = rec();

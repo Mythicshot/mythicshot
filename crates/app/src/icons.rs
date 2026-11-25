@@ -73,13 +73,15 @@ pub enum Icon {
     Preferences,
     /// A picture with an arrow up out of it: the Home tile that opens a picture file.
     OpenImage,
+    /// A picture frame with a mountain and the sun: the editor's Picture tool.
+    Picture,
 }
 
 impl Icon {
     /// Every icon, for the tests that draw them all.
     #[cfg(test)]
-    pub const ALL: [Icon; 57] = [
-        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Slice, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences, Icon::OpenImage,
+    pub const ALL: [Icon; 58] = [
+        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Slice, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences, Icon::OpenImage, Icon::Picture,
     ];
 }
 
@@ -404,6 +406,14 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             p.add(line(&[(0.85, 0.66), (0.85, 0.1)]));
             p.add(line(&[(0.73, 0.22), (0.85, 0.1), (0.97, 0.22)]));
         }
+        Icon::Picture => {
+            // A picture frame filling the square, the sun at the top right and a mountain (a tall
+            // peak and a low one) standing on the frame's bottom edge.
+            p.rect_stroke(rect(0.06, 0.14, 0.94, 0.86), 2.0, s, StrokeKind::Middle);
+            p.circle_filled(at(0.7, 0.36), r.width() * 0.08, c);
+            p.add(poly(&[(0.12, 0.8), (0.38, 0.42), (0.64, 0.8)]));
+            p.add(poly(&[(0.5, 0.8), (0.68, 0.58), (0.88, 0.8)]));
+        }
     }
 }
 
@@ -427,7 +437,7 @@ mod tests {
                 assert!(inked.len() as f32 >= 8.0 * ppp * ppp, "{icon:?} at {ppp} draws almost nothing");
                 // The page icons stay inside their square (a pixel of slack for the line's
                 // width); some older toolbar icons reach a little past theirs on purpose.
-                if !matches!(icon, Icon::Plus | Icon::ChevronDown | Icon::Home | Icon::Tours | Icon::Workspace | Icon::Preferences | Icon::OpenImage) {
+                if !matches!(icon, Icon::Plus | Icon::ChevronDown | Icon::Home | Icon::Tours | Icon::Workspace | Icon::Preferences | Icon::OpenImage | Icon::Picture) {
                     continue;
                 }
                 let slack = 2.0 * ppp;
@@ -459,6 +469,37 @@ mod tests {
             assert!(inked(0.0, 0.3, 0.72, 1.0) as f32 >= 40.0 * ppp * ppp, "the picture at {ppp}");
             assert!(inked(0.76, 0.0, 1.0, 0.3) as f32 >= 6.0 * ppp * ppp, "the arrow's head above the picture at {ppp}");
             assert_eq!(inked(0.0, 0.0, 0.6, 0.25), 0, "nothing above the picture at the left at {ppp}");
+        }
+    }
+
+    /// The Picture tool's icon: a frame, the sun inside it at the top right, a mountain filled
+    /// in at the bottom, and nothing inked at the top left inside the frame (the sky).
+    #[test]
+    fn the_picture_icon_is_a_frame_with_a_mountain_and_a_sun() {
+        for ppp in [1.0, 2.0] {
+            let side = 28.0;
+            let size = vec2(side, side);
+            let image = crate::snapshot::picture(&theme::test_context(), size, ppp, 1, |ui| {
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::ZERO, size), 0.0, theme::SURFACE);
+                paint(ui.painter(), Rect::from_min_size(Pos2::ZERO, size), Icon::Picture, theme::TEXT);
+            });
+            let inked = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                image.enumerate_pixels().filter(|(x, y, p)| {
+                    let (x, y) = ((*x as f32 + 0.5) / (side * ppp), (*y as f32 + 0.5) / (side * ppp));
+                    x >= x0 && x < x1 && y >= y0 && y < y1 && theme::contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), theme::SURFACE) >= 3.0
+                }).count()
+            };
+            let area = |x0: f32, y0: f32, x1: f32, y1: f32| (x1 - x0) * (y1 - y0) * side * side * ppp * ppp;
+            // The frame's four sides.
+            for (name, r) in [("top", (0.2, 0.1, 0.8, 0.18)), ("bottom", (0.2, 0.82, 0.8, 0.9)), ("left", (0.02, 0.3, 0.1, 0.7)), ("right", (0.9, 0.3, 0.98, 0.7))] {
+                assert!(inked(r.0, r.1, r.2, r.3) as f32 >= area(r.0, r.1, r.2, r.3) * 0.3, "the frame's {name} side at {ppp}");
+            }
+            // The sun, a filled dot at the top right inside the frame.
+            assert!(inked(0.65, 0.31, 0.75, 0.41) as f32 >= area(0.65, 0.31, 0.75, 0.41) * 0.6, "the sun at {ppp}");
+            // The mountain, filled, low in the frame.
+            assert!(inked(0.3, 0.62, 0.46, 0.76) as f32 >= area(0.3, 0.62, 0.46, 0.76) * 0.8, "the mountain at {ppp}");
+            // The sky at the top left is empty.
+            assert_eq!(inked(0.14, 0.24, 0.5, 0.36), 0, "the sky at {ppp}");
         }
     }
 }

@@ -287,8 +287,8 @@ fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
     let (a, b) = (PathBuf::from("C:/p/a.png"), PathBuf::from("C:/p/b.png"));
     let mut loads = ImageLoads::default();
     assert!(!loads.pending(), "nothing asked for yet");
-    let (ga, _) = loads.request(a.clone()).expect("starts at once");
-    let (gb, _) = loads.request(b.clone()).expect("a second read runs beside the first");
+    let ga = loads.request(a.clone()).expect("starts at once").generation;
+    let gb = loads.request(b.clone()).expect("a second read runs beside the first").generation;
     assert!(loads.pending());
     // The newer one ends first and opens.
     let (settled, next) = loads.finished(gb, &b, Ok(RgbaImage::new(4, 4)));
@@ -299,12 +299,12 @@ fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
     let (settled, _) = loads.finished(ga, &a, Ok(RgbaImage::new(2, 2)));
     assert!(matches!(settled, Settled::Superseded));
     // A superseded read that fails says nothing either.
-    let (gc, _) = loads.request(a.clone()).unwrap();
-    let (gd, _) = loads.request(b.clone()).unwrap();
-    assert!(matches!(loads.finished(gc, &a, Err(gone())).0, Settled::Superseded));
+    let gc = loads.request(a.clone()).unwrap().generation;
+    let gd = loads.request(b.clone()).unwrap().generation;
+    assert!(matches!(loads.finished(gc, &a, Err::<RgbaImage, _>(gone())).0, Settled::Superseded));
     assert!(loads.pending(), "the newest is still being read");
     // The newest failing says the usual sentence.
-    let (settled, _) = loads.finished(gd, &b, Err(gone()));
+    let (settled, _) = loads.finished(gd, &b, Err::<RgbaImage, _>(gone()));
     match settled {
         Settled::Failed(sentence) => assert_eq!(sentence, could_not_open(&b, &gone())),
         other => panic!("{other:?}"),
@@ -316,22 +316,144 @@ fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
 fn at_most_two_reads_run_and_only_the_newest_waiting_request_is_kept() {
     let mut loads = ImageLoads::default();
     let p = |n: &str| PathBuf::from(format!("C:/p/{n}.png"));
-    let (g1, _) = loads.request(p("1")).unwrap();
-    let (g2, _) = loads.request(p("2")).unwrap();
+    let g1 = loads.request(p("1")).unwrap().generation;
+    let g2 = loads.request(p("2")).unwrap().generation;
     assert!(loads.request(p("3")).is_none(), "a third waits");
     assert!(loads.request(p("4")).is_none(), "and a fourth replaces it");
     // One ends: the newest waiting request starts, the replaced one never does.
     let (settled, next) = loads.finished(g1, &p("1"), Ok(RgbaImage::new(1, 1)));
     assert!(matches!(settled, Settled::Superseded));
-    let (g4, path) = next.expect("the waiting request starts");
+    let job = next.expect("the waiting request starts");
+    let (g4, path) = (job.generation, job.path.clone());
     assert_eq!(path, p("4"));
     assert!(loads.pending(), "an update waits for it");
     // The other old one ends: nothing waits, nothing starts.
-    let (settled, next) = loads.finished(g2, &p("2"), Err(gone()));
+    let (settled, next) = loads.finished(g2, &p("2"), Err::<RgbaImage, _>(gone()));
     assert!(matches!(settled, Settled::Superseded) && next.is_none());
     let (settled, _) = loads.finished(g4, &p("4"), Ok(RgbaImage::new(1, 1)));
     assert!(matches!(settled, Settled::Open(..)));
     assert!(!loads.pending(), "an update may close the app now");
+}
+
+/// Five windows asking at once share four slots: four reads start, the fifth window's request
+/// waits (and an update waits for it), and a slot given back wakes the windows so the waiting
+/// read starts on its next frame.
+#[test]
+fn a_request_beyond_the_apps_four_reads_waits_for_any_windows_read_to_end() {
+    let pool = ReadPool::new(MAX_READS_ALL);
+    let woken = Arc::new(AtomicU64::new(0));
+    let mut windows: Vec<ImageLoads> = (0..5).map(|_| ImageLoads::with_pool(pool.clone())).collect();
+    for w in &mut windows {
+        let woken = woken.clone();
+        w.set_wake(move || { woken.fetch_add(1, Ordering::SeqCst); });
+    }
+    let mut jobs: Vec<ReadJob> = Vec::new();
+    for (i, w) in windows.iter_mut().enumerate() {
+        if let Some(job) = w.request(PathBuf::from(format!("C:/p/{i}.png"))) {
+            jobs.push(job);
+        }
+    }
+    assert_eq!((jobs.len(), pool.in_flight()), (4, 4), "four start");
+    assert!(windows[4].pending(), "the fifth waits, and an update waits for it");
+    assert!(windows[4].retry().is_none(), "no slot yet");
+    // Another window's read ends: its slot comes back and every window is woken.
+    drop(jobs.remove(0));
+    assert_eq!(pool.in_flight(), 3);
+    assert_eq!(woken.load(Ordering::SeqCst), 5);
+    let job = windows[4].retry().expect("the waiting read starts");
+    assert_eq!((job.generation, job.path.clone(), pool.in_flight()), (1, PathBuf::from("C:/p/4.png"), 4));
+    // Its own window's limit still holds: a window with two running waits even with a slot free.
+    drop(jobs.remove(0));
+    let mut busy = ImageLoads::with_pool(ReadPool::new(MAX_READS_ALL));
+    let _a = busy.request(PathBuf::from("a")).unwrap();
+    let _b = busy.request(PathBuf::from("b")).unwrap();
+    assert!(busy.request(PathBuf::from("c")).is_none() && busy.retry().is_none());
+}
+
+/// The slot comes back however the read ends: a picture read, a file that is no picture, a
+/// panic while preparing the picture, and a panic in what is done with the result.
+#[test]
+fn a_reads_slot_comes_back_on_every_way_out_panics_included() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pic = tmp.path().join("a.png");
+    std::fs::write(&pic, png(&RgbaImage::new(3, 2))).unwrap();
+    let pool = ReadPool::new(MAX_READS_ALL);
+    let mut loads = ImageLoads::with_pool(pool.clone());
+    let job = |loads: &mut ImageLoads, path: &Path| {
+        let job = loads.request(path.to_path_buf()).unwrap();
+        loads.finished::<()>(job.generation, path, Ok(()));
+        job
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    job(&mut loads, &pic).spawn(|img| img.dimensions(), move |_, _, r| tx.send(r.ok()).unwrap()).join().unwrap();
+    assert_eq!((rx.recv().unwrap(), pool.in_flight()), (Some((3, 2)), 0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    job(&mut loads, &tmp.path().join("gone.png")).spawn(|img| img, move |_, _, r| tx.send(r.is_err()).unwrap()).join().unwrap();
+    assert!(rx.recv().unwrap() && pool.in_flight() == 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    job(&mut loads, &pic).spawn(|_| -> u8 { panic!("a hostile picture") }, move |_, _, r| tx.send(r.is_err()).unwrap()).join().unwrap();
+    assert!(rx.recv().unwrap() && pool.in_flight() == 0, "a panic while preparing is a failure, and the slot is back");
+    let ended = job(&mut loads, &pic).spawn(|img| img, |_, _, _| panic!("the window is gone")).join();
+    assert!(ended.is_err());
+    assert_eq!(pool.in_flight(), 0, "the slot was back before the result was handed over");
+}
+
+/// Five windows each asking at once, their reads on real threads: never more than four run,
+/// and every window's newest request is answered in the end.
+#[test]
+fn five_windows_asking_at_once_never_run_more_than_four_reads_and_all_are_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = ReadPool::new(MAX_READS_ALL);
+    let mut windows: Vec<ImageLoads> = (0..5).map(|_| ImageLoads::with_pool(pool.clone())).collect();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, u64, PathBuf, Result<(u32, u32), ImageError>)>();
+    let most = Arc::new(AtomicU64::new(0));
+    let start = |w: usize, job: ReadJob| {
+        let tx = tx.clone();
+        let (p, most) = (pool.clone(), most.clone());
+        job.spawn(
+            move |img| {
+                most.fetch_max(p.in_flight() as u64, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                img.dimensions()
+            },
+            move |g, path, r| tx.send((w, g, path, r)).unwrap(),
+        );
+    };
+    let mut answers: Vec<Option<(u32, u32)>> = vec![None; 5];
+    for (w, window) in windows.iter_mut().enumerate() {
+        // Each window asks twice; only its newest picture counts.
+        for n in 0..2 {
+            let path = tmp.path().join(format!("{w}-{n}.png"));
+            std::fs::write(&path, png(&RgbaImage::new(w as u32 + 1, n + 1))).unwrap();
+            if let Some(job) = window.request(path) {
+                start(w, job);
+            }
+            assert!(pool.in_flight() <= MAX_READS_ALL);
+        }
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while windows.iter().any(ImageLoads::pending) && std::time::Instant::now() < until {
+        assert!(pool.in_flight() <= MAX_READS_ALL, "{} reads at once", pool.in_flight());
+        if let Ok((w, g, path, r)) = rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            let (settled, next) = windows[w].finished(g, &path, r);
+            if let Some(job) = next {
+                start(w, job);
+            }
+            if let Settled::Open(dims, _) = settled {
+                answers[w] = Some(dims);
+            }
+        }
+        // Each window's frame: a read waiting for a slot starts once one is free.
+        for (w, window) in windows.iter_mut().enumerate() {
+            if let Some(job) = window.retry() {
+                start(w, job);
+            }
+        }
+    }
+    assert!(windows.iter().all(|w| !w.pending()), "every newest request was answered");
+    let most = most.load(Ordering::SeqCst);
+    assert!(most >= 1 && most <= MAX_READS_ALL as u64, "at most four ran at once: {most}");
+    assert_eq!(answers, (0..5).map(|w| Some((w as u32 + 1, 2))).collect::<Vec<_>>(), "with its newest picture");
 }
 
 #[test]
@@ -422,6 +544,40 @@ fn the_overlay_says_what_a_drop_would_do_and_a_drop_hands_over_only_a_picture() 
     }
 }
 
+/// An editor's overlay says its own words over a picture, the same refusal over anything else,
+/// and while nothing may be placed it refuses a picture with its own reason (anything else with
+/// the usual sentence), and a drop hands nothing over.
+#[test]
+fn a_window_with_its_own_words_takes_a_picture_only_while_it_is_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pic = tmp.path().join("shot.png");
+    std::fs::write(&pic, "x").unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "x").unwrap();
+    let ctx = theme::test_context();
+    let mut state = DropState::default();
+    let frame = |state: &mut DropState, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, allowed: bool| {
+        let mut got = None;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| got = state.frame_for(ui.ctx(), ui.ctx().content_rect(), hovered.clone(), dropped.clone(), Words { accept: "Place it", blocked: "Not now" }, allowed));
+        out.textures_delta.clear();
+        (texts(&out), got)
+    };
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], true), (vec!["Place it".to_string()], None));
+    assert_eq!(frame(&mut state, vec![Some(notes.clone())], vec![], true).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], true), (vec![], Some(pic.clone())));
+    // Not allowed now: the picture is refused with that reason, anything else as always, and a
+    // drop does nothing.
+    frame(&mut state, vec![], vec![], false);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, ["Not now"]);
+    assert_eq!(frame(&mut state, vec![Some(notes.clone())], vec![], false).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone()), Some(pic.clone())], vec![], false).0, [ONLY_PICTURES]);
+    // Allowed again in the same drag: the picture is taken again.
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, ["Not now"]);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], true).0, ["Place it"]);
+    frame(&mut state, vec![], vec![], false);
+    assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], false), (vec![], None));
+}
+
 #[test]
 fn a_drop_of_several_files_arriving_a_file_a_frame_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -475,10 +631,11 @@ fn the_overlay_words_keep_their_contrast_on_a_solid_chip() {
     }
 }
 
-/// An editor is a window of its own and does not read dragged or dropped files: no overlay is
-/// drawn there and a drop on it asks nothing of the app.
+/// An editor is a window of its own: the main window's overlay, which opens a new editor, never
+/// shows there (the editor shows its own, which places the picture on its capture), and a drop on
+/// it asks nothing of the app.
 #[test]
-fn the_overlay_never_appears_in_an_editor_and_a_drop_there_does_nothing() {
+fn the_main_windows_overlay_never_appears_in_an_editor_and_a_drop_there_asks_nothing_of_the_app() {
     let tmp = tempfile::tempdir().unwrap();
     let pic = tmp.path().join("shot.png");
     std::fs::write(&pic, png(&RgbaImage::new(1, 1))).unwrap();
@@ -487,12 +644,15 @@ fn the_overlay_never_appears_in_an_editor_and_a_drop_there_does_nothing() {
     let ctx = theme::test_context();
     let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
     let hovered = vec![egui::HoveredFile { path: Some(pic.clone()), mime: String::new() }];
+    let mut seen = Vec::new();
     for _ in 0..3 {
         let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), hovered_files: hovered.clone(), ..Default::default() }, |ui| ed.ui(ui));
         out.textures_delta.clear();
         let t = texts(&out);
-        assert!(!t.iter().any(|t| t == DROP_TO_OPEN || t == ONLY_PICTURES), "{t:?}");
+        assert!(!t.iter().any(|t| t == DROP_TO_OPEN), "{t:?}");
+        seen.extend(t);
     }
+    assert!(seen.iter().any(|t| t == crate::place_picture::PLACE_HERE), "the editor's own overlay: {seen:?}");
     let dropped: Vec<egui::DroppedFileHandle> = vec![Arc::new(Dropped(pic))];
     let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), dropped_files: dropped, ..Default::default() }, |ui| ed.ui(ui));
     out.textures_delta.clear();

@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.38 (2026-11-25)
+
+- A picture file can be placed on a capture: drop it on an editor window, or use the new "Picture" tool on the rail. It lands where it was dropped (the tool puts it in the middle of the view), selected, as one undo step, and from there it is the picture object the editor already had. A picture larger than the capture is scaled down to fit and kept at that size.
+- It works wherever a picture can be pasted: the image editor, a recording's timeline and a tour step. Where a picture cannot be placed, the editor says so while you drag.
+- The "Picture" tool has no key of its own; one can be given on the Hotkeys page.
+- At most four picture files are read at a time across all windows.
+
 ## 0.2.37 (2026-11-25)
 
 - Home has a fifth tile, "Open image", which opens a picture file in the editor as if it had just been captured. Dropping a picture file on the Mythicshot window does the same; while you drag, the window says whether the file can be opened.

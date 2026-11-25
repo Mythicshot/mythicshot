@@ -39,7 +39,7 @@ const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
     (Some("Draw"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
     (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Text, Tool::Slice]),
-    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
+    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Picture, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,8 @@ pub enum Tool {
     /// A tour step's guide card; Tour view only.
     Card,
     Crop,
+    /// Place a picture file on the capture: an action that asks for the file, never a mode.
+    Picture,
 }
 
 impl Tool {
@@ -87,6 +89,7 @@ impl Tool {
             Tool::Spotlight => "spotlight",
             Tool::Card => "card",
             Tool::Crop => "crop",
+            Tool::Picture => "picture",
         }
     }
 
@@ -97,12 +100,12 @@ impl Tool {
     /// The tool the editor opens on for `k`, the last tool used as the settings file names it:
     /// that tool, or Select for one of the tools taken off the rail (Cross, Asterisk and Donut),
     /// or the Rectangle for a word no version knew. Crop, Spotlight and guide cards are never
-    /// where the editor opens.
+    /// where the editor opens, nor Picture, which is never a tool in use.
     fn opening(k: &str) -> Tool {
         if REMOVED_TOOLS.contains(&k) {
             return Tool::Select;
         }
-        Tool::from_key(k).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle)
+        Tool::from_key(k).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card | Tool::Picture)).unwrap_or(Tool::Rectangle)
     }
 
     /// The tool that draws a shape, so editing an item updates that tool's style.
@@ -129,7 +132,7 @@ impl Tool {
         }
     }
 
-    const ALL: [Tool; 18] = [
+    const ALL: [Tool; 19] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
@@ -148,6 +151,7 @@ impl Tool {
         Tool::Spotlight,
         Tool::Card,
         Tool::Crop,
+        Tool::Picture,
     ];
 
     fn icon(self) -> Icon {
@@ -170,6 +174,7 @@ impl Tool {
             Tool::Spotlight => Icon::Spotlight,
             Tool::Card => Icon::Card,
             Tool::Crop => Icon::Crop,
+            Tool::Picture => Icon::Picture,
         }
     }
 
@@ -193,6 +198,7 @@ impl Tool {
             Tool::Spotlight => EditorAction::Spotlight,
             Tool::Card => EditorAction::Card,
             Tool::Crop => EditorAction::Crop,
+            Tool::Picture => EditorAction::Picture,
         }
     }
 }
@@ -256,6 +262,18 @@ fn color_image_to_rgba(img: &egui::ColorImage) -> RgbaImage {
     let [w, h] = img.size;
     let bytes = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
     RgbaImage::from_raw(w as u32, h as u32, bytes).unwrap_or_default()
+}
+
+/// Ask for a picture file to place, with the dialog "Open image" uses ([`crate::open_image::pick`],
+/// through the stub-able dialog helper). A test build records the dialog and answers with the
+/// file a test put in [`tests::PICKED`], if any.
+fn pick_picture(dir: &std::path::Path) -> Option<PathBuf> {
+    let picked = crate::open_image::pick(dir);
+    #[cfg(test)]
+    if let Some(answer) = tests::PICKED.with(|p| p.borrow_mut().take()) {
+        return Some(answer);
+    }
+    picked
 }
 
 /// What is on the system clipboard right now, for the right-click Paste here.
@@ -381,6 +399,10 @@ pub struct Editor {
     instance: u64,
     /// Where the canvas was in the last frame, for the box a text is typed in.
     canvas_rect: Option<Rect>,
+    /// A drag of files over this window: what it holds, for the overlay over the canvas.
+    picture_drop: crate::open_image::DropState,
+    /// The picture files being read to be placed on this capture, this editor's newest winning.
+    placing: crate::place_picture::Placing,
 }
 
 /// The toolbar row's scrolling as of the last frame: how wide its content and its view are, how far
@@ -514,6 +536,8 @@ impl Editor {
             panel_open,
             instance: NEXT_EDITOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             canvas_rect: None,
+            picture_drop: crate::open_image::DropState::default(),
+            placing: crate::place_picture::Placing::default(),
         };
         editor.tool = tool;
         editor.load_tool_style(tool);
@@ -683,6 +707,7 @@ impl Editor {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         theme::window_background(ui);
         let ctx = ui.ctx().clone();
+        self.placing.set_wake(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.asks_before_closing() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -721,6 +746,9 @@ impl Editor {
         self.properties_panel(ui);
         self.tool_rail(ui);
         self.canvas(ui);
+        // A picture file dragged over the canvas, and the pictures that have been read since.
+        self.picture_drop(&ctx, modal || self.confirm_close);
+        self.take_placed_pictures();
         // After the canvas, so a key typed in the same frame as the press still reaches the card first.
         // A press on the menu bar, or in one of its menus, leaves the typing on.
         if !self.menu_hold {
@@ -866,6 +894,9 @@ impl Editor {
     }
 
     fn run(&mut self, action: EditorAction) {
+        if action == EditorAction::Picture {
+            return self.picture_tool();
+        }
         if let Some(tool) = Tool::ALL.into_iter().find(|t| t.action() == action) {
             // The screenshot editor has no Spotlight tool, and guide cards live in the Tour view.
             let usable = match tool {
@@ -1083,6 +1114,111 @@ impl Editor {
         let at = at.unwrap_or(pt((dw - w) / 2.0, (dh - h) / 2.0));
         let shape = Shape::Image { rect: Bounds::new(at, pt(at.x + w, at.y + h)), image: mythicshot_editor::ImageData::from_rgba(img) };
         self.add_copy(shape, Style::default(), 0);
+    }
+
+    /// Whether a picture may be placed now: wherever a picture may be pasted, so everywhere but
+    /// the Tour view while it shows no step to pin the picture to.
+    pub(crate) fn can_place_picture(&self) -> bool {
+        !self.drawing_blocked()
+    }
+
+    /// The rail's Picture tool, or its key: ask for a picture file with the dialog "Open image"
+    /// uses (its filters and the captures folder), and place the one chosen at the middle of the
+    /// part of the capture the canvas shows. An action, not a mode: the tool in use stays (until
+    /// the picture is placed, which selects it with the Select tool, as a drop does).
+    pub(crate) fn picture_tool(&mut self) {
+        if !self.can_place_picture() {
+            return;
+        }
+        let Some(path) = pick_picture(&self.dest.output_dir) else { return };
+        let centre = self.visible_centre();
+        self.place_picture_file(path, centre);
+    }
+
+    /// What a picture asked for now would be placed on: see [`crate::place_picture::Target`].
+    fn place_target(&self) -> crate::place_picture::Target {
+        crate::place_picture::Target { capture: (self.doc.width(), self.doc.height()), view: self.video.as_ref().map(|v| (v.view == crate::video_editor::VideoView::Tour, self.tour_src())) }
+    }
+
+    /// Read the picture file at `path` in the background ([`crate::open_image::load`], within
+    /// its limits), to be placed centred on `centre` (capture pixels) once it arrives.
+    pub(crate) fn place_picture_file(&mut self, path: PathBuf, centre: Pt) {
+        if !self.can_place_picture() {
+            return;
+        }
+        let target = self.place_target();
+        self.placing.request(path, centre, target);
+    }
+
+    /// The point of the capture (in its pixels) under `p`, a point of the window, as the canvas
+    /// was last drawn; it may lie outside the capture.
+    fn capture_point(&self, p: egui::Pos2) -> Pt {
+        let c = self.last_canvas;
+        pt((p.x - c.min.x) / c.zoom, (p.y - c.min.y) / c.zoom)
+    }
+
+    /// The middle of the part of the capture the canvas shows, in capture pixels; the capture's
+    /// middle before the canvas was first drawn.
+    fn visible_centre(&self) -> Pt {
+        match self.canvas_rect {
+            Some(r) => self.capture_point(r.center()),
+            None => pt(self.doc.width() as f32 / 2.0, self.doc.height() as f32 / 2.0),
+        }
+    }
+
+    /// Where the pointer is in this window as a file is dropped. While the system drags a file
+    /// the window is told nothing of the pointer, so the system's own cursor position is asked
+    /// for and turned into a point of this window; egui's last pointer position otherwise.
+    fn drop_point(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        #[cfg(not(test))]
+        if let (Some((x, y)), Some(inner)) = (crate::platform::cursor_pos(), ctx.input(|i| i.viewport().inner_rect)) {
+            let ppp = ctx.pixels_per_point();
+            return Some(pos2(x as f32 / ppp - inner.min.x, y as f32 / ppp - inner.min.y));
+        }
+        ctx.input(|i| i.pointer.latest_pos())
+    }
+
+    /// A file dragged over the window: the drop overlay over the canvas only (it takes the
+    /// picture, or refuses anything else, or everything while nothing may be placed or a dialog
+    /// is open: `blocked`, saying so over a picture), and a dropped picture read to be placed
+    /// where it was dropped.
+    fn picture_drop(&mut self, ctx: &egui::Context, blocked: bool) {
+        let Some(area) = self.canvas_rect else { return };
+        let allowed = !blocked && self.can_place_picture();
+        let words = crate::open_image::Words { accept: crate::place_picture::PLACE_HERE, blocked: crate::place_picture::CANNOT_PLACE_NOW };
+        if let Some(path) = self.picture_drop.frame_from_input_for(ctx, area, words, allowed) {
+            let centre = self.drop_point(ctx).filter(|p| area.contains(*p)).map(|p| self.capture_point(p)).unwrap_or_else(|| self.visible_centre());
+            self.place_picture_file(path, centre);
+        }
+    }
+
+    /// Place the pictures that have arrived, or say why a file could not be opened, the way the
+    /// editor reports its other failures. A picture for a capture that has changed meanwhile
+    /// (cropped or resized, another view or step shown), or for a closed editor, is dropped
+    /// without a word.
+    fn take_placed_pictures(&mut self) {
+        for placed in self.placing.poll() {
+            if self.closed {
+                continue;
+            }
+            match placed {
+                crate::place_picture::Placed::Picture { image, centre, target } if target == self.place_target() => {
+                    let size = (image.width() as f32, image.height() as f32);
+                    let rect = crate::place_picture::placed_rect(size, centre, target.capture);
+                    // One undo step, selected with the Select tool, as a pasted picture is.
+                    self.add_copy(Shape::Image { rect, image }, Style::default(), 0);
+                }
+                crate::place_picture::Placed::Failed { sentence, target } if target == self.place_target() => self.notify(sentence),
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether an app update must wait for this editor: it exports or publishes, it is reading
+    /// a picture to place, or it holds a saved recording whose edits not sent to the site a
+    /// close would drop.
+    pub(crate) fn holds_update(&self) -> bool {
+        !self.closed && (self.exporting() || self.may_hold_unsent_edits() || self.placing.pending())
     }
 
     /// Ctrl+D: a copy of the selection just beside it, without the clipboard.
@@ -1555,9 +1691,15 @@ impl Editor {
     fn rail_button(&mut self, ui: &mut egui::Ui, tool: Tool) {
         let binding = self.keys.get(&tool.action()).map(String::as_str).unwrap_or("");
         let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
-        // Guide cards belong to tour steps: the tool works only in the Tour view.
-        let usable = tool != Tool::Card || self.in_tour_view();
-        let resp = ui.add_enabled_ui(usable, |ui| icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip)).inner.on_disabled_hover_text("Open the Tour view to add guide cards");
+        // Guide cards belong to tour steps: the tool works only in the Tour view. A picture is
+        // placed wherever one may be pasted.
+        let usable = match tool {
+            Tool::Card => self.in_tour_view(),
+            Tool::Picture => self.can_place_picture(),
+            _ => true,
+        };
+        let disabled_tip = if tool == Tool::Card { "Open the Tour view to add guide cards" } else { tip.as_str() };
+        let resp = ui.add_enabled_ui(usable, |ui| icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip)).inner.on_disabled_hover_text(disabled_tip);
         let key = hotkeys::display(binding);
         if !key.is_empty() && key.chars().count() <= 2 {
             let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
@@ -1565,7 +1707,11 @@ impl Editor {
             ui.painter().text(corner, egui::Align2::RIGHT_BOTTOM, key, FontId::proportional(9.0), color);
         }
         if resp.clicked() {
-            self.set_tool(tool);
+            if tool == Tool::Picture {
+                self.picture_tool();
+            } else {
+                self.set_tool(tool);
+            }
         }
     }
 
@@ -2374,6 +2520,7 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Group => "Drag around an area to mark it as a group.",
         Tool::Cone => "Drag from the point of the cone to its wide end.",
         Tool::Slice => "Drag from the point of the slice to the middle of its curved edge.",
+        Tool::Picture => "Choose a picture to place on the capture.",
         _ => "Drag on the image to draw.",
     }
 }
@@ -2535,7 +2682,7 @@ impl EditorWindow {
 
     pub fn show(&self, ctx: &egui::Context, icon: Arc<egui::IconData>, first_frame: bool) {
         let title = self.editor.lock().map(|e| format!("{} – Mythicshot", e.title())).unwrap_or_default();
-        let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1280.0, 820.0]).with_min_inner_size(EDITOR_MIN_SIZE).with_icon(icon);
+        let builder = editor_builder(title, icon);
         let editor = self.editor.clone();
         let id = self.id;
         ctx.show_viewport_deferred(id, builder, move |ui, _class| {
@@ -2548,6 +2695,12 @@ impl EditorWindow {
             theme::dark_title_bar(ctx, id);
         }
     }
+}
+
+/// An editor window's viewport. It takes files dropped on it (a picture is placed on the capture),
+/// said outright rather than left to the platform, as for the main window.
+fn editor_builder(title: String, icon: Arc<egui::IconData>) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default().with_title(title).with_inner_size([1280.0, 820.0]).with_min_inner_size(EDITOR_MIN_SIZE).with_icon(icon).with_drag_and_drop(true)
 }
 
 /// Make `ui` and everything drawn in it take no clicks, drags, scrolls, hovers or keys, as
@@ -4280,7 +4433,7 @@ pub(crate) mod tests {
                 (None, vec!["select"]),
                 (Some("Draw"), vec!["freehand", "arrow", "line"]),
                 (Some("Shapes"), vec!["circle", "group", "cone", "rectangle", "ellipse", "text", "slice"]),
-                (Some("More"), vec!["bubble", "step", "highlight", "obfuscate", "spotlight", "card", "crop"]),
+                (Some("More"), vec!["bubble", "step", "picture", "highlight", "obfuscate", "spotlight", "card", "crop"]),
             ]
         );
         for key in REMOVED_KEYS {
@@ -4470,5 +4623,410 @@ pub(crate) mod tests {
         }
         // Another word nobody knows still falls back as before.
         assert_eq!(editor(EditorPrefs { tool: "sculpt".into(), ..EditorPrefs::default() }).tool, Tool::Rectangle);
+    }
+
+    // ---- A picture file dropped on the editor ----
+
+    use crate::place_picture::PLACE_HERE;
+
+    /// An editor of a white capture `w` by `h`, its keys the default ones.
+    pub(crate) fn white_editor(w: u32, h: u32) -> Editor {
+        let s = Settings::default();
+        let mut ed = Editor::new(RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255])), "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs::default());
+        ed.keys = s.editor_keys;
+        ed
+    }
+
+    /// One frame of the editor with `hovered` dragged over its window and `dropped` dropped on it.
+    pub(crate) fn file_frame(ed: &mut Editor, ctx: &egui::Context, hovered: &[PathBuf], dropped: &[PathBuf], events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(dialog_checks::WINDOW),
+            events,
+            hovered_files: hovered.iter().map(|p| egui::HoveredFile { path: Some(p.clone()), mime: String::new() }).collect(),
+            dropped_files: dropped.iter().map(|p| Arc::new(crate::open_image::tests::Dropped(p.clone())) as egui::DroppedFileHandle).collect(),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| ed.ui(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    fn texts(out: &egui::FullOutput) -> Vec<String> {
+        crate::share_ui::tests::shapes_of(out).into_iter().filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect()
+    }
+
+    /// Frames of the editor until `done` holds (at most ten seconds): a picture is read off the
+    /// window's thread.
+    pub(crate) fn frames_until(ed: &mut Editor, ctx: &egui::Context, done: impl Fn(&Editor) -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !done(ed) && Instant::now() < until {
+            dialog_checks::frame(ed, ctx, vec![]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // And a frame more, so whatever the picture's arrival changed is drawn.
+        dialog_checks::frame(ed, ctx, vec![]);
+    }
+
+    /// The window point over capture pixel `p`, as the canvas was last drawn.
+    fn screen_at(ed: &Editor, p: Pt) -> egui::Pos2 {
+        let c = ed.last_canvas;
+        pos2(c.min.x + p.x * c.zoom, c.min.y + p.y * c.zoom)
+    }
+
+    /// Drop `file` on the canvas over capture pixel `at`, the pointer there, after a frame of it
+    /// being dragged; then wait for the read to end.
+    pub(crate) fn drop_on(ed: &mut Editor, ctx: &egui::Context, file: &std::path::Path, at: Pt) {
+        let p = screen_at(ed, at);
+        file_frame(ed, ctx, &[file.to_path_buf()], &[], vec![egui::Event::PointerMoved(p)]);
+        file_frame(ed, ctx, &[], &[file.to_path_buf()], vec![egui::Event::PointerMoved(p)]);
+        frames_until(ed, ctx, |e| !e.placing.pending());
+    }
+
+    fn images(ed: &Editor) -> Vec<(u64, Bounds, (u32, u32))> {
+        ed.doc.items().iter().filter_map(|it| match &it.shape {
+            Shape::Image { rect, image } => Some((it.id, *rect, (image.width(), image.height()))),
+            _ => None,
+        }).collect()
+    }
+
+    /// One supported picture dragged over the editor shows the overlay that places it, over the
+    /// canvas only; anything else, or several files, the refusal; no drag, none. The main window's
+    /// words never show here.
+    #[test]
+    fn a_picture_dragged_over_an_editor_shows_the_place_overlay_over_its_canvas_and_anything_else_the_refusal() {
+        use crate::open_image::{ACCEPT_TINT, DROP_TO_OPEN, ONLY_PICTURES, REFUSE_TINT};
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 8, 8, [255, 0, 0, 255]);
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let out = file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        assert!(!texts(&out).iter().any(|t| t == PLACE_HERE || t == ONLY_PICTURES), "no drag, no overlay");
+        let canvas = ed.canvas_rect.expect("the canvas was drawn");
+        for (files, words, tint) in [(vec![pic.clone()], PLACE_HERE, ACCEPT_TINT), (vec![notes.clone()], ONLY_PICTURES, REFUSE_TINT), (vec![pic.clone(), pic.clone()], ONLY_PICTURES, REFUSE_TINT)] {
+            let out = file_frame(&mut ed, &ctx, &files, &[], vec![]);
+            let t = texts(&out);
+            assert!(t.iter().any(|t| t == words), "{files:?}: {t:?}");
+            assert!(!t.iter().any(|t| t == DROP_TO_OPEN), "never the main window's words: {t:?}");
+            // The tint lies exactly over the canvas: not over the menu bar, toolbar, rail or status bar.
+            let tints: Vec<Rect> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.fill == tint => Some(r.rect),
+                _ => None,
+            }).collect();
+            assert_eq!(tints, vec![canvas], "{files:?}");
+            file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        }
+        let out = file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        assert!(!texts(&out).iter().any(|t| t == PLACE_HERE || t == ONLY_PICTURES), "the drag left, the overlay went");
+    }
+
+    /// A dropped picture becomes exactly one placed picture: at its natural size, centred where it
+    /// was dropped, selected with the Select tool, and one undo step (undo removes it, redo puts it back).
+    #[test]
+    fn a_dropped_picture_is_placed_once_where_it_was_dropped_selected_and_as_one_undo_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 40, 20, [255, 0, 0, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        ed.set_tool(Tool::Arrow);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        drop_on(&mut ed, &ctx, &pic, pt(100.0, 80.0));
+        let placed = images(&ed);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (id, rect, stored) = placed[0];
+        assert_eq!(stored, (40, 20), "its natural size: it fits");
+        assert!((rect.x0 - 80.0).abs() < 1.5 && (rect.y0 - 70.0).abs() < 1.5 && (rect.width() - 40.0).abs() < 0.01 && (rect.height() - 20.0).abs() < 0.01, "centred on the drop point: {rect:?}");
+        assert_eq!((ed.selected, ed.tool), (Some(id), Tool::Select));
+        // It is drawn.
+        assert_eq!(ed.doc.flatten().get_pixel(100, 80).0, [255, 0, 0, 255]);
+        ed.run(EditorAction::Undo);
+        assert!(images(&ed).is_empty(), "undo removes it");
+        ed.run(EditorAction::Redo);
+        assert_eq!(images(&ed).len(), 1, "redo puts it back");
+        assert!(!ed.doc.can_redo());
+        ed.run(EditorAction::Undo);
+        assert!(!ed.doc.can_undo(), "it was one undo step");
+    }
+
+    /// Dropped by an edge, the picture is moved in only as far as it must to lie inside the capture.
+    #[test]
+    fn a_picture_dropped_by_an_edge_is_moved_inside_the_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 60, 40, [0, 0, 255, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        drop_on(&mut ed, &ctx, &pic, pt(395.0, 5.0));
+        let (_, rect, _) = images(&ed)[0];
+        assert!((rect.x1 - 400.0).abs() < 0.01 && rect.y0.abs() < 0.01, "against the top right corner: {rect:?}");
+        assert!((rect.x0 - 340.0).abs() < 0.01 && (rect.y1 - 40.0).abs() < 0.01, "{rect:?}");
+    }
+
+    /// A picture larger than the capture is scaled down to fit inside it with a margin, keeping its
+    /// proportions, and its pixels are resampled to that size, so the editor keeps no more.
+    #[test]
+    fn a_picture_larger_than_the_capture_is_scaled_to_fit_and_stored_at_that_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "huge.png", 2000, 1000, [0, 160, 0, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        drop_on(&mut ed, &ctx, &pic, pt(200.0, 150.0));
+        let placed = images(&ed);
+        assert_eq!(placed.len(), 1);
+        let (_, rect, stored) = placed[0];
+        assert_eq!(stored, (360, 180), "resampled to the size it is shown at: 90% of the width");
+        assert!((rect.width() - 360.0).abs() < 0.01 && (rect.height() - 180.0).abs() < 0.01, "{rect:?}");
+        assert!(rect.x0 >= 0.0 && rect.y0 >= 0.0 && rect.x1 <= 400.0 && rect.y1 <= 300.0, "inside the capture: {rect:?}");
+        assert!((rect.x0 - 20.0).abs() < 0.6, "the margin, centred: {rect:?}");
+    }
+
+    /// A file that cannot be opened is said with the usual sentence in the status bar, and
+    /// nothing is placed.
+    #[test]
+    fn a_dropped_file_that_is_no_picture_places_nothing_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake.png");
+        std::fs::write(&fake, "not a picture").unwrap();
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        drop_on(&mut ed, &ctx, &fake, pt(100.0, 100.0));
+        assert!(ed.doc.items().is_empty() && !ed.doc.can_undo());
+        let e = crate::open_image::load(&fake).unwrap_err();
+        assert_eq!(ed.status_text(), Some(crate::open_image::could_not_open(&fake, &e).as_str()));
+    }
+
+    /// While a picture is read the editor holds an update back; once it is placed, no more.
+    #[test]
+    fn an_update_waits_while_a_picture_is_still_being_placed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 8, 8, [255, 0, 0, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        assert!(!ed.holds_update());
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.place_picture_file(pic, pt(10.0, 10.0));
+        assert!(ed.holds_update(), "the picture is being read");
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert_eq!(images(&ed).len(), 1);
+        assert!(!ed.holds_update());
+        // A closed editor holds nothing back.
+        ed.place_picture_file(crate::place_picture::tests::picture_file(tmp.path(), "b.png", 8, 8, [0, 0, 0, 255]), pt(10.0, 10.0));
+        ed.closed = true;
+        assert!(!ed.holds_update());
+    }
+
+    /// A picture that arrives once the editor is closed, or once its capture has changed (here
+    /// cropped), is dropped without a word: nothing is placed and nothing is said.
+    #[test]
+    fn a_picture_arriving_for_a_closed_editor_or_a_changed_capture_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 8, 8, [255, 0, 0, 255]);
+        let ctx = crate::theme::test_context();
+        // Closed.
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.place_picture_file(pic.clone(), pt(10.0, 10.0));
+        ed.closed = true;
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert!(ed.doc.items().is_empty() && ed.status_text().is_none());
+        // Cropped meanwhile: another capture.
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.place_picture_file(pic.clone(), pt(10.0, 10.0));
+        ed.doc.crop(Bounds::new(pt(0.0, 0.0), pt(200.0, 150.0)));
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert!(images(&ed).is_empty() && ed.status_text().is_none());
+        // A failure for a changed capture says nothing either.
+        let fake = tmp.path().join("fake.png");
+        std::fs::write(&fake, "x").unwrap();
+        ed.place_picture_file(fake, pt(10.0, 10.0));
+        ed.doc.crop(Bounds::new(pt(0.0, 0.0), pt(100.0, 100.0)));
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert!(ed.status_text().is_none());
+    }
+
+    /// With a dialog open over the editor a picture dragged there is refused with the reason (a
+    /// picture cannot be placed now), a file that is no picture with the usual sentence, and a
+    /// drop places nothing.
+    #[test]
+    fn a_picture_dropped_while_the_close_question_is_up_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 8, 8, [255, 0, 0, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(400, 300);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        ed.confirm_close = true;
+        let out = file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
+        let t = texts(&out);
+        assert!(t.iter().any(|t| t == crate::place_picture::CANNOT_PLACE_NOW), "a picture, refused for the right reason: {t:?}");
+        assert!(!t.iter().any(|t| t == crate::open_image::ONLY_PICTURES || t == PLACE_HERE), "{t:?}");
+        // The refusal's tint, over the canvas.
+        let tints = crate::share_ui::tests::shapes_of(&out).into_iter().filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == crate::open_image::REFUSE_TINT)).count();
+        assert_eq!(tints, 1);
+        // A file that is no picture keeps the usual sentence.
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        let t = texts(&file_frame(&mut ed, &ctx, std::slice::from_ref(&notes), &[], vec![]));
+        assert!(t.iter().any(|t| t == crate::open_image::ONLY_PICTURES) && !t.iter().any(|t| t == crate::place_picture::CANNOT_PLACE_NOW), "{t:?}");
+        file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
+        file_frame(&mut ed, &ctx, &[], std::slice::from_ref(&pic), vec![]);
+        assert!(!ed.placing.pending());
+        std::thread::sleep(Duration::from_millis(50));
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        assert!(ed.doc.items().is_empty());
+    }
+
+    /// An editor's window takes dropped files, said outright.
+    #[test]
+    fn an_editor_windows_viewport_takes_dropped_files() {
+        assert_eq!(editor_builder("t".into(), Arc::new(egui::IconData::default())).drag_and_drop, Some(true));
+    }
+
+    /// The editor with a picture dragged over its canvas, for the owner: the overlay that places
+    /// it, the refusal of a file that is no picture, and the refusal of a picture while nothing
+    /// may be placed. Run with
+    /// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot editor_drop_renders -- --ignored`.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn editor_drop_renders() {
+        let shot = RgbaImage::from_fn(960, 600, |x, y| {
+            let band = if y < 48 { [40, 44, 52] } else if x < 200 { [235, 237, 240] } else { [250, 250, 251] };
+            let block = (260..900).contains(&x) && ((90..170).contains(&y) || (200..330).contains(&y) || (360..560).contains(&y));
+            let c = if block { [212, 222, 240] } else { band };
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let s = Settings::default();
+        for ppp in [1.0f32, 2.0] {
+            for (label, accept, blocked) in [("editor-drop-picture", true, false), ("editor-drop-refused", false, false), ("editor-drop-blocked", false, true)] {
+                let mut ed = Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
+                ed.keys = s.editor_keys.clone();
+                ed.picture_drop.shown_for_render = Some(accept);
+                ed.picture_drop.blocked_for_render = blocked;
+                let shot = crate::snapshot::shot(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 4, |ui| ed.ui(ui));
+                assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{ppp}x")), 0, "{label}");
+            }
+        }
+    }
+
+    // ---- The rail's Picture tool ----
+
+    thread_local! {
+        /// The file the stubbed "Open image" dialog answers with in this test thread, once.
+        pub(crate) static PICKED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The Picture button on the rail as the editor last drew it: the point a click on which asks
+    /// for the "Open image" dialog.
+    fn picture_button(make: impl Fn() -> Editor) -> egui::Pos2 {
+        let top = 60.0;
+        (0..120).flat_map(|i| [pos2(RAIL / 4.0 + 2.0, top + i as f32 * 6.0), pos2(RAIL * 3.0 / 4.0 - 2.0, top + i as f32 * 6.0)]).find(|&at| {
+            let (mut ed, ctx) = (make(), crate::theme::test_context());
+            dialog_checks::frame(&mut ed, &ctx, vec![]);
+            mythicshot_destinations::stubs::take();
+            dialog_checks::click(&mut ed, &ctx, at);
+            mythicshot_destinations::stubs::take() == ["open dialog: open image"]
+        }).expect("the Picture button on the rail")
+    }
+
+    /// Clicking the Picture tool asks for a file with the dialog "Open image" uses (in a test
+    /// build the stub, answering as if cancelled): nothing is placed and the tool in use stays.
+    /// Answered with a picture, it is placed at the middle of the canvas as a drop places it.
+    #[test]
+    fn the_picture_tool_asks_for_a_file_like_open_image_and_places_it_at_the_middle_of_the_canvas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 30, 20, [0, 0, 255, 255]);
+        let make = || {
+            let mut ed = white_editor(400, 300);
+            ed.set_tool(Tool::Arrow);
+            ed.dest.output_dir = tmp.path().to_path_buf();
+            ed
+        };
+        let at = picture_button(make);
+        // Cancelled: nothing changes.
+        let ctx = crate::theme::test_context();
+        let mut ed = make();
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        mythicshot_destinations::stubs::take();
+        dialog_checks::click(&mut ed, &ctx, at);
+        assert_eq!(mythicshot_destinations::stubs::take(), ["open dialog: open image"]);
+        assert!(ed.doc.items().is_empty() && !ed.holds_update());
+        assert_eq!(ed.tool, Tool::Arrow, "an action, not a mode: the tool stays");
+        assert_eq!(ed.prefs.tool, "arrow", "and is the one remembered");
+        // A picture chosen: placed at the middle of what the canvas shows, selected.
+        PICKED.with(|p| *p.borrow_mut() = Some(pic.clone()));
+        dialog_checks::click(&mut ed, &ctx, at);
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        let placed = images(&ed);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (id, rect, stored) = placed[0];
+        assert_eq!(stored, (30, 20));
+        assert!((rect.x0 - 185.0).abs() < 1.5 && (rect.y0 - 140.0).abs() < 1.5, "the middle of the capture, all of it shown: {rect:?}");
+        assert_eq!((ed.selected, ed.tool), (Some(id), Tool::Select));
+        // Its key runs the same action, with no key of its own by default; the tool in use stays
+        // until the picture is placed.
+        assert_eq!(EditorAction::Picture.default_binding(), "");
+        ed.set_tool(Tool::Arrow);
+        mythicshot_destinations::stubs::take();
+        PICKED.with(|p| *p.borrow_mut() = Some(pic.clone()));
+        ed.run(EditorAction::Picture);
+        assert_eq!(mythicshot_destinations::stubs::take(), ["open dialog: open image"]);
+        assert_eq!(ed.tool, Tool::Arrow, "nothing changes until the picture is placed");
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert_eq!((images(&ed).len(), ed.tool), (2, Tool::Select));
+    }
+
+    /// Zoomed in, the picture goes to the middle of the part of the capture the canvas shows.
+    #[test]
+    fn the_picture_tool_places_at_the_middle_of_the_visible_part_of_a_zoomed_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 10, 10, [0, 0, 255, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(2000, 1500);
+        ed.zoom = Some(2.0);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let canvas = ed.canvas_rect.unwrap();
+        let shown_centre = ed.capture_point(canvas.center());
+        PICKED.with(|p| *p.borrow_mut() = Some(pic));
+        ed.picture_tool();
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        let (_, rect, _) = images(&ed)[0];
+        assert!(((rect.x0 + rect.x1) / 2.0 - shown_centre.x).abs() < 0.6 && ((rect.y0 + rect.y1) / 2.0 - shown_centre.y).abs() < 0.6, "{rect:?} around {shown_centre:?}");
+        assert!(shown_centre.x < 1000.0, "the scrolled-to corner, not the capture's middle: {shown_centre:?}");
+    }
+
+    /// The tool's tip says what it does, and its row on the Hotkeys page is named.
+    #[test]
+    fn the_picture_tool_has_its_hint_and_its_hotkey_name() {
+        assert_eq!(tool_hint(Tool::Picture), "Choose a picture to place on the capture.");
+        assert_eq!(EditorAction::Picture.label(), "Picture tool");
+        assert_eq!(Tool::Picture.action(), EditorAction::Picture);
+        assert!(EditorAction::ALL.contains(&EditorAction::Picture));
+        // Never the tool an editor opens on, even if a settings file names it.
+        assert_eq!(editor(EditorPrefs { tool: "picture".into(), ..EditorPrefs::default() }).tool, Tool::Rectangle);
+    }
+
+    /// The rail with the Picture tool, for the owner: the image editor, at 100% and 200%. Run with
+    /// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot editor_rail_renders -- --ignored`.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn editor_rail_renders() {
+        let s = Settings::default();
+        for ppp in [1.0f32, 2.0] {
+            let mut ed = Editor::new(RgbaImage::from_pixel(960, 600, image::Rgba([250, 250, 251, 255])), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
+            ed.keys = s.editor_keys.clone();
+            // The rail and the start of the canvas beside it.
+            let size = egui::vec2(RAIL + 120.0, 600.0);
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 4, |ui| ed.ui(ui));
+            let crop = image::imageops::crop_imm(&shot.image, 0, 0, (size.x * ppp) as u32, (size.y * ppp) as u32).to_image();
+            let cropped = crate::snapshot::Shot { image: crop, uncovered: shot.uncovered, uncovered_at: shot.uncovered_at };
+            assert_eq!(crate::snapshot::save(&cropped, &format!("editor-rail-picture-{ppp}x")), 0);
+        }
     }
 }

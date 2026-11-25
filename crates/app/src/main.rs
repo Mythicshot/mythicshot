@@ -24,6 +24,7 @@ mod main_window;
 mod menu_bar;
 mod open_image;
 mod overlay;
+mod place_picture;
 mod placement;
 mod password;
 mod platform;
@@ -393,6 +394,9 @@ impl App {
                 wake
             },
         };
+        // A picture read waiting for an app-wide slot starts once any window's read gives one back.
+        let wake = ctx.clone();
+        app.images.set_wake(move || wake.request_repaint());
         platform::stop_raw_keyboard_input();
         app.publish_taken_keys();
         app
@@ -455,6 +459,10 @@ impl App {
                     }
                 }
             }
+        }
+        // A picture read that waited for an app-wide slot, now that one is free.
+        if let Some(job) = self.images.retry() {
+            self.start_image_read(ctx, job);
         }
     }
 
@@ -578,9 +586,10 @@ impl App {
 
     /// What an update waits for: a recording or its countdown, a GIF being saved, a capture on
     /// screen or a picker waiting, a recording or a picture file being opened, a publish, update, share or Tours
-    /// job (each holds its profile), a tour export, an add to a site, an editor that exports or
-    /// publishes, and an editor of a saved recording, whose edits not sent to the site a close
-    /// would drop. An editor with unsaved changes asks its own question when the app closes.
+    /// job (each holds its profile), a tour export, an add to a site, an editor that exports,
+    /// publishes or is still reading a picture to place, and an editor of a saved recording, whose
+    /// edits not sent to the site a close would drop ([`editor_ui::Editor::holds_update`]). An
+    /// editor with unsaved changes asks its own question when the app closes.
     fn work_running(&self) -> bool {
         self.session.is_some()
             || !self.encoding.is_empty()
@@ -591,7 +600,7 @@ impl App {
             || publish_ui::any_running()
             || site::adds_in_flight() > 0
             || profiles_ui::endings_in_flight()
-            || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| !e.closed && (e.exporting() || e.may_hold_unsent_edits())))
+            || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| e.holds_update()))
     }
 
     /// Updates, every frame: start the check once the UI is up, take in what the background work
@@ -1116,9 +1125,9 @@ impl App {
         }
     }
 
-    fn start_image_read(&mut self, ctx: &egui::Context, (generation, path): open_image::ReadJob) {
+    fn start_image_read(&mut self, ctx: &egui::Context, job: open_image::ReadJob) {
         let (tx, wake) = (self.tx.clone(), ctx.clone());
-        open_image::spawn_load(path, move |path, result| {
+        job.spawn(|img| img, move |generation, path, result| {
             let _ = tx.send(AppEvent::ImageLoaded(Box::new((generation, path, result))));
             wake.request_repaint();
         });
