@@ -39,7 +39,7 @@ const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
     (Some("Draw"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
     (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Text, Tool::Slice]),
-    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
+    (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Picture, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,8 @@ pub enum Tool {
     /// A tour step's guide card; Tour view only.
     Card,
     Crop,
+    /// Place a picture file on the capture: an action that asks for the file, never a mode.
+    Picture,
 }
 
 impl Tool {
@@ -87,6 +89,7 @@ impl Tool {
             Tool::Spotlight => "spotlight",
             Tool::Card => "card",
             Tool::Crop => "crop",
+            Tool::Picture => "picture",
         }
     }
 
@@ -97,12 +100,12 @@ impl Tool {
     /// The tool the editor opens on for `k`, the last tool used as the settings file names it:
     /// that tool, or Select for one of the tools taken off the rail (Cross, Asterisk and Donut),
     /// or the Rectangle for a word no version knew. Crop, Spotlight and guide cards are never
-    /// where the editor opens.
+    /// where the editor opens, nor Picture, which is never a tool in use.
     fn opening(k: &str) -> Tool {
         if REMOVED_TOOLS.contains(&k) {
             return Tool::Select;
         }
-        Tool::from_key(k).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle)
+        Tool::from_key(k).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card | Tool::Picture)).unwrap_or(Tool::Rectangle)
     }
 
     /// The tool that draws a shape, so editing an item updates that tool's style.
@@ -129,7 +132,7 @@ impl Tool {
         }
     }
 
-    const ALL: [Tool; 18] = [
+    const ALL: [Tool; 19] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
@@ -148,6 +151,7 @@ impl Tool {
         Tool::Spotlight,
         Tool::Card,
         Tool::Crop,
+        Tool::Picture,
     ];
 
     fn icon(self) -> Icon {
@@ -170,6 +174,7 @@ impl Tool {
             Tool::Spotlight => Icon::Spotlight,
             Tool::Card => Icon::Card,
             Tool::Crop => Icon::Crop,
+            Tool::Picture => Icon::Picture,
         }
     }
 
@@ -193,6 +198,7 @@ impl Tool {
             Tool::Spotlight => EditorAction::Spotlight,
             Tool::Card => EditorAction::Card,
             Tool::Crop => EditorAction::Crop,
+            Tool::Picture => EditorAction::Picture,
         }
     }
 }
@@ -256,6 +262,18 @@ fn color_image_to_rgba(img: &egui::ColorImage) -> RgbaImage {
     let [w, h] = img.size;
     let bytes = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
     RgbaImage::from_raw(w as u32, h as u32, bytes).unwrap_or_default()
+}
+
+/// Ask for a picture file to place, with the dialog "Open image" uses ([`crate::open_image::pick`],
+/// through the stub-able dialog helper). A test build records the dialog and answers with the
+/// file a test put in [`tests::PICKED`], if any.
+fn pick_picture(dir: &std::path::Path) -> Option<PathBuf> {
+    let picked = crate::open_image::pick(dir);
+    #[cfg(test)]
+    if let Some(answer) = tests::PICKED.with(|p| p.borrow_mut().take()) {
+        return Some(answer);
+    }
+    picked
 }
 
 /// What is on the system clipboard right now, for the right-click Paste here.
@@ -876,6 +894,9 @@ impl Editor {
     }
 
     fn run(&mut self, action: EditorAction) {
+        if action == EditorAction::Picture {
+            return self.picture_tool();
+        }
         if let Some(tool) = Tool::ALL.into_iter().find(|t| t.action() == action) {
             // The screenshot editor has no Spotlight tool, and guide cards live in the Tour view.
             let usable = match tool {
@@ -1099,6 +1120,19 @@ impl Editor {
     /// the Tour view while it shows no step to pin the picture to.
     pub(crate) fn can_place_picture(&self) -> bool {
         !self.drawing_blocked()
+    }
+
+    /// The rail's Picture tool, or its key: ask for a picture file with the dialog "Open image"
+    /// uses (its filters and the captures folder), and place the one chosen at the middle of the
+    /// part of the capture the canvas shows. An action, not a mode: the tool in use stays (until
+    /// the picture is placed, which selects it with the Select tool, as a drop does).
+    pub(crate) fn picture_tool(&mut self) {
+        if !self.can_place_picture() {
+            return;
+        }
+        let Some(path) = pick_picture(&self.dest.output_dir) else { return };
+        let centre = self.visible_centre();
+        self.place_picture_file(path, centre);
     }
 
     /// What a picture asked for now would be placed on: see [`crate::place_picture::Target`].
@@ -1655,9 +1689,15 @@ impl Editor {
     fn rail_button(&mut self, ui: &mut egui::Ui, tool: Tool) {
         let binding = self.keys.get(&tool.action()).map(String::as_str).unwrap_or("");
         let tip = format!("{}\n{}", self.key_hint(tool.action()), tool_hint(tool));
-        // Guide cards belong to tour steps: the tool works only in the Tour view.
-        let usable = tool != Tool::Card || self.in_tour_view();
-        let resp = ui.add_enabled_ui(usable, |ui| icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip)).inner.on_disabled_hover_text("Open the Tour view to add guide cards");
+        // Guide cards belong to tour steps: the tool works only in the Tour view. A picture is
+        // placed wherever one may be pasted.
+        let usable = match tool {
+            Tool::Card => self.in_tour_view(),
+            Tool::Picture => self.can_place_picture(),
+            _ => true,
+        };
+        let disabled_tip = if tool == Tool::Card { "Open the Tour view to add guide cards" } else { tip.as_str() };
+        let resp = ui.add_enabled_ui(usable, |ui| icons::button(ui, tool.icon(), TOOL_BUTTON, self.tool == tool, &tip)).inner.on_disabled_hover_text(disabled_tip);
         let key = hotkeys::display(binding);
         if !key.is_empty() && key.chars().count() <= 2 {
             let corner = resp.rect.right_bottom() - vec2(2.0, 1.0);
@@ -1665,7 +1705,11 @@ impl Editor {
             ui.painter().text(corner, egui::Align2::RIGHT_BOTTOM, key, FontId::proportional(9.0), color);
         }
         if resp.clicked() {
-            self.set_tool(tool);
+            if tool == Tool::Picture {
+                self.picture_tool();
+            } else {
+                self.set_tool(tool);
+            }
         }
     }
 
@@ -2474,6 +2518,7 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Group => "Drag around an area to mark it as a group.",
         Tool::Cone => "Drag from the point of the cone to its wide end.",
         Tool::Slice => "Drag from the point of the slice to the middle of its curved edge.",
+        Tool::Picture => "Choose a picture to place on the capture.",
         _ => "Drag on the image to draw.",
     }
 }
@@ -4386,7 +4431,7 @@ pub(crate) mod tests {
                 (None, vec!["select"]),
                 (Some("Draw"), vec!["freehand", "arrow", "line"]),
                 (Some("Shapes"), vec!["circle", "group", "cone", "rectangle", "ellipse", "text", "slice"]),
-                (Some("More"), vec!["bubble", "step", "highlight", "obfuscate", "spotlight", "card", "crop"]),
+                (Some("More"), vec!["bubble", "step", "picture", "highlight", "obfuscate", "spotlight", "card", "crop"]),
             ]
         );
         for key in REMOVED_KEYS {
@@ -4847,6 +4892,122 @@ pub(crate) mod tests {
                 let shot = crate::snapshot::shot(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 4, |ui| ed.ui(ui));
                 assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{ppp}x")), 0, "{label}");
             }
+        }
+    }
+
+    // ---- The rail's Picture tool ----
+
+    thread_local! {
+        /// The file the stubbed "Open image" dialog answers with in this test thread, once.
+        pub(crate) static PICKED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The Picture button on the rail as the editor last drew it: the point a click on which asks
+    /// for the "Open image" dialog.
+    fn picture_button(make: impl Fn() -> Editor) -> egui::Pos2 {
+        let top = 60.0;
+        (0..120).flat_map(|i| [pos2(RAIL / 4.0 + 2.0, top + i as f32 * 6.0), pos2(RAIL * 3.0 / 4.0 - 2.0, top + i as f32 * 6.0)]).find(|&at| {
+            let (mut ed, ctx) = (make(), crate::theme::test_context());
+            dialog_checks::frame(&mut ed, &ctx, vec![]);
+            mythicshot_destinations::stubs::take();
+            dialog_checks::click(&mut ed, &ctx, at);
+            mythicshot_destinations::stubs::take() == ["open dialog: open image"]
+        }).expect("the Picture button on the rail")
+    }
+
+    /// Clicking the Picture tool asks for a file with the dialog "Open image" uses (in a test
+    /// build the stub, answering as if cancelled): nothing is placed and the tool in use stays.
+    /// Answered with a picture, it is placed at the middle of the canvas as a drop places it.
+    #[test]
+    fn the_picture_tool_asks_for_a_file_like_open_image_and_places_it_at_the_middle_of_the_canvas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 30, 20, [0, 0, 255, 255]);
+        let make = || {
+            let mut ed = white_editor(400, 300);
+            ed.set_tool(Tool::Arrow);
+            ed.dest.output_dir = tmp.path().to_path_buf();
+            ed
+        };
+        let at = picture_button(make);
+        // Cancelled: nothing changes.
+        let ctx = crate::theme::test_context();
+        let mut ed = make();
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        mythicshot_destinations::stubs::take();
+        dialog_checks::click(&mut ed, &ctx, at);
+        assert_eq!(mythicshot_destinations::stubs::take(), ["open dialog: open image"]);
+        assert!(ed.doc.items().is_empty() && !ed.holds_update());
+        assert_eq!(ed.tool, Tool::Arrow, "an action, not a mode: the tool stays");
+        assert_eq!(ed.prefs.tool, "arrow", "and is the one remembered");
+        // A picture chosen: placed at the middle of what the canvas shows, selected.
+        PICKED.with(|p| *p.borrow_mut() = Some(pic.clone()));
+        dialog_checks::click(&mut ed, &ctx, at);
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        let placed = images(&ed);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (id, rect, stored) = placed[0];
+        assert_eq!(stored, (30, 20));
+        assert!((rect.x0 - 185.0).abs() < 1.5 && (rect.y0 - 140.0).abs() < 1.5, "the middle of the capture, all of it shown: {rect:?}");
+        assert_eq!((ed.selected, ed.tool), (Some(id), Tool::Select));
+        // Its key runs the same action, with no key of its own by default; the tool in use stays
+        // until the picture is placed.
+        assert_eq!(EditorAction::Picture.default_binding(), "");
+        ed.set_tool(Tool::Arrow);
+        mythicshot_destinations::stubs::take();
+        PICKED.with(|p| *p.borrow_mut() = Some(pic.clone()));
+        ed.run(EditorAction::Picture);
+        assert_eq!(mythicshot_destinations::stubs::take(), ["open dialog: open image"]);
+        assert_eq!(ed.tool, Tool::Arrow, "nothing changes until the picture is placed");
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        assert_eq!((images(&ed).len(), ed.tool), (2, Tool::Select));
+    }
+
+    /// Zoomed in, the picture goes to the middle of the part of the capture the canvas shows.
+    #[test]
+    fn the_picture_tool_places_at_the_middle_of_the_visible_part_of_a_zoomed_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 10, 10, [0, 0, 255, 255]);
+        let ctx = crate::theme::test_context();
+        let mut ed = white_editor(2000, 1500);
+        ed.zoom = Some(2.0);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let canvas = ed.canvas_rect.unwrap();
+        let shown_centre = ed.capture_point(canvas.center());
+        PICKED.with(|p| *p.borrow_mut() = Some(pic));
+        ed.picture_tool();
+        frames_until(&mut ed, &ctx, |e| !e.placing.pending());
+        let (_, rect, _) = images(&ed)[0];
+        assert!(((rect.x0 + rect.x1) / 2.0 - shown_centre.x).abs() < 0.6 && ((rect.y0 + rect.y1) / 2.0 - shown_centre.y).abs() < 0.6, "{rect:?} around {shown_centre:?}");
+        assert!(shown_centre.x < 1000.0, "the scrolled-to corner, not the capture's middle: {shown_centre:?}");
+    }
+
+    /// The tool's tip says what it does, and its row on the Hotkeys page is named.
+    #[test]
+    fn the_picture_tool_has_its_hint_and_its_hotkey_name() {
+        assert_eq!(tool_hint(Tool::Picture), "Choose a picture to place on the capture.");
+        assert_eq!(EditorAction::Picture.label(), "Picture tool");
+        assert_eq!(Tool::Picture.action(), EditorAction::Picture);
+        assert!(EditorAction::ALL.contains(&EditorAction::Picture));
+        // Never the tool an editor opens on, even if a settings file names it.
+        assert_eq!(editor(EditorPrefs { tool: "picture".into(), ..EditorPrefs::default() }).tool, Tool::Rectangle);
+    }
+
+    /// The rail with the Picture tool, for the owner: the image editor, at 100% and 200%. Run with
+    /// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot editor_rail_renders -- --ignored`.
+    #[test]
+    #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+    fn editor_rail_renders() {
+        let s = Settings::default();
+        for ppp in [1.0f32, 2.0] {
+            let mut ed = Editor::new(RgbaImage::from_pixel(960, 600, image::Rgba([250, 250, 251, 255])), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
+            ed.keys = s.editor_keys.clone();
+            // The rail and the start of the canvas beside it.
+            let size = egui::vec2(RAIL + 120.0, 600.0);
+            let shot = crate::snapshot::shot(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 4, |ui| ed.ui(ui));
+            let crop = image::imageops::crop_imm(&shot.image, 0, 0, (size.x * ppp) as u32, (size.y * ppp) as u32).to_image();
+            let cropped = crate::snapshot::Shot { image: crop, uncovered: shot.uncovered, uncovered_at: shot.uncovered_at };
+            assert_eq!(crate::snapshot::save(&cropped, &format!("editor-rail-picture-{ppp}x")), 0);
         }
     }
 }

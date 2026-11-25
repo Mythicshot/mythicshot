@@ -346,16 +346,22 @@ impl DropState {
 
     /// [`DropState::frame`] with the files egui says are dragged over and dropped on the window.
     pub fn frame_from_input(&mut self, ctx: &egui::Context, area: Rect) -> Option<PathBuf> {
-        self.frame_from_input_for(ctx, area, DROP_TO_OPEN, true)
+        let (hovered, dropped) = files_from_input(ctx);
+        self.frame(ctx, area, hovered, dropped)
     }
 
     /// [`DropState::frame_for`] with the files egui says are dragged over and dropped on the
     /// window whose frame this is: each window has its own, so an overlay shows only in the
     /// window the files are over.
     pub fn frame_from_input_for(&mut self, ctx: &egui::Context, area: Rect, accept: &str, allowed: bool) -> Option<PathBuf> {
-        let (hovered, dropped) = ctx.input(|i| (i.raw.hovered_files.iter().map(|f| f.path.clone()).collect(), i.raw.dropped_files.iter().map(|f| Some(f.path().to_path_buf())).collect()));
+        let (hovered, dropped) = files_from_input(ctx);
         self.frame_for(ctx, area, hovered, dropped, accept, allowed)
     }
+}
+
+/// The files egui says are dragged over, and dropped on, the window whose frame this is.
+fn files_from_input(ctx: &egui::Context) -> (Vec<Option<PathBuf>>, Vec<Option<PathBuf>>) {
+    ctx.input(|i| (i.raw.hovered_files.iter().map(|f| f.path.clone()).collect(), i.raw.dropped_files.iter().map(|f| Some(f.path().to_path_buf())).collect()))
 }
 
 /// The overlay's see-through tints over the page, from the theme's selection and danger tints:

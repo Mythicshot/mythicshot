@@ -5586,5 +5586,9 @@ mod tests {
         // Asked for directly, nothing is read either.
         ed.place_picture_file(pic.clone(), pt(10.0, 10.0));
         assert!(!ed.holds_update());
+        // Nor does the Picture tool ask for a file there.
+        mythicshot_destinations::stubs::take();
+        ed.picture_tool();
+        assert!(mythicshot_destinations::stubs::take().is_empty());
     }
 }
