@@ -133,28 +133,21 @@ fn the_approved_sentences_are_word_for_word() {
 }
 
 #[test]
-fn the_proposed_sentences_all_come_from_the_one_function() {
+fn every_status_line_and_the_download_failure_are_word_for_word() {
     let last = |outcome| LastCheck { at: at(18, 13), outcome };
-    assert_eq!(status_text(v("0.2.34"), false, None, at(19, 0)), proposed(Proposed::NeverChecked { running: v("0.2.34") }));
-    assert_eq!(status_text(v("0.2.34"), true, None, at(19, 0)), proposed(Proposed::Checking { running: v("0.2.34") }));
-    assert_eq!(status_text(v("0.2.34"), false, Some(&last(Outcome::Newer(v("0.2.35")))), at(19, 0)), proposed(Proposed::Newer { running: v("0.2.34"), when: "today, 6:13 PM".into(), new: v("0.2.35") }));
-    assert_eq!(status_text(v("0.2.34"), false, Some(&last(Outcome::Failed)), at(19, 0)), proposed(Proposed::CheckFailed { running: v("0.2.34"), when: "today, 6:13 PM".into() }));
-    // A check of another day.
+    let r = v("0.2.34");
+    assert_eq!(status_text(r, false, None, at(19, 0)), "Version 0.2.34. Not checked yet.");
+    assert_eq!(status_text(r, true, None, at(19, 0)), "Version 0.2.34. Checking now…");
+    assert_eq!(status_text(r, false, Some(&last(Outcome::Newer(v("0.2.35")))), at(19, 0)), "Version 0.2.34. Last checked today, 6:13 PM: 0.2.35 is available.");
+    assert_eq!(status_text(r, false, Some(&last(Outcome::Failed)), at(19, 0)), "Version 0.2.34. Last checked today, 6:13 PM: mythicshot.com could not be reached or did not answer as expected.");
+    // Checks of other days.
     let next_day = at(18, 13) + chrono::Duration::days(1);
-    assert_eq!(status_text(v("0.2.34"), false, Some(&last(Outcome::UpToDate)), next_day), format!("Version 0.2.34. Last checked {}: up to date.", proposed(Proposed::Yesterday { time: "6:13 PM".into() })));
+    assert_eq!(status_text(r, false, Some(&last(Outcome::UpToDate)), next_day), "Version 0.2.34. Last checked yesterday, 6:13 PM: up to date.");
     let later = at(18, 13) + chrono::Duration::days(3);
-    assert_eq!(status_text(v("0.2.34"), false, Some(&last(Outcome::UpToDate)), later), format!("Version 0.2.34. Last checked {}: up to date.", proposed(Proposed::OtherDay { date: "Nov 24".into(), time: "6:13 PM".into() })));
-    // Each is one plain sentence (or, for the day, a few words), never empty.
-    for p in [
-        Proposed::NeverChecked { running: v("0.2.34") },
-        Proposed::Checking { running: v("0.2.34") },
-        Proposed::Newer { running: v("0.2.34"), when: "today, 6:13 PM".into(), new: v("0.2.35") },
-        Proposed::CheckFailed { running: v("0.2.34"), when: "today, 6:13 PM".into() },
-        Proposed::DownloadFailed,
-    ] {
-        let s = proposed(p);
-        assert!(s.starts_with(|c: char| c.is_uppercase()) && s.ends_with(['.', '…']), "{s}");
-    }
+    assert_eq!(status_text(r, false, Some(&last(Outcome::UpToDate)), later), "Version 0.2.34. Last checked Nov 24, 6:13 PM: up to date.");
+    assert_eq!(status_text(r, false, Some(&last(Outcome::Failed)), next_day), "Version 0.2.34. Last checked yesterday, 6:13 PM: mythicshot.com could not be reached or did not answer as expected.");
+    // The download that did not finish: one sentence, the second one dropped.
+    assert_eq!(DOWNLOAD_FAILED, "The download from mythicshot.com did not finish, so nothing was installed.");
 }
 
 // ---- The check at start ----
@@ -198,7 +191,7 @@ fn a_check_at_start_that_fails_shows_nothing_anywhere() {
     assert_eq!(net.checks.load(Ordering::SeqCst), 1);
     assert_eq!(text(&u), None);
     assert_eq!(u.tray_label(), None);
-    assert_eq!(u.status_line(at(19, 0)), proposed(Proposed::NeverChecked { running: v("0.2.34") }), "the status line says nothing about it either");
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Not checked yet.", "the status line says nothing about it either");
     assert!(net.logged.lock().unwrap().iter().any(|l| l == "check: failed (no answer)"));
 }
 
@@ -209,10 +202,10 @@ fn check_now_reports_a_failure_and_works_with_the_setting_off() {
     u.start(false);
     settle(&mut u);
     u.check_now();
-    assert_eq!(u.status_line(at(19, 0)), proposed(Proposed::Checking { running: v("0.2.34") }));
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Checking now…");
     settle(&mut u);
     assert_eq!(net.checks.load(Ordering::SeqCst), 1);
-    assert_eq!(u.status_line(at(19, 0)), proposed(Proposed::CheckFailed { running: v("0.2.34"), when: "today, 6:13 PM".into() }));
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Last checked today, 6:13 PM: mythicshot.com could not be reached or did not answer as expected.");
     *net.answer.lock().unwrap() = Some(Ok(Checked::UpToDate));
     u.check_now();
     settle(&mut u);
@@ -321,14 +314,14 @@ fn a_download_that_does_not_match_offers_try_again_and_the_download_page() {
 }
 
 #[test]
-fn a_download_that_breaks_off_says_so_in_the_proposed_sentence() {
+fn a_download_that_breaks_off_says_so() {
     let net = Arc::new(FakeNet::default());
     *net.download_end.lock().unwrap() = Some(Downloaded::Failed("the connection broke or stalled".into()));
     net.release_download.store(true, Ordering::SeqCst);
     let mut u = offered(&net);
     u.tray_update();
     settle(&mut u);
-    assert_eq!(text(&u), Some(proposed(Proposed::DownloadFailed)));
+    assert_eq!(text(&u).as_deref(), Some(DOWNLOAD_FAILED));
     assert_eq!(buttons(&u), [Button::TryAgain, Button::OpenDownloadPage]);
     assert!(net.logged.lock().unwrap().iter().any(|l| l == "download: failed (the connection broke or stalled)"));
 }

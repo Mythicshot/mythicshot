@@ -5,8 +5,7 @@
 //! The work runs on threads of its own and lands in slots that [`Updater::poll`] takes in on the
 //! next frame, as `profiles_ui` does; nothing here ever waits for the network.
 //!
-//! Wording: the owner approved the constants and functions marked "Approved" character for
-//! character. Every other sentence is in [`proposed`] and is NOT approved yet.
+//! Wording: every sentence here is approved by the owner, character for character; add none.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,42 +86,9 @@ impl Button {
     }
 }
 
-// ---- Proposed wording (NOT approved) ----
-
-/// The states whose wording the owner has not approved yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Proposed {
-    /// The status line before any check this run (or after a check at start that failed,
-    /// which is shown nowhere).
-    NeverChecked { running: Version },
-    /// The status line while a check runs.
-    Checking { running: Version },
-    /// The status line after a check that found a newer version.
-    Newer { running: Version, when: String, new: Version },
-    /// The status line after a Check now that failed (offline or a bad answer).
-    CheckFailed { running: Version, when: String },
-    /// The line in the main window when the download broke off or stalled.
-    DownloadFailed,
-    /// The "when" of the approved status line for a check made yesterday.
-    Yesterday { time: String },
-    /// The "when" for a check made before yesterday.
-    OtherDay { date: String, time: String },
-}
-
-/// PROPOSED, NOT APPROVED: every sentence of the update screens the owner has not signed off yet,
-/// in one place. The approved pattern they follow is "Version 0.2.34. Last checked today,
-/// 6:13 PM: up to date." (see [`status_text`]).
-pub fn proposed(p: Proposed) -> String {
-    match p {
-        Proposed::NeverChecked { running } => format!("Version {running}. Not checked yet."),
-        Proposed::Checking { running } => format!("Version {running}. Checking now…"),
-        Proposed::Newer { running, when, new } => format!("Version {running}. Last checked {when}: {new} is available."),
-        Proposed::CheckFailed { running, when } => format!("Version {running}. Last checked {when}: mythicshot.com could not be reached or did not answer as expected."),
-        Proposed::DownloadFailed => "The download from mythicshot.com did not finish, so nothing was installed. Nothing was changed.".to_string(),
-        Proposed::Yesterday { time } => format!("yesterday, {time}"),
-        Proposed::OtherDay { date, time } => format!("{date}, {time}"),
-    }
-}
+/// Approved: the line in the main window when the download broke off or stalled, with "Try
+/// again" and "Open download page".
+pub const DOWNLOAD_FAILED: &str = "The download from mythicshot.com did not finish, so nothing was installed.";
 
 // ---- The status line ----
 
@@ -141,31 +107,31 @@ pub struct LastCheck {
     pub outcome: Outcome,
 }
 
-/// When a check was, as the status line says it: "today, 6:13 PM" (approved), or a proposed
-/// wording for another day.
+/// Approved: when a check was, as the status line says it: "today, 6:13 PM", "yesterday,
+/// 6:13 PM" or "Nov 24, 6:13 PM".
 fn when(at: NaiveDateTime, now: NaiveDateTime) -> String {
     let time = at.format("%-I:%M %p").to_string();
     match (now.date() - at.date()).num_days() {
         0 => format!("today, {time}"),
-        1 => proposed(Proposed::Yesterday { time }),
-        _ => proposed(Proposed::OtherDay { date: at.format("%b %-d").to_string(), time }),
+        1 => format!("yesterday, {time}"),
+        _ => format!("{}, {time}", at.format("%b %-d")),
     }
 }
 
 /// The status line beside Check now. Approved pattern: "Version 0.2.34. Last checked today,
-/// 6:13 PM: up to date."; every other state is [`proposed`].
+/// 6:13 PM: up to date.", and the approved line of every other state.
 pub fn status_text(running: Version, checking: bool, last: Option<&LastCheck>, now: NaiveDateTime) -> String {
     if checking {
-        return proposed(Proposed::Checking { running });
+        return format!("Version {running}. Checking now…");
     }
     match last {
-        None => proposed(Proposed::NeverChecked { running }),
+        None => format!("Version {running}. Not checked yet."),
         Some(last) => {
             let when = when(last.at, now);
             match last.outcome {
                 Outcome::UpToDate => format!("Version {running}. Last checked {when}: up to date."),
-                Outcome::Newer(new) => proposed(Proposed::Newer { running, when, new }),
-                Outcome::Failed => proposed(Proposed::CheckFailed { running, when }),
+                Outcome::Newer(new) => format!("Version {running}. Last checked {when}: {new} is available."),
+                Outcome::Failed => format!("Version {running}. Last checked {when}: mythicshot.com could not be reached or did not answer as expected."),
             }
         }
     }
@@ -527,7 +493,7 @@ impl Updater {
             Flow::Ready { .. } if self.waiting => line(WAITING.to_string(), vec![Button::CancelUpdate]),
             Flow::Ready { release, .. } => line(closing_text(release.version), vec![]),
             Flow::Mismatch => line(MISMATCH.to_string(), vec![Button::TryAgain, Button::OpenDownloadPage]),
-            Flow::Failed => line(proposed(Proposed::DownloadFailed), vec![Button::TryAgain, Button::OpenDownloadPage]),
+            Flow::Failed => line(DOWNLOAD_FAILED.to_string(), vec![Button::TryAgain, Button::OpenDownloadPage]),
             Flow::Idle => match &self.available {
                 Some(r) if !self.later => line(available_text(r.version, self.running), vec![Button::WhatsNew, Button::Later, Button::UpdateNow]),
                 _ => None,
