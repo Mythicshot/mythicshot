@@ -299,6 +299,10 @@ pub const NAV_ITEM_HEIGHT: f32 = 36.0;
 pub const NAV_ICON_GAP: f32 = 10.0;
 /// The space before a navigation item's label (or its icon).
 pub const NAV_PAD_X: f32 = 12.0;
+/// The space left and right inside a status pill or chip.
+pub const PILL_PAD_X: f32 = 10.0;
+/// The gap between a chip's icon and its text.
+pub const CHIP_ICON_GAP: f32 = 6.0;
 /// The round badge with a profile's initials.
 pub const BADGE_SIZE: f32 = 40.0;
 /// A tab of a page's tab row (Preferences: General, Output, Hotkeys).
@@ -494,32 +498,39 @@ pub enum Tone {
     Neutral,
 }
 
-/// A status pill: fully rounded, in the tone's tint, with its icon before the text.
+/// A status pill: fully rounded, in the tone's tint, with its icon before the text. As wide and
+/// as high as what it holds, wherever it is laid out.
 pub fn pill(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
     let (fill, fg, icon) = match tone {
         Tone::Success => (SUCCESS_TINT, SUCCESS_TEXT, Some((crate::icons::Icon::Check, SUCCESS_TEXT))),
         Tone::Warning => (CAUTION_TINT, CAUTION_TEXT, Some((crate::icons::Icon::Warning, CAUTION_BORDER))),
         Tone::Neutral => (CHIP, MUTED, None),
     };
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(RADIUS_FULL)
-        .inner_margin(Margin::symmetric(10, 4))
-        .show(ui, |ui| {
-            // As high as its text, not as a control; and from the left whatever the row
-            // around it does: the icon comes first.
-            ui.spacing_mut().interact_size.y = 0.0;
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = SPACE_1 + 2.0;
-                if let Some((icon, colour)) = icon {
-                    let side = ui.text_style_height(&TextStyle::Small);
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-                    crate::icons::paint(ui.painter(), rect.shrink(side * 0.15), icon, colour);
-                }
-                ui.add(egui::Label::new(strong(RichText::new(text).size(SMALL_SIZE).color(fg))).extend());
-            }));
-        })
-        .response
+    chip(ui, strong(RichText::new(text).size(SMALL_SIZE).color(fg)), fill, icon)
+}
+
+/// A chip: `text` on `fill`, fully rounded, with `icon` in its colour before the text when there
+/// is one, as wide and as high as what it holds wherever it is laid out.
+pub fn chip(ui: &mut egui::Ui, text: RichText, fill: egui::Color32, icon: Option<(crate::icons::Icon, egui::Color32)>) -> egui::Response {
+    let label = text.text().to_string();
+    let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Small);
+    let side = galley.size().y;
+    let gap = CHIP_ICON_GAP;
+    let icon_w = if icon.is_some() { side + gap } else { 0.0 };
+    let pad = egui::vec2(PILL_PAD_X, SPACE_1);
+    let size = egui::vec2(icon_w + galley.size().x, side) + 2.0 * pad;
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, RADIUS_FULL, fill);
+    let inner = rect.shrink2(pad);
+    if let Some((icon, colour)) = icon {
+        let r = egui::Rect::from_min_size(inner.min, egui::vec2(side, side));
+        crate::icons::paint(p, r.shrink(side * 0.15), icon, colour);
+    }
+    // The text keeps the colour it was given; TEXT only stands in for a text given none.
+    p.galley(egui::pos2(inner.left() + icon_w, inner.top()), galley, TEXT);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
+    resp
 }
 
 /// Up to two initials of `name`, upper case: of its first two words, or its first two letters.

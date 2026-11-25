@@ -2176,10 +2176,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
 
 fn badge_ui(ui: &mut egui::Ui, t: &RemoteTour) {
     let (fg, bg) = if t.is_public() { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
-    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(theme::SPACE_2 as i8, theme::SPACE_1 as i8 / 2)).show(ui, |ui| {
-        // As high as its text, not as a control.
-        ui.with_layout(Layout::top_down(Align::Min), |ui| ui.label(RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE)));
-    });
+    theme::chip(ui, RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE), bg, None);
 }
 
 /// The Refresh button: a circular arrow, drawn here.
