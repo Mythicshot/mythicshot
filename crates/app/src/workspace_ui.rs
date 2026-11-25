@@ -645,14 +645,13 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     theme::card(ui, |rows_ui| {
         let link = site_link(&effective);
         let mut open_failed = None;
-        rows_ui.row(
+        rows_ui.row_under(
             "Site",
             |ui| {
                 match &conn.test_server {
                     Some(t) => {
                         let mut shown = t.clone();
                         ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
-                        theme::caption(ui, "Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.");
                     }
                     // The address is the profile's own.
                     None if p.profile_mode => {
@@ -668,6 +667,11 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                             }
                         }
                     }
+                }
+            },
+            |ui| {
+                if conn.test_server.is_some() {
+                    theme::caption(ui, "Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.");
                 }
                 if !effective.trim().is_empty()
                     && let Err(e) = publish::check_server(&effective)
@@ -689,12 +693,14 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
         }
 
         if !p.profile_mode {
-            rows_ui.row(
+            rows_ui.row_under(
                 "Status",
                 |ui| {
                     let label = status(&conn.token, checking && conn.token == TokenStatus::Saved, info.as_ref().map(|i| i.workspace.as_str()));
                     let tone = if is_connected_status(&label) { theme::Tone::Success } else { theme::Tone::Neutral };
-                    ui.horizontal(|ui| theme::pill(ui, &label, tone));
+                    theme::pill(ui, &label, tone);
+                },
+                |ui| {
                     if refused && conn.token == TokenStatus::Saved {
                         theme::caution_line(ui, publish::REJECTED_TOKEN, theme::SMALL_SIZE, theme::Fit::Wrap);
                     }
@@ -738,16 +744,16 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             );
         }
         if (rows.sign_in || conn.token == TokenStatus::Checking) && !p.profile_mode {
-            rows_ui.row("Token", |ui| token_ui(ui, p, conn, &effective, busy), |_| {});
+            rows_ui.row("Token", |ui| drop(ui.vertical(|ui| token_ui(ui, p, conn, &effective, busy))), |_| {});
         }
 
         let result = p.current_message(&effective);
         let mut test = false;
-        rows_ui.row(
+        rows_ui.row_under(
             "Site version",
+            |ui| drop(theme::value(ui, info.as_ref().map_or_else(|| NOTHING.to_string(), |i| version_label(i.version.as_deref())))),
             |ui| {
-                theme::value(ui, info.as_ref().map_or_else(|| NOTHING.to_string(), |i| version_label(i.version.as_deref())));
-                // The result of the last check.
+                // The result of the last check, under the version.
                 if busy || checking {
                     ui.add(egui::Spinner::new());
                 } else if let Some((text, ok)) = result {

@@ -920,10 +920,13 @@ fn no_other_path_ends_a_token() {
     // The app runs these on the OS credential store (`main.rs` at start, and
     // `publish_ui::note_check`, `publish_ui::forget_active_token` through `change_profiles`), so
     // their own entry points cannot be driven here. What makes an end impossible on them is the
-    // type: a token is only ever ended by `spawn_change`, for a `Done::ThenEnd`, which is only
-    // made from the `Ending` that `profiles::remove` and `profiles::renew` hand back. These four
-    // return no `Ending`, and the lines below pin that: one of them returning one no longer
-    // compiles. They are run on the stub's address all the same, and the stub sees nothing.
+    // type: a token is only ever ended from an `Ending`, by one of two routes. `spawn_change`
+    // ends one for a `Done::ThenEnd`, which is only made from the `Ending` that `profiles::remove`
+    // and `profiles::renew` hand back; `spawn_abandon` ends the connection of a sign-in the add
+    // form leaves unkept, from `Candidate::into_ending`, which only a candidate the form holds
+    // can make. These four return no `Ending` and hold no candidate, and the lines below pin
+    // that: one of them returning one no longer compiles. They are run on the stub's address all
+    // the same, and the stub sees nothing.
     let _: fn(&mut crate::settings::Settings, &dyn KeyStore) -> Result<Option<String>, String> = profiles::migrate;
     let _: fn(&mut Book, &dyn KeyStore, &str, &str) -> Result<(), String> = profiles::attach;
     let _: fn(&crate::settings::Settings, &dyn KeyStore) -> Result<bool, String> = profiles::remove_legacy;

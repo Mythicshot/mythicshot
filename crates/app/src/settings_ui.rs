@@ -189,11 +189,12 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
             });
         });
         rows.full(|ui| {
-            // The choices wrap under the first choice, not under the words.
-            ui.horizontal_top(|ui| {
-                ui.label(RichText::new("Left-click on the tray icon").color(theme::MUTED));
-                ui.horizontal_wrapped(|ui| {
-                    theme::choices(ui, |ui| {
+            // The choices wrap under the first choice, not under the words, which stand level
+            // with the first choice's line.
+            theme::choices(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.horizontal(|ui| ui.label(RichText::new("Left-click on the tray icon").color(theme::MUTED)));
+                    ui.horizontal_wrapped(|ui| {
                         for choice in TrayLeftClick::ALL {
                             if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
                                 out.push(UiAction::SettingsChanged);
@@ -267,6 +268,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
                 let mut browse = false;
                 theme::value_then_actions(
                     ui,
+                    "captures-folder",
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         let mut dir = s.output_dir.display().to_string();
@@ -289,6 +291,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
                 let mut default = false;
                 theme::value_then_actions(
                     ui,
+                    "file-name-pattern",
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace)).changed() {
@@ -919,6 +922,7 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
     ui.horizontal(|ui| {
         theme::value_then_actions(
             ui,
+            "hotkeys-header",
             Layout::left_to_right(Align::Center),
             |ui| drop(ui.heading("Hotkeys")),
             |ui| {
@@ -1003,12 +1007,14 @@ fn row(rows: &mut theme::CardRows<'_>, state: &mut SettingsState, view: &View<'_
     } else {
         None
     };
-    rows.row_tinted(
+    rows.row_keyed(
         "",
+        &format!("hotkey {action:?}"),
         tint,
         |ui| {
             ui.add(egui::Label::new(RichText::new(action.label()).color(theme::TEXT)).truncate());
         },
+        |_| {},
         |ui| {
             if listening {
                 ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(theme::SMALL_SIZE));

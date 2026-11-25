@@ -665,3 +665,103 @@ fn the_smaller_findings_hold() {
         }
     }
 }
+
+/// The Tours page with profiles at the smallest window, at 100% and 200%: the profile dropdown
+/// ends before Refresh, nothing runs over anything, and every control stays in the window.
+#[test]
+fn the_tours_header_never_overlaps_at_the_smallest_window() {
+    let book = {
+        let p = |id: &str, name: &str| Profile { id: id.into(), name: name.into(), server: "https://tours.example.com".into(), account: Some(ACCOUNT.into()), workspace: Some("Sandbox test".into()), identity: None, state: State::Ready, named: true };
+        Book { list: vec![p("pa", "Sandbox test with a long profile name"), p("pb", "Customer demo")], active: Some("pa".into()), legacy: None }
+    };
+    for ppp in [1.0, 2.0] {
+        let what = format!("Tours at {ppp}");
+        let ctx = crate::theme::test_context();
+        ctx.set_pixels_per_point(ppp);
+        let mut f = fixture(Kind::Add);
+        f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
+        f.s.nav.request(Page::Tours);
+        let size = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let tours = crate::tours_ui::tests::conn(TokenStatus::Saved);
+        let out = crate::publish_ui::with_test_book(book.clone(), || {
+            let mut last = None;
+            for _ in 0..3 {
+                let input = egui::RawInput { screen_rect: Some(window), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, None));
+                out.textures_delta.clear();
+                last = Some(out);
+            }
+            last.unwrap()
+        });
+        let record = holder(&out, crate::tours_ui::RECORD_A_TOUR);
+        let dropdown = shapes_of(&out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.rect.right() < record.left() && r.rect.left() > NAV_WIDTH && (r.fill.a() > 0 || r.stroke.width > 0.0) && (r.rect.height() - theme::CONTROL_HEIGHT).abs() < 1.0 && (r.rect.center().y - record.center().y).abs() < 2.0 => Some(r.rect),
+                _ => None,
+            })
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .expect("the dropdown");
+        let refresh_left = record.left() - theme::ITEM_GAP - theme::CONTROL_HEIGHT;
+        assert!(dropdown.right() <= refresh_left + 0.5, "{what}: the dropdown {dropdown:?} runs under Refresh (from {refresh_left})");
+        theme::checks::assert_no_overlaps(&out, &what);
+        theme::checks::assert_texts_fit(&out, &what);
+        assert_inside_across(&out, window, &what);
+    }
+}
+
+/// A row keeps where its buttons stand when something appears above it: the width they took is
+/// remembered by the row's key, not by its place.
+#[test]
+fn a_row_keeps_its_buttons_in_place_when_something_appears_above() {
+    let ctx = crate::theme::test_context();
+    let draw = |extra: bool| {
+        let mut o = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))), ..Default::default() }, |ui| {
+            theme::page(ui, |ui| {
+                if extra {
+                    ui.label("A line that was not there before");
+                }
+                theme::card(ui, |rows| rows.row("Site", |ui| drop(theme::value(ui, "tours.example.com")), |ui| drop(ui.button("Open site"))));
+            });
+        });
+        o.textures_delta.clear();
+        o
+    };
+    draw(false);
+    let before = holder(&draw(false), "Open site");
+    let after = holder(&draw(true), "Open site");
+    assert!((before.left() - after.left()).abs() < 0.5, "{before:?} then {after:?}");
+}
+
+/// The parts of a row stand on one line: Site version's value and Test connection; the Updates
+/// checkbox has its helper text a line's gap under it; the tray words stand level with the first
+/// choice; the add form's Site address stands level with its field; and the card with no
+/// profile keeps its badge's place, empty.
+#[test]
+fn the_parts_of_a_row_stand_on_one_line() {
+    let (_ctx, _f, out) = settled(Kind::Connected, egui::vec2(SIZE[0], 1100.0), 1.0);
+    let (version, test) = (text_rect(&out, "0.4.2").unwrap(), holder(&out, workspace_ui::TEST_CONNECTION));
+    assert!((version.center().y - test.center().y).abs() < 1.5, "{version:?} {test:?}");
+    assert!(text_rect(&out, workspace_ui::CHECKED_NOW).unwrap().top() > version.bottom(), "the result stays under the version");
+    for size in SIZES.map(|(_, s)| egui::vec2(s[0], 1100.0)) {
+        let (_ctx, _f, out) = settled(Kind::Add, size, 1.0);
+        let label = on_page(&out, profiles::SITE_ADDRESS);
+        let field = holder(&out, "https://tours.example.com");
+        assert!((label.center().y - field.center().y).abs() < 1.5, "{label:?} {field:?}");
+    }
+    let ctx = crate::theme::test_context();
+    let mut f = fixture(Kind::Add);
+    f.s.nav.request(Page::Preferences);
+    f.s.prefs.state.tab = settings_ui::Tab::General;
+    let size = egui::vec2(SIZE[0], 1100.0);
+    frame(&ctx, &mut f, size);
+    let out = frame(&ctx, &mut f, size);
+    let (check, helper) = (text_rect(&out, crate::update_ui::CHECKBOX).unwrap(), text_rect(&out, crate::update_ui::HELPER).unwrap());
+    assert!(helper.top() - check.bottom() <= theme::ITEM_GAP + 1.0, "{check:?} {helper:?}");
+    let (words, first) = (text_rect(&out, "Left-click on the tray icon").unwrap(), text_rect(&out, "Open Mythicshot").unwrap());
+    assert!((words.center().y - first.center().y).abs() < 1.5, "{words:?} {first:?}");
+    let (_ctx, _f, out) = settled(Kind::NoActive, egui::vec2(SIZE[0], SIZE[1]), 1.0);
+    let placeholder = shapes_of(&out).into_iter().any(|s| matches!(s, egui::Shape::Circle(c) if c.fill == theme::CHIP && (c.radius - theme::BADGE_SIZE / 2.0).abs() < 0.5));
+    assert!(placeholder, "the badge's place is kept");
+}

@@ -263,6 +263,7 @@ fn recent_row(ui: &mut egui::Ui, f: &Recent) {
     ui.horizontal(|ui| {
         theme::value_then_actions(
             ui,
+            ("recent", &f.path),
             Layout::left_to_right(Align::Center),
             |ui| drop(theme::value(ui, &f.name)),
             |ui| {

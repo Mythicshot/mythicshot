@@ -324,6 +324,8 @@ pub const KEYS_WIDTH: f32 = 170.0;
 /// The profile dropdown's selected profile, and the list it opens.
 pub const PROFILE_DROPDOWN_WIDTH: f32 = 240.0;
 pub const PROFILE_LIST_WIDTH: f32 = 300.0;
+/// The narrowest the profile dropdown gets on a narrow line.
+pub const PROFILE_DROPDOWN_MIN_WIDTH: f32 = 96.0;
 /// The space inside a dialog (a question over a page), all round.
 pub const DIALOG_PAD: f32 = SPACE_6;
 /// A dialog's width.
@@ -446,49 +448,59 @@ impl CardRows<'_> {
     }
 
     /// A row: `label` in the label column, in the secondary colour; what `value` draws beside it;
-    /// and what `actions` draws at the right end, laid out from the right. The value gets the
-    /// width that is left, so it wraps or is cut short with "…" there and never runs under the
-    /// actions.
+    /// and what `actions` draws at the right end, from the left, all centred on one line. The
+    /// value gets the width that is left, so it is cut short with "…" there and never runs under
+    /// the actions. The row's label is its key (see [`Self::row_keyed`]).
     pub fn row(&mut self, label: &str, value: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
-        self.row_tinted(label, None, value, actions);
+        self.row_keyed(label, label, None, value, |_| {}, actions);
     }
 
-    /// [`Self::row`] on `tint` across the card's width, when there is one: a row in a state of
-    /// its own (a shortcut waiting for its keys, one that could not be set).
-    pub fn row_tinted(&mut self, label: &str, tint: Option<egui::Color32>, value: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
+    /// [`Self::row`] with what `under` draws under the value, in the value's column: a result,
+    /// a caution, a second line.
+    pub fn row_under(&mut self, label: &str, value: impl FnOnce(&mut egui::Ui), under: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
+        self.row_keyed(label, label, None, value, under, actions);
+    }
+
+    /// The row in full. `key` tells the row from every other one of the window whatever is
+    /// drawn above it, so the width its actions took is remembered for it (a row without a
+    /// label needs a key of its own). On `tint` across the card's width when there is one: a
+    /// row in a state of its own (a shortcut waiting for its keys, one that could not be set).
+    pub fn row_keyed(&mut self, label: &str, key: &str, tint: Option<egui::Color32>, value: impl FnOnce(&mut egui::Ui), under: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
         self.hairline();
         let ui = &mut *self.ui;
         let spacing = self.spacing;
         let behind = ui.painter().add(egui::Shape::Noop);
         let width = ui.available_width();
-        let row = ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        let left = ui.cursor().left();
+        // A row without a label gives the whole width to its value.
+        let label_width = if label.is_empty() { 0.0 } else { LABEL_WIDTH.min(width / 3.0) };
+        let main = ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_size(egui::vec2(width, ROW_HEIGHT));
             ui.spacing_mut().item_spacing = egui::vec2(spacing.x, spacing.y.min(ITEM_GAP / 2.0));
-            // A row without a label gives the whole width to its value.
-            if !label.is_empty() {
-                let label_width = LABEL_WIDTH.min(width / 3.0);
+            if label_width > 0.0 {
                 ui.allocate_ui_with_layout(egui::vec2(label_width, ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.set_min_size(egui::vec2(label_width, ROW_HEIGHT));
                     ui.set_max_width(label_width);
                     ui.add(egui::Label::new(RichText::new(label).color(MUTED)).truncate());
                 });
             }
-            value_then_actions(
-                ui,
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    // A one-line value sits in the middle of the row: the space under it counts
-                    // the gap the layout leaves after every item.
-                    let pad = ((ROW_HEIGHT - ui.text_style_height(&TextStyle::Body)) / 2.0).max(0.0);
-                    ui.add_space(pad);
-                    value(ui);
-                    ui.add_space((pad - ui.spacing().item_spacing.y).max(0.0));
-                },
-                actions,
-            );
+            value_then_actions(ui, ("card-row", key), egui::Layout::left_to_right(egui::Align::Center), value, actions);
         });
+        // What goes under the value, in its column; nothing at all when it draws nothing.
+        let indent = if label_width > 0.0 { label_width + spacing.x } else { 0.0 };
+        let top = ui.cursor().top();
+        let column = egui::Rect::from_min_max(egui::pos2(left + indent, top), egui::pos2(left + width, f32::INFINITY));
+        let below = ui.scope_builder(egui::UiBuilder::new().max_rect(column).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(spacing.x, LINE_GAP);
+            under(ui);
+        });
+        let mut rect = main.response.rect;
+        if below.response.rect.height() > 0.0 {
+            rect = rect.union(below.response.rect);
+            ui.add_space(ITEM_GAP);
+        }
         if let Some(tint) = tint {
-            let r = row.response.rect.expand2(egui::vec2(CARD_PAD_X / 2.0, -0.5));
+            let r = rect.expand2(egui::vec2(CARD_PAD_X / 2.0, -0.5));
             ui.painter().set(behind, egui::Shape::rect_filled(r, RADIUS_SM, tint));
         }
     }
@@ -524,25 +536,36 @@ impl CardRows<'_> {
 /// value is made first and the actions after it, so the keyboard's Tab goes from a field to its
 /// buttons in the order they are seen. The actions' width is the one they took when last drawn
 /// (half the line the first time); when it changes, the window is drawn again at once.
-pub fn value_then_actions<R>(ui: &mut egui::Ui, layout: egui::Layout, value: impl FnOnce(&mut egui::Ui) -> R, actions: impl FnOnce(&mut egui::Ui)) -> R {
-    let id = ui.next_auto_id().with("value-then-actions");
+pub fn value_then_actions<R>(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debug, layout: egui::Layout, value: impl FnOnce(&mut egui::Ui) -> R, actions: impl FnOnce(&mut egui::Ui)) -> R {
+    // Its own key, not the place it is drawn at: a widget appearing above it keeps what it learnt.
+    let id = egui::Id::unique(("value-then-actions", key));
     let known: Option<f32> = ui.data(|d| d.get_temp(id));
     let gap = ui.spacing().item_spacing.x;
     let line = ui.available_rect_before_wrap();
     // Before the actions were ever measured, half the line is kept for them, so they never push
-    // past the line's end while they are measured.
+    // past the line's end while they are measured. When they need more than the line holds,
+    // they go on a line of their own under the value: they never stand over what is beside them.
     let kept = known.unwrap_or(line.width() / 2.0);
-    let width = (line.width() - kept - if kept > 0.0 { gap } else { 0.0 }).max(0.0);
-    let shown = ui.allocate_ui_with_layout(egui::vec2(width, line.height()), layout, |ui| {
+    let own_line = kept > 0.0 && kept + gap > line.width();
+    let width = if own_line { line.width() } else { (line.width() - kept - if kept > 0.0 { gap } else { 0.0 }).max(0.0) };
+    let bounded = line.height() <= 4.0 * ROW_HEIGHT;
+    let height = if bounded { line.height() } else { 0.0 };
+    let shown = ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
         ui.set_min_width(width);
         ui.set_max_width(width);
         value(ui)
     });
-    // The actions, from the left, in the space at the line's end: as high as the line (or as the
-    // value, when that is taller), so they stand level with it.
+    // The actions, from the left, in the space at the line's end, centred on the line (or on
+    // the value, where the line has no height of its own).
     let at = shown.response.rect;
-    let bottom = if line.height() <= 4.0 * ROW_HEIGHT { line.bottom().max(at.bottom()) } else { at.bottom() };
-    let space = egui::Rect::from_min_max(egui::pos2(line.right() - kept, line.top()), egui::pos2(line.right(), bottom));
+    let (top, bottom) = if own_line {
+        (at.bottom() + gap, at.bottom() + gap + line.height().min(CONTROL_HEIGHT))
+    } else if bounded {
+        (line.top(), line.bottom())
+    } else {
+        (at.top(), at.bottom())
+    };
+    let space = egui::Rect::from_min_max(egui::pos2((line.right() - kept).max(line.left()), top), egui::pos2(line.right(), bottom.max(top)));
     let taken = ui.scope_builder(egui::UiBuilder::new().max_rect(space).layout(egui::Layout::left_to_right(egui::Align::Center)), actions).response.rect.width();
     if known.is_none_or(|known| (taken - known).abs() > 0.5) {
         ui.data_mut(|d| d.insert_temp(id, taken));
@@ -683,6 +706,14 @@ pub fn icon_button(ui: &mut egui::Ui, text: &str, icon: crate::icons::Icon, side
         crate::icons::paint(p, icon_rect, icon, colour);
         p.galley(egui::pos2(text_x, rect.center().y - galley.size().y / 2.0), galley, colour);
     }
+    resp
+}
+
+/// The round badge's place when there is no profile to show: the same circle, empty, in the
+/// neutral chip colour, so a card keeps its shape.
+pub fn badge_placeholder(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(BADGE_SIZE, BADGE_SIZE), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), BADGE_SIZE / 2.0, CHIP);
     resp
 }
 

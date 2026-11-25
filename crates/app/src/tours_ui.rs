@@ -1861,15 +1861,19 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 
     ui.horizontal(|ui| {
         ui.set_min_height(theme::CONTROL_HEIGHT);
-        ui.heading("Tours");
-        // The profile the list, the storage use and every action here belong to.
-        if crate::profiles_ui::dropdown(ui, "tours", true) {
-            ui.ctx().request_repaint();
-        }
         theme::value_then_actions(
             ui,
+            "tours-header",
             Layout::left_to_right(Align::Center),
-            |_| {},
+            // The heading and the profile dropdown take the room the buttons leave, the dropdown
+            // narrowing when the window does.
+            |ui| {
+                ui.heading("Tours");
+                // The profile the list, the storage use and every action here belong to.
+                if crate::profiles_ui::dropdown(ui, "tours", true) {
+                    ui.ctx().request_repaint();
+                }
+            },
             |ui| {
                 if m.is_loading() && m.loaded_at.is_some() {
                     ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));

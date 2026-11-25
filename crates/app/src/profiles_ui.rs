@@ -276,7 +276,9 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
         ui.horizontal(|ui| {
             dot(ui, active.is_none_or(|a| a.waiting));
             let text = active.map_or_else(|| crate::workspace_ui::NOT_CONNECTED.to_string(), |a| a.name.clone());
-            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).width(theme::PROFILE_DROPDOWN_WIDTH).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
+            // As wide as it may be, and narrower where the line has less room.
+            let width = theme::PROFILE_DROPDOWN_WIDTH.min(ui.available_width() - ui.spacing().icon_width - 2.0 * ui.spacing().button_padding.x).max(theme::PROFILE_DROPDOWN_MIN_WIDTH);
+            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).truncate().width(width).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
         });
     });
     pick
@@ -844,13 +846,12 @@ impl AddFlow {
                 let mut paste_instead = false;
                 let (address, paste) = (&mut self.address, &mut self.paste);
                 theme::card(ui, |rows| {
-                    rows.row(
+                    let problem = publish::check_server(address).err().filter(|_| !address.trim().is_empty());
+                    rows.row_under(
                         profiles::SITE_ADDRESS,
+                        |ui| drop(ui.add_enabled(!renewing && !signing, egui::TextEdit::singleline(address).hint_text("https://tours.example.com").desired_width(f32::INFINITY))),
                         |ui| {
-                            ui.add_enabled(!renewing && !signing, egui::TextEdit::singleline(address).hint_text("https://tours.example.com").desired_width(f32::INFINITY));
-                            if !address.trim().is_empty()
-                                && let Err(e) = publish::check_server(address)
-                            {
+                            if let Some(e) = problem {
                                 theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                             }
                         },
@@ -867,6 +868,7 @@ impl AddFlow {
                             ui.horizontal(|ui| {
                                 theme::value_then_actions(
                                     ui,
+                                    "add-profile-paste",
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| drop(ui.add(egui::TextEdit::singleline(paste).password(true).hint_text(PASTE_HINT).desired_width(f32::INFINITY))),
                                     |ui| {
@@ -1222,6 +1224,7 @@ impl Panel {
                         dot(ui, e.waiting);
                         theme::value_then_actions(
                             ui,
+                            ("manage-profile", &e.id),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
                                 ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
@@ -1295,8 +1298,10 @@ fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str,
         card.full(|ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = theme::SPACE_3;
-                if let Some(active) = active {
-                    theme::initials_badge(ui, &active.name);
+                match active {
+                    Some(active) => drop(theme::initials_badge(ui, &active.name)),
+                    // No profile is active: the badge's place is kept, empty.
+                    None => drop(theme::badge_placeholder(ui)),
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = theme::ITEM_GAP;

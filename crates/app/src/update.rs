@@ -167,21 +167,18 @@ struct RawRelease {
 /// The public keys a release file must be signed with, at least one of them: Ed25519, each the
 /// raw 32-byte public key in standard base64 with padding (44 characters), with a short id.
 ///
-/// The real keys are put in by the owner, who made them; until then the list holds only
-/// [`RELEASE_KEY_PLACEHOLDER`], which is not a key at all, so every release file is refused (a
-/// build shipped before the real keys fails closed). To put the keys in, replace the placeholder
-/// entry with one line per key, for example
-/// `("2026-main", "<44 base64 characters of the raw public key>"),`
-/// keeping a second (backup) key beside the main one; rotating means adding the new key in one
-/// version and removing the old one in a later version. Then delete the line that checks the
-/// placeholder in `update/tests.rs` (`assert_eq!(RELEASE_KEYS, [RELEASE_KEY_PLACEHOLDER])`).
+/// These are the owner's keys: a main one and a backup beside it, one line per key, for example
+/// `("2026-main", "<44 base64 characters of the raw public key>"),`. Rotating means adding the
+/// new key in one version and removing the old one in a later version.
 /// Nothing (no setting, no environment variable, no debug switch) adds to or skips this list.
 pub const RELEASE_KEYS: &[(&str, &str)] = &[
     ("primary", "v8SQJVA9CaiFcBQkcsZ6I+Kh7caBv74L+SMF8BhN1hA="),
     ("backup", "7ZYdjH8mnVUOJeqR78A2XAHONIAwQ8rgdv5YfaRIrZ0="),
 ];
 
-/// Stands in the list until the real keys exist: not base64 of 32 bytes, so it is never a key.
+/// What stood in the list before the real keys: not base64 of 32 bytes, so it is never a key.
+/// Kept for the tests that check it is refused and is no longer in the list.
+#[cfg(test)]
 pub const RELEASE_KEY_PLACEHOLDER: (&str, &str) = ("placeholder: no release key yet", "NOT-A-KEY-REPLACE-WITH-THE-OWNERS-PUBLIC-KEY");
 
 /// What the log says for a release file whose signature is missing, malformed or does not

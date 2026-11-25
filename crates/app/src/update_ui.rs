@@ -546,8 +546,9 @@ pub fn prefs_ui(ui: &mut egui::Ui, u: &mut Updater, settings: &mut crate::settin
     theme::section_heading(ui, SECTION);
     theme::card(ui, |rows| {
         rows.full(|ui| {
-            changed = ui.checkbox(&mut settings.check_for_updates, CHECKBOX).changed();
-            // The helper text stands under the checkbox's label.
+            // The helper text stands under the checkbox's label, a line's gap below it.
+            ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+            changed = theme::choices(ui, |ui| ui.checkbox(&mut settings.check_for_updates, CHECKBOX).changed());
             ui.horizontal(|ui| {
                 ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
                 theme::caption(ui, HELPER);
@@ -556,11 +557,14 @@ pub fn prefs_ui(ui: &mut egui::Ui, u: &mut Updater, settings: &mut crate::settin
         let checking = u.checking();
         let status = u.status_line(now);
         let mut check = false;
-        rows.row(
+        rows.row_keyed(
             "",
+            "updates-status",
+            None,
             |ui| {
                 ui.add(egui::Label::new(RichText::new(status).size(theme::SMALL_SIZE).color(theme::MUTED)).wrap());
             },
+            |_| {},
             |ui| check = ui.add_enabled(!checking, egui::Button::new(CHECK_NOW)).clicked(),
         );
         if check {
