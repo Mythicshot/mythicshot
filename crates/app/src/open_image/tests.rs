@@ -545,7 +545,8 @@ fn the_overlay_says_what_a_drop_would_do_and_a_drop_hands_over_only_a_picture() 
 }
 
 /// An editor's overlay says its own words over a picture, the same refusal over anything else,
-/// and while nothing may be placed it refuses even a picture, and a drop hands nothing over.
+/// and while nothing may be placed it refuses a picture with its own reason (anything else with
+/// the usual sentence), and a drop hands nothing over.
 #[test]
 fn a_window_with_its_own_words_takes_a_picture_only_while_it_is_allowed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -557,16 +558,23 @@ fn a_window_with_its_own_words_takes_a_picture_only_while_it_is_allowed() {
     let mut state = DropState::default();
     let frame = |state: &mut DropState, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, allowed: bool| {
         let mut got = None;
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| got = state.frame_for(ui.ctx(), ui.ctx().content_rect(), hovered.clone(), dropped.clone(), "Place it", allowed));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| got = state.frame_for(ui.ctx(), ui.ctx().content_rect(), hovered.clone(), dropped.clone(), Words { accept: "Place it", blocked: "Not now" }, allowed));
         out.textures_delta.clear();
         (texts(&out), got)
     };
     assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], true), (vec!["Place it".to_string()], None));
     assert_eq!(frame(&mut state, vec![Some(notes.clone())], vec![], true).0, [ONLY_PICTURES]);
     assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], true), (vec![], Some(pic.clone())));
-    // Not allowed now: the picture is refused, and its drop does nothing.
+    // Not allowed now: the picture is refused with that reason, anything else as always, and a
+    // drop does nothing.
     frame(&mut state, vec![], vec![], false);
-    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, ["Not now"]);
+    assert_eq!(frame(&mut state, vec![Some(notes.clone())], vec![], false).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone()), Some(pic.clone())], vec![], false).0, [ONLY_PICTURES]);
+    // Allowed again in the same drag: the picture is taken again.
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, ["Not now"]);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], true).0, ["Place it"]);
+    frame(&mut state, vec![], vec![], false);
     assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], false), (vec![], None));
 }
 

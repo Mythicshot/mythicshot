@@ -1180,11 +1180,13 @@ impl Editor {
 
     /// A file dragged over the window: the drop overlay over the canvas only (it takes the
     /// picture, or refuses anything else, or everything while nothing may be placed or a dialog
-    /// is open: `blocked`), and a dropped picture read to be placed where it was dropped.
+    /// is open: `blocked`, saying so over a picture), and a dropped picture read to be placed
+    /// where it was dropped.
     fn picture_drop(&mut self, ctx: &egui::Context, blocked: bool) {
         let Some(area) = self.canvas_rect else { return };
         let allowed = !blocked && self.can_place_picture();
-        if let Some(path) = self.picture_drop.frame_from_input_for(ctx, area, crate::place_picture::PLACE_HERE, allowed) {
+        let words = crate::open_image::Words { accept: crate::place_picture::PLACE_HERE, blocked: crate::place_picture::CANNOT_PLACE_NOW };
+        if let Some(path) = self.picture_drop.frame_from_input_for(ctx, area, words, allowed) {
             let centre = self.drop_point(ctx).filter(|p| area.contains(*p)).map(|p| self.capture_point(p)).unwrap_or_else(|| self.visible_centre());
             self.place_picture_file(path, centre);
         }
@@ -4847,7 +4849,9 @@ pub(crate) mod tests {
         assert!(ed.status_text().is_none());
     }
 
-    /// With a dialog open over the editor a drag is refused and a drop places nothing.
+    /// With a dialog open over the editor a picture dragged there is refused with the reason (a
+    /// picture cannot be placed now), a file that is no picture with the usual sentence, and a
+    /// drop places nothing.
     #[test]
     fn a_picture_dropped_while_the_close_question_is_up_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4857,7 +4861,20 @@ pub(crate) mod tests {
         dialog_checks::frame(&mut ed, &ctx, vec![]);
         ed.confirm_close = true;
         let out = file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
-        assert!(texts(&out).iter().any(|t| t == crate::open_image::ONLY_PICTURES));
+        let t = texts(&out);
+        assert!(t.iter().any(|t| t == crate::place_picture::CANNOT_PLACE_NOW), "a picture, refused for the right reason: {t:?}");
+        assert!(!t.iter().any(|t| t == crate::open_image::ONLY_PICTURES || t == PLACE_HERE), "{t:?}");
+        // The refusal's tint, over the canvas.
+        let tints = crate::share_ui::tests::shapes_of(&out).into_iter().filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == crate::open_image::REFUSE_TINT)).count();
+        assert_eq!(tints, 1);
+        // A file that is no picture keeps the usual sentence.
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        let t = texts(&file_frame(&mut ed, &ctx, std::slice::from_ref(&notes), &[], vec![]));
+        assert!(t.iter().any(|t| t == crate::open_image::ONLY_PICTURES) && !t.iter().any(|t| t == crate::place_picture::CANNOT_PLACE_NOW), "{t:?}");
+        file_frame(&mut ed, &ctx, &[], &[], vec![]);
+        file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
         file_frame(&mut ed, &ctx, &[], std::slice::from_ref(&pic), vec![]);
         assert!(!ed.placing.pending());
         std::thread::sleep(Duration::from_millis(50));
@@ -4872,7 +4889,8 @@ pub(crate) mod tests {
     }
 
     /// The editor with a picture dragged over its canvas, for the owner: the overlay that places
-    /// it and the refusal. Run with
+    /// it, the refusal of a file that is no picture, and the refusal of a picture while nothing
+    /// may be placed. Run with
     /// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot editor_drop_renders -- --ignored`.
     #[test]
     #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
@@ -4885,10 +4903,11 @@ pub(crate) mod tests {
         });
         let s = Settings::default();
         for ppp in [1.0f32, 2.0] {
-            for (label, accept) in [("editor-drop-picture", true), ("editor-drop-refused", false)] {
+            for (label, accept, blocked) in [("editor-drop-picture", true, false), ("editor-drop-refused", false, false), ("editor-drop-blocked", false, true)] {
                 let mut ed = Editor::new(shot.clone(), "Loot window".into(), BTreeMap::new(), s.dest_context("Loot window"), EditorPrefs::default());
                 ed.keys = s.editor_keys.clone();
                 ed.picture_drop.shown_for_render = Some(accept);
+                ed.picture_drop.blocked_for_render = blocked;
                 let shot = crate::snapshot::shot(&crate::theme::test_context(), dialog_checks::WINDOW.size(), ppp, 4, |ui| ed.ui(ui));
                 assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{ppp}x")), 0, "{label}");
             }

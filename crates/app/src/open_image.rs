@@ -436,6 +436,9 @@ pub struct DropState {
     /// A picture of the window with the overlay up, without a drag: the renders.
     #[cfg(test)]
     pub(crate) shown_for_render: Option<bool>,
+    /// With `shown_for_render` false: the refusal for a picture that may not be placed now.
+    #[cfg(test)]
+    pub(crate) blocked_for_render: bool,
 }
 
 impl DropState {
@@ -443,13 +446,14 @@ impl DropState {
     /// was dropped on it (`dropped`). While a drag is over the window, paints the overlay over
     /// `area`; returns the picture file to open when one was dropped.
     pub fn frame(&mut self, ctx: &egui::Context, area: Rect, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>) -> Option<PathBuf> {
-        self.frame_for(ctx, area, hovered, dropped, DROP_TO_OPEN, true)
+        self.frame_for(ctx, area, hovered, dropped, Words { accept: DROP_TO_OPEN, blocked: ONLY_PICTURES }, true)
     }
 
-    /// [`DropState::frame`] for a window whose overlay says `accept` over a picture a drop would
-    /// take. While `allowed` is false every drag is refused like a file that is not a picture,
-    /// and a drop hands nothing over: an editor where nothing may be placed now.
-    pub fn frame_for(&mut self, ctx: &egui::Context, area: Rect, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, accept: &str, allowed: bool) -> Option<PathBuf> {
+    /// [`DropState::frame`] for a window whose overlay says `words.accept` over a picture a drop
+    /// would take. While `allowed` is false every drag is refused, and a drop hands nothing over
+    /// (an editor where nothing may be placed now): over a picture the overlay says
+    /// `words.blocked`, over anything else the usual [`ONLY_PICTURES`].
+    pub fn frame_for(&mut self, ctx: &egui::Context, area: Rect, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, words: Words<'_>, allowed: bool) -> Option<PathBuf> {
         if !dropped.is_empty() {
             // A drop of several files can arrive a file a frame: the drag before it said how many.
             // The rest of such a drop, in the frames that follow, is refused with it.
@@ -471,24 +475,26 @@ impl DropState {
             self.judged = None;
             #[cfg(test)]
             if let Some(shown) = self.shown_for_render {
-                paint_overlay(ctx, area, shown, accept);
+                let text = if shown { words.accept } else if self.blocked_for_render { words.blocked } else { ONLY_PICTURES };
+                paint_overlay(ctx, area, shown, text);
             }
             return None;
         }
         let verdict = match &self.judged {
             Some((paths, verdict)) if *paths == hovered => verdict.clone(),
-            // Nothing may be placed: the disk is not looked at, and the drag is refused.
-            _ if !allowed => {
-                self.judged = Some((hovered, Verdict::Refuse));
-                Verdict::Refuse
-            }
             _ => {
                 let verdict = judge(&hovered);
                 self.judged = Some((hovered, verdict.clone()));
                 verdict
             }
         };
-        paint_overlay(ctx, area, allowed && matches!(verdict, Verdict::Accept(_)), accept);
+        let (accept, text) = match (verdict, allowed) {
+            (Verdict::Accept(_), true) => (true, words.accept),
+            // A picture, but nothing may be placed now: that is the reason given.
+            (Verdict::Accept(_), false) => (false, words.blocked),
+            (Verdict::Refuse, _) => (false, ONLY_PICTURES),
+        };
+        paint_overlay(ctx, area, accept, text);
         None
     }
 
@@ -501,10 +507,19 @@ impl DropState {
     /// [`DropState::frame_for`] with the files egui says are dragged over and dropped on the
     /// window whose frame this is: each window has its own, so an overlay shows only in the
     /// window the files are over.
-    pub fn frame_from_input_for(&mut self, ctx: &egui::Context, area: Rect, accept: &str, allowed: bool) -> Option<PathBuf> {
+    pub fn frame_from_input_for(&mut self, ctx: &egui::Context, area: Rect, words: Words<'_>, allowed: bool) -> Option<PathBuf> {
         let (hovered, dropped) = files_from_input(ctx);
-        self.frame_for(ctx, area, hovered, dropped, accept, allowed)
+        self.frame_for(ctx, area, hovered, dropped, words, allowed)
     }
+}
+
+/// What a window's drop overlay says over one picture file: when a drop would take it
+/// (`accept`), and when the window takes none now (`blocked`). Anything that is not one
+/// picture always gets [`ONLY_PICTURES`].
+#[derive(Debug, Clone, Copy)]
+pub struct Words<'a> {
+    pub accept: &'a str,
+    pub blocked: &'a str,
 }
 
 /// The files egui says are dragged over, and dropped on, the window whose frame this is.
@@ -527,14 +542,12 @@ pub fn overlay_colours(accept: bool) -> (Color32, Color32, Color32, Color32) {
 
 /// The overlay over `area` (the window below its menu bar, or an editor's canvas) while files are
 /// dragged over the window: a see-through tint over the page, a dashed frame, and on a solid chip
-/// in the middle the Open image icon and what a drop would do (`accept_text` when it would take
-/// the picture), in the purple selection tint when it would take a picture and in the danger
-/// tint when it would not. It is painted on a layer of its own above the page and takes no
-/// input, so clicks still reach the page.
-fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool, accept_text: &str) {
+/// in the middle the Open image icon and what a drop would do (`text`), in the purple selection
+/// tint when it would take the picture (`accept`) and in the danger tint when it would not. It is
+/// painted on a layer of its own above the page and takes no input, so clicks still reach the page.
+fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool, text: &str) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("open-image-drop")));
     let (tint, edge, chip, ink) = overlay_colours(accept);
-    let text = if accept { accept_text } else { ONLY_PICTURES };
     p.rect_filled(area, 0.0, tint);
     let frame = area.shrink(theme::PAGE_PAD.min(area.width() / 4.0).min(area.height() / 4.0));
     let corners = vec![frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom(), frame.left_top()];

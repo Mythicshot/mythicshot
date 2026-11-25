@@ -24,6 +24,10 @@ use crate::open_image::{self, ImageLoads, ReadJob, Settled};
 /// a drop would place. Approved wording.
 pub const PLACE_HERE: &str = "Drop the picture to place it on this capture";
 
+/// What it says over a picture while nothing may be placed (the Tour view with no step to pin
+/// to, or a dialog open). Approved wording.
+pub const CANNOT_PLACE_NOW: &str = "A picture cannot be placed here right now";
+
 /// The room a picture too large for the capture keeps from each edge once scaled down, as a
 /// share of the capture's width (left and right) and height (top and bottom): 5%, the margin a
 /// pasted picture keeps.

@@ -5540,8 +5540,8 @@ mod tests {
 
     /// A picture dropped on the recording editor is placed wherever a picture may be pasted: in
     /// the Timeline view (shown from the current frame for a while) and in the Tour view on a step
-    /// (pinned to that step). In the Tour view without a step to pin to, a drag is refused like a
-    /// file that is no picture, and a drop places nothing.
+    /// (pinned to that step). In the Tour view without a step to pin to, a picture dragged there
+    /// is refused with that reason, and a drop places nothing.
     #[test]
     fn a_picture_is_placed_on_a_recording_wherever_one_may_be_pasted_and_refused_where_not() {
         use crate::editor_ui::tests::{drop_on, file_frame, frames_until};
@@ -5579,7 +5579,8 @@ mod tests {
         assert!(!ed.can_place_picture());
         let out = file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
         let texts: Vec<String> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect();
-        assert!(texts.iter().any(|t| t == crate::open_image::ONLY_PICTURES) && !texts.iter().any(|t| t == crate::place_picture::PLACE_HERE), "{texts:?}");
+        assert!(texts.iter().any(|t| t == crate::place_picture::CANNOT_PLACE_NOW), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == crate::open_image::ONLY_PICTURES || t == crate::place_picture::PLACE_HERE), "{texts:?}");
         file_frame(&mut ed, &ctx, &[], std::slice::from_ref(&pic), vec![]);
         frames_until(&mut ed, &ctx, |e| !e.holds_update());
         assert!(image_items(&ed).is_empty(), "nothing was placed");
