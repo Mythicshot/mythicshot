@@ -190,7 +190,7 @@ fn an_animated_gif_opens_its_first_frame() {
 }
 
 #[test]
-fn a_folder_a_device_a_shortcut_and_a_missing_file_are_refused_and_never_followed() {
+fn a_folder_a_device_a_shortcut_and_a_missing_file_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     // A folder with a picture's name.
     let folder = tmp.path().join("pictures.png");
@@ -212,15 +212,52 @@ fn a_folder_a_device_a_shortcut_and_a_missing_file_are_refused_and_never_followe
         let nul = load(Path::new(r"\\.\NUL"));
         assert!(matches!(nul, Err(ImageError::Unsupported(_))), "{nul:?}");
     }
-    // A link to a picture is opened as the link and refused, where this computer lets a test make one.
+    // A pipe-like device: refused, or not opened at all where the test has no console.
     #[cfg(windows)]
     {
-        let target = tmp.path().join("real.png");
-        std::fs::write(&target, png(&RgbaImage::new(2, 2))).unwrap();
-        let link = tmp.path().join("link.png");
-        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
-            assert!(matches!(load(&link), Err(ImageError::Unsupported(_))), "{:?}", load(&link));
-        }
+        let con = load(Path::new(r"\\.\CONIN$"));
+        assert!(matches!(con, Err(ImageError::Unsupported(_)) | Err(ImageError::IoError(_))), "{con:?}");
+    }
+}
+
+/// A link to a picture is followed and the picture opens, where this computer lets a test make a
+/// link without elevation (Developer Mode); elsewhere the test says so and checks the rest.
+#[test]
+fn a_link_to_a_picture_is_followed_and_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let img = RgbaImage::from_pixel(2, 2, Rgba([9, 8, 7, 255]));
+    let target = tmp.path().join("real.png");
+    std::fs::write(&target, png(&img)).unwrap();
+    let link = tmp.path().join("link.png");
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    #[cfg(not(windows))]
+    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    if made {
+        assert_eq!(load(&link).unwrap(), img);
+        assert_eq!(judge(&[Some(link.clone())]), Verdict::Accept(link));
+    } else {
+        eprintln!("skipped: this computer does not let a test make a link");
+    }
+}
+
+/// A file in a cloud-synced folder carries a reparse attribute even when it is on this computer.
+/// A test cannot give a file one without elevation, so this opens a real one only when the temp
+/// folder is itself inside a synced folder; otherwise it says it was skipped.
+#[cfg(windows)]
+#[test]
+fn a_file_with_a_cloud_reparse_attribute_still_opens() {
+    use std::os::windows::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("synced.png");
+    std::fs::write(&path, png(&RgbaImage::new(3, 3))).unwrap();
+    const REPARSE: u32 = 0x400;
+    if std::fs::metadata(&path).unwrap().file_attributes() & REPARSE != 0 {
+        assert_eq!(load(&path).unwrap().dimensions(), (3, 3));
+    } else {
+        eprintln!("skipped: no file with a reparse attribute can be made here without elevation");
+        // The rest of the check still holds: a plain file opens.
+        assert!(load(&path).is_ok());
     }
 }
 

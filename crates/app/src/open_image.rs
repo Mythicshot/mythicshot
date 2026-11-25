@@ -57,8 +57,8 @@ pub fn could_not_open(path: &Path, e: &ImageError) -> String {
 }
 
 /// Read the picture in the file at `path`, whatever its name says, within the limits above. An
-/// animated GIF or WebP gives its first frame. Only a regular file on a disk is read: a folder, a
-/// link, a pipe or a device is refused as a file that is not a picture, without being followed.
+/// animated GIF or WebP gives its first frame. Only a regular file on a disk is read (a link is
+/// followed): a folder, a pipe or a device is refused as a file that is not a picture.
 pub fn load(path: &Path) -> Result<RgbaImage, ImageError> {
     let file = open_disk_file(path)?;
     // The size the file says it has refuses most files at once; the bounded read below holds
@@ -122,24 +122,22 @@ fn not_a_picture() -> ImageError {
 }
 
 /// Open `path` for reading only when it is a regular file on a disk, checked on the opened handle
-/// itself. On Windows the path is opened without following a reparse point (a link or junction
-/// is opened as itself and refused), and a pipe or device is refused by the handle's type rather
-/// than read, so it can never block the read.
+/// itself. A link is followed, as any program would: the person chose the file and can read it
+/// anyway. A file in a cloud-synced folder (which carries a reparse attribute even when it is on
+/// this computer) opens, and one kept only online downloads as it is read, as in any program.
+/// On Windows a pipe or device is refused by the handle's type rather than read, so it can never
+/// block the read, and a folder (opened with backup semantics only so it can be refused cleanly)
+/// is refused as not a picture.
 #[cfg(windows)]
 fn open_disk_file(path: &Path) -> Result<File, ImageError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_DISK, GetFileType};
-    // Backup semantics only lets a folder be opened, so it is refused below like any non-file.
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0).open(path).map_err(ImageError::IoError)?;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_TYPE_DISK, GetFileType};
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(path).map_err(ImageError::IoError)?;
     // SAFETY: the handle belongs to `file`, which outlives the call.
     let kind = unsafe { GetFileType(HANDLE(file.as_raw_handle())) };
-    if kind != FILE_TYPE_DISK {
-        return Err(not_a_picture());
-    }
-    let meta = file.metadata().map_err(ImageError::IoError)?;
-    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if kind != FILE_TYPE_DISK || !file.metadata().map_err(ImageError::IoError)?.is_file() {
         return Err(not_a_picture());
     }
     Ok(file)
@@ -187,10 +185,10 @@ pub fn spawn_load(path: PathBuf, done: impl FnOnce(PathBuf, Result<RgbaImage, Im
     })
 }
 
-/// Whether `path` names a plain file, for the overlay: not a folder, and not a link of any kind.
-/// The read itself checks again on the opened file ([`load`]).
+/// Whether `path` names a file, for the overlay: not a folder; a link is followed, as the read
+/// follows it. The read itself checks again on the opened file ([`load`]).
 fn plain_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
 }
 
 /// Whether a file name ends in one of the [`SUPPORTED`] extensions, in any letter case.
@@ -207,8 +205,8 @@ pub enum Verdict {
     Refuse,
 }
 
-/// Judge the files of a drag: one plain file with a picture's name is taken; several files, a
-/// folder, a link or shortcut, a file of another kind, or an item without a path are not.
+/// Judge the files of a drag: one file with a picture's name (or a link to one) is taken; several
+/// files, a folder, a shortcut, a file of another kind, or an item without a path are not.
 /// Only the name is read and the path looked at, never the file's content.
 pub fn judge(paths: &[Option<PathBuf>]) -> Verdict {
     match paths {
