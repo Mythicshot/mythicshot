@@ -1092,6 +1092,28 @@ mod tests {
         assert!(css.contains(".v3 #restart { color: var(--accent); }"));
     }
 
+    /// The gold focus ring is for dark grounds: inside a light card (Light, Compact, and Auto when the
+    /// script resolves it to `light`) it is the brand's light focus colour.
+    #[test]
+    fn the_focus_ring_stays_visible_on_light_cards() {
+        use crate::theme::contrast;
+        use brand_css::{colour, var};
+        let css = player_css();
+        assert_eq!(var(css, "chrome-focus-light"), "#8a5a00", "the brand's focus colour on light grounds");
+        assert!(css.contains("#card.light :focus-visible, #card.compact :focus-visible { outline: 2px solid var(--chrome-focus-light); outline-offset: 2px; }"), "{css}");
+        // Auto reaches the card as one of the classes above, never as a class of its own.
+        assert!(PREVIEW_TEMPLATE.contains(r#"function style() { return cardStyle === "auto" ? (prefersDark.matches ? "dark" : "light") : cardStyle; }"#));
+        assert!(PREVIEW_TEMPLATE.contains(r#"var palette = style() === "compact" ? "light" : style();"#));
+        for card in ["#card.light { ", "#card.compact { "] {
+            let rule = css.split_once(card).unwrap().1.split('}').next().unwrap();
+            let bg = rule.split("background: ").nth(1).unwrap().split(';').next().unwrap();
+            let c = contrast(colour(var(css, "chrome-focus-light")), colour(bg));
+            assert!(c >= 3.0, "light focus ring on {card}{bg}: {c:.2}");
+        }
+    }
+
+
+
     #[test]
     fn no_clicks_leaves_no_folder_behind() {
         let r = rec();
@@ -2191,7 +2213,7 @@ mod tests {
         // brand's colours.
         use sha2::Digest;
         let hash: String = sha2::Sha256::digest(html.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hash, "9809e6d8f10834184745110ffcfb03f96981d9360a6b5f1f96b7ad8c0af701e2");
+        assert_eq!(hash, "717575f41df31e098206bdddd120f01016c8f92497c80de61205545279d4f51b");
         // Text in a manifest that looks like a marker stays as it is.
         let page = preview_page(r#"{"title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->"}"#);
         assert!(page.contains(r#""title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->""#));

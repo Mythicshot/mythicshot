@@ -23,6 +23,7 @@
     --chrome-gold-gone: rgba(245, 184, 65, 0);    /* gold, where it ends */
     --chrome-gold-text: #f5b841;                  /* accent-text */
     --chrome-focus: #f5b841;                      /* focus */
+    --chrome-focus-light: #8a5a00;                /* focus on light */
     --chrome-end-scrim: rgba(22, 18, 28, .72);    /* ground, behind the older players' end card */
   }/*CHROME_END*/
   :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse; the editor's Tour view uses the same as PULSE_PERIOD in tour_view.rs. */ --pulse-period: 1.9s; }
@@ -51,6 +52,7 @@
   #end.on { display: flex; }
   #restart { color: var(--chrome-gold-text); }
   :focus-visible { outline: 2px solid var(--chrome-focus); outline-offset: 2px; }
+  #card.light :focus-visible, #card.compact :focus-visible { outline: 2px solid var(--chrome-focus-light); outline-offset: 2px; }
   footer { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 10px 16px; border-top: 1px solid var(--chrome-border); }
   button { padding: 6px 14px; border: 1px solid var(--chrome-border-strong); border-radius: 6px; background: var(--chrome-surface); color: inherit; font: inherit; cursor: pointer; }
   button:disabled { opacity: .4; cursor: default; }
