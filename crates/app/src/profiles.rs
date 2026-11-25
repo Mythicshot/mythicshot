@@ -52,6 +52,10 @@ pub const NAME_MAX: usize = 60;
 pub const ACTIVE: &str = "Active";
 pub const SIGN_IN_AGAIN: &str = "Sign in again";
 pub const ADD_PROFILE: &str = "+ Add profile…";
+/// The Workspace page's button beside its title: what "+ Add profile…" does.
+pub const ADD_PROFILE_BUTTON: &str = "Add profile";
+/// The profile card's button that opens the profile list.
+pub const SWITCH_PROFILE: &str = "Switch profile";
 pub const MANAGE_PROFILES: &str = "Manage profiles…";
 pub const SITE_ADDRESS: &str = "Site address";
 pub const SIGN_IN: &str = "Sign in";
@@ -87,6 +91,15 @@ pub fn connected(account: Option<&str>, workspace: &str) -> String {
 /// "You already have a profile for this account: "Alex · mythicshot.com"."
 pub fn exists(name: &str) -> String {
     format!("You already have a profile for this account: \"{name}\".")
+}
+
+/// The button beside "Switch to it" that signs in afresh.
+pub const TRY_DIFFERENT_ACCOUNT: &str = "Try a different account";
+
+/// The second sentence under [`exists`], saying why the sign-in came back as an account that
+/// has a profile.
+pub fn exists_why() -> String {
+    "The browser was signed in as that account. To add a different user, start again and choose \"Use a different account\" in the browser.".to_string()
 }
 
 /// ""customer1 test" needs you to sign in again. Nothing can be uploaded with it until you do."
@@ -262,6 +275,14 @@ pub fn site_label(server: &str) -> String {
     let s = publish::check_server(server).unwrap_or_else(|_| server.trim().to_string());
     let rest = s.split_once("://").map_or(s.as_str(), |(_, r)| r);
     rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// The site's address as the Workspace page shows it: [`site_label`]'s host, and the path when
+/// the site lives under one ("tours.example.com/demo").
+pub fn site_address_label(server: &str) -> String {
+    let s = publish::check_server(server).unwrap_or_else(|_| server.trim().to_string());
+    let rest = s.split_once("://").map_or(s.as_str(), |(_, r)| r);
+    rest.trim_end_matches('/').to_string()
 }
 
 /// The site as a default profile name writes it: [`site_label`] without a leading `www.` or
@@ -628,6 +649,31 @@ fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>, 
         Held::Yes | Held::Unknown => return None,
     }
     Some(Ending { id: p.id.clone(), name: p.name.clone(), server, token })
+}
+
+impl Candidate {
+    /// The connection a sign-in made, which is not kept (another account was tried, the form was
+    /// cancelled, or the profile that is there already was switched to): to end at the site the
+    /// sign-in was made at. Its token goes with it, and is wiped when it is dropped. It belongs
+    /// to no profile, so whether anything here holds it is asked of every profile and of the
+    /// entry of the versions before profiles ([`Ending::held_in`]).
+    pub fn into_ending(self) -> Option<Ending> {
+        let server = publish::check_server(&self.server).ok()?;
+        Some(Ending { id: String::new(), name: self.workspace, server, token: self.token })
+    }
+}
+
+/// The log line after the connection of a sign-in that was not kept was to be ended; it never
+/// holds the token.
+pub fn abandoned_log_line(server: &str, outcome: &Outcome) -> String {
+    let site = site_label(server);
+    match outcome {
+        Outcome::Ended => format!("Profiles: the connection of a sign-in that was not kept was ended at {site}."),
+        Outcome::AlreadyEnded => format!("Profiles: the connection of a sign-in that was not kept was no longer valid at {site}."),
+        Outcome::SiteTooOld => format!("Profiles: {site} cannot end the connection of a sign-in that was not kept yet; it lapses there by itself."),
+        Outcome::NotAConnection => format!("Profiles: {site} keeps the token of a sign-in that was not kept, because it is not a sign-in connection."),
+        Outcome::NotReached(why) => format!("Profiles: the connection of a sign-in that was not kept could not be ended at {site}: {why}."),
+    }
 }
 
 /// What a removal says when the site did not end its token; nothing when it did, or the token

@@ -8,8 +8,26 @@
 <title>{{title}}</title>
 <link rel="icon" href="favicon.ico">
 <style>
-  :root { color-scheme: light dark; --bg: #f5f6f8; --fg: #1b2029; --muted: #5b6474; --card: #ffffff; --line: rgba(16, 22, 32, .1); --shade: #e6e9ee; --focus: #2f6fdb; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #14161b; --fg: #e6e9ef; --muted: #9aa3b5; --card: #1c2028; --line: rgba(255, 255, 255, .08); --shade: #262b35; --focus: #8ab4ff; } }
+  /* The index's colours, each named by its role: light values, then dark values for a dark system theme. */
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f5fb;     /* ground */
+    --card: #fdfcff;   /* surface */
+    --line: #ddd7ea;   /* border */
+    --shade: #ddd7ea;  /* border */
+    --fg: #1d1828;     /* text */
+    --muted: #5c5470;  /* text-muted */
+    --focus: #8a5a00;  /* focus */
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg: #16121c;     /* ground */
+    --card: #1e1928;   /* surface */
+    --line: #3a3250;   /* border */
+    --shade: #3a3250;  /* border */
+    --fg: #ede8f5;     /* text */
+    --muted: #b2a8c6;  /* text-muted */
+    --focus: #f5b841;  /* focus */
+  } }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   main { max-width: 1120px; margin: 0 auto; padding: 32px 16px 48px; }
@@ -18,7 +36,7 @@
   .tours { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 20px; }
   .tour { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--card); color: inherit; text-decoration: none; }
   .tour:hover { border-color: var(--muted); }
-  .tour:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+  .tour:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .tour img { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; background: var(--shade); }
   .tour b { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; margin: 12px 14px 2px; font-weight: 600; overflow-wrap: anywhere; }
   .tour span { margin: 0 14px 14px; color: var(--muted); font-size: 13px; }

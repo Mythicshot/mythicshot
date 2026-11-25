@@ -179,7 +179,7 @@ pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
 /// The pixel grid lines of the magnifier, over the desktop.
-pub const PICTURE_GUIDE: Color32 = Color32::from_rgba_unmultiplied_const(0xf5, 0xb8, 0x41, 120);
+pub const PICTURE_GUIDE: Color32 = Color32::from_rgba_unmultiplied_const(DARK.gold.r(), DARK.gold.g(), DARK.gold.b(), 120);
 /// Behind a picture while it loads, or around one that does not fill its box.
 pub const PICTURE_BACKDROP: Color32 = Color32::BLACK;
 /// A texture drawn as it is (egui multiplies a picture by this).
@@ -250,6 +250,476 @@ pub const FOCUS_WIDTH: f32 = 2.0;
 /// The corner radius of a control `height` points high: radius-md from 36 points up, radius-sm below.
 pub fn control_radius(height: f32) -> u8 {
     if height >= 36.0 { RADIUS_MD } else { RADIUS_SM }
+}
+
+// ---- The roomy sizes ----
+//
+// The main window's pages and the dialogs opened from them (the profiles list, the publish
+// dialog, the share window, the tour rows) are laid out on one sizing system, defined here and
+// nowhere else: a 4-point grid, 36-point controls, 44-point rows inside raised cards. A page
+// takes it with [`page`] (or [`roomy`] for a dialog's own Ui) and draws its groups with
+// [`section_heading`], [`card`] and [`CardRows::row`]. The editor windows keep egui's dense
+// controls. Every size is in points, so it scales with pixels-per-point like the rest of egui.
+
+/// The grid every size below sits on.
+pub const GRID: f32 = 4.0;
+/// Buttons, text fields and dropdowns.
+pub const CONTROL_HEIGHT: f32 = 36.0;
+/// The space left and right of a button's label, and inside a field.
+pub const CONTROL_PAD_X: f32 = 14.0;
+/// The space above and below a field's text: centres a line of [`CONTROL_TEXT_SIZE`] in [`CONTROL_HEIGHT`].
+pub const CONTROL_PAD_Y: f32 = 8.0;
+/// The text of controls and of the page.
+pub const CONTROL_TEXT_SIZE: f32 = 14.0;
+/// A control's corners: radius-md, a quarter of [`CONTROL_HEIGHT`] at most.
+pub const CONTROL_RADIUS: u8 = RADIUS_MD;
+/// The gap between two controls side by side, and between stacked lines.
+pub const ITEM_GAP: f32 = 8.0;
+/// The gap between two lines of text that belong together (a name and the line under it).
+pub const LINE_GAP: f32 = 2.0;
+/// One line of a stacked list of checkboxes or radio buttons: more compact than a control.
+pub const CHOICE_HEIGHT: f32 = 28.0;
+/// The least height of a row in a card.
+pub const ROW_HEIGHT: f32 = 44.0;
+/// The width of a row's label column.
+pub const LABEL_WIDTH: f32 = 120.0;
+/// A card's corners.
+pub const CARD_RADIUS: u8 = RADIUS_LG;
+/// The space inside a card, left and right of its rows.
+pub const CARD_PAD_X: f32 = 16.0;
+/// The space inside a card above its first row and below its last.
+pub const CARD_PAD_Y: f32 = 4.0;
+/// The gap between two cards, and after the last one before what follows.
+pub const CARD_GAP: f32 = 14.0;
+/// The small heading above a card.
+pub const SECTION_HEADING_SIZE: f32 = SMALL_SIZE;
+/// The gap between a section heading and its card.
+pub const SECTION_HEADING_GAP: f32 = 6.0;
+/// The space around a page, inside the window.
+pub const PAGE_PAD: f32 = 20.0;
+/// The left navigation's items.
+pub const NAV_ITEM_HEIGHT: f32 = 36.0;
+/// The gap between a navigation item's icon and its label.
+pub const NAV_ICON_GAP: f32 = 10.0;
+/// A navigation item's icon.
+pub const NAV_ICON_SIZE: f32 = 18.0;
+/// The icon on a button beside its label, and the gap between them.
+pub const BUTTON_ICON_SIZE: f32 = 14.0;
+pub const BUTTON_ICON_GAP: f32 = 8.0;
+/// The space before a navigation item's label (or its icon).
+pub const NAV_PAD_X: f32 = 12.0;
+/// The space left and right inside a status pill or chip.
+pub const PILL_PAD_X: f32 = 10.0;
+/// The gap between a chip's icon and its text.
+pub const CHIP_ICON_GAP: f32 = 6.0;
+/// The round badge with a profile's initials.
+pub const BADGE_SIZE: f32 = 40.0;
+/// A tab of a page's tab row (Preferences: General, Output, Hotkeys).
+pub const TAB_WIDTH: f32 = 96.0;
+/// A dropdown that holds a short choice ("30 fps"), and one that holds a few words.
+pub const COMBO_WIDTH: f32 = 96.0;
+pub const COMBO_WIDTH_WIDE: f32 = 136.0;
+/// The button that shows a shortcut's keys.
+pub const KEYS_WIDTH: f32 = 170.0;
+/// The profile dropdown's selected profile, and the list it opens.
+pub const PROFILE_DROPDOWN_WIDTH: f32 = 240.0;
+pub const PROFILE_LIST_WIDTH: f32 = 300.0;
+/// The narrowest the profile dropdown gets on a narrow line.
+pub const PROFILE_DROPDOWN_MIN_WIDTH: f32 = 96.0;
+/// The space inside a dialog (a question over a page), all round.
+pub const DIALOG_PAD: f32 = SPACE_6;
+/// A dialog's width.
+pub const DIALOG_WIDTH: f32 = 440.0;
+
+/// `style` on the roomy sizes: 36-point controls with 14-point text, radius-md corners.
+pub fn roomy_style(style: &mut Style) {
+    let s = &mut style.spacing;
+    s.interact_size.y = CONTROL_HEIGHT;
+    s.button_padding = egui::vec2(CONTROL_PAD_X, CONTROL_PAD_Y);
+    s.item_spacing = egui::vec2(ITEM_GAP, ITEM_GAP);
+    for (text, size) in [(TextStyle::Body, CONTROL_TEXT_SIZE), (TextStyle::Button, CONTROL_TEXT_SIZE)] {
+        style.text_styles.insert(text, FontId::proportional(size));
+    }
+    let w = &mut style.visuals.widgets;
+    for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        v.corner_radius = CornerRadius::same(CONTROL_RADIUS);
+    }
+}
+
+/// [`CARD_GAP`] between the block above and the next one, whatever gap the layout adds itself.
+pub fn block_gap(ui: &mut egui::Ui) {
+    let spacing = ui.spacing().item_spacing.y;
+    ui.add_space((CARD_GAP - spacing).max(0.0));
+}
+
+/// Checkboxes and radio buttons stacked one under the other, [`CHOICE_HEIGHT`] apart, as `add`
+/// draws them. Only for the choices themselves: a button drawn in here would be that low too.
+pub fn choices<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = CHOICE_HEIGHT;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        add(ui)
+    })
+    .inner
+}
+
+/// Put `ui` (and what is drawn in it from now on) on the roomy sizes.
+pub fn roomy(ui: &mut egui::Ui) {
+    roomy_style(ui.style_mut());
+}
+
+/// A page of the main window: [`PAGE_PAD`] all round, on the roomy sizes.
+pub fn page<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .inner_margin(Margin::same(PAGE_PAD as i8))
+        .show(ui, |ui| {
+            roomy(ui);
+            add(ui)
+        })
+        .inner
+}
+
+/// A page's title at the left and, at the right, what `right` draws (laid out from the right),
+/// on one line [`CONTROL_HEIGHT`] high.
+pub fn page_title(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(width, CONTROL_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_size(egui::vec2(width, CONTROL_HEIGHT));
+        ui.add(egui::Label::new(RichText::new(title).heading()).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+    });
+    block_gap(ui);
+}
+
+/// The small heading above a card, in the secondary text colour.
+pub fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(strong(RichText::new(text).size(SECTION_HEADING_SIZE).color(MUTED))).truncate());
+    ui.add_space(SECTION_HEADING_GAP - ITEM_GAP);
+}
+
+/// A card's frame: the surface one step above the page, a hairline edge, [`CARD_RADIUS`].
+pub fn card_box() -> egui::Frame {
+    egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CARD_RADIUS).inner_margin(Margin::symmetric(CARD_PAD_X as i8, CARD_PAD_Y as i8))
+}
+
+/// A card across the width, with the rows `add` draws through [`CardRows`], and [`CARD_GAP`]
+/// after it.
+pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut CardRows<'_>) -> R) -> R {
+    let r = card_box()
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Rows meet at their hairlines; inside a row, the page's own spacing.
+            let spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(&mut CardRows { ui, count: 0, spacing })
+        })
+        .inner;
+    block_gap(ui);
+    r
+}
+
+/// The rows of a [`card`]: each at least [`ROW_HEIGHT`] high, with a hairline between two rows.
+pub struct CardRows<'a> {
+    ui: &'a mut egui::Ui,
+    count: usize,
+    /// The spacing between items inside a row: the page's.
+    spacing: egui::Vec2,
+}
+
+impl CardRows<'_> {
+    /// How many rows were drawn.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Ask for the card's window to be drawn again after `after`.
+    pub fn repaint_after(&self, after: std::time::Duration) {
+        self.ui.ctx().request_repaint_after(after);
+    }
+
+    /// The hairline above every row but the first.
+    fn hairline(&mut self) {
+        if self.count > 0 {
+            let x = self.ui.max_rect().x_range();
+            let y = self.ui.cursor().top();
+            self.ui.painter().hline(x, y, Stroke::new(1.0, BORDER));
+        }
+        self.count += 1;
+    }
+
+    /// A row: `label` in the label column, in the secondary colour; what `value` draws beside it;
+    /// and what `actions` draws at the right end, from the left, all centred on one line. The
+    /// value gets the width that is left, so it is cut short with "…" there and never runs under
+    /// the actions. The row's label is its key (see [`Self::row_keyed`]).
+    pub fn row(&mut self, label: &str, value: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
+        self.row_keyed(label, label, None, value, |_| {}, actions);
+    }
+
+    /// [`Self::row`] with what `under` draws under the value, in the value's column: a result,
+    /// a caution, a second line.
+    pub fn row_under(&mut self, label: &str, value: impl FnOnce(&mut egui::Ui), under: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
+        self.row_keyed(label, label, None, value, under, actions);
+    }
+
+    /// The row in full. `key` tells the row from every other one of the window whatever is
+    /// drawn above it, so the width its actions took is remembered for it (a row without a
+    /// label needs a key of its own). On `tint` across the card's width when there is one: a
+    /// row in a state of its own (a shortcut waiting for its keys, one that could not be set).
+    pub fn row_keyed(&mut self, label: &str, key: &str, tint: Option<egui::Color32>, value: impl FnOnce(&mut egui::Ui), under: impl FnOnce(&mut egui::Ui), actions: impl FnOnce(&mut egui::Ui)) {
+        self.hairline();
+        let ui = &mut *self.ui;
+        let spacing = self.spacing;
+        let behind = ui.painter().add(egui::Shape::Noop);
+        let width = ui.available_width();
+        let left = ui.cursor().left();
+        // A row without a label gives the whole width to its value.
+        let label_width = if label.is_empty() { 0.0 } else { LABEL_WIDTH.min(width / 3.0) };
+        let main = ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(width, ROW_HEIGHT));
+            ui.spacing_mut().item_spacing = egui::vec2(spacing.x, spacing.y.min(ITEM_GAP / 2.0));
+            if label_width > 0.0 {
+                ui.allocate_ui_with_layout(egui::vec2(label_width, ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_size(egui::vec2(label_width, ROW_HEIGHT));
+                    ui.set_max_width(label_width);
+                    ui.add(egui::Label::new(RichText::new(label).color(MUTED)).truncate());
+                });
+            }
+            value_then_actions(ui, ("card-row", key), egui::Layout::left_to_right(egui::Align::Center), value, actions);
+        });
+        // What goes under the value, in its column; nothing at all when it draws nothing.
+        let indent = if label_width > 0.0 { label_width + spacing.x } else { 0.0 };
+        let top = ui.cursor().top();
+        let column = egui::Rect::from_min_max(egui::pos2(left + indent, top), egui::pos2(left + width, f32::INFINITY));
+        let below = ui.scope_builder(egui::UiBuilder::new().max_rect(column).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(spacing.x, LINE_GAP);
+            under(ui);
+        });
+        let mut rect = main.response.rect;
+        if below.response.rect.height() > 0.0 {
+            rect = rect.union(below.response.rect);
+            ui.add_space(ITEM_GAP);
+        }
+        if let Some(tint) = tint {
+            let r = rect.expand2(egui::vec2(CARD_PAD_X / 2.0, -0.5));
+            ui.painter().set(behind, egui::Shape::rect_filled(r, RADIUS_SM, tint));
+        }
+    }
+
+    /// A row with no label: what `add` draws, across the card's width, with the same space
+    /// above and below it (at least [`ITEM_GAP`]; more when it is lower than [`ROW_HEIGHT`], so
+    /// it sits in the middle). Its height is the one it took when last drawn.
+    pub fn full(&mut self, add: impl FnOnce(&mut egui::Ui)) {
+        self.hairline();
+        let spacing = self.spacing;
+        let ui = &mut *self.ui;
+        let width = ui.available_width();
+        let id = ui.next_auto_id().with("full-row");
+        let known: Option<f32> = ui.data(|d| d.get_temp(id));
+        ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_width(width);
+            ui.spacing_mut().item_spacing = spacing;
+            let pad = known.map_or(ITEM_GAP, |h| ((ROW_HEIGHT - h) / 2.0).max(ITEM_GAP));
+            ui.add_space(pad);
+            let taken = ui.scope(add).response.rect.height();
+            // The layout leaves its gap after the content already.
+            ui.add_space((pad - spacing.y).max(0.0));
+            if known.is_none_or(|h| (h - taken).abs() > 0.5) {
+                ui.data_mut(|d| d.insert_temp(id, taken));
+                ui.ctx().request_repaint();
+            }
+        });
+    }
+}
+
+/// On a line laid out from the left: what `value` draws (in `layout`), taking the width the
+/// actions leave, then what `actions` draws, from the left, at the right end of the line. The
+/// value is made first and the actions after it, so the keyboard's Tab goes from a field to its
+/// buttons in the order they are seen. The actions' width is the one they took when last drawn
+/// (half the line the first time); when it changes, the window is drawn again at once.
+pub fn value_then_actions<R>(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debug, layout: egui::Layout, value: impl FnOnce(&mut egui::Ui) -> R, actions: impl FnOnce(&mut egui::Ui)) -> R {
+    // Its own key, not the place it is drawn at: a widget appearing above it keeps what it learnt.
+    let id = egui::Id::unique(("value-then-actions", key));
+    let known: Option<f32> = ui.data(|d| d.get_temp(id));
+    let gap = ui.spacing().item_spacing.x;
+    let line = ui.available_rect_before_wrap();
+    // Before the actions were ever measured, half the line is kept for them, so they never push
+    // past the line's end while they are measured. When they need more than the line holds,
+    // they go on a line of their own under the value: they never stand over what is beside them.
+    let kept = known.unwrap_or(line.width() / 2.0);
+    let own_line = kept > 0.0 && kept + gap > line.width();
+    let width = if own_line { line.width() } else { (line.width() - kept - if kept > 0.0 { gap } else { 0.0 }).max(0.0) };
+    let bounded = line.height() <= 4.0 * ROW_HEIGHT;
+    let height = if bounded { line.height() } else { 0.0 };
+    let shown = ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        value(ui)
+    });
+    // The actions, from the left, in the space at the line's end, centred on the line (or on
+    // the value, where the line has no height of its own).
+    let at = shown.response.rect;
+    let (top, bottom) = if own_line {
+        (at.bottom() + gap, at.bottom() + gap + line.height().min(CONTROL_HEIGHT))
+    } else if bounded {
+        (line.top(), line.bottom())
+    } else {
+        (at.top(), at.bottom())
+    };
+    let space = egui::Rect::from_min_max(egui::pos2((line.right() - kept).max(line.left()), top), egui::pos2(line.right(), bottom.max(top)));
+    let taken = ui.scope_builder(egui::UiBuilder::new().max_rect(space).layout(egui::Layout::left_to_right(egui::Align::Center)), actions).response.rect.width();
+    if known.is_none_or(|known| (taken - known).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(id, taken));
+        ui.ctx().request_repaint();
+    }
+    shown.inner
+}
+
+/// A row's value: `text` in the primary text colour, cut short with "…" when it does not fit.
+pub fn value(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(text.into()).color(TEXT)).truncate())
+}
+
+/// A secondary line: small, in the secondary colour, wrapped.
+pub fn caption(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(text.into()).size(SMALL_SIZE).color(MUTED)).wrap())
+}
+
+/// What a status pill says by its colour (never by colour alone: success carries a check,
+/// warning the warning icon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Success,
+    Warning,
+    Neutral,
+}
+
+/// A status pill: fully rounded, in the tone's tint, with its icon before the text. As wide and
+/// as high as what it holds, wherever it is laid out.
+pub fn pill(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
+    let (fill, fg, icon) = match tone {
+        Tone::Success => (SUCCESS_TINT, SUCCESS_TEXT, Some((crate::icons::Icon::Check, SUCCESS_TEXT))),
+        Tone::Warning => (CAUTION_TINT, CAUTION_TEXT, Some((crate::icons::Icon::Warning, CAUTION_BORDER))),
+        Tone::Neutral => (CHIP, MUTED, None),
+    };
+    chip(ui, strong(RichText::new(text).size(SMALL_SIZE).color(fg)), fill, icon)
+}
+
+/// A chip: `text` on `fill`, fully rounded, with `icon` in its colour before the text when there
+/// is one, as wide and as high as what it holds wherever it is laid out.
+pub fn chip(ui: &mut egui::Ui, text: RichText, fill: egui::Color32, icon: Option<(crate::icons::Icon, egui::Color32)>) -> egui::Response {
+    let label = text.text().to_string();
+    let galley = egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Small);
+    let side = galley.size().y;
+    let gap = CHIP_ICON_GAP;
+    let icon_w = if icon.is_some() { side + gap } else { 0.0 };
+    let pad = egui::vec2(PILL_PAD_X, SPACE_1);
+    let size = egui::vec2(icon_w + galley.size().x, side) + 2.0 * pad;
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, RADIUS_FULL, fill);
+    let inner = rect.shrink2(pad);
+    if let Some((icon, colour)) = icon {
+        let r = egui::Rect::from_min_size(inner.min, egui::vec2(side, side));
+        crate::icons::paint(p, r.shrink(side * 0.15), icon, colour);
+    }
+    // The text keeps the colour it was given; TEXT only stands in for a text given none.
+    p.galley(egui::pos2(inner.left() + icon_w, inner.top()), galley, TEXT);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
+    resp
+}
+
+/// Up to two initials of `name`, upper case: of its first two words, or its first two letters.
+pub fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let letters: String = match words.as_slice() {
+        [] => String::new(),
+        [one] => one.chars().take(2).collect(),
+        [a, b, ..] => a.chars().take(1).chain(b.chars().take(1)).collect(),
+    };
+    letters.to_uppercase()
+}
+
+/// A round badge [`BADGE_SIZE`] across with `name`'s initials, on the purple selection tint.
+pub fn initials_badge(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(BADGE_SIZE, BADGE_SIZE), egui::Sense::hover());
+    let p = ui.painter();
+    p.circle_filled(rect.center(), BADGE_SIZE / 2.0, SELECTION);
+    p.text(rect.center(), egui::Align2::CENTER_CENTER, initials(name), FontId::new(CONTROL_TEXT_SIZE, heading_family()), PRIMARY_TEXT);
+    resp
+}
+
+/// An item of the left navigation, [`NAV_ITEM_HEIGHT`] high across the width: its icon (when it
+/// has one, [`NAV_ICON_SIZE`] square) and [`NAV_ICON_GAP`] after it the label, from the left; on
+/// the purple selection fill with icon and label in accent-text when `selected` (the treatment
+/// of egui's selectable buttons), on surface-raised while hovered.
+pub fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<crate::icons::Icon>, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), NAV_ITEM_HEIGHT), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label));
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, CONTROL_RADIUS, SELECTION);
+    } else if resp.hovered() {
+        p.rect_filled(rect, CONTROL_RADIUS, RAISED);
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect, CONTROL_RADIUS, Stroke::new(FOCUS_WIDTH, FOCUS), egui::StrokeKind::Inside);
+    }
+    let colour = if selected { ACCENT } else { TEXT };
+    let mut x = rect.left() + NAV_PAD_X;
+    if let Some(icon) = icon {
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.center().y - NAV_ICON_SIZE / 2.0), egui::vec2(NAV_ICON_SIZE, NAV_ICON_SIZE));
+        crate::icons::paint(p, r, icon, colour);
+        x += NAV_ICON_SIZE + NAV_ICON_GAP;
+    }
+    let galley = ui.fonts_mut(|f| f.layout(label.to_string(), FontId::proportional(CONTROL_TEXT_SIZE), colour, (rect.right() - NAV_PAD_X - x).max(0.0)));
+    p.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, colour);
+    resp
+}
+
+/// Which side of a button's label its icon stands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconSide {
+    /// Before the label: what the button does (Add profile).
+    Leading,
+    /// After the label: where it leads (a list opens: Switch profile).
+    Trailing,
+}
+
+/// A secondary button with an icon beside its label: [`CONTROL_HEIGHT`] high, the control's
+/// padding and corners, egui's own looks for each state.
+pub fn icon_button(ui: &mut egui::Ui, text: &str, icon: crate::icons::Icon, side: IconSide) -> egui::Response {
+    let font = FontId::proportional(CONTROL_TEXT_SIZE);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, TEXT));
+    let size = egui::vec2(2.0 * CONTROL_PAD_X + BUTTON_ICON_SIZE + BUTTON_ICON_GAP + galley.size().x, CONTROL_HEIGHT.max(ui.spacing().interact_size.y));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), text));
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        let p = ui.painter();
+        p.rect(rect, CONTROL_RADIUS, v.weak_bg_fill, v.bg_stroke, egui::StrokeKind::Inside);
+        let colour = v.text_color();
+        let (icon_x, text_x) = match side {
+            IconSide::Leading => (rect.left() + CONTROL_PAD_X, rect.left() + CONTROL_PAD_X + BUTTON_ICON_SIZE + BUTTON_ICON_GAP),
+            IconSide::Trailing => (rect.right() - CONTROL_PAD_X - BUTTON_ICON_SIZE, rect.left() + CONTROL_PAD_X),
+        };
+        let icon_rect = egui::Rect::from_min_size(egui::pos2(icon_x, rect.center().y - BUTTON_ICON_SIZE / 2.0), egui::vec2(BUTTON_ICON_SIZE, BUTTON_ICON_SIZE));
+        crate::icons::paint(p, icon_rect, icon, colour);
+        p.galley(egui::pos2(text_x, rect.center().y - galley.size().y / 2.0), galley, colour);
+    }
+    resp
+}
+
+/// The round badge's place when there is no profile to show: the same circle, empty, in the
+/// neutral chip colour, so a card keeps its shape.
+pub fn badge_placeholder(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(BADGE_SIZE, BADGE_SIZE), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), BADGE_SIZE / 2.0, CHIP);
+    resp
+}
+
+/// A danger outline button (Sign out): no fill, a danger-border edge, danger-text label.
+pub fn danger_outline_button(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).color(DANGER_TEXT)).fill(egui::Color32::TRANSPARENT).stroke(Stroke::new(1.0, DANGER_BORDER))
 }
 
 /// Fix the app to the dark theme, with the brand's look and fonts. Called once, at start-up.
@@ -665,6 +1135,33 @@ pub mod checks {
         checked
     }
 
+    /// No two texts in sight run over each other: the letters of every pair of texts drawn
+    /// where they can be seen (each cut to its clip) share no more than a point's sliver.
+    pub fn assert_no_overlaps(out: &egui::FullOutput, what: &str) {
+        fn open(clip: Rect, s: &Shape, into: &mut Vec<(Rect, String)>) {
+            match s {
+                Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, into)),
+                Shape::Text(t) if !t.galley.text().trim().is_empty() => {
+                    let r = t.visual_bounding_rect().intersect(clip);
+                    if r.is_positive() {
+                        into.push((r, t.galley.text().to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for c in &out.shapes {
+            open(c.clip_rect, &c.shape, &mut texts);
+        }
+        for (i, (a, ta)) in texts.iter().enumerate() {
+            for (b, tb) in &texts[i + 1..] {
+                let both = a.intersect(*b);
+                assert!(!(both.width() > 1.0 && both.height() > 1.0), "{what}: {ta:?} at {a:?} runs over {tb:?} at {b:?}");
+            }
+        }
+    }
+
     /// The glass band around `hole` (in points, on whole pixels at `ppp`): twelve filled
     /// rectangles in the band's colours, four per layer, on whole physical pixels, together
     /// covering exactly each layer's ring of pixels around the hole, no pixel twice.
@@ -749,6 +1246,7 @@ pub(crate) mod tests {
             ("meter over the limit on ground", METER_OVER, GROUND, 3.0),
             ("text on selection", TEXT, SELECTION, 4.5),
             ("accent-text on selection (selected label)", ACCENT, SELECTION, 4.5),
+            ("primary-text on selection (initials badge)", PRIMARY_TEXT, SELECTION, 4.5),
             ("success-text on success-tint", SUCCESS_TEXT, SUCCESS_TINT, 4.5),
             ("caution-text on caution-tint", CAUTION_TEXT, CAUTION_TINT, 4.5),
             ("danger-text on danger-tint", DANGER_TEXT, DANGER_TINT, 4.5),
@@ -1018,6 +1516,93 @@ pub(crate) mod tests {
 "));
     }
 
+    /// The roomy sizes sit on the 4-point grid (but the approved 14-point card gap and padding),
+    /// and a page on them draws 36-point buttons, fields and dropdowns with radius-md corners and
+    /// 14-point text, at 100% and at 200%.
+    #[test]
+    fn the_roomy_sizes_make_36_point_controls_and_44_point_rows() {
+        for v in [CONTROL_HEIGHT, ROW_HEIGHT, LABEL_WIDTH, CARD_PAD_X, PAGE_PAD, NAV_ITEM_HEIGHT, BADGE_SIZE, DIALOG_PAD, ITEM_GAP, CONTROL_PAD_Y, CARD_PAD_Y] {
+            assert_eq!(v % GRID, 0.0, "{v} is off the grid");
+        }
+        assert_eq!((CONTROL_HEIGHT, CONTROL_PAD_X, CONTROL_TEXT_SIZE, CONTROL_RADIUS, ROW_HEIGHT, CARD_RADIUS, CARD_PAD_X, CARD_GAP, PAGE_PAD, NAV_ITEM_HEIGHT, NAV_ICON_GAP), (36.0, 14.0, 14.0, 8, 44.0, 12, 16.0, 14.0, 20.0, 36.0, 10.0));
+        assert!(f32::from(CONTROL_RADIUS) <= CONTROL_HEIGHT / 4.0, "never a pill");
+        for ppp in [1.0, 2.0] {
+            let ctx = test_context();
+            ctx.set_pixels_per_point(ppp);
+            let mut text = String::from("Name");
+            let mut out = None;
+            for _ in 0..2 {
+                let mut o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    page(ui, |ui| {
+                        let _ = ui.button("Save");
+                        ui.text_edit_singleline(&mut text);
+                        egui::ComboBox::from_id_salt("pick").selected_text("PNG").show_ui(ui, |_| {});
+                        card(ui, |rows| {
+                            rows.row("Site", |ui| drop(value(ui, "tours.example.com")), |ui| drop(ui.button("Open site")));
+                            rows.row("Account", |ui| drop(value(ui, "alex")), |_| {});
+                            rows.full(|ui| drop(caption(ui, "A line.")));
+                            assert_eq!(rows.count(), 3);
+                        });
+                    });
+                });
+                o.textures_delta.clear();
+                out = Some(o);
+            }
+            let out = out.unwrap();
+            let controls: Vec<_> = checks::fills(&out).into_iter().filter(|(r, _, radius)| *radius != CARD_RADIUS && r.width() >= 30.0 && r.height() >= 20.0 && r.height() < 60.0).collect();
+            assert!(controls.len() >= 4, "{controls:?}");
+            for (r, c, radius) in &controls {
+                assert!((r.height() - CONTROL_HEIGHT).abs() < 0.6 && *radius == CONTROL_RADIUS, "at {ppp}: a control {r:?} filled {c:?} with radius {radius}");
+            }
+            // The card: surface, a hairline edge, radius-lg; its rows 44 points apart.
+            let card_fill = checks::fills(&out).into_iter().find(|(_, c, r)| *c == SURFACE && *r == CARD_RADIUS).expect("the card");
+            assert!(card_fill.0.height() >= 3.0 * ROW_HEIGHT, "{card_fill:?}");
+            let (site, account) = (crate::share_ui::tests::text_rect(&out, "Site").unwrap(), crate::share_ui::tests::text_rect(&out, "Account").unwrap());
+            assert!((account.center().y - site.center().y - ROW_HEIGHT).abs() < 0.6, "{site:?} {account:?}");
+            let value_at = crate::share_ui::tests::text_rect(&out, "tours.example.com").unwrap();
+            assert!((value_at.left() - site.left() - LABEL_WIDTH - ITEM_GAP).abs() < 0.6, "the value column: {value_at:?}");
+            checks::assert_texts_fit(&out, &format!("the card at {ppp}"));
+            checks::assert_no_overlaps(&out, &format!("the card at {ppp}"));
+        }
+    }
+
+    /// Stacked checkboxes and radio buttons are CHOICE_HEIGHT apart on a page; its buttons stay 36.
+    #[test]
+    fn stacked_choices_are_compact_and_buttons_stay_36() {
+        let ctx = test_context();
+        let (mut a, mut b) = (true, false);
+        let mut out = None;
+        for _ in 0..2 {
+            let mut o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                page(ui, |ui| {
+                    choices(ui, |ui| {
+                        ui.checkbox(&mut a, "First");
+                        ui.checkbox(&mut b, "Second");
+                        let _ = ui.radio(true, "Third");
+                    });
+                    let _ = ui.button("Save");
+                });
+            });
+            o.textures_delta.clear();
+            out = Some(o);
+        }
+        let out = out.unwrap();
+        let at = |t: &str| crate::share_ui::tests::text_rect(&out, t).unwrap().center().y;
+        assert!((at("Second") - at("First") - CHOICE_HEIGHT).abs() < 0.6 && (at("Third") - at("Second") - CHOICE_HEIGHT).abs() < 0.6, "{} {} {}", at("First"), at("Second"), at("Third"));
+        let save = checks::fills(&out).into_iter().filter(|(r, _, radius)| *radius == CONTROL_RADIUS && r.width() > 30.0).map(|(r, ..)| r).next().expect("the button");
+        assert!((save.height() - CONTROL_HEIGHT).abs() < 0.6, "{save:?}");
+        assert_eq!(CHOICE_HEIGHT % GRID, 0.0);
+    }
+
+    #[test]
+    fn initials_are_of_the_first_two_words_or_letters() {
+        assert_eq!(initials("Sandbox test"), "ST");
+        assert_eq!(initials("customer1"), "CU");
+        assert_eq!(initials("Alex · mythicshot.com"), "AM");
+        assert_eq!(initials("  "), "");
+        assert_eq!(initials("élan vital"), "ÉV");
+    }
+
     /// The ground under the whole window alone does not pass for a window's panels.
     #[test]
     #[should_panic(expected = "its panels")]
@@ -1258,5 +1843,14 @@ pub(crate) mod tests {
         for (file, snippet, why) in ALLOWED {
             assert!(found.iter().any(|(f, _, l)| f == file && l.contains(snippet)), "an allowance nothing uses any more: {file} {snippet} ({why})");
         }
+    }
+
+    #[test]
+    fn the_picture_guide_is_the_palettes_gold() {
+        let g = DARK.gold;
+        assert_eq!(PICTURE_GUIDE, Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), 120));
+        // Taken from the palette, not typed a second time.
+        let line = include_str!("theme.rs").lines().find(|l| l.starts_with("pub const PICTURE_GUIDE")).unwrap();
+        assert!(line.contains("DARK.gold") && !line.contains("0xf5"), "{line}");
     }
 }

@@ -643,6 +643,14 @@ impl Editor {
         }
     }
 
+    /// Whether closing could drop edits without asking: a recording opened from a saved project,
+    /// whose edits not sent to the site Quit discards. The app cannot tell from here whether any
+    /// were made, so an app update waits for every such editor to be closed instead: it never
+    /// loses them.
+    pub(crate) fn may_hold_unsent_edits(&self) -> bool {
+        self.video.as_ref().is_some_and(|v| v.origin.is_some())
+    }
+
     /// The status bar's message.
     #[cfg(test)]
     pub(crate) fn status_text(&self) -> Option<&str> {

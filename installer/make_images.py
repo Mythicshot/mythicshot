@@ -33,8 +33,8 @@ name = "MYTHICSHOT"
 # here: what HarfBuzz's Rust port (harfrust 0.12, the shaper egui uses) applies to "MYTHICSHOT"
 # with Cinzel's default features, against the same word shaped with kern off.
 KERN = [-24, 20, 0, 0, -20, 0, -4, -20, -23, 0]
-# The wordmark's letter spacing, 0.04 em, on top of the kerning.
-spacing = 0.04 * SIZE
+# The wordmark's letter spacing, 0.06 em, on top of the kerning (the brand's lockups, website and platform use the same).
+spacing = 0.06 * SIZE
 steps = [d.textlength(c, font=font) + k * SIZE / 1000 + spacing for c, k in zip(name, KERN)]
 w = sum(steps) - steps[-1] + d.textlength(name[-1], font=font)
 x = (164 - w) / 2

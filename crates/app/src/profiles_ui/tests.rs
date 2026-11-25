@@ -394,6 +394,104 @@ fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
     assert!(shelf.writes().is_empty());
 }
 
+/// Every text one frame of the add form draws.
+fn form_texts(f: &mut AddFlow) -> Vec<String> {
+    fn collect(shape: &egui::Shape, into: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => into.push(t.galley.text().replace('\n', " ")),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+            _ => {}
+        }
+    }
+    let ctx = crate::theme::test_context();
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 500.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| f.ui(ui));
+        out.textures_delta.clear();
+        texts.clear();
+        out.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
+    }
+    texts
+}
+
+/// The browser was still signed in as an account that has a profile: the form says so and why,
+/// offers "Switch to it" first and a fresh sign-in second.
+#[test]
+fn the_profile_is_there_already_form_says_why_and_offers_a_different_account() {
+    let s = ids_site("acc-c");
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    assert!(matches!(f.step(), Step::Same { .. }));
+    let texts = form_texts(&mut f);
+    let joined = texts.join(" ");
+    assert!(joined.contains("You already have a profile for this account: \"customer1 test\"."), "{texts:?}");
+    assert!(joined.contains(&profiles::exists_why()), "{texts:?}");
+    assert_eq!(profiles::exists_why(), "The browser was signed in as that account. To add a different user, start again and choose \"Use a different account\" in the browser.");
+    let switch = texts.iter().position(|t| t == profiles::SWITCH_TO_IT).expect("Switch to it");
+    let other = texts.iter().position(|t| t == profiles::TRY_DIFFERENT_ACCOUNT).expect("Try a different account");
+    assert!(switch < other, "Switch to it comes first: {texts:?}");
+    assert_eq!(profiles::TRY_DIFFERENT_ACCOUNT, "Try a different account");
+}
+
+#[test]
+fn try_a_different_account_signs_in_again_at_the_same_address_and_stores_nothing() {
+    // The first sign-in is the account that has a profile; the second another one.
+    let me = |seen: usize| if seen == 0 { format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-c"}}"#) } else { format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-d"}}"#) };
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => connected(ACCOUNT),
+        "GET /api/v1/me" => reply(200, &me(seen)),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let book = Book { legacy: None, list: vec![pc], active: Some("pc".into()) };
+    let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let opened: Arc<Mutex<Vec<String>>> = Arc::default();
+    let record = opened.clone();
+    let dyn_shelf: Arc<dyn Shelf> = shelf.clone();
+    let mut f = AddFlow::new(Purpose::New, s.base.clone(), dyn_shelf, Arc::new(move |url: &str| { lock(&record).push(url.to_string()); Ok(()) }), Arc::new(FakeClock::default()));
+    sign_in(&mut f);
+    assert!(matches!(f.step(), Step::Same { .. }));
+    f.try_different_account();
+    assert!(f.is_signing_in(), "a fresh sign-in started");
+    assert!(matches!(f.step(), Step::Address), "the form waits again");
+    assert_eq!(f.sign_in_dialog().map(|d| d.server().to_string()), Some(s.base.clone()), "for the same address");
+    assert_eq!(shelf.book().list, book.list, "nothing stored from the first sign-in");
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())]);
+    // The second sign-in comes back as another account: the name step, as usual.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.is_signing_in() {
+        assert!(Instant::now() < deadline, "the second sign-in did not end");
+        f.poll_sign_in();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(f.step(), Step::Checked { .. }), "on to the name");
+    assert_eq!(lock(&opened).len(), 2, "the browser was opened twice");
+    assert_eq!(s.lines().iter().filter(|l| *l == "POST /api/v1/connect/start").count(), 2, "a new code");
+    assert!(shelf.writes().is_empty());
+}
+
+#[test]
+fn try_a_different_account_that_comes_back_as_the_same_one_shows_the_same_dead_end() {
+    let s = site(|_| connected(ACCOUNT), (200, Box::leak(format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-c"}}"#).into_boxed_str())));
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    f.try_different_account();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.is_signing_in() {
+        assert!(Instant::now() < deadline, "the second sign-in did not end");
+        f.poll_sign_in();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(f.step(), Step::Same { .. }), "the same account again");
+    assert!(shelf.writes().is_empty() && shelf.book().list.len() == 1);
+}
+
 #[test]
 fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
     let s = ids_site("acc-c");
@@ -644,6 +742,7 @@ fn a_slow_site_never_holds_up_the_local_removal() {
     let took = remove_now(&mut panel, "pa");
     assert!(took < Duration::from_secs(2), "the removal waited for the site: {took:?}");
     assert!(panel.is_ending(), "the site is still being asked");
+    assert!(crate::profiles_ui::endings_in_flight(), "an app update counts an ending being sent as running work");
     assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "the list is updated already");
     assert!(panel.notices().is_empty());
     let started = Instant::now();
@@ -809,26 +908,25 @@ fn no_other_path_ends_a_token() {
     assert!(matches!(f.sign_in_dialog().map(|d| d.stage()), Some(Stage::Failed { .. })));
     shelves.push(shelf);
 
-    // "Switch to it" for a profile that is there and ready, and a switch in the dropdown.
+    // A switch in the dropdown. ("Switch to it" ends the connection of the sign-in it leaves
+    // unkept: see `every_way_of_leaving_a_passed_sign_in_unkept_ends_its_connection_once`.)
     let ready = Profile { identity: Some(ided(WS_ID, "acc-new")), state: State::Ready, ..pc.clone() };
     let other = profile("pd", "D", &s.base, None, None, State::Ready);
     let shelf = TestShelf::with(Book { legacy: None, list: vec![ready, other], active: Some("pd".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B), ("profile-pd", TOKEN_A)]));
-    let mut f = flow(&shelf, Purpose::New, &s.base);
-    sign_in(&mut f);
-    settle(&mut f);
-    f.switch_to_it();
-    assert!(f.is_finished());
-    assert!(shelf.switch("pd"));
+    assert!(shelf.switch("pc") && shelf.switch("pd"));
     shelves.push(shelf.clone());
 
     // The update that adds profiles, the join of twins, the old entry's cleanup and Sign out.
     // The app runs these on the OS credential store (`main.rs` at start, and
     // `publish_ui::note_check`, `publish_ui::forget_active_token` through `change_profiles`), so
     // their own entry points cannot be driven here. What makes an end impossible on them is the
-    // type: a token is only ever ended by `spawn_change`, for a `Done::ThenEnd`, which is only
-    // made from the `Ending` that `profiles::remove` and `profiles::renew` hand back. These four
-    // return no `Ending`, and the lines below pin that: one of them returning one no longer
-    // compiles. They are run on the stub's address all the same, and the stub sees nothing.
+    // type: a token is only ever ended from an `Ending`, by one of two routes. `spawn_change`
+    // ends one for a `Done::ThenEnd`, which is only made from the `Ending` that `profiles::remove`
+    // and `profiles::renew` hand back; `spawn_abandon` ends the connection of a sign-in the add
+    // form leaves unkept, from `Candidate::into_ending`, which only a candidate the form holds
+    // can make. These four return no `Ending` and hold no candidate, and the lines below pin
+    // that: one of them returning one no longer compiles. They are run on the stub's address all
+    // the same, and the stub sees nothing.
     let _: fn(&mut crate::settings::Settings, &dyn KeyStore) -> Result<Option<String>, String> = profiles::migrate;
     let _: fn(&mut Book, &dyn KeyStore, &str, &str) -> Result<(), String> = profiles::attach;
     let _: fn(&crate::settings::Settings, &dyn KeyStore) -> Result<bool, String> = profiles::remove_legacy;
@@ -1067,6 +1165,7 @@ fn an_ending_that_waits_for_a_job_asks_for_no_repaint_and_wakes_the_page_once_fo
     remove_now(&mut panel, "pa");
     std::thread::sleep(Duration::from_millis(200));
     assert!(panel.is_ending(), "still waiting for the job");
+    assert!(crate::profiles_ui::endings_in_flight(), "an app update counts it as running work");
     assert!(!panel.wants_repaint(), "an idle page does not repaint while only waiting");
     assert_eq!(woken.load(Ordering::SeqCst), 0);
     drop(held);
@@ -1074,4 +1173,159 @@ fn an_ending_that_waits_for_a_job_asks_for_no_repaint_and_wakes_the_page_once_fo
     assert_eq!(panel.notices(), [profiles::not_ended("A")]);
     assert_eq!(woken.load(Ordering::SeqCst), 1, "woken once, when the line arrived");
     assert!(!panel.wants_repaint());
+}
+
+// ---- 11. The connection an abandoned sign-in made ----
+
+/// A site that signs in (as `account_id`, by ids) and answers the end of a token with `end`.
+fn abandoning_site(account_id: &'static str, end: u16) -> Stub {
+    let me: &'static str = Box::leak(format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"{account_id}"}}"#).into_boxed_str());
+    stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+        "GET /api/v1/me" => reply(200, me),
+        END => reply(end, if end == 204 { "" } else { r#"{"error":"x"}"# }),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    })
+}
+
+/// A shelf holding profile `pc` for account `acc-c` at the stub's address, `state` as given.
+fn shelf_with_pc(s: &Stub, state: State) -> Arc<TestShelf> {
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), state) };
+    TestShelf::with(Book { legacy: None, list: vec![pc], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]))
+}
+
+/// Wait until the stub has seen `n` ends, and a little longer, so a second would show.
+fn ended_once(s: &Stub, f: &AddFlow) -> Vec<Option<String>> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ends(s).is_empty() {
+        assert!(Instant::now() < deadline, "the connection was never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wait_flow_ended(f);
+    std::thread::sleep(Duration::from_millis(50));
+    ends(s)
+}
+
+/// "Try a different account", Cancel after the sign-in passed, and "Switch to it" each end the
+/// connection the sign-in made, once, at its own site, with its own token.
+#[test]
+fn every_way_of_leaving_a_passed_sign_in_unkept_ends_its_connection_once() {
+    // Try a different account.
+    let s = abandoning_site("acc-c", 204);
+    let shelf = shelf_with_pc(&s, State::Ready);
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    assert!(matches!(f.step(), Step::Same { .. }));
+    f.try_different_account();
+    assert_eq!(ended_once(&s, &f), vec![bearer(NEW_TOKEN)], "Try a different account");
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())]);
+    // Cancel at the name, and at the renewal's confirmation.
+    for (purpose, account) in [(Purpose::New, "acc-new"), (Purpose::Renew("pc".into()), "acc-c")] {
+        let s = abandoning_site(account, 204);
+        let shelf = shelf_with_pc(&s, State::SignInAgain);
+        let mut f = flow(&shelf, purpose.clone(), &s.base);
+        sign_in(&mut f);
+        assert!(matches!(f.step(), Step::Checked { .. } | Step::Renew { .. }), "{purpose:?}");
+        f.cancel();
+        assert_eq!(ended_once(&s, &f), vec![bearer(NEW_TOKEN)], "Cancel, {purpose:?}");
+        assert!(f.error.is_none() && shelf.writes().is_empty());
+    }
+    // Switch to it, for a profile that is ready.
+    let s = abandoning_site("acc-c", 204);
+    let shelf = shelf_with_pc(&s, State::Ready);
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    f.switch_to_it();
+    assert!(f.is_finished());
+    assert_eq!(ended_once(&s, &f), vec![bearer(NEW_TOKEN)], "Switch to it");
+    assert_eq!(*lock(&shelf.switched), ["pc"]);
+}
+
+/// A sign-in that is saved, or renews its profile, ends nothing; nor does a pasted token
+/// (the site's own setup token), whatever becomes of it.
+#[test]
+fn a_kept_sign_in_or_a_pasted_token_ends_nothing() {
+    let s = abandoning_site("acc-new", 204);
+    let shelf = shelf_with_pc(&s, State::Ready);
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    f.save();
+    settle(&mut f);
+    assert!(f.is_finished());
+    let s2 = abandoning_site("acc-c", 204);
+    let shelf2 = shelf_with_pc(&s2, State::SignInAgain);
+    let mut g = flow(&shelf2, Purpose::Renew("pc".into()), &s2.base);
+    sign_in(&mut g);
+    g.save();
+    settle(&mut g);
+    assert!(g.is_finished());
+    // The pasted token, checked, then the form cancelled.
+    let s3 = abandoning_site("acc-new", 204);
+    let shelf3 = shelf_with_pc(&s3, State::Ready);
+    let mut h = flow(&shelf3, Purpose::New, &s3.base);
+    check_paste(&mut h, TOKEN_A);
+    assert!(matches!(h.step(), Step::Checked { .. }), "{:?}", h.error);
+    h.cancel();
+    std::thread::sleep(Duration::from_millis(200));
+    // The save ends nothing of the new token (the renewal ends only the old one it replaced).
+    assert!(ends(&s).is_empty() && ends(&s3).is_empty(), "{:?} {:?}", ends(&s), ends(&s3));
+    wait_flow_ended(&g);
+    assert!(!ends(&s2).contains(&bearer(NEW_TOKEN)), "{:?}", ends(&s2));
+}
+
+/// Whatever the site answers, nothing is said: the form shows no error and no line.
+#[test]
+fn ending_an_abandoned_connection_is_silent_on_every_answer() {
+    for code in [401, 404, 409, 500] {
+        let s = abandoning_site("acc-new", code);
+        let shelf = shelf_with_pc(&s, State::Ready);
+        let mut f = flow(&shelf, Purpose::New, &s.base);
+        sign_in(&mut f);
+        f.cancel();
+        assert_eq!(ended_once(&s, &f), vec![bearer(NEW_TOKEN)], "{code}");
+        f.poll();
+        assert!(f.error.is_none() && lock(&f.endings.notices).is_empty(), "{code}: {:?}", f.error);
+        assert!(form_texts(&mut f).iter().all(|t| !t.contains("site") || t.contains("Site address") || t.contains("browser")), "{code}");
+    }
+}
+
+/// The token is never ended while anything on this computer holds it: a saved profile, or the
+/// entry of the versions before profiles.
+#[test]
+fn an_abandoned_connection_held_by_a_saved_profile_or_the_old_entry_is_not_ended() {
+    for key in ["profile-pd", publish::LEGACY_KEY] {
+        let s = abandoning_site("acc-new", 204);
+        let pd = profile("pd", "D", &s.base, None, None, State::Ready);
+        let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+        let shelf = TestShelf::with(Book { legacy: None, list: vec![pc, pd], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B), (key, NEW_TOKEN)]));
+        let mut f = flow(&shelf, Purpose::New, &s.base);
+        sign_in(&mut f);
+        f.cancel();
+        wait_flow_ended(&f);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(ends(&s).is_empty(), "{key}: {:?}", ends(&s));
+    }
+}
+
+/// While the site is asked to end an abandoned connection, an app update counts it as running
+/// work; the form itself is not held up.
+#[test]
+fn an_abandoned_connection_being_ended_counts_as_running_work() {
+    let me: &'static str = Box::leak(format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-new"}}"#).into_boxed_str());
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => if seen == 0 { reply(200, r#"{"status":"pending"}"#) } else { connected(ACCOUNT) },
+        "GET /api/v1/me" => reply(200, me),
+        END => Answer::Hang,
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let shelf = shelf_with_pc(&s, State::Ready);
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    f.cancel();
+    assert!(f.is_finished(), "Cancel does not wait for the site");
+    assert!(f.is_ending() && crate::profiles_ui::endings_in_flight());
+    wait_flow_ended(&f);
+    assert!(f.error.is_none());
 }

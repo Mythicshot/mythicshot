@@ -31,6 +31,12 @@ impl Holds {
         Hold { holds: self.clone(), id: id.to_string() }
     }
 
+    /// Whether any job holds any profile's token now: a publish, an update, a share or a job of
+    /// the Tours page is under way. An app update waits for it.
+    pub fn any_held(&self) -> bool {
+        self.held().values().any(|n| *n > 0)
+    }
+
     #[cfg(test)]
     pub fn is_held(&self, id: &str) -> bool {
         self.held().get(id).is_some_and(|n| *n > 0)
@@ -80,7 +86,7 @@ mod tests {
     fn a_hold_counts_until_every_guard_is_dropped_and_wakes_a_waiter() {
         let holds = Holds::default();
         let (a, b) = (holds.hold("pa"), holds.hold("pa"));
-        assert!(holds.is_held("pa") && !holds.is_held("pb"));
+        assert!(holds.is_held("pa") && !holds.is_held("pb") && holds.any_held());
         let waiter = {
             let holds = holds.clone();
             std::thread::spawn(move || holds.wait_free("pa"))
@@ -90,7 +96,7 @@ mod tests {
         assert!(!waiter.is_finished(), "one job still holds it");
         drop(b);
         waiter.join().unwrap();
-        assert!(!holds.is_held("pa"));
+        assert!(!holds.is_held("pa") && !holds.any_held());
         holds.wait_free("pa");
     }
 

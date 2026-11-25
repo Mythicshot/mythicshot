@@ -34,6 +34,8 @@ pub enum Command {
     /// Open the main window on its Preferences page.
     Preferences,
     OpenFolder,
+    /// The first entry while a newer version is available: what "Update now" does.
+    Update,
     Exit,
 }
 
@@ -114,6 +116,10 @@ pub fn left_click(choice: TrayLeftClick, activity: Activity) -> Option<Command> 
 
 pub struct Tray {
     _icon: TrayIcon,
+    /// The menu, to put the update entry at its top and take it away again.
+    menu: Menu,
+    /// The update entry and the separator under it, while they are in the menu, and its label.
+    update: Option<(MenuItem, PredefinedMenuItem, String)>,
     commands: HashMap<MenuId, Command>,
     labelled: Vec<(Action, MenuItem)>,
     destinations: Vec<(DestId, CheckMenuItem)>,
@@ -204,14 +210,36 @@ impl Tray {
         labelled.push((Action::RecordFullScreen, rec_full));
 
         let icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(menu.clone()))
             .with_menu_on_left_click(false)
             .with_tooltip("Mythicshot")
             .with_icon(app_icon())
             .build()
             .map_err(|e| e.to_string())?;
 
-        Ok(Self { _icon: icon, commands, labelled, destinations, magnifier })
+        Ok(Self { _icon: icon, menu, update: None, commands, labelled, destinations, magnifier })
+    }
+
+    /// Show `label` as the menu's first entry ([`Command::Update`]), or no such entry for None.
+    /// Nothing changes when the menu already shows it.
+    pub fn set_update(&mut self, label: Option<String>) {
+        if self.update.as_ref().map(|(_, _, l)| l) == label.as_ref() {
+            return;
+        }
+        if let Some((item, sep, _)) = self.update.take() {
+            self.commands.remove(item.id());
+            let _ = self.menu.remove(&item);
+            let _ = self.menu.remove(&sep);
+        }
+        if let Some(label) = label {
+            let item = MenuItem::new(&label, true, None);
+            let sep = PredefinedMenuItem::separator();
+            if self.menu.insert(&item, 0).is_ok() {
+                let _ = self.menu.insert(&sep, 1);
+                self.commands.insert(item.id().clone(), Command::Update);
+                self.update = Some((item, sep, label));
+            }
+        }
     }
 
     pub fn command(&self, id: &MenuId) -> Option<Command> {
@@ -285,7 +313,7 @@ mod tests {
 
     #[test]
     fn only_switches_and_recording_controls_leave_a_waiting_capture_alone() {
-        for cmd in [Command::Region, Command::LastRegion, Command::Window, Command::FullScreen, Command::Record, Command::RecordLastRegion, Command::RecordWindow, Command::RecordFullScreen, Command::Display(0), Command::FromClipboard, Command::OpenFile, Command::OpenApp, Command::Preferences, Command::OpenFolder, Command::Exit] {
+        for cmd in [Command::Region, Command::LastRegion, Command::Window, Command::FullScreen, Command::Record, Command::RecordLastRegion, Command::RecordWindow, Command::RecordFullScreen, Command::Display(0), Command::FromClipboard, Command::OpenFile, Command::OpenApp, Command::Preferences, Command::OpenFolder, Command::Update, Command::Exit] {
             assert!(cmd.changes_the_screen(), "{cmd:?}");
         }
         for cmd in [Command::PauseRecording, Command::LiveDraw, Command::ToggleMagnifier, Command::ToggleDestination(DestId::File)] {

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Screenshot and GIF recording tool in the spirit of Greenshot"
+description = "Screenshots, screen recordings and click-through tours for Windows"
 
 [dependencies]
 mythicshot-capture = { path = "../capture" }
@@ -31,6 +31,9 @@ keyring = "4"
 tempfile = "3"
 # Content hashes in the names of a site's shared player files.
 sha2 = "0.11"
+# Verifies the Ed25519 signature of the release file before an update is offered. Pinned to the
+# version rustls already brings in, so nothing new is fetched.
+ring = { version = "=0.17.14", default-features = false }
 
 [dev-dependencies]
 # Tests never reach the desktop: the destinations' file dialog, clipboard, printer, mail and
@@ -38,7 +41,7 @@ sha2 = "0.11"
 mythicshot-destinations = { path = "../destinations", features = ["test-stubs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_SystemInformation"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

@@ -2,6 +2,16 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.35 (2026-11-24)
+
+- Updates: when it starts, Mythicshot asks mythicshot.com for the current version number and, if a newer one exists, says so in a line under the menu bar and in the tray menu. "Update now" downloads the installer from mythicshot.com, checks it, closes Mythicshot, installs and opens it again. Nothing about you or the computer is sent, and Preferences has a switch for the check and a "Check now" button.
+- Updates are only accepted when the release file carries a signature made with a key that is kept off the website, and the downloaded installer matches the size and checksum that file names. An update waits for recordings, uploads and open recording editors, and a failed or cancelled install leaves the version you had.
+- Roomier pages: buttons and fields are 36 points tall, rows 44, grouped in cards, on Home, Tours, Workspace, Preferences and in the dialogs. The left menu has icons, and its foot reads "Signed in to" with the site.
+- Workspace: a profile card shows the profile, who it is signed in as and its status, with "Switch profile" and "Add profile". Connection details and tours are in cards, each action sits on its row, and Sign out is last.
+- Adding a profile: when the browser was signed in as an account you already have, the form says so and offers "Try a different account". A sign-in that is not kept is ended on the site.
+- Exported tours and sites use Mythicshot's own colours for the player's bars, buttons and focus ring. A tour's accent, card style, backdrop and logo stay the author's.
+- The program and the installer name Mythicshot, LLC, and describe Mythicshot as "screenshots, recordings and tours".
+
 ## 0.2.34 (2026-11-24)
 
 - Profiles: removing a profile now also ends its connection on the site, so the computer no longer stays listed under Connections there. The profile is removed from this computer at once, whatever the site answers. When the site cannot be reached, or is an older one without this, one line says the computer is still listed there until you remove it.

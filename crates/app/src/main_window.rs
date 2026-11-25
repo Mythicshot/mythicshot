@@ -55,6 +55,16 @@ impl Page {
         }
     }
 
+    /// The page's icon in the left menu.
+    pub fn icon(self) -> crate::icons::Icon {
+        match self {
+            Page::Home => crate::icons::Icon::Home,
+            Page::Tours => crate::icons::Icon::Tours,
+            Page::Workspace => crate::icons::Icon::Workspace,
+            Page::Preferences => crate::icons::Icon::Preferences,
+        }
+    }
+
 }
 
 /// A request to show the main window.
@@ -200,13 +210,16 @@ pub struct Shared {
     pub busy: bool,
     /// What the menu bar asked of the app, in order; the app takes them on its next frame.
     pub app_requests: Vec<AppRequest>,
+    /// Updates: the line under the menu bar and the Preferences section. The app hands in the
+    /// real one at start and drives it each frame.
+    pub update: crate::update_ui::Updater,
     /// The open window's title bar was told to be dark; a closed window is made anew, so it is told again.
     title_dark: bool,
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -348,7 +361,7 @@ pub fn tile_command(cmd: Command, front: Option<WindowKind>) -> Command {
     }
 }
 
-/// The host name for the "Connected to" line: the saved server's, when a token is saved too.
+/// The host name for the "Signed in to" line: the saved server's, when a token is saved too.
 /// Nothing is asked of the server; this only says what is set up.
 /// `bound` is the address the token was saved for: with another address set, the token is not
 /// used there, so that is not a connection. Nor is a token the site refused the last time it
@@ -396,7 +409,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -413,64 +426,93 @@ pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
 
 /// [`window_ui`] with the Tours page's site connection given: tests draw the window this way.
 fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn) {
+    window_ui_given(ui, s, tours_conn, None);
+}
+
+/// The active profile and its connection, as a test gives them to the Workspace page.
+type WorkspaceGiven = (Option<crate::profiles::Profile>, workspace_ui::Conn);
+
+/// [`window_ui_with`] with the Workspace page's active profile and connection given too.
+fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, workspace: Option<&WorkspaceGiven>) {
     theme::window_background(ui);
     let mut out = PageOut::default();
     let menu = s.menu_state();
     if let Some(entry) = menu_bar::bar(ui, "main-menu-bar", &menu).picked {
         s.menu_entry(entry, &mut out);
     }
-    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
-    egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, tours_conn, &mut out));
+    // A newer version, its download or its install: one line under the menu bar, on every page.
+    if s.update.banner().is_some() {
+        egui::Panel::top("update-line").resizable(false).frame(egui::Frame::new()).show(ui, |ui| crate::update_ui::banner_ui(ui, &mut s.update));
+    }
+    egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), workspace, &mut out));
+    egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| theme::page(ui, |ui| page_ui(ui, s, tours_conn, workspace, &mut out)));
     s.take(out);
 }
 
-fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
-    ui.add_space(8.0);
+/// The lines at the foot of the left menu: "Signed in to" and the host when this computer holds
+/// a saved connection for the active address (no site is asked), else "Not connected".
+pub fn nav_footer(host: Option<&str>) -> Vec<String> {
+    match host {
+        Some(host) => vec![SIGNED_IN_TO.to_string(), host.to_string()],
+        None => vec![workspace_ui::NOT_CONNECTED.to_string()],
+    }
+}
+
+/// What the foot of the left menu says above the host of a saved connection.
+pub const SIGNED_IN_TO: &str = "Signed in to";
+
+fn nav_ui(ui: &mut egui::Ui, current: Page, given: Option<&WorkspaceGiven>, out: &mut PageOut) {
+    theme::roomy(ui);
+    ui.add_space(theme::ITEM_GAP);
+    ui.spacing_mut().item_spacing.y = theme::GRID;
     for page in Page::ALL {
-        if ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(current == page, page.label())).clicked() {
+        if theme::nav_item(ui, page.label(), Some(page.icon()), current == page).clicked() {
             out.go_to = Some(page);
         }
     }
     // Whether a site is set up, at the bottom of the menu.
-    let token = publish_ui::token_status();
-    if token == TokenStatus::Checking {
-        ui.ctx().request_repaint_after(Duration::from_millis(200));
-    }
-    let host = connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref(), publish_ui::token_refused());
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-        ui.add_space(8.0);
-        match host {
-            Some(host) => {
-                ui.add(egui::Label::new(RichText::new(host).size(12.0).color(theme::MUTED)).truncate());
-                ui.label(RichText::new("Connected to").size(12.0).color(theme::MUTED));
+    let host = match given {
+        // A test's own profile and connection.
+        Some((active, conn)) => active.as_ref().and_then(|a| connected_host(&a.server, &conn.token, conn.bound.as_deref(), conn.refused)),
+        None => {
+            let token = publish_ui::token_status();
+            if token == TokenStatus::Checking {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
-            None => {
-                ui.label(RichText::new("Not connected").size(12.0).color(theme::MUTED));
+            connected_host(&publish_ui::server(), &token, publish_ui::token_site().as_deref(), publish_ui::token_refused())
+        }
+    };
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+        ui.add_space(theme::ITEM_GAP);
+        // Laid out from the bottom: the last line first.
+        let lines = nav_footer(host.as_deref());
+        for (i, line) in lines.iter().enumerate().rev() {
+            let text = RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED);
+            if i + 1 == lines.len() && lines.len() > 1 {
+                // The host: cut short with "…" when it does not fit.
+                ui.add(egui::Label::new(text).truncate());
+            } else {
+                ui.label(text);
             }
         }
     });
 }
 
 /// Draw the selected page. Each page gets the part of [`Shared`] it owns and a [`PageOut`].
-fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: &mut PageOut) {
+fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, workspace: Option<&WorkspaceGiven>, out: &mut PageOut) {
     match s.nav.page() {
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
         Page::Tours => tours_ui::ui(ui, &mut s.tours, tours_conn, out),
         Page::Workspace => {
-            // The profiles first: the dropdown, the notices, the add form or the list. The rows
-            // below are the active profile's, at its own address.
+            // The profiles first: the title, the active profile's card, the notices, the add
+            // form or the list. The cards below are the active profile's, at its own address.
             let request = publish_ui::take_profiles_request();
-            if s.profiles.ui(ui, request) == crate::profiles_ui::Below::Details
-                && let Some(active) = publish_ui::book().active().cloned()
-            {
-                s.workspace.profile_mode = true;
-                let mut address = active.server;
-                workspace_ui::ui(ui, &mut s.workspace, &mut address, &workspace_ui::Conn::current());
-            }
+            let (active, conn) = workspace.cloned().unwrap_or_else(|| (publish_ui::book().active().cloned(), workspace_ui::Conn::current()));
+            workspace_page(ui, &mut s.profiles, &mut s.workspace, request, active, &conn, out);
         }
         Page::Preferences => {
             let p = &mut s.prefs;
-            let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart };
+            let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart, updates: Some(&mut s.update) };
             for action in settings_ui::ui(ui, &mut p.state, view) {
                 match action {
                     // The Output tab's link: a page switch, which is the window's own business.
@@ -482,10 +524,32 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: 
     }
 }
 
+/// The Workspace page: the profiles' part (the title, the active profile's card, the notices,
+/// the add form or the list), then the cards of the active profile, `active`, at its own address.
+fn workspace_page(ui: &mut egui::Ui, profiles: &mut crate::profiles_ui::Panel, workspace: &mut WorkspaceState, request: Option<publish_ui::ProfilesRequest>, active: Option<crate::profiles::Profile>, conn: &workspace_ui::Conn, out: &mut PageOut) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let server = active.as_ref().map(|a| a.server.clone()).unwrap_or_default();
+        let below = profiles.ui(ui, request, &mut || workspace_ui::status_pill(workspace, &server, conn));
+        if below == crate::profiles_ui::Below::Details
+            && let Some(active) = active
+        {
+            workspace.profile_mode = true;
+            workspace.profile_account = active.account.clone();
+            workspace.profile_workspace = active.workspace.clone();
+            let mut address = active.server;
+            if workspace_ui::ui(ui, workspace, &mut address, conn).open_tours {
+                out.go_to = Some(Page::Tours);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::settings::Settings;
+
+    mod roomy;
 
     #[test]
     fn an_edit_request_reaches_the_app_once() {
@@ -851,7 +915,10 @@ pub(crate) mod tests {
         choose(&mut s, "Help", "About Mythicshot");
         assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, settings_ui::Tab::General));
         let version = window_frame(&ctx, &mut s, size, vec![]);
-        assert!(crate::share_ui::tests::text_rect(&version, concat!("Version ", env!("CARGO_PKG_VERSION"))).is_some(), "the version is on the page");
+        // The Updates section's status line starts with it.
+        let status = s.update.status_line(chrono::Local::now().naive_local());
+        assert!(status.starts_with(concat!("Version ", env!("CARGO_PKG_VERSION"), ".")), "{status}");
+        assert!(crate::share_ui::tests::text_rect(&version, &status).is_some(), "the version is on the page");
 
         // Capture region and Record region: the window goes, then the capture, as from the Home tiles.
         for (entry, cmd) in [("Capture region", Command::Region), ("Record region", Command::Record)] {

@@ -54,6 +54,8 @@ pub enum AfterEnd {
     Notice,
     /// A "Sign in again": silent for the person, one line in the app's log.
     Log,
+    /// A sign-in that was not kept: silent for the person, one line in the app's log.
+    Abandoned,
 }
 
 /// A change of the profiles, run on a background thread.
@@ -137,6 +139,18 @@ impl Endings {
     }
 }
 
+/// Tokens being ended at their sites in this process, waiting for a job or being sent, whatever
+/// page or form started them: an app update counts them as running work and waits.
+fn in_flight() -> &'static Arc<AtomicUsize> {
+    static IN_FLIGHT: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Arc::default)
+}
+
+/// Whether a token is being ended at its site now (waiting for a job, or being sent).
+pub fn endings_in_flight() -> bool {
+    in_flight().load(Ordering::SeqCst) > 0
+}
+
 /// One token on its way to its site: counted while it is, whichever way the thread ends.
 struct Busy(Arc<AtomicUsize>);
 
@@ -167,28 +181,47 @@ fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings
             done => (done, None),
         };
         // Counted before the change's end is handed over, so nobody sees it idle in between.
-        let busy = then_end.as_ref().map(|_| Busy::new(&endings.busy));
+        let busy = then_end.as_ref().map(|_| (Busy::new(&endings.busy), Busy::new(in_flight())));
         *lock(&slot) = Some(done);
         let Some((ending, after)) = then_end else { return };
-        // A job that started with this token runs to its end first.
-        shelf.holds().wait_free(&ending.id);
-        let sending = Busy::new(&endings.sending);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
-        match (after, outcome) {
-            // Held here again meanwhile: nothing was sent, and nothing is said.
-            (_, None) => {}
-            (AfterEnd::Notice, Some(outcome)) => {
-                if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
-                    endings.say(text);
-                }
-            }
-            (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
-        }
-        drop(sending);
-        // The token's copy is wiped here.
-        drop(ending);
+        end_counted(&*shelf, &endings, ending, after);
         drop(busy);
     });
+}
+
+/// End `ending`'s token at its site on a thread of its own, counted as running work while it
+/// is: the connection of a sign-in that was not kept. Silent for the person on every answer.
+fn spawn_abandon(shelf: &Arc<dyn Shelf>, endings: &Endings, ending: Ending) {
+    let (shelf, endings) = (shelf.clone(), endings.clone());
+    let busy = (Busy::new(&endings.busy), Busy::new(in_flight()));
+    std::thread::spawn(move || {
+        end_counted(&*shelf, &endings, ending, AfterEnd::Abandoned);
+        drop(busy);
+    });
+}
+
+/// Once no running job holds `ending`'s token ([`Holds::wait_free`]), and only if nothing here
+/// holds it then (asked again under the change lock, [`Shelf::held`]), ask its site to end it;
+/// then say or log what came of it, as `after` says. Never on the UI thread.
+fn end_counted(shelf: &dyn Shelf, endings: &Endings, ending: Ending, after: AfterEnd) {
+    // A job that started with this token runs to its end first.
+    shelf.holds().wait_free(&ending.id);
+    let sending = Busy::new(&endings.sending);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
+    match (after, outcome) {
+        // Held here again meanwhile: nothing was sent, and nothing is said.
+        (_, None) => {}
+        (AfterEnd::Notice, Some(outcome)) => {
+            if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
+                endings.say(text);
+            }
+        }
+        (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
+        (AfterEnd::Abandoned, Some(outcome)) => eprintln!("{}", profiles::abandoned_log_line(&ending.server, &outcome)),
+    }
+    drop(sending);
+    // The token's copy is wiped here.
+    drop(ending);
 }
 
 // ---- The dropdown ----
@@ -243,38 +276,44 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
         ui.horizontal(|ui| {
             dot(ui, active.is_none_or(|a| a.waiting));
             let text = active.map_or_else(|| crate::workspace_ui::NOT_CONNECTED.to_string(), |a| a.name.clone());
-            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).width(240.0).show_ui(ui, |ui| {
-                ui.set_min_width(300.0);
-                for e in rows {
-                    ui.horizontal(|ui| {
-                        dot(ui, e.waiting);
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                if ui.add(egui::Button::selectable(e.active, RichText::new(&e.name).strong())).clicked() && !e.active {
-                                    pick = Some(Pick::Switch(e.id.clone()));
-                                }
-                                if e.active {
-                                    ui.label(RichText::new(profiles::ACTIVE).size(12.0).color(theme::MUTED));
-                                }
-                                if e.waiting {
-                                    theme::caution_line(ui, profiles::SIGN_IN_AGAIN, 12.0, theme::Fit::Truncate);
-                                }
-                            });
-                            ui.label(RichText::new(&e.detail).size(12.0).color(theme::MUTED));
-                        });
-                    });
-                }
-                ui.separator();
-                if ui.add(egui::Button::new(RichText::new(profiles::ADD_PROFILE).color(theme::GOLD)).frame(false)).clicked() {
-                    pick = Some(Pick::Add);
-                }
-                if ui.add(egui::Button::new(RichText::new(profiles::MANAGE_PROFILES).color(theme::MUTED)).frame(false)).clicked() {
-                    pick = Some(Pick::Manage);
-                }
-            });
+            // As wide as it may be, and narrower where the line has less room.
+            let width = theme::PROFILE_DROPDOWN_WIDTH.min(ui.available_width() - ui.spacing().icon_width - 2.0 * ui.spacing().button_padding.x).max(theme::PROFILE_DROPDOWN_MIN_WIDTH);
+            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).truncate().width(width).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
         });
     });
     pick
+}
+
+/// The list the dropdown and "Switch profile" open: every profile with its dot and state, then
+/// "+ Add profile…" and "Manage profiles…".
+fn profile_menu(ui: &mut egui::Ui, rows: &[Entry], pick: &mut Option<Pick>) {
+    ui.set_min_width(theme::PROFILE_LIST_WIDTH);
+    for e in rows {
+        ui.horizontal(|ui| {
+            dot(ui, e.waiting);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::selectable(e.active, RichText::new(&e.name).strong())).clicked() && !e.active {
+                        *pick = Some(Pick::Switch(e.id.clone()));
+                    }
+                    if e.active {
+                        ui.label(RichText::new(profiles::ACTIVE).size(theme::SMALL_SIZE).color(theme::MUTED));
+                    }
+                    if e.waiting {
+                        theme::caution_line(ui, profiles::SIGN_IN_AGAIN, theme::SMALL_SIZE, theme::Fit::Truncate);
+                    }
+                });
+                ui.label(RichText::new(&e.detail).size(theme::SMALL_SIZE).color(theme::MUTED));
+            });
+        });
+    }
+    ui.separator();
+    if ui.add(egui::Button::new(RichText::new(profiles::ADD_PROFILE).color(theme::GOLD)).frame(false)).clicked() {
+        *pick = Some(Pick::Add);
+    }
+    if ui.add(egui::Button::new(RichText::new(profiles::MANAGE_PROFILES).color(theme::MUTED)).frame(false)).clicked() {
+        *pick = Some(Pick::Manage);
+    }
 }
 
 /// The dropdown over the app's own profiles, with what is picked done: a switch at once, and
@@ -318,7 +357,7 @@ pub fn note(ui: &mut egui::Ui, tone: Tone, text: &str) {
             return;
         }
     };
-    egui::Frame::new().fill(fill).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+    egui::Frame::new().fill(fill).corner_radius(theme::RADIUS_MD).inner_margin(egui::Margin::symmetric(theme::SPACE_3 as i8, theme::SPACE_2 as i8)).show(ui, |ui| {
         ui.add(egui::Label::new(RichText::new(text).color(fg)).wrap());
     });
 }
@@ -366,13 +405,14 @@ impl OwnerPrompt {
         }
         let (text, buttons) = self.view();
         let mut chosen = None;
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
         crate::share_ui::modal(egui::Id::unique("owner-prompt")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
+            theme::roomy(ui);
+            ui.set_width(theme::DIALOG_WIDTH);
             ui.heading("Publish tour");
-            ui.add_space(8.0);
+            theme::block_gap(ui);
             note(ui, Tone::Bad, &text);
-            ui.add_space(12.0);
+            theme::block_gap(ui);
             ui.horizontal_wrapped(|ui| {
                 for (i, label) in buttons.iter().enumerate() {
                     let b = if i == 0 { theme::primary_button(label.as_str()) } else { egui::Button::new(label.as_str()) };
@@ -466,8 +506,12 @@ pub struct AddFlow {
     /// The check of a pasted token, running on its thread, and its end.
     pasted: Arc<Mutex<Option<Result<Candidate, String>>>>,
     checking_paste: bool,
-    /// The token a renewal replaced, being ended at its site.
+    /// The token a renewal replaced, or the connection of a sign-in that was not kept, being
+    /// ended at its site.
     endings: Endings,
+    /// The candidate the form holds came from a browser sign-in (not from a pasted token, which
+    /// is the site's own setup token and is never ended here).
+    signed_in: bool,
     shelf: Arc<dyn Shelf>,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -481,7 +525,7 @@ impl Drop for AddFlow {
 
 impl AddFlow {
     pub fn new(purpose: Purpose, address: String, shelf: Arc<dyn Shelf>, open: Opener, clock: Arc<dyn Clock + Send + Sync>) -> AddFlow {
-        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, endings: Endings::default(), shelf, open, clock }
+        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, endings: Endings::default(), signed_in: false, shelf, open, clock }
     }
 
     /// The form for the app's own profiles, the real browser and the real clock.
@@ -536,6 +580,7 @@ impl AddFlow {
         self.sign_in = None;
         let candidate = lock(&self.slot).take();
         if let (SignInAction::Connected(_), Some(candidate)) = (action, candidate) {
+            self.signed_in = true;
             self.accept(candidate);
         }
     }
@@ -631,10 +676,19 @@ impl AddFlow {
             self.purpose = Purpose::Renew(id);
             self.accept(candidate);
         } else {
-            drop(candidate);
+            self.abandon(candidate);
             self.shelf.switch(&id);
             self.step = Step::Finished;
         }
+    }
+
+    /// "Try a different account": the sign-in that came back as an account with a profile goes,
+    /// unstored, as on Cancel, and a fresh browser sign-in starts for the same address.
+    pub fn try_different_account(&mut self) {
+        let Step::Same { candidate, .. } = std::mem::replace(&mut self.step, Step::Address) else { return };
+        self.abandon(candidate);
+        *lock(&self.slot) = None;
+        self.begin_sign_in();
     }
 
     /// Whether Cancel can be pressed: not while a save or renewal runs (it would not stop it).
@@ -693,8 +747,24 @@ impl AddFlow {
         }
         publish_ui::wipe(&mut self.paste);
         self.sign_in = None;
-        *lock(&self.slot) = None;
-        self.step = Step::Finished;
+        // A sign-in that passed and is left here is ended at its site; nothing was stored.
+        if let Some(candidate) = lock(&self.slot).take() {
+            self.signed_in = true;
+            self.abandon(candidate);
+        }
+        if let Step::Checked { candidate, .. } | Step::Same { candidate, .. } | Step::Renew { candidate, .. } = std::mem::replace(&mut self.step, Step::Finished) {
+            self.abandon(candidate);
+        }
+    }
+
+    /// The connection `candidate`'s sign-in made, which is not kept: ended at its site in the
+    /// background, silently. A pasted token is only dropped (wiped).
+    fn abandon(&self, candidate: Candidate) {
+        if self.signed_in
+            && let Some(ending) = candidate.into_ending()
+        {
+            spawn_abandon(&self.shelf, &self.endings, ending);
+        }
     }
 
     /// Take in a save or renewal that ended.
@@ -711,6 +781,7 @@ impl AddFlow {
                 Ok(_) if self.is_finished() => {}
                 Ok(candidate) => {
                     self.pasting = false;
+                    self.signed_in = false;
                     self.accept(candidate);
                 }
                 Err(e) => self.error = Some(e),
@@ -766,41 +837,61 @@ impl AddFlow {
         let mut pressed: Option<&'static str> = None;
         match &mut self.step {
             Step::Address | Step::Finished => {
-                ui.label(RichText::new(profiles::SITE_ADDRESS).strong().color(theme::MUTED));
-                ui.horizontal(|ui| {
-                    let renewing = matches!(self.purpose, Purpose::Renew(_));
-                    ui.add_enabled(!renewing && self.sign_in.is_none(), egui::TextEdit::singleline(&mut self.address).hint_text("https://tours.example.com").desired_width(300.0));
-                    let can = matches!(self.step, Step::Address) && !self.working && self.sign_in.is_none() && publish::check_server(&self.address).is_ok();
-                    if ui.add_enabled(can, theme::primary_button(profiles::SIGN_IN)).clicked() {
-                        pressed = Some(profiles::SIGN_IN);
-                    }
-                });
-                if !self.address.trim().is_empty()
-                    && let Err(e) = publish::check_server(&self.address)
-                {
-                    theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
-                }
-                ui.add(egui::Label::new(RichText::new(profiles::ADDRESS_HINT).color(theme::MUTED).size(12.0)).wrap());
-                // A site without Sign in: a token from its setup page, checked the same way.
-                if self.pasting {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.paste).password(true).hint_text(PASTE_HINT).desired_width(240.0));
-                        let can = matches!(self.step, Step::Address) && !self.working && !self.checking_paste && self.sign_in.is_none() && !self.paste.trim().is_empty() && publish::check_server(&self.address).is_ok();
-                        if ui.add_enabled(can, egui::Button::new(CHECK_PASTE)).clicked() {
-                            pressed = Some(CHECK_PASTE);
-                        }
-                        if self.checking_paste {
-                            ui.add(egui::Spinner::new());
+                let renewing = matches!(self.purpose, Purpose::Renew(_));
+                let signing = self.sign_in.is_some();
+                let at_address = matches!(self.step, Step::Address);
+                let can = at_address && !self.working && !signing && publish::check_server(&self.address).is_ok();
+                let can_check = at_address && !self.working && !self.checking_paste && !signing && !self.paste.trim().is_empty() && publish::check_server(&self.address).is_ok();
+                let (working, checking_paste, pasting) = (self.working, self.checking_paste, self.pasting);
+                let mut paste_instead = false;
+                let (address, paste) = (&mut self.address, &mut self.paste);
+                theme::card(ui, |rows| {
+                    let problem = publish::check_server(address).err().filter(|_| !address.trim().is_empty());
+                    rows.row_under(
+                        profiles::SITE_ADDRESS,
+                        |ui| drop(ui.add_enabled(!renewing && !signing, egui::TextEdit::singleline(address).hint_text("https://tours.example.com").desired_width(f32::INFINITY))),
+                        |ui| {
+                            if let Some(e) = problem {
+                                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
+                            }
+                        },
+                        |ui| {
+                            if ui.add_enabled(can, theme::primary_button(profiles::SIGN_IN)).clicked() {
+                                pressed = Some(profiles::SIGN_IN);
+                            }
+                        },
+                    );
+                    rows.full(|ui| {
+                        theme::caption(ui, profiles::ADDRESS_HINT);
+                        // A site without Sign in: a token from its setup page, checked the same way.
+                        if pasting {
+                            ui.horizontal(|ui| {
+                                theme::value_then_actions(
+                                    ui,
+                                    "add-profile-paste",
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| drop(ui.add(egui::TextEdit::singleline(paste).password(true).hint_text(PASTE_HINT).desired_width(f32::INFINITY))),
+                                    |ui| {
+                                        if ui.add_enabled(can_check, egui::Button::new(CHECK_PASTE)).clicked() {
+                                            pressed = Some(CHECK_PASTE);
+                                        }
+                                        if checking_paste {
+                                            ui.add(egui::Spinner::new());
+                                        }
+                                    },
+                                );
+                            });
+                        } else if ui.add_enabled(!working && !signing, egui::Link::new(crate::workspace_ui::PASTE_INSTEAD)).clicked() {
+                            paste_instead = true;
                         }
                     });
-                } else if ui.add_enabled(!self.working && self.sign_in.is_none(), egui::Link::new(crate::workspace_ui::PASTE_INSTEAD)).clicked() {
+                });
+                if paste_instead {
                     self.begin_paste();
                 }
                 if let Some(e) = &self.error {
-                    ui.add_space(6.0);
                     note(ui, Tone::Bad, e);
                 }
-                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
                         pressed = Some(profiles::CANCEL);
@@ -813,10 +904,10 @@ impl AddFlow {
             }
             Step::Checked { candidate, name } => {
                 note(ui, Tone::Ok, &profiles::connected(candidate.account.as_deref(), &candidate.workspace));
-                ui.add_space(6.0);
-                ui.label(RichText::new(profiles::PROFILE_NAME).strong().color(theme::MUTED));
-                ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(300.0));
-                ui.add_space(8.0);
+                theme::block_gap(ui);
+                theme::card(ui, |rows| {
+                    rows.row(profiles::PROFILE_NAME, |ui| drop(ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(f32::INFINITY))), |_| {});
+                });
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
                         pressed = Some(profiles::CANCEL);
@@ -828,7 +919,7 @@ impl AddFlow {
             }
             Step::Renew { candidate, .. } => {
                 note(ui, Tone::Ok, &profiles::connected(candidate.account.as_deref(), &candidate.workspace));
-                ui.add_space(8.0);
+                theme::block_gap(ui);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
                         pressed = Some(profiles::CANCEL);
@@ -839,11 +930,14 @@ impl AddFlow {
                 });
             }
             Step::Same { name, .. } => {
-                note(ui, Tone::Warn, &profiles::exists(name));
-                ui.add_space(8.0);
+                note(ui, Tone::Warn, &format!("{}\n{}", profiles::exists(name), profiles::exists_why()));
+                theme::block_gap(ui);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, theme::primary_button(profiles::SWITCH_TO_IT)).clicked() {
                         pressed = Some(profiles::SWITCH_TO_IT);
+                    }
+                    if ui.add_enabled(!self.working, egui::Button::new(profiles::TRY_DIFFERENT_ACCOUNT)).clicked() {
+                        pressed = Some(profiles::TRY_DIFFERENT_ACCOUNT);
                     }
                     if ui.button(profiles::CANCEL).clicked() {
                         pressed = Some(profiles::CANCEL);
@@ -855,6 +949,7 @@ impl AddFlow {
             Some(profiles::SIGN_IN) => self.begin_sign_in(),
             Some(profiles::SAVE_PROFILE) => self.save(),
             Some(profiles::SWITCH_TO_IT) => self.switch_to_it(),
+            Some(profiles::TRY_DIFFERENT_ACCOUNT) => self.try_different_account(),
             Some(profiles::CANCEL) => self.cancel(),
             Some(CHECK_PASTE) => self.check_paste(),
             _ => {}
@@ -891,11 +986,14 @@ pub struct Panel {
     shelf: Arc<dyn Shelf>,
     /// Makes the add form; tests hand in one with fakes.
     make: Arc<dyn Fn(Purpose, String) -> AddFlow + Send + Sync>,
+    /// The active profile's token as the page sees it, and whether its site refused it:
+    /// [`publish_ui::token_status`] and [`publish_ui::token_refused`]; tests hand in their own.
+    pub token_state: Arc<dyn Fn() -> (publish_ui::TokenStatus, bool) + Send + Sync>,
 }
 
 impl Default for Panel {
     fn default() -> Self {
-        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, endings: Endings::default(), notices: Vec::new(), shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app) }
+        Panel { mode: Mode::Details, removing: None, working: false, done: Arc::default(), error: None, endings: Endings::default(), notices: Vec::new(), shelf: Arc::new(AppShelf), make: Arc::new(AddFlow::for_app), token_state: Arc::new(|| (publish_ui::token_status(), publish_ui::token_refused())) }
     }
 }
 
@@ -1016,7 +1114,7 @@ impl Panel {
     }
 
     /// Draw the panel under the page's heading. With no profile at all, the add form shows by itself.
-    pub fn ui(&mut self, ui: &mut egui::Ui, request: Option<ProfilesRequest>) -> Below {
+    pub fn ui(&mut self, ui: &mut egui::Ui, request: Option<ProfilesRequest>, status: &mut dyn FnMut() -> (&'static str, theme::Tone)) -> Below {
         self.poll(request);
         let book = self.shelf.book();
         if book.list.is_empty() && !matches!(self.mode, Mode::Add(_)) {
@@ -1030,13 +1128,27 @@ impl Panel {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let mut pick = None;
-        ui.horizontal(|ui| {
-            ui.heading("Workspace");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pick = dropdown_with(ui, "workspace", &entries(&book, publish_ui::token_refused()), !self.working);
-            });
+        let working = self.working;
+        let (token, refused) = (self.token_state)();
+        theme::page_title(ui, "Workspace", |ui| {
+            if ui.add_enabled_ui(!working, |ui| theme::icon_button(ui, profiles::ADD_PROFILE_BUTTON, crate::icons::Icon::Plus, theme::IconSide::Leading)).inner.clicked() {
+                pick = Some(Pick::Add);
+            }
         });
-        ui.add_space(10.0);
+        // The active profile: who it is signed in as, how it stands, and the list to switch from.
+        let rows = entries(&book, refused);
+        // With profiles but none of them active, the card stays, so the list stays one click away.
+        if !book.list.is_empty() {
+            let pill = match book.active() {
+                None => Some((crate::workspace_ui::NOT_CONNECTED, theme::Tone::Warning)),
+                Some(active) if needs_sign_in(active, refused, &token) => Some((profiles::SIGN_IN_AGAIN, theme::Tone::Warning)),
+                Some(_) if matches!(self.mode, Mode::Details) => Some(status()),
+                Some(_) => None,
+            };
+            if let Some(p) = profile_card(ui, book.active(), pill, &rows, !working) {
+                pick = Some(p);
+            }
+        }
         match pick {
             Some(Pick::Switch(id)) => {
                 self.shelf.switch(&id);
@@ -1048,16 +1160,16 @@ impl Panel {
         }
         if let Some(e) = &self.error {
             note(ui, Tone::Bad, e);
-            ui.add_space(8.0);
+            theme::block_gap(ui);
         }
         for text in &self.notices {
             note(ui, Tone::Warn, text);
-            ui.add_space(8.0);
+            theme::block_gap(ui);
         }
         // The update that adds profiles could not run at this start: the store's own sentence.
         if let Some(problem) = publish_ui::migration_problem() {
             theme::caution_line(ui, problem, theme::BODY_SIZE, theme::Fit::Wrap);
-            ui.add_space(8.0);
+            theme::block_gap(ui);
         }
         self.remove_window(ui.ctx());
         let mut below = Below::Nothing;
@@ -1072,13 +1184,12 @@ impl Panel {
             Mode::Details => {
                 if let Some(text) = publish_ui::migrated_notice() {
                     note(ui, Tone::Ok, &text);
-                    ui.add_space(8.0);
+                    theme::block_gap(ui);
                 }
                 if let Some(p) = book.active() {
-                    if needs_sign_in(p, publish_ui::token_refused(), &publish_ui::token_status()) {
+                    if needs_sign_in(p, refused, &token) {
                         let id = p.id.clone();
                         note(ui, Tone::Warn, &profiles::needs_sign_in(&p.name));
-                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!self.working, theme::primary_button(profiles::SIGN_IN_AGAIN)).clicked() {
                                 self.sign_in_again(&id);
@@ -1087,12 +1198,12 @@ impl Panel {
                                 self.ask_remove(&id);
                             }
                         });
-                        ui.add_space(10.0);
+                        theme::block_gap(ui);
                     }
                     // The credential store cannot be used: its own sentence.
-                    if let publish_ui::TokenStatus::Unavailable(e) = publish_ui::token_status() {
+                    if let publish_ui::TokenStatus::Unavailable(e) = token.clone() {
                         theme::caution_line(ui, e, theme::BODY_SIZE, theme::Fit::Wrap);
-                        ui.add_space(8.0);
+                        theme::block_gap(ui);
                     }
                     below = Below::Details;
                 }
@@ -1102,33 +1213,42 @@ impl Panel {
     }
 
     fn manage_ui(&mut self, ui: &mut egui::Ui, book: &Book) {
-        ui.label(RichText::new(profiles::MANAGE_PROFILES.trim_end_matches('…')).strong());
-        ui.add_space(6.0);
+        theme::section_heading(ui, profiles::MANAGE_PROFILES.trim_end_matches('…'));
         let mut again = None;
         let mut remove = None;
-        for e in entries(book, publish_ui::token_refused()) {
-            ui.horizontal(|ui| {
-                dot(ui, e.waiting);
-                ui.vertical(|ui| {
+        let working = self.working;
+        theme::card(ui, |rows| {
+            for e in entries(book, (self.token_state)().1) {
+                rows.full(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&e.name).strong());
-                        if e.active {
-                            ui.label(RichText::new(profiles::ACTIVE).size(12.0).color(theme::MUTED));
-                        }
+                        dot(ui, e.waiting);
+                        theme::value_then_actions(
+                            ui,
+                            ("manage-profile", &e.id),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(&e.name).strong()).truncate());
+                                    if e.active {
+                                        ui.label(RichText::new(profiles::ACTIVE).size(theme::SMALL_SIZE).color(theme::MUTED));
+                                    }
+                                });
+                                ui.add(egui::Label::new(RichText::new(&e.detail).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                            },
+                            |ui| {
+                                if e.waiting && ui.add_enabled(!working, egui::Button::new(profiles::SIGN_IN_AGAIN)).clicked() {
+                                    again = Some(e.id.clone());
+                                }
+                                if ui.add_enabled(!working, egui::Button::new(profiles::REMOVE_PROFILE)).clicked() {
+                                    remove = Some(e.id.clone());
+                                }
+                            },
+                        );
                     });
-                    ui.label(RichText::new(&e.detail).size(12.0).color(theme::MUTED));
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!self.working, egui::Button::new(profiles::REMOVE_PROFILE)).clicked() {
-                        remove = Some(e.id.clone());
-                    }
-                    if e.waiting && ui.add_enabled(!self.working, egui::Button::new(profiles::SIGN_IN_AGAIN)).clicked() {
-                        again = Some(e.id.clone());
-                    }
-                });
-            });
-            ui.separator();
-        }
+            }
+        });
         if let Some(id) = again {
             self.sign_in_again(&id);
         }
@@ -1146,11 +1266,12 @@ impl Panel {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             answer = Some(false);
         }
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
         crate::share_ui::modal(egui::Id::unique("remove-profile")).frame(frame).show(ctx, |ui| {
-            ui.set_width(420.0);
+            theme::roomy(ui);
+            ui.set_width(theme::DIALOG_WIDTH);
             note(ui, Tone::Warn, &text);
-            ui.add_space(12.0);
+            theme::block_gap(ui);
             ui.horizontal(|ui| {
                 if ui.add(theme::danger_button(profiles::REMOVE)).clicked() {
                     answer = Some(true);
@@ -1166,6 +1287,50 @@ impl Panel {
             None => {}
         }
     }
+}
+
+/// The active profile's card: the badge with its initials, its name, "Signed in as" when the site
+/// named an account, the status `pill`, and "Switch profile", which opens the profile list.
+/// What was picked in that list.
+fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str, theme::Tone)>, rows: &[Entry], enabled: bool) -> Option<Pick> {
+    let mut pick = None;
+    theme::card(ui, |card| {
+        card.full(|ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::SPACE_3;
+                match active {
+                    Some(active) => drop(theme::initials_badge(ui, &active.name)),
+                    // No profile is active: the badge's place is kept, empty.
+                    None => drop(theme::badge_placeholder(ui)),
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = theme::ITEM_GAP;
+                    let button = ui.add_enabled_ui(enabled, |ui| theme::icon_button(ui, profiles::SWITCH_PROFILE, crate::icons::Icon::ChevronDown, theme::IconSide::Trailing)).inner;
+                    egui::Popup::menu(&button).show(|ui| profile_menu(ui, rows, &mut pick));
+                    if let Some((text, tone)) = pill {
+                        theme::pill(ui, text, tone);
+                    }
+                    if let Some(active) = active {
+                        let name = egui::Label::new(theme::strong(RichText::new(&active.name).size(theme::STRONG_SIZE))).truncate();
+                        match crate::workspace_ui::signed_in_line(active.account.as_deref()) {
+                            Some(line) => {
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+                                    ui.add(name);
+                                    ui.add(egui::Label::new(RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                                });
+                            }
+                            // The name alone stands level with the middle of the badge.
+                            None => {
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(name));
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    });
+    pick
 }
 
 /// Whether profile `p` (the active one) shows "needs you to sign in again": the site refused

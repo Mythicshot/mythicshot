@@ -264,6 +264,14 @@ const SINGLE_IMG_SRC: &str = "img-src data:;";
 // are cut from the same page and can never drift from it. The preview and the single file drop the
 // markers, so their bytes are exactly what they were without them.
 const CSS_BEGIN: &str = "/*PLAYER_CSS_BEGIN*/";
+// The player's own colours (its chrome) are the block between `/*CHROME_BEGIN*/` and `/*CHROME_END*/` at the
+// top of the player's styles. Each copies a brand token from the brand's `tokens.json`, dark values because
+// the player is always dark, which are the app's palette `theme::DARK`; the exported comment names only the
+// token. `--chrome-gold-soft`, `-pulse` and `-gone` are gold at .18, .6 and 0 (an older tour's hotspot ring
+// and its pulse), `--chrome-end-scrim` is ground at .72 (an older tour's end card), and `--chrome-focus-light`
+// is the light value of `focus`, for focus inside a light card. A tour's accent, card style, backdrop and
+// logo are the author's and are not in the block. `the_player_chrome_is_the_brand_and_the_accent_is_the_authors`
+// pins every value. A site's index copies both values of each neutral token the same way (see `site::pages`).
 const CSS_END: &str = "/*PLAYER_CSS_END*/";
 const HTML_BEGIN: &str = "<!--PLAYER_HTML_BEGIN-->";
 const HTML_END: &str = "<!--PLAYER_HTML_END-->";
@@ -718,6 +726,35 @@ fn write_into(
     Ok((n, total, squeezed))
 }
 
+/// Reading the brand colours the exported pages copy, for the tests of the player and of a site.
+#[cfg(test)]
+pub(crate) mod brand_css {
+    use eframe::egui::Color32;
+
+    /// The value of the first `--name:` declaration in `css`, without the semicolon.
+    pub fn var<'a>(css: &'a str, name: &str) -> &'a str {
+        let decl = format!("--{name}:");
+        let rest = css.split_once(&decl).unwrap_or_else(|| panic!("no {decl} in the stylesheet")).1;
+        rest.split(';').next().unwrap().trim()
+    }
+
+    /// `#rrggbb` as an opaque colour.
+    pub fn colour(hex: &str) -> Color32 {
+        let h = hex.strip_prefix('#').filter(|h| h.len() == 6).unwrap_or_else(|| panic!("{hex} is not #rrggbb"));
+        let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap();
+        Color32::from_rgb(byte(0), byte(2), byte(4))
+    }
+
+    /// The player's chrome before it took the brand's colours; none may come back.
+    pub const OLD_SLATE_CHROME: [&str; 13] =
+        ["#16181d", "#d8dbe2", "#262a33", "#3a4152", "#9aa3b5", "#20242d", "#8ab4ff", "#f2b84b", "242, 184, 75", "#1b1f27", "#8e97a8", "22, 24, 29", "#5a6378"];
+
+    /// A colour as the stylesheets write it.
+    pub fn hex(c: Color32) -> String {
+        format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1044,113 @@ mod tests {
         assert!(PREVIEW_TEMPLATE.contains(r#"<button id="restart""#));
         assert!(PREVIEW_TEMPLATE.contains(":focus-visible"));
     }
+
+    /// The player's own chrome copies the brand's dark tokens (the player is dark-only), which are the
+    /// app's palette in `theme.rs`; the tour's accent stays the author's default.
+    #[test]
+    fn the_player_chrome_is_the_brand_and_the_accent_is_the_authors() {
+        use crate::theme::{DARK, contrast};
+        use brand_css::{OLD_SLATE_CHROME, colour, hex, var};
+        let css = player_css();
+        for (name, token) in [
+            ("chrome-ground", DARK.ground),
+            ("chrome-surface", DARK.surface),
+            ("chrome-border", DARK.border),
+            ("chrome-border-strong", DARK.border_strong),
+            ("chrome-text", DARK.text),
+            ("chrome-muted", DARK.muted),
+            ("chrome-gold", DARK.gold),
+            ("chrome-gold-text", DARK.accent),
+            ("chrome-focus", DARK.focus),
+        ] {
+            assert_eq!(var(css, name), hex(token), "--{name}");
+        }
+        // The gold the older players' hotspot ring is drawn with, at its alphas.
+        for (name, alpha) in [("chrome-gold-soft", ".18"), ("chrome-gold-pulse", ".6"), ("chrome-gold-gone", "0")] {
+            assert_eq!(var(css, name), format!("rgba(245, 184, 65, {alpha})"), "--{name}");
+        }
+        assert_eq!(var(css, "chrome-end-scrim"), "rgba(22, 18, 28, .72)", "ground behind the older players' end card");
+        // The chrome block is the only place the chrome's colours are typed.
+        let root = css.split_once("/*CHROME_BEGIN*/").unwrap().1.split_once("/*CHROME_END*/").unwrap().0;
+        let rest = css.replacen(root, "", 1);
+        for v in [DARK.ground, DARK.surface, DARK.border, DARK.border_strong, DARK.text, DARK.muted, DARK.gold] {
+            assert!(!rest.contains(&hex(v)), "{} typed outside the chrome block", hex(v));
+        }
+        // The brand focus ring: 2px solid with a 2px offset, and nothing hides it.
+        assert!(css.contains(":focus-visible { outline: 2px solid var(--chrome-focus); outline-offset: 2px; }"), "{css}");
+        assert!(!css.contains("outline: none") && !css.contains("outline: 0"));
+        // Contrast of the chrome's text and focus ring on the grounds they sit on.
+        let (ground, surface) = (colour(var(css, "chrome-ground")), colour(var(css, "chrome-surface")));
+        for (what, fg, min) in [("text", "chrome-text", 4.5), ("muted text", "chrome-muted", 4.5), ("focus ring", "chrome-focus", 3.0)] {
+            for (on, bg) in [("ground", ground), ("surface", surface)] {
+                let c = contrast(colour(var(css, fg)), bg);
+                assert!(c >= min, "{what} on {on}: {c:.2}");
+            }
+        }
+        // No colour of the old slate chrome is left in the page (a site's own rules are checked in `site::pages`).
+        for old in OLD_SLATE_CHROME {
+            assert!(!PREVIEW_TEMPLATE.contains(old), "old chrome colour {old}");
+        }
+        // The author's parts are untouched: the default accent and its text, the auto backdrop's base and the card styles.
+        assert_eq!(var(css, "accent"), "#5dcaa5");
+        assert_eq!(var(css, "on-accent"), "#0c1d17");
+        assert!(PREVIEW_TEMPLATE.contains(r##"TourCore.color(theme.accent, "#5dcaa5")"##) && PREVIEW_TEMPLATE.contains(r##"mix("#111318", accent, 0.06)"##));
+        assert!(css.contains("#card.dark { background: #1a1e26;") && css.contains("#card.light { background: #fcfcfd;"));
+        assert!(css.contains(".v3 #ring { width: 30px; height: 30px; margin: -15px 0 0 -15px; border: 2px solid var(--accent);"));
+        assert!(css.contains(".v3 #restart { color: var(--accent); }"));
+    }
+
+    /// The gold focus ring is for dark grounds: inside a light card (Light, Compact, and Auto when the
+    /// script resolves it to `light`) it is the brand's light focus colour.
+    #[test]
+    fn the_focus_ring_stays_visible_on_light_cards() {
+        use crate::theme::contrast;
+        use brand_css::{colour, var};
+        let css = player_css();
+        assert_eq!(var(css, "chrome-focus-light"), "#8a5a00", "the brand's focus colour on light grounds");
+        assert!(css.contains("#card.light :focus-visible, #card.compact :focus-visible { outline: 2px solid var(--chrome-focus-light); outline-offset: 2px; }"), "{css}");
+        // Auto reaches the card as one of the classes above, never as a class of its own.
+        assert!(PREVIEW_TEMPLATE.contains(r#"function style() { return cardStyle === "auto" ? (prefersDark.matches ? "dark" : "light") : cardStyle; }"#));
+        assert!(PREVIEW_TEMPLATE.contains(r#"var palette = style() === "compact" ? "light" : style();"#));
+        for card in ["#card.light { ", "#card.compact { "] {
+            let rule = css.split_once(card).unwrap().1.split('}').next().unwrap();
+            let bg = rule.split("background: ").nth(1).unwrap().split(';').next().unwrap();
+            let c = contrast(colour(var(css, "chrome-focus-light")), colour(bg));
+            assert!(c >= 3.0, "light focus ring on {card}{bg}: {c:.2}");
+        }
+    }
+
+    /// Around an older player's gold hotspot ring and its gold pulse, the focus ring is the chrome's text
+    /// colour, so it is not taken for the pulse. Version 3 keeps the general rule.
+    #[test]
+    fn the_older_hotspot_ring_has_a_focus_ring_unlike_its_pulse() {
+        use crate::theme::contrast;
+        use brand_css::{colour, var};
+        let css = player_css();
+        assert!(css.contains("body:not(.v3) #ring:focus-visible { outline: 2px solid var(--chrome-text); outline-offset: 2px; }"), "{css}");
+        let c = contrast(colour(var(css, "chrome-text")), colour(var(css, "chrome-ground")));
+        assert!(c >= 3.0, "older hotspot focus ring on ground: {c:.2}");
+    }
+
+    /// The chrome block ships in every exported page, so its comments name only each colour's role; the
+    /// mapping to the brand's files is documented beside `CHROME_BEGIN` in this file. Nothing in the
+    /// page's styles names an internal file.
+    #[test]
+    fn the_exported_chrome_block_names_only_roles() {
+        let block = player_css().split_once("/*CHROME_BEGIN*/").unwrap().1.split_once("/*CHROME_END*/").unwrap().0;
+        let roles = ["ground", "surface", "border", "border-strong", "text", "text-muted", "gold", "accent-text", "focus"];
+        let comments: Vec<&str> = block.split("/*").skip(1).map(|c| c.split_once("*/").unwrap().0.trim()).collect();
+        assert!(!comments.is_empty());
+        for c in comments {
+            assert!(roles.iter().any(|r| c == *r || c.starts_with(&format!("{r} "))), "a comment that is not a role: {c}");
+        }
+        let style = PREVIEW_TEMPLATE.split_once("</style>").unwrap().0;
+        for (part, text) in [("chrome block", block), ("the page's head and styles", style)] {
+            assert!(!text.contains(".json") && !text.contains(".rs"), "{part} names an internal file");
+        }
+    }
+
+
 
     #[test]
     fn no_clicks_leaves_no_folder_behind() {
@@ -2103,10 +2247,11 @@ mod tests {
             assert!(!html.contains(m) && !TOUR_CORE_JS.contains(m), "{m}");
         }
         // Byte for byte the page written before the markers existed. Change this only together with a
-        // reviewed change to the preview page or the shared rules.
+        // reviewed change to the preview page or the shared rules. Last changed when the chrome took the
+        // brand's colours.
         use sha2::Digest;
         let hash: String = sha2::Sha256::digest(html.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hash, "048d477819f6d38db7fc90ee146eb5042cb6730aaa0d0727bbe582f770a970cd");
+        assert_eq!(hash, "6e86be5fe474ece609edda308e50253a356dcf2a95f6c129764f4fb9d97afeeb");
         // Text in a manifest that looks like a marker stays as it is.
         let page = preview_page(r#"{"title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->"}"#);
         assert!(page.contains(r#""title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->""#));

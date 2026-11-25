@@ -65,6 +65,23 @@ pub enum Icon {
     Lock,
     /// A triangle with an exclamation mark: the icon of every caution box.
     Warning,
+    /// Add something: Add profile.
+    Plus,
+    /// A list opens under the control: Switch profile.
+    ChevronDown,
+    /// The main window's left menu, one per page.
+    Home,
+    Tours,
+    Workspace,
+    Preferences,
+}
+
+impl Icon {
+    /// Every icon, for the tests that draw them all.
+    #[cfg(test)]
+    pub const ALL: [Icon; 59] = [
+        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Donut, Icon::Slice, Icon::Cross, Icon::Asterisk, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences,
+    ];
 }
 
 
@@ -359,6 +376,72 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::Shadow => {
             p.rect_filled(rect(0.25, 0.25, 1.0, 1.0), 2.0, theme::ICON_SHADOW);
             p.rect_stroke(rect(0.0, 0.0, 0.75, 0.75), 2.0, s, StrokeKind::Middle);
+        }
+        Icon::Plus => {
+            p.add(line(&[(0.5, 0.12), (0.5, 0.88)]));
+            p.add(line(&[(0.12, 0.5), (0.88, 0.5)]));
+        }
+        Icon::ChevronDown => {
+            p.add(line(&[(0.18, 0.36), (0.5, 0.68), (0.82, 0.36)]));
+        }
+        Icon::Home => {
+            // A house: the roof, the walls and the door.
+            p.add(line(&[(0.06, 0.5), (0.5, 0.1), (0.94, 0.5)]));
+            p.add(line(&[(0.2, 0.4), (0.2, 0.92), (0.8, 0.92), (0.8, 0.4)]));
+            p.add(line(&[(0.41, 0.92), (0.41, 0.64), (0.59, 0.64), (0.59, 0.92)]));
+        }
+        Icon::Tours => {
+            // A screen with the play mark of a tour on it.
+            p.rect_stroke(rect(0.04, 0.14, 0.96, 0.86), 2.5, s, StrokeKind::Middle);
+            p.add(poly(&[(0.4, 0.32), (0.7, 0.5), (0.4, 0.68)]));
+        }
+        Icon::Workspace => {
+            // A globe: the site the tours are published to.
+            p.circle_stroke(r.center(), r.width() * 0.44, s);
+            p.add(Shape::ellipse_stroke(r.center(), vec2(r.width() * 0.2, r.height() * 0.44), thin));
+            p.add(Shape::line_segment([at(0.06, 0.5), at(0.94, 0.5)], thin));
+        }
+        Icon::Preferences => {
+            // A gear: a ring with eight teeth.
+            p.circle_stroke(r.center(), r.width() * 0.24, s);
+            for i in 0..8 {
+                let a = std::f32::consts::TAU * i as f32 / 8.0;
+                let (x, y) = (a.cos(), a.sin());
+                p.add(Shape::line_segment([at(0.5 + 0.3 * x, 0.5 + 0.3 * y), at(0.5 + 0.46 * x, 0.5 + 0.46 * y)], Stroke::new(s.width * 1.4, c)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every icon draws something, inside its square and in the colour asked for, at 100% and
+    /// 200%; the ones the main window's pages use among them.
+    #[test]
+    fn every_icon_draws_inside_its_square_in_its_colour() {
+        for ppp in [1.0, 2.0] {
+            for icon in Icon::ALL {
+                let side = 18.0;
+                let size = vec2(side + 8.0, side + 8.0);
+                let image = crate::snapshot::picture(&theme::test_context(), size, ppp, 1, |ui| {
+                    ui.painter().rect_filled(Rect::from_min_size(Pos2::ZERO, size), 0.0, theme::SURFACE);
+                    paint(ui.painter(), Rect::from_min_size(pos2(4.0, 4.0), Vec2::splat(side)), icon, theme::TEXT);
+                });
+                let inked = image.enumerate_pixels().filter(|(_, _, p)| theme::contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), theme::SURFACE) >= 3.0).collect::<Vec<_>>();
+                assert!(inked.len() as f32 >= 8.0 * ppp * ppp, "{icon:?} at {ppp} draws almost nothing");
+                // The page icons stay inside their square (a pixel of slack for the line's
+                // width); some older toolbar icons reach a little past theirs on purpose.
+                if !matches!(icon, Icon::Plus | Icon::ChevronDown | Icon::Home | Icon::Tours | Icon::Workspace | Icon::Preferences) {
+                    continue;
+                }
+                let slack = 2.0 * ppp;
+                for (x, y, _) in &inked {
+                    let (x, y) = (*x as f32, *y as f32);
+                    assert!(x >= 4.0 * ppp - slack && x <= (4.0 + side) * ppp + slack && y >= 4.0 * ppp - slack && y <= (4.0 + side) * ppp + slack, "{icon:?} at {ppp} draws outside its square at {x},{y}");
+                }
+            }
         }
     }
 }
