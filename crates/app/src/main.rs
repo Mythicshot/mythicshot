@@ -22,6 +22,7 @@ mod input;
 mod live_draw;
 mod main_window;
 mod menu_bar;
+mod open_image;
 mod overlay;
 mod placement;
 mod password;
@@ -85,6 +86,8 @@ enum AppEvent {
     /// The thread that expanded a recording kept as a video has ended: the project it was asked
     /// to open, and the recording ready for an editor or why there is none.
     ProjectOpened(Box<(project::ProjectKey, Result<project::Loaded, project::LoadError>)>),
+    /// The thread that read a picture file has ended: the file, and its picture or why there is none.
+    ImageLoaded(Box<(u64, PathBuf, Result<image::RgbaImage, image::ImageError>)>),
 }
 
 /// A recording kept as a video that is being expanded for an editor, on a thread of its own.
@@ -220,6 +223,8 @@ struct App {
     draw_when_live: bool,
     /// The recording kept as a video that is being expanded for an editor.
     opening: Option<Opening>,
+    /// The picture files being read for an editor, on threads of their own; the newest request wins.
+    images: open_image::ImageLoads,
     /// Quit asked the editors that would lose something, and waits for their answers.
     quitting: bool,
     /// The capture waiting in `hide_then_run` came from an editor's menu bar, for the capture log.
@@ -370,6 +375,7 @@ impl App {
             started: Instant::now(),
             draw_when_live: false,
             opening: None,
+            images: open_image::ImageLoads::default(),
             quitting: false,
             menu_capture: false,
             update_started: false,
@@ -439,6 +445,10 @@ impl App {
                     let (key, result) = *done;
                     self.project_opened(key, result);
                 }
+                AppEvent::ImageLoaded(done) => {
+                    let (generation, path, result) = *done;
+                    self.image_loaded(ctx, generation, &path, result);
+                }
                 AppEvent::Input(ev) => {
                     if self.session.is_some() {
                         self.rec_events.push(ev);
@@ -495,7 +505,7 @@ impl App {
                 Ok(img) => self.captured(ctx, img, "Clipboard image".into()),
                 Err(e) => self.notify(e),
             },
-            Command::OpenFile => self.open_file(),
+            Command::OpenFile => self.open_file(ctx),
             Command::ToggleDestination(d) => {
                 self.settings.toggle_destination(d);
                 self.settings_changed();
@@ -567,7 +577,7 @@ impl App {
     }
 
     /// What an update waits for: a recording or its countdown, a GIF being saved, a capture on
-    /// screen or a picker waiting, a recording being opened, a publish, update, share or Tours
+    /// screen or a picker waiting, a recording or a picture file being opened, a publish, update, share or Tours
     /// job (each holds its profile), a tour export, an add to a site, an editor that exports or
     /// publishes, and an editor of a saved recording, whose edits not sent to the site a close
     /// would drop. An editor with unsaved changes asks its own question when the app closes.
@@ -575,6 +585,7 @@ impl App {
         self.session.is_some()
             || !self.encoding.is_empty()
             || self.opening.is_some()
+            || self.images.pending()
             || self.activity().busy()
             || profiles::holds::global().any_held()
             || publish_ui::any_running()
@@ -1090,15 +1101,40 @@ impl App {
         }
     }
 
-    fn open_file(&mut self) {
-        let picked = dialogs::pick_file(rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir), "open image");
-        let Some(path) = picked else { return };
-        match image::open(&path) {
-            Ok(img) => {
-                let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.open_editor(img.to_rgba8(), title);
-            }
-            Err(e) => self.notify(format!("Could not open {}: {e}", path.display())),
+    fn open_file(&mut self, ctx: &egui::Context) {
+        let Some(path) = open_image::pick(&self.settings.output_dir) else { return };
+        self.open_image_file(ctx, path);
+    }
+
+    /// Read the picture file at `path` within [`open_image::load`]'s limits on a thread of its
+    /// own, so the windows stay responsive; [`AppEvent::ImageLoaded`] brings it back, and the
+    /// editor is made here, on the app's thread. A request while others are being read is taken
+    /// too: the newest wins ([`open_image::ImageLoads`]).
+    fn open_image_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if let Some(job) = self.images.request(path) {
+            self.start_image_read(ctx, job);
+        }
+    }
+
+    fn start_image_read(&mut self, ctx: &egui::Context, (generation, path): open_image::ReadJob) {
+        let (tx, wake) = (self.tx.clone(), ctx.clone());
+        open_image::spawn_load(path, move |path, result| {
+            let _ = tx.send(AppEvent::ImageLoaded(Box::new((generation, path, result))));
+            wake.request_repaint();
+        });
+    }
+
+    /// A picture file has been read: open it in an editor or say it could not be opened, when it
+    /// is the newest request's; an older one is dropped without a word.
+    fn image_loaded(&mut self, ctx: &egui::Context, generation: u64, path: &Path, result: Result<image::RgbaImage, image::ImageError>) {
+        let (settled, next) = self.images.finished(generation, path, result);
+        if let Some(job) = next {
+            self.start_image_read(ctx, job);
+        }
+        match settled {
+            open_image::Settled::Open(img, title) => self.open_editor(img, title),
+            open_image::Settled::Failed(sentence) => self.notify(sentence),
+            open_image::Settled::Superseded => {}
         }
     }
 
@@ -1425,13 +1461,20 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture, edit_project, requests) = {
+        let (actions, edited, tab, capture, edit_project, requests, open) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests))
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take())
         };
+        // The Open image tile: exactly what the tray's "Open image from file…" runs. A picture
+        // dropped on the window opens the same way as one picked there. The window stays.
+        match open {
+            Some(open_image::OpenImage::Pick) => self.run(ctx, Command::OpenFile),
+            Some(open_image::OpenImage::Dropped(path)) => self.open_image_file(ctx, path),
+            None => {}
+        }
         for request in requests {
             self.menu_request(ctx, request);
         }

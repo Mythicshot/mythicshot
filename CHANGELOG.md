@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.37 (2026-11-25)
+
+- Home has a fifth tile, "Open image", which opens a picture file in the editor as if it had just been captured. Dropping a picture file on the Mythicshot window does the same; while you drag, the window says whether the file can be opened.
+- Opening a picture is safer and no longer holds the window up: the file is read in the background, files over 64 MB and pictures over 16,384 pixels on a side or too large to hold in memory are refused before they are decoded, the kind of picture is told from its contents and not its name, and a damaged file gives "Could not open" where it could have closed Mythicshot. This goes for the tray's "Open image from file…" too.
+- An update waits for a picture that is still being opened.
+
 ## 0.2.36 (2026-11-25)
 
 - Menus and dropdowns show what the pointer is on: the row lights up across its whole width, the whole row can be clicked, and the pointer becomes a hand. This goes for the profile list, the menu bar, the editor's menus and every dropdown. In the profile list the active profile also has a bar at its left edge.

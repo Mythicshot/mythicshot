@@ -9,6 +9,7 @@ use eframe::egui::{self, Align, Align2, CornerRadius, FontId, Layout, RichText, 
 use crate::hotkeys::{self, Action};
 use crate::icons::{self, Icon};
 use crate::main_window::PageOut;
+use crate::open_image::OpenImage;
 use crate::platform;
 use crate::settings::Settings;
 use crate::theme;
@@ -33,25 +34,53 @@ pub const NOTHING_RECENT: &str = "Nothing is saved in the captures folder yet.";
 pub const READING_RECENT: &str = "Reading the captures folder…";
 pub const CANNOT_READ_RECENT: &str = "The captures folder cannot be read right now.";
 
-/// A capture tile: what it is called, the action whose hotkey it shows, and the command it runs,
-/// the same one the tray menu and the hotkey run.
+/// The Open image tile's caption, where the capture tiles show their hotkey.
+pub const OR_DROP_A_FILE: &str = "or drop a file";
+
+/// A tile: what it is called, the action whose hotkey it shows (none for Open image, which shows
+/// [`OR_DROP_A_FILE`]), and the command it runs, the same one the tray menu and the hotkey run.
 pub struct Tile {
     pub name: &'static str,
     pub icon: Icon,
-    pub action: Action,
+    pub action: Option<Action>,
     pub command: Command,
 }
 
-pub const TILES: [Tile; 4] = [
-    Tile { name: "Region", icon: Icon::Region, action: Action::CaptureRegion, command: Command::Region },
-    Tile { name: "Window", icon: Icon::Window, action: Action::CaptureWindow, command: Command::Window },
-    Tile { name: "Full screen", icon: Icon::Screen, action: Action::CaptureFullScreen, command: Command::FullScreen },
-    Tile { name: "Record", icon: Icon::Record, action: Action::RecordRegion, command: Command::Record },
+pub const TILES: [Tile; 5] = [
+    Tile { name: "Region", icon: Icon::Region, action: Some(Action::CaptureRegion), command: Command::Region },
+    Tile { name: "Window", icon: Icon::Window, action: Some(Action::CaptureWindow), command: Command::Window },
+    Tile { name: "Full screen", icon: Icon::Screen, action: Some(Action::CaptureFullScreen), command: Command::FullScreen },
+    Tile { name: "Record", icon: Icon::Record, action: Some(Action::RecordRegion), command: Command::Record },
+    Tile { name: "Open image", icon: Icon::OpenImage, action: None, command: Command::OpenFile },
 ];
+
+/// The narrowest a tile may be; tiles that would be narrower wrap to another row.
+pub const TILE_MIN_WIDTH: f32 = 96.0;
+pub const TILE_HEIGHT: f32 = 112.0;
 
 /// The hotkey a tile shows: the one set for its action now, empty when it has none.
 pub fn tile_hotkey(settings: &Settings, action: Action) -> String {
     hotkeys::display(settings.binding(action))
+}
+
+/// What a tile shows under its name: its hotkey, or for Open image [`OR_DROP_A_FILE`].
+pub fn tile_caption(settings: &Settings, t: &Tile) -> String {
+    match t.action {
+        Some(action) => tile_hotkey(settings, action),
+        None => OR_DROP_A_FILE.to_string(),
+    }
+}
+
+/// How `count` tiles share `width` with `gap` between them: how many stand on a row and how wide
+/// each is. As many as fit at [`TILE_MIN_WIDTH`] stand on a row; when that is not all of them,
+/// the rows are evened out (five in two rows: three and two), all tiles the same width.
+pub fn tile_grid(width: f32, count: usize, gap: f32) -> (usize, f32) {
+    let count = count.max(1);
+    let fit = (((width + gap) / (TILE_MIN_WIDTH + gap)).floor() as usize).clamp(1, count);
+    let rows = count.div_ceil(fit);
+    let per_row = count.div_ceil(rows);
+    let tile = ((width - gap * (per_row - 1) as f32) / per_row as f32).max(TILE_MIN_WIDTH.min(width));
+    (per_row, tile)
 }
 
 /// A file in the captures folder.
@@ -207,15 +236,25 @@ impl HomeState {
 pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: bool, out: &mut PageOut) {
     ui.heading("Capture");
     let gap = theme::ITEM_GAP;
-    let width = ((ui.available_width() - gap * (TILES.len() - 1) as f32) / TILES.len() as f32).max(96.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for t in &TILES {
-            if tile(ui, t, &tile_hotkey(settings, t.action), width, !busy) {
-                out.capture = Some(t.command);
+    let (per_row, width) = tile_grid(ui.available_width(), TILES.len(), gap);
+    let spacing = std::mem::replace(&mut ui.spacing_mut().item_spacing.y, gap);
+    for row in TILES.chunks(per_row) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for t in row {
+                // Open image starts no capture, so it works while one is going on, as the tray's item does.
+                let opens = t.command == Command::OpenFile;
+                if tile(ui, t, &tile_caption(settings, t), width, opens || !busy) {
+                    if opens {
+                        out.open_image = Some(OpenImage::Pick);
+                    } else {
+                        out.capture = Some(t.command);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
+    ui.spacing_mut().item_spacing.y = spacing;
     theme::caption(ui, RECORD_A_TOUR);
     theme::block_gap(ui);
     ui.heading("Recent");
@@ -243,17 +282,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: b
     ui.ctx().request_repaint_after(REFRESH_EVERY);
 }
 
-/// One capture tile: its icon, its name and its hotkey. Returns whether it was clicked.
-fn tile(ui: &mut egui::Ui, t: &Tile, hotkey: &str, width: f32, enabled: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 112.0), if enabled { Sense::click() } else { Sense::hover() });
+/// One tile: its icon, its name and its caption (a hotkey, or Open image's words). Returns
+/// whether it was clicked.
+fn tile(ui: &mut egui::Ui, t: &Tile, caption: &str, width: f32, enabled: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, TILE_HEIGHT), if enabled { Sense::click() } else { Sense::hover() });
     let hovered = enabled && resp.hovered();
     let p = ui.painter();
     p.rect(rect, CornerRadius::same(theme::RADIUS_LG), if hovered { theme::RAISED } else { theme::SURFACE }, Stroke::new(1.0, theme::BORDER_STRONG), StrokeKind::Inside);
     let (fg, dim) = if enabled { (theme::TEXT, theme::MUTED) } else { (theme::DISABLED, theme::DISABLED) };
     icons::paint(p, egui::Rect::from_center_size(pos2(rect.center().x, rect.top() + 34.0), vec2(28.0, 28.0)), t.icon, fg);
     p.text(pos2(rect.center().x, rect.top() + 70.0), Align2::CENTER_CENTER, t.name, FontId::proportional(14.0), fg);
-    if !hotkey.is_empty() {
-        p.text(pos2(rect.center().x, rect.top() + 92.0), Align2::CENTER_CENTER, hotkey, FontId::monospace(12.0), dim);
+    if !caption.is_empty() {
+        // A hotkey in the monospace face; Open image's words in the body face.
+        let font = if t.action.is_some() { FontId::monospace(12.0) } else { FontId::proportional(theme::SMALL_SIZE) };
+        p.text(pos2(rect.center().x, rect.top() + 92.0), Align2::CENTER_CENTER, caption, font, dim);
     }
     resp.clicked()
 }
@@ -444,8 +486,8 @@ mod tests {
         s.hotkeys.insert(Action::CaptureWindow, "alt+PrintScreen".into());
         s.hotkeys.insert(Action::CaptureFullScreen, String::new());
         s.hotkeys.insert(Action::RecordRegion, "control+shift+KeyR".into());
-        let shown: Vec<(&str, String)> = TILES.iter().map(|t| (t.name, tile_hotkey(&s, t.action))).collect();
-        assert_eq!(shown, [("Region", "PrtSc".to_string()), ("Window", "Alt+PrtSc".to_string()), ("Full screen", String::new()), ("Record", "Ctrl+Shift+R".to_string())]);
+        let shown: Vec<(&str, String)> = TILES.iter().map(|t| (t.name, tile_caption(&s, t))).collect();
+        assert_eq!(shown, [("Region", "PrtSc".to_string()), ("Window", "Alt+PrtSc".to_string()), ("Full screen", String::new()), ("Record", "Ctrl+Shift+R".to_string()), ("Open image", "or drop a file".to_string())]);
         // An action missing from the file has no hotkey to show.
         s.hotkeys.remove(&Action::CaptureRegion);
         assert_eq!(tile_hotkey(&s, Action::CaptureRegion), "");
@@ -454,9 +496,36 @@ mod tests {
     #[test]
     fn each_tile_runs_the_command_its_hotkey_runs() {
         for t in &TILES {
-            assert_eq!(t.command, Command::from_action(t.action), "{}", t.name);
+            match t.action {
+                Some(action) => assert_eq!(t.command, Command::from_action(action), "{}", t.name),
+                // Open image has no hotkey: it runs the tray's "Open image from file…".
+                None => assert_eq!((t.name, t.command), ("Open image", Command::OpenFile)),
+            }
         }
-        assert_eq!(TILES.iter().map(|t| t.command).collect::<Vec<_>>(), [Command::Region, Command::Window, Command::FullScreen, Command::Record]);
+        assert_eq!(TILES.iter().map(|t| t.command).collect::<Vec<_>>(), [Command::Region, Command::Window, Command::FullScreen, Command::Record, Command::OpenFile]);
+        assert_eq!(TILES[4].icon, Icon::OpenImage);
+    }
+
+    /// Five tiles fit on one row on the window's usual page; at its smallest they go to two
+    /// rows of three and two, all the same width, never narrower than the least a tile may be.
+    #[test]
+    fn the_tiles_wrap_to_a_second_row_when_the_page_is_narrow() {
+        let gap = theme::ITEM_GAP;
+        // The page beside the left menu, inside its margins, at the usual and the smallest window.
+        let page = |window: f32| window - 170.0 - 2.0 * theme::PAGE_PAD;
+        let (n, w) = tile_grid(page(760.0), 5, gap);
+        assert_eq!(n, 5);
+        assert!((5.0 * w + 4.0 * gap - page(760.0)).abs() < 0.01 && w >= TILE_MIN_WIDTH, "{w}");
+        let (n, w) = tile_grid(page(640.0), 5, gap);
+        assert_eq!(n, 3, "three and two");
+        assert!((3.0 * w + 2.0 * gap - page(640.0)).abs() < 0.01 && w >= TILE_MIN_WIDTH, "{w}");
+        // However narrow, every row fits the width, and only one tile stands alone when nothing else fits.
+        for width in [96.0, 150.0, 200.0, 300.0, 400.0, 512.0, 600.0, 1000.0] {
+            let (n, w) = tile_grid(width, 5, gap);
+            assert!(n >= 1 && n <= 5, "{width}");
+            assert!(n as f32 * w + (n - 1) as f32 * gap <= width + 0.01, "{width}: {n} of {w}");
+            assert!(w >= TILE_MIN_WIDTH - 0.01, "{width}: {w}");
+        }
     }
 
     #[test]

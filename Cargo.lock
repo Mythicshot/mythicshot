@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "arboard",
  "chrono",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-capture"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "image",
  "xcap",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-destinations"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "arboard",
  "chrono",
@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-editor"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "ab_glyph",
  "epaint_default_fonts",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-recording"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "gifski",
  "image",
@@ -3918,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "phase0"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "eframe",
  "gifski",
