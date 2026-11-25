@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontId, Rect, Shape, Stroke, pos2, vec2};
 use image::error::{ImageFormatHint, LimitError, LimitErrorKind, UnsupportedError, UnsupportedErrorKind};
@@ -153,12 +154,109 @@ fn open_disk_file(path: &Path) -> Result<File, ImageError> {
     Ok(file)
 }
 
-/// The most picture reads that may run at once, each on a thread of its own. A read stuck on a
-/// share that does not answer keeps its thread, so this bounds how many such threads there are.
+/// The most picture reads one window may run at once, each on a thread of its own. A read stuck
+/// on a share that does not answer keeps its thread, so this bounds how many such threads there are.
 pub const MAX_READS: usize = 2;
 
-/// A read to start: its generation and the file.
-pub type ReadJob = (u64, PathBuf);
+/// The most picture reads the whole app may run at once, whatever the number of windows: each
+/// may hold up to [`MAX_FILE_BYTES`] read and [`MAX_DECODED_BYTES`] decoded while it runs.
+pub const MAX_READS_ALL: usize = 4;
+
+/// The read slots the windows share ([`MAX_READS_ALL`] in the app). A slot is taken when a read
+/// starts and given back when its thread is done with the picture, on every way out, a panic
+/// included ([`Slot`] gives it back when dropped); every window that set a wake is then woken,
+/// to start a waiting read if a slot is free ([`ImageLoads::retry`]).
+pub struct ReadPool {
+    cap: usize,
+    state: std::sync::Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    in_flight: usize,
+    wakers: Vec<std::sync::Weak<dyn Fn() + Send + Sync>>,
+}
+
+/// What wakes a window when a slot is given back.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+impl ReadPool {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self { cap, state: std::sync::Mutex::new(PoolState::default()) })
+    }
+
+    /// The pool every window of the app shares.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: std::sync::OnceLock<Arc<ReadPool>> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(|| ReadPool::new(MAX_READS_ALL)).clone()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A slot, if one is free.
+    fn take(self: &Arc<Self>) -> Option<Slot> {
+        let mut st = self.state();
+        if st.in_flight >= self.cap {
+            return None;
+        }
+        st.in_flight += 1;
+        Some(Slot(self.clone()))
+    }
+
+    /// Call `waker` whenever a slot is given back, for as long as it lives.
+    fn register(&self, waker: &Waker) {
+        self.state().wakers.push(Arc::downgrade(waker));
+    }
+
+    /// How many reads hold a slot now.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.state().in_flight
+    }
+}
+
+/// A read's slot in a [`ReadPool`], given back when dropped.
+pub struct Slot(Arc<ReadPool>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let wakers: Vec<Waker> = {
+            let mut st = self.0.state();
+            st.in_flight = st.in_flight.saturating_sub(1);
+            st.wakers.retain(|w| w.strong_count() > 0);
+            st.wakers.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        // Outside the lock: a wake may ask for a slot again.
+        for wake in wakers {
+            wake();
+        }
+    }
+}
+
+/// A read to start: its generation, the file, and the app-wide slot it holds while it runs.
+pub struct ReadJob {
+    pub generation: u64,
+    pub path: PathBuf,
+    slot: Slot,
+}
+
+impl ReadJob {
+    /// Read the picture on a thread of its own, running `prepare` on it inside the same panic
+    /// guard (placing a picture resamples it there, off the window's thread): the slot is given
+    /// back once the read and `prepare` are done (or have panicked), before `done` is handed the
+    /// result, and also if the thread ends any other way.
+    pub fn spawn<T: Send + 'static>(self, prepare: impl FnOnce(RgbaImage) -> T + Send + 'static, done: impl FnOnce(u64, PathBuf, Result<T, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
+        let ReadJob { generation, path, slot } = self;
+        std::thread::spawn(move || {
+            let result = read_prepared(&path, prepare);
+            drop(slot);
+            done(generation, path, result);
+        })
+    }
+}
 
 /// What became of a read that has ended. `T` is what the read made of the picture: the picture
 /// itself for an editor to open, or the picture made ready to place on a capture.
@@ -174,40 +272,81 @@ pub enum Settled<T = RgbaImage> {
 
 /// The picture reads off the window's thread, the newest request winning: every request (the
 /// tile, the tray's dialog, a drop) is numbered, a result is used only when it is the newest's,
-/// and an older read that ends later is dropped. At most [`MAX_READS`] run at once; a request
-/// beyond that waits until one ends, and only the newest waiting request is kept.
-#[derive(Debug, Default)]
+/// and an older read that ends later is dropped. At most [`MAX_READS`] of a window run at once,
+/// and at most [`MAX_READS_ALL`] of the whole app; a request beyond either waits until a read
+/// ends (this window's, or any window's: [`ImageLoads::retry`]), and only the newest waiting
+/// request is kept.
 pub struct ImageLoads {
     newest: u64,
     running: usize,
-    waiting: Option<ReadJob>,
+    waiting: Option<(u64, PathBuf)>,
     /// The newest request has been answered.
     answered: bool,
+    pool: Arc<ReadPool>,
+    /// Woken when any window's read gives its slot back.
+    wake: Option<Waker>,
+}
+
+impl Default for ImageLoads {
+    /// Reads sharing the app's pool. In a test build each has a pool of its own, so tests running
+    /// side by side never wait for one another; a test of the shared cap shares one explicitly
+    /// ([`ImageLoads::with_pool`]).
+    fn default() -> Self {
+        #[cfg(not(test))]
+        let pool = ReadPool::global();
+        #[cfg(test)]
+        let pool = ReadPool::new(MAX_READS_ALL);
+        Self::with_pool(pool)
+    }
 }
 
 impl ImageLoads {
-    /// A new request for `path`: the read to start now, or none when [`MAX_READS`] run already
-    /// (it starts when one ends, unless a newer request replaces it first).
+    pub fn with_pool(pool: Arc<ReadPool>) -> Self {
+        Self { newest: 0, running: 0, waiting: None, answered: false, pool, wake: None }
+    }
+
+    /// What wakes this window when any read gives its slot back, so a read waiting for one
+    /// starts on the window's next frame ([`ImageLoads::retry`]). Set once; later calls change nothing.
+    pub fn set_wake(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        if self.wake.is_none() {
+            let wake: Waker = Arc::new(wake);
+            self.pool.register(&wake);
+            self.wake = Some(wake);
+        }
+    }
+
+    /// The waiting read, when this window and the app both have room for it now.
+    fn start_waiting(&mut self) -> Option<ReadJob> {
+        if self.running >= MAX_READS || self.waiting.is_none() {
+            return None;
+        }
+        let slot = self.pool.take()?;
+        let (generation, path) = self.waiting.take()?;
+        self.running += 1;
+        Some(ReadJob { generation, path, slot })
+    }
+
+    /// A new request for `path`: the read to start now, or none when [`MAX_READS`] of this
+    /// window or [`MAX_READS_ALL`] of the app run already (it starts when one ends, unless a
+    /// newer request replaces it first).
     pub fn request(&mut self, path: PathBuf) -> Option<ReadJob> {
         self.newest += 1;
         self.answered = false;
-        if self.running < MAX_READS {
-            self.running += 1;
-            Some((self.newest, path))
-        } else {
-            self.waiting = Some((self.newest, path));
-            None
-        }
+        self.waiting = Some((self.newest, path));
+        self.start_waiting()
+    }
+
+    /// The waiting read, if a slot has come free since it was asked for: called on the window's
+    /// frames, which a slot given back wakes ([`ImageLoads::set_wake`]).
+    pub fn retry(&mut self) -> Option<ReadJob> {
+        self.start_waiting()
     }
 
     /// The read numbered `generation` of `path` has ended with `result`: what to do with it, and
     /// a waiting read to start now.
     pub fn finished<T>(&mut self, generation: u64, path: &Path, result: Result<T, ImageError>) -> (Settled<T>, Option<ReadJob>) {
         self.running = self.running.saturating_sub(1);
-        let next = if self.running < MAX_READS { self.waiting.take() } else { None };
-        if next.is_some() {
-            self.running += 1;
-        }
+        let next = self.start_waiting();
         if generation != self.newest {
             return (Settled::Superseded, next);
         }
@@ -219,9 +358,9 @@ impl ImageLoads {
         (settled, next)
     }
 
-    /// Whether the newest request is still being read, or waits to be: an update holds back so
-    /// the app is not closed between the read and the editor opening. A superseded read still
-    /// running holds nothing back.
+    /// Whether the newest request is still being read, or waits to be (for this window's room
+    /// or for an app-wide slot): an update holds back so the app is not closed between the read
+    /// and the editor opening. A superseded read still running holds nothing back.
     pub fn pending(&self) -> bool {
         self.newest > 0 && !self.answered
     }
@@ -232,8 +371,16 @@ impl ImageLoads {
     }
 }
 
+/// Read the picture at `path` and run `prepare` on it, a panic in either turned into the error
+/// for a file that is not a picture, so a read always ends in a result.
+fn read_prepared<T>(path: &Path, prepare: impl FnOnce(RgbaImage) -> T) -> Result<T, ImageError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(path).map(prepare))).unwrap_or_else(|_| Err(not_a_picture()))
+}
+
 /// Read the picture at `path` on a thread of its own and hand the result to `done` there. A
 /// panic anywhere in the read still ends in a result, so the read is always counted as ended.
+/// The app reads through [`ReadJob::spawn`], which also holds an app-wide slot.
+#[cfg(test)]
 pub fn spawn_load(path: PathBuf, done: impl FnOnce(PathBuf, Result<RgbaImage, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
     spawn_load_with(path, |img| img, done)
 }
@@ -241,9 +388,10 @@ pub fn spawn_load(path: PathBuf, done: impl FnOnce(PathBuf, Result<RgbaImage, Im
 /// [`spawn_load`] that also runs `prepare` on the picture read, on the same thread and inside the
 /// same panic guard, before `done` is handed the result: placing a picture resamples it there, so
 /// a large picture is never worked on by the window's thread.
+#[cfg(test)]
 pub fn spawn_load_with<T: Send + 'static>(path: PathBuf, prepare: impl FnOnce(RgbaImage) -> T + Send + 'static, done: impl FnOnce(PathBuf, Result<T, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path).map(prepare))).unwrap_or_else(|_| Err(not_a_picture()));
+        let result = read_prepared(&path, prepare);
         done(path, result);
     })
 }

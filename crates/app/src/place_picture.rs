@@ -1,7 +1,8 @@
 //! Placing a picture file on a capture: a file dropped on an editor window, or chosen with the
 //! rail's Picture tool. The file is untrusted: it is read only by [`open_image::load`], within its
 //! limits and its panic guard, on a thread of its own, and only the newest request of an editor
-//! is placed ([`open_image::ImageLoads`], one per editor, so two editors never cancel each other).
+//! is placed ([`open_image::ImageLoads`], one per editor, so two editors never cancel each other,
+//! sharing the app-wide cap on reads in flight, [`open_image::MAX_READS_ALL`]).
 //!
 //! The picture becomes the editor's existing placed picture (`Shape::Image`): at its natural size
 //! when it fits inside the capture, else scaled down, keeping its proportions, to fit inside the
@@ -158,14 +159,24 @@ pub struct Placing {
 
 impl Default for Placing {
     fn default() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self { loads: ImageLoads::default(), newest: None, tx, rx, wake: None }
+        Self::with_loads(ImageLoads::default())
     }
 }
 
 impl Placing {
+    /// Reads made through `loads` (its pool of app-wide slots).
+    pub fn with_loads(loads: ImageLoads) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { loads, newest: None, tx, rx, wake: None }
+    }
+
     /// The window to wake when a read ends: the one whose frame is being drawn.
     pub fn set_wake(&mut self, ctx: &egui::Context) {
+        if self.wake.is_none() {
+            let (wake, viewport) = (ctx.clone(), ctx.viewport_id());
+            // A read waiting for an app-wide slot starts on the frame after one comes free.
+            self.loads.set_wake(move || wake.request_repaint_of(viewport));
+        }
         self.wake = Some((ctx.clone(), ctx.viewport_id()));
     }
 
@@ -180,13 +191,12 @@ impl Placing {
 
     /// Start a read. A read that starts later (it waited for a free slot) is always the newest
     /// request's, so it is made ready for the newest request's capture.
-    fn start(&self, (generation, path): ReadJob) {
+    fn start(&self, job: ReadJob) {
         let Some(capture) = self.newest.map(|r| r.target.capture) else { return };
         let (tx, wake) = (self.tx.clone(), self.wake.clone());
-        open_image::spawn_load_with(
-            path,
+        job.spawn(
             move |img| prepare(img, capture),
-            move |path, result| {
+            move |generation, path, result| {
                 // The editor may be gone: then nobody waits for this picture, and it is dropped.
                 if tx.send((generation, path, result)).is_ok()
                     && let Some((ctx, viewport)) = wake
@@ -201,6 +211,9 @@ impl Placing {
     /// if it has arrived. A waiting read starts as one ends; an older read's result is dropped.
     pub fn poll(&mut self) -> Vec<Placed> {
         let mut placed = Vec::new();
+        if let Some(job) = self.loads.retry() {
+            self.start(job);
+        }
         while let Ok((generation, path, result)) = self.rx.try_recv() {
             let (settled, next) = self.loads.finished(generation, &path, result);
             if let Some(job) = next {

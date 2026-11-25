@@ -394,6 +394,9 @@ impl App {
                 wake
             },
         };
+        // A picture read waiting for an app-wide slot starts once any window's read gives one back.
+        let wake = ctx.clone();
+        app.images.set_wake(move || wake.request_repaint());
         platform::stop_raw_keyboard_input();
         app.publish_taken_keys();
         app
@@ -456,6 +459,10 @@ impl App {
                     }
                 }
             }
+        }
+        // A picture read that waited for an app-wide slot, now that one is free.
+        if let Some(job) = self.images.retry() {
+            self.start_image_read(ctx, job);
         }
     }
 
@@ -1118,9 +1125,9 @@ impl App {
         }
     }
 
-    fn start_image_read(&mut self, ctx: &egui::Context, (generation, path): open_image::ReadJob) {
+    fn start_image_read(&mut self, ctx: &egui::Context, job: open_image::ReadJob) {
         let (tx, wake) = (self.tx.clone(), ctx.clone());
-        open_image::spawn_load(path, move |path, result| {
+        job.spawn(|img| img, move |generation, path, result| {
             let _ = tx.send(AppEvent::ImageLoaded(Box::new((generation, path, result))));
             wake.request_repaint();
         });
