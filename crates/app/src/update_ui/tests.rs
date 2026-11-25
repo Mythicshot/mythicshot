@@ -393,3 +393,27 @@ fn the_line_and_the_section_draw_their_sentences() {
     }
     assert!(!changed);
 }
+
+/// An updater whose line shows `state` ("available", "downloading", "checked", "waiting" or
+/// "mismatch"), driven there through its own flow against the stand-in network, for pictures.
+/// The network is handed back too: a download in progress watches it.
+pub(crate) fn showing(state: &str) -> (Updater, Arc<FakeNetHandle>) {
+    let net = Arc::new(FakeNet::default());
+    let mut u = offered(&net);
+    match state {
+        "available" => {}
+        "downloading" => u.press(Button::UpdateNow),
+        "checked" | "waiting" | "mismatch" => {
+            *net.download_end.lock().unwrap() = Some(if state == "mismatch" { Downloaded::Mismatch } else { Downloaded::Ready(std::env::temp_dir().join("mythicshot-render-installer.exe")) });
+            net.release_download.store(true, Ordering::SeqCst);
+            u.press(Button::UpdateNow);
+            settle(&mut u);
+            u.set_waiting(state == "waiting");
+        }
+        other => panic!("no such state: {other}"),
+    }
+    (u, Arc::new(FakeNetHandle(net)))
+}
+
+/// Keeps the stand-in network of [`showing`] alive.
+pub(crate) struct FakeNetHandle(#[allow(dead_code)] Arc<FakeNet>);

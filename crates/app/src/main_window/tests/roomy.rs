@@ -384,25 +384,79 @@ fn every_page_fits_the_smallest_window_on_the_roomy_sizes() {
     }
 }
 
+/// A clock that moves only when slept on, so a sign-in in a picture never waits.
+#[derive(Default)]
+struct FastClock(Mutex<Duration>);
+
+impl crate::publish::connect::Clock for FastClock {
+    fn now(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
+    fn sleep(&self, d: Duration) {
+        *self.0.lock().unwrap() += d;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The add form at its dead end: the browser signed in as the account of a profile that is
+/// there already. Signed in against a stand-in site of its own.
+fn dead_end_fixture() -> (Fixture, Stub) {
+    const WS: &str = "ws_0123456789abcdef01234567";
+    let s = stub(|req, _| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, r#"{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"K7QM-2HXD","verify_url":"/connections","expires_in":600,"interval":5}"#),
+        "POST /api/v1/connect/token" => reply(200, r#"{"status":"connected","token":"dp_c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff","workspace":{"name":"Sandbox test"},"account":{"username":"alex@mythicshot.test"}}"#),
+        "GET /api/v1/me" => reply(200, &format!(r#"{{"workspace":"Sandbox test","workspace_id":"{WS}","account_id":"acc-a"}}"#)),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let mut f = fixture(Kind::Connected);
+    let pa = Profile { id: "pa".into(), name: "Sandbox test".into(), server: s.base.clone(), account: Some(ACCOUNT.into()), workspace: Some("Sandbox test".into()), identity: Some(crate::profiles::tests::ided(WS, "acc-a")), state: State::Ready, named: true };
+    let shelf: Arc<dyn Shelf> = Arc::new(MemShelf(Mutex::new(Book { list: vec![pa.clone()], active: Some("pa".into()), legacy: None })));
+    let mut flow = AddFlow::new(crate::profiles_ui::Purpose::New, s.base.clone(), shelf.clone(), Arc::new(|_: &str| Ok(())), Arc::new(FastClock::default()));
+    flow.begin_sign_in();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while flow.is_signing_in() {
+        assert!(Instant::now() < deadline, "the sign-in did not end");
+        flow.poll_sign_in();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let make_shelf = shelf.clone();
+    let mut panel = Panel::with(shelf, Arc::new(move |purpose, address| AddFlow::new(purpose, address, make_shelf.clone(), Arc::new(|_: &str| Ok(())), Arc::new(FastClock::default()))));
+    panel.token_state = Arc::new(|| (TokenStatus::Saved, false));
+    panel.mode = crate::profiles_ui::Mode::Add(Box::new(flow));
+    f.s.profiles = panel;
+    f.given.0 = Some(pa);
+    (f, s)
+}
+
 /// Pictures of the pages on the roomy sizes, for the owner: each main state at 100% and 200%,
 /// at the window's usual and smallest sizes. Run with
-/// `MYTHICSHOT_SNAPSHOTS=target-roomy/renders cargo test -p mythicshot roomy_renders -- --ignored`.
+/// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot roomy_renders -- --ignored`.
 #[test]
 #[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
 fn roomy_renders() {
     let tours_conn = crate::tours_ui::tests::conn(TokenStatus::Saved);
+    let tour_book = || {
+        let p = |id: &str, name: &str| Profile { id: id.into(), name: name.into(), server: "https://tours.example.com".into(), account: Some(ACCOUNT.into()), workspace: Some("Sandbox test".into()), identity: None, state: State::Ready, named: true };
+        Book { list: vec![p("pa", "Sandbox test"), p("pb", "Customer demo")], active: Some("pa".into()), legacy: None }
+    };
     for (name, size) in SIZES {
         for ppp in [1.0f32, 2.0] {
             let size = egui::vec2(size[0], size[1]);
             let suffix = format!("{name}-{}x", ppp);
-            for (kind, label) in [(Kind::Connected, "workspace-connected"), (Kind::NoAccount, "workspace-no-account"), (Kind::SignInAgain, "workspace-sign-in-again"), (Kind::Add, "workspace-add-profile"), (Kind::Manage, "workspace-manage")] {
-                let (_ctx, mut f, _) = settled(kind, size, ppp);
+            let save = |f: &mut Fixture, label: &str, given: bool, tours: &crate::tours_ui::Conn| {
                 let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| {
-                    let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
-                    window_ui_given(ui, &mut f.s, &tours, Some(&f.given));
+                    let ws = given.then(|| f.given.clone());
+                    window_ui_given(ui, &mut f.s, tours, ws.as_ref());
                 });
                 assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{suffix}")), 0, "{label}");
+            };
+            let missing = crate::tours_ui::tests::conn(TokenStatus::Missing);
+            for (kind, label) in [(Kind::Connected, "workspace-connected"), (Kind::NoAccount, "workspace-no-account"), (Kind::SignInAgain, "workspace-sign-in-again"), (Kind::Add, "workspace-add-profile"), (Kind::Manage, "workspace-manage"), (Kind::NoActive, "workspace-no-active-profile")] {
+                let (_ctx, mut f, _) = settled(kind, size, ppp);
+                save(&mut f, label, true, &missing);
             }
+            let (mut f, _site) = dead_end_fixture();
+            save(&mut f, "workspace-add-profile-dead-end", true, &missing);
             let mut pages: Vec<(String, Page, Option<settings_ui::Tab>)> = vec![("home".into(), Page::Home, None), ("tours".into(), Page::Tours, None)];
             pages.extend(settings_ui::Tab::ALL.map(|t| (format!("preferences-{}", t.label().to_lowercase()), Page::Preferences, Some(t))));
             for (label, page, tab) in pages {
@@ -414,8 +468,20 @@ fn roomy_renders() {
                 if let Some(tab) = tab {
                     f.s.prefs.state.tab = tab;
                 }
-                let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 4, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
-                assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{suffix}")), 0, "{label}");
+                save(&mut f, &label, false, &tours_conn);
+            }
+            // The Tours page with profiles: the dropdown names the active one.
+            let mut f = fixture(Kind::Add);
+            f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
+            f.s.nav.request(Page::Tours);
+            crate::publish_ui::with_test_book(tour_book(), || save(&mut f, "tours-with-profile", false, &tours_conn));
+            // The update line, in each of its states, over the Home page.
+            for state in ["available", "downloading", "checked", "waiting", "mismatch"] {
+                let mut f = fixture(Kind::Add);
+                f.s.nav.request(Page::Home);
+                let (u, _net) = crate::update_ui::tests::showing(state);
+                f.s.update = u;
+                save(&mut f, &format!("update-line-{state}"), false, &tours_conn);
             }
         }
     }

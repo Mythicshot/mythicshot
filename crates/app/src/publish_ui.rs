@@ -444,7 +444,27 @@ pub enum ProfilesRequest {
 
 /// The profiles and the active one, as they are now.
 pub fn book() -> Book {
+    #[cfg(test)]
+    if let Some(book) = TEST_BOOK.with(|b| b.borrow().clone()) {
+        return book;
+    }
     config().wired.book.clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The profiles a test draws a page with, on its own thread only (see [`with_test_book`]).
+    static TEST_BOOK: std::cell::RefCell<Option<Book>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with [`book`] answering `book` on this thread: a picture of a page with profiles,
+/// without touching the app's own.
+#[cfg(test)]
+pub fn with_test_book<R>(book: Book, f: impl FnOnce() -> R) -> R {
+    TEST_BOOK.with(|b| *b.borrow_mut() = Some(book));
+    let r = f();
+    TEST_BOOK.with(|b| *b.borrow_mut() = None);
+    r
 }
 
 /// Make `id` the active profile: the address, the token, the Tours page and every dialog that

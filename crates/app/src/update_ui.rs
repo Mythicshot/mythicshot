@@ -574,4 +574,4 @@ pub fn prefs_ui(ui: &mut egui::Ui, u: &mut Updater, settings: &mut crate::settin
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
