@@ -86,6 +86,8 @@ enum AppEvent {
     /// The thread that expanded a recording kept as a video has ended: the project it was asked
     /// to open, and the recording ready for an editor or why there is none.
     ProjectOpened(Box<(project::ProjectKey, Result<project::Loaded, project::LoadError>)>),
+    /// The thread that read a picture file has ended: the file, and its picture or why there is none.
+    ImageLoaded(Box<(PathBuf, Result<image::RgbaImage, image::ImageError>)>),
 }
 
 /// A recording kept as a video that is being expanded for an editor, on a thread of its own.
@@ -221,6 +223,8 @@ struct App {
     draw_when_live: bool,
     /// The recording kept as a video that is being expanded for an editor.
     opening: Option<Opening>,
+    /// A picture file being read for an editor, on a thread of its own; one at a time.
+    image_gate: open_image::LoadGate,
     /// Quit asked the editors that would lose something, and waits for their answers.
     quitting: bool,
     /// The capture waiting in `hide_then_run` came from an editor's menu bar, for the capture log.
@@ -371,6 +375,7 @@ impl App {
             started: Instant::now(),
             draw_when_live: false,
             opening: None,
+            image_gate: open_image::LoadGate::default(),
             quitting: false,
             menu_capture: false,
             update_started: false,
@@ -440,6 +445,10 @@ impl App {
                     let (key, result) = *done;
                     self.project_opened(key, result);
                 }
+                AppEvent::ImageLoaded(done) => {
+                    let (path, result) = *done;
+                    self.image_loaded(&path, result);
+                }
                 AppEvent::Input(ev) => {
                     if self.session.is_some() {
                         self.rec_events.push(ev);
@@ -496,7 +505,7 @@ impl App {
                 Ok(img) => self.captured(ctx, img, "Clipboard image".into()),
                 Err(e) => self.notify(e),
             },
-            Command::OpenFile => self.open_file(),
+            Command::OpenFile => self.open_file(ctx),
             Command::ToggleDestination(d) => {
                 self.settings.toggle_destination(d);
                 self.settings_changed();
@@ -1091,15 +1100,34 @@ impl App {
         }
     }
 
-    fn open_file(&mut self) {
+    fn open_file(&mut self, ctx: &egui::Context) {
+        // A picture still being read: this request is ignored, the dialog included.
+        if self.image_gate.is_loading() {
+            return;
+        }
         let Some(path) = open_image::pick(&self.settings.output_dir) else { return };
-        self.open_image_file(&path);
+        self.open_image_file(ctx, path);
     }
 
-    /// Open the picture file at `path` in an editor, read within [`open_image::load`]'s limits,
-    /// or say it could not be opened. Read here, on the app's thread, as it always was.
-    fn open_image_file(&mut self, path: &Path) {
-        match open_image::load(path) {
+    /// Read the picture file at `path` within [`open_image::load`]'s limits on a thread of its
+    /// own, so the windows stay responsive; [`AppEvent::ImageLoaded`] brings it back, and the
+    /// editor is made here, on the app's thread. A request while another picture is being read
+    /// is ignored.
+    fn open_image_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if !self.image_gate.begin() {
+            return;
+        }
+        let (tx, wake) = (self.tx.clone(), ctx.clone());
+        open_image::spawn_load(path, move |path, result| {
+            let _ = tx.send(AppEvent::ImageLoaded(Box::new((path, result))));
+            wake.request_repaint();
+        });
+    }
+
+    /// A picture file has been read: open it in an editor, or say it could not be opened.
+    fn image_loaded(&mut self, path: &Path, result: Result<image::RgbaImage, image::ImageError>) {
+        self.image_gate.end();
+        match result {
             Ok(img) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.open_editor(img, title);
@@ -1442,7 +1470,7 @@ impl App {
         // dropped on the window opens the same way as one picked there. The window stays.
         match open {
             Some(open_image::OpenImage::Pick) => self.run(ctx, Command::OpenFile),
-            Some(open_image::OpenImage::Dropped(path)) => self.open_image_file(&path),
+            Some(open_image::OpenImage::Dropped(path)) => self.open_image_file(ctx, path),
             None => {}
         }
         for request in requests {

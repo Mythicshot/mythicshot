@@ -1,7 +1,7 @@
 //! Opening and dropping picture files: the dialog asked for, the limits a file is read within,
 //! and the verdict on what is dragged. Every file here is made in the OS temp folder.
 
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,31 +18,18 @@ fn picking_asks_the_open_image_dialog_and_no_real_dialog_opens() {
     assert_eq!(stubs::take(), ["open dialog: open image"]);
 }
 
-/// A reader that counts the bytes taken from it, to show a refusal read only a header.
-struct Counted {
-    inner: Cursor<Vec<u8>>,
+/// A reader that counts the bytes taken from it.
+struct Counted<R> {
+    inner: R,
     read: Arc<AtomicU64>,
 }
 
-impl Read for Counted {
+impl<R: Read> Read for Counted<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.read.fetch_add(n as u64, Ordering::SeqCst);
         Ok(n)
     }
-}
-
-impl Seek for Counted {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(pos)
-    }
-}
-
-/// Decode `bytes` through a counting reader: the result and how many bytes were read.
-fn decode_counted(bytes: Vec<u8>, len: u64) -> (Result<RgbaImage, ImageError>, u64) {
-    let read = Arc::new(AtomicU64::new(0));
-    let result = decode(BufReader::new(Counted { inner: Cursor::new(bytes), read: read.clone() }), len);
-    (result, read.load(Ordering::SeqCst))
 }
 
 fn png(img: &RgbaImage) -> Vec<u8> {
@@ -62,23 +49,27 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// A real PNG whose header says it is `w` by `h`, followed by `junk` bytes of nothing: what a
+/// A real PNG whose header says it is `w` by `h` at `depth` bits a channel (RGBA): what a
 /// decompression bomb looks like from the outside.
-fn png_claiming(w: u32, h: u32, junk: usize) -> Vec<u8> {
+fn png_claiming_depth(w: u32, h: u32, depth: u8) -> Vec<u8> {
     let mut bytes = png(&RgbaImage::new(1, 1));
     bytes[16..20].copy_from_slice(&w.to_be_bytes());
     bytes[20..24].copy_from_slice(&h.to_be_bytes());
+    bytes[24] = depth;
     let crc = crc32(&bytes[12..29]);
     bytes[29..33].copy_from_slice(&crc.to_be_bytes());
-    bytes.extend(std::iter::repeat_n(0u8, junk));
     bytes
 }
 
-/// A BMP header saying `w` by `h` at 24 bits, followed by `junk` bytes.
-fn bmp_claiming(w: i32, h: i32, junk: usize) -> Vec<u8> {
+fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+    png_claiming_depth(w, h, 8)
+}
+
+/// A BMP header saying `w` by `h` at 24 bits, and a little of nothing after it.
+fn bmp_claiming(w: i32, h: i32) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend(b"BM");
-    b.extend(((54 + junk) as u32).to_le_bytes());
+    b.extend(1054u32.to_le_bytes());
     b.extend([0u8; 4]);
     b.extend(54u32.to_le_bytes());
     b.extend(40u32.to_le_bytes());
@@ -87,30 +78,21 @@ fn bmp_claiming(w: i32, h: i32, junk: usize) -> Vec<u8> {
     b.extend(1u16.to_le_bytes());
     b.extend(24u16.to_le_bytes());
     b.extend([0u8; 24]);
-    b.extend(std::iter::repeat_n(0u8, junk));
+    b.extend([0u8; 1000]);
     b
 }
-
-const JUNK: usize = 4 * 1024 * 1024;
-/// Far less than the file: the header and a buffer's worth around it.
-const HEADER_READ: u64 = 64 * 1024;
 
 #[test]
 fn the_limits_are_the_ones_stated() {
     assert_eq!(MAX_FILE_BYTES, 67_108_864);
     assert_eq!(MAX_SIDE, 16_384);
     assert_eq!(MAX_PIXELS, 67_108_864);
+    assert_eq!(MAX_DECODED_BYTES, 268_435_456);
 }
 
 #[test]
-fn a_file_over_the_size_limit_is_refused_before_a_byte_is_read() {
-    let (result, read) = decode_counted(png(&RgbaImage::new(2, 2)), MAX_FILE_BYTES + 1);
-    assert!(matches!(result, Err(ImageError::Limits(_))), "{result:?}");
-    assert_eq!(read, 0);
-    // A file exactly at the limit is read.
-    let (result, _) = decode_counted(png(&RgbaImage::new(2, 2)), MAX_FILE_BYTES);
-    assert!(result.is_ok());
-    // From disk: a file one byte over (sparse, nothing written) is refused by its size.
+fn a_file_over_the_size_limit_is_refused_by_its_size() {
+    // A file one byte over (sparse, nothing written) is refused by its size, unread.
     let tmp = tempfile::tempdir().unwrap();
     let big = tmp.path().join("big.png");
     let f = File::create(&big).unwrap();
@@ -122,20 +104,57 @@ fn a_file_over_the_size_limit_is_refused_before_a_byte_is_read() {
 }
 
 #[test]
-fn a_picture_whose_header_is_too_large_is_refused_after_reading_only_the_header() {
+fn the_read_stops_one_byte_past_the_limit_however_much_more_there_is() {
+    // A reader that never ends, as a file that keeps growing or lies about its size would.
+    let read = Arc::new(AtomicU64::new(0));
+    let result = read_bounded(Counted { inner: std::io::repeat(7), read: read.clone() });
+    assert!(matches!(result, Err(ImageError::Limits(_))), "{:?}", result.map(|b| b.len()));
+    assert_eq!(read.load(Ordering::SeqCst), MAX_FILE_BYTES + 1);
+    // Up to the limit is read whole.
+    let read = Arc::new(AtomicU64::new(0));
+    let bytes = read_bounded(Counted { inner: std::io::repeat(7).take(MAX_FILE_BYTES), read }).unwrap();
+    assert_eq!(bytes.len() as u64, MAX_FILE_BYTES);
+}
+
+#[test]
+fn a_picture_whose_header_is_too_large_or_empty_is_refused_from_the_header() {
     // Over the side limit, and under it on each side but over the pixel limit.
     for (w, h) in [(MAX_SIDE + 1, 10), (10, MAX_SIDE + 1), (9_000, 9_000), (40_000, 40_000)] {
-        let (result, read) = decode_counted(png_claiming(w, h, JUNK), (JUNK + 100) as u64);
+        let result = decode(&png_claiming(w, h));
         assert!(matches!(result, Err(ImageError::Limits(_))), "{w}x{h}: {result:?}");
-        assert!(read < HEADER_READ, "{w}x{h}: read {read} bytes");
     }
-    let (result, read) = decode_counted(bmp_claiming(20_000, 20_000, JUNK), (JUNK + 54) as u64);
+    let result = decode(&bmp_claiming(20_000, 20_000));
     assert!(matches!(result, Err(ImageError::Limits(_))), "{result:?}");
-    assert!(read < HEADER_READ, "read {read} bytes");
+    // No width or no height.
+    for (w, h) in [(0, 10), (10, 0), (0, 0)] {
+        assert!(decode(&png_claiming(w, h)).is_err(), "{w}x{h}");
+        assert!(decode(&bmp_claiming(w as i32, h as i32)).is_err(), "bmp {w}x{h}");
+    }
     // The largest picture allowed on a side still opens.
     let wide = RgbaImage::from_pixel(MAX_SIDE, 2, Rgba([1, 2, 3, 255]));
-    let (result, _) = decode_counted(png(&wide), 1000);
-    assert_eq!(result.map(|i| i.dimensions()).ok(), Some((MAX_SIDE, 2)));
+    assert_eq!(decode(&png(&wide)).map(|i| i.dimensions()).ok(), Some((MAX_SIDE, 2)));
+}
+
+#[test]
+fn a_sixteen_bit_picture_may_have_half_the_pixels() {
+    // 8000 x 5000 is 40 million pixels, under the pixel limit: at 8 bits a channel it takes 160 MB
+    // as stored and passes the header check (this one then fails to decode, its pixels are not
+    // there); at 16 bits it would take 320 MB and is refused from the header.
+    let deep = decode(&png_claiming_depth(8_000, 5_000, 16));
+    assert!(matches!(deep, Err(ImageError::Limits(_))), "{deep:?}");
+    let shallow = decode(&png_claiming_depth(8_000, 5_000, 8));
+    assert!(shallow.is_err() && !matches!(shallow, Err(ImageError::Limits(_))), "{shallow:?}");
+    // Half the pixels at 16 bits is under the memory limit.
+    let half = decode(&png_claiming_depth(4_000, 5_000, 16));
+    assert!(!matches!(half, Err(ImageError::Limits(_))), "{half:?}");
+}
+
+#[test]
+fn a_decoder_that_panics_gives_the_not_a_picture_error() {
+    let result = guarded(|| panic!("a hostile file"));
+    assert!(matches!(result, Err(ImageError::Unsupported(_))), "{result:?}");
+    // A decode that ends normally is passed through.
+    assert_eq!(guarded(|| Ok(RgbaImage::new(2, 1))).unwrap().dimensions(), (2, 1));
 }
 
 #[test]
@@ -171,24 +190,60 @@ fn an_animated_gif_opens_its_first_frame() {
 }
 
 #[test]
-fn a_folder_a_shortcut_and_a_missing_file_are_refused_and_never_followed() {
+fn a_folder_a_device_a_shortcut_and_a_missing_file_are_refused_and_never_followed() {
     let tmp = tempfile::tempdir().unwrap();
     // A folder with a picture's name.
     let folder = tmp.path().join("pictures.png");
     std::fs::create_dir(&folder).unwrap();
-    assert!(matches!(load(&folder), Err(ImageError::Unsupported(_))));
-    // A shortcut: its content is no picture, and only its header is looked at.
+    assert!(matches!(load(&folder), Err(ImageError::Unsupported(_))), "{:?}", load(&folder));
+    // A shortcut: its content is no picture.
     let mut lnk = vec![0x4c, 0, 0, 0, 0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
-    lnk.extend(std::iter::repeat_n(0u8, JUNK));
-    let (result, read) = decode_counted(lnk.clone(), lnk.len() as u64);
-    assert!(matches!(result, Err(ImageError::Unsupported(_))), "{result:?}");
-    assert!(read < HEADER_READ, "read {read} bytes");
+    lnk.extend([0u8; 200]);
+    assert!(matches!(decode(&lnk), Err(ImageError::Unsupported(_))));
     let shortcut = tmp.path().join("shot.png.lnk");
     std::fs::write(&shortcut, &lnk).unwrap();
     assert!(load(&shortcut).is_err());
-    // A file that is gone.
+    // A file that is gone says why.
     let gone = tmp.path().join("gone.png");
     assert!(matches!(load(&gone), Err(ImageError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound));
+    // A device is refused by its kind and never read: a read of one could wait for ever.
+    #[cfg(windows)]
+    {
+        let nul = load(Path::new(r"\\.\NUL"));
+        assert!(matches!(nul, Err(ImageError::Unsupported(_))), "{nul:?}");
+    }
+    // A link to a picture is opened as the link and refused, where this computer lets a test make one.
+    #[cfg(windows)]
+    {
+        let target = tmp.path().join("real.png");
+        std::fs::write(&target, png(&RgbaImage::new(2, 2))).unwrap();
+        let link = tmp.path().join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+            assert!(matches!(load(&link), Err(ImageError::Unsupported(_))), "{:?}", load(&link));
+        }
+    }
+}
+
+#[test]
+fn one_picture_is_read_at_a_time_off_the_calling_thread() {
+    let mut gate = LoadGate::default();
+    assert!(gate.begin() && gate.is_loading());
+    assert!(!gate.begin(), "a second request while one is read is ignored");
+    gate.end();
+    assert!(gate.begin());
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("a.png");
+    std::fs::write(&path, png(&RgbaImage::new(3, 2))).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let caller = std::thread::current().id();
+    spawn_load(path.clone(), move |p, result| tx.send((p, result.map(|i| i.dimensions()).ok(), std::thread::current().id())).unwrap()).join().unwrap();
+    let (p, dims, on) = rx.recv().unwrap();
+    assert_eq!((p, dims), (path, Some((3, 2))));
+    assert_ne!(on, caller, "read on a thread of its own");
+    // A file that cannot be opened still reports, so the gate is let go.
+    let (tx, rx) = std::sync::mpsc::channel();
+    spawn_load(tmp.path().join("gone.png"), move |_, result| tx.send(result.is_err()).unwrap()).join().unwrap();
+    assert!(rx.recv().unwrap());
 }
 
 #[test]
@@ -273,9 +328,31 @@ fn the_overlay_says_what_a_drop_would_do_and_a_drop_hands_over_only_a_picture() 
     let (out, got) = drag_frame(&ctx, &mut state, vec![], vec![Some(pic.clone())]);
     assert_eq!((texts(&out).len(), got), (0, Some(pic.clone())));
     for dropped in [vec![Some(notes.clone())], vec![Some(pic.clone()), Some(pic.clone())], vec![None]] {
+        drag_frame(&ctx, &mut state, vec![], vec![]);
         let (out, got) = drag_frame(&ctx, &mut state, vec![], dropped);
         assert!(texts(&out).is_empty() && got.is_none());
     }
+}
+
+#[test]
+fn a_drop_of_several_files_arriving_a_file_a_frame_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+    std::fs::write(&a, "x").unwrap();
+    std::fs::write(&b, "x").unwrap();
+    let ctx = theme::test_context();
+    let mut state = DropState::default();
+    drag_frame(&ctx, &mut state, vec![Some(a.clone()), Some(b.clone())], vec![]);
+    // The drop lands one file a frame: neither opens.
+    let (_, got) = drag_frame(&ctx, &mut state, vec![], vec![Some(a.clone())]);
+    assert_eq!(got, None);
+    let (_, got) = drag_frame(&ctx, &mut state, vec![], vec![Some(b.clone())]);
+    assert_eq!(got, None);
+    // The next drag of one picture is taken again.
+    drag_frame(&ctx, &mut state, vec![], vec![]);
+    drag_frame(&ctx, &mut state, vec![Some(a.clone())], vec![]);
+    let (_, got) = drag_frame(&ctx, &mut state, vec![], vec![Some(a.clone())]);
+    assert_eq!(got, Some(a));
 }
 
 #[test]
