@@ -643,6 +643,31 @@ fn ending_of(book: &Book, store: &dyn KeyStore, id: &str, except: Option<&str>, 
     Some(Ending { id: p.id.clone(), name: p.name.clone(), server, token })
 }
 
+impl Candidate {
+    /// The connection a sign-in made, which is not kept (another account was tried, the form was
+    /// cancelled, or the profile that is there already was switched to): to end at the site the
+    /// sign-in was made at. Its token goes with it, and is wiped when it is dropped. It belongs
+    /// to no profile, so whether anything here holds it is asked of every profile and of the
+    /// entry of the versions before profiles ([`Ending::held_in`]).
+    pub fn into_ending(self) -> Option<Ending> {
+        let server = publish::check_server(&self.server).ok()?;
+        Some(Ending { id: String::new(), name: self.workspace, server, token: self.token })
+    }
+}
+
+/// The log line after the connection of a sign-in that was not kept was to be ended; it never
+/// holds the token.
+pub fn abandoned_log_line(server: &str, outcome: &Outcome) -> String {
+    let site = site_label(server);
+    match outcome {
+        Outcome::Ended => format!("Profiles: the connection of a sign-in that was not kept was ended at {site}."),
+        Outcome::AlreadyEnded => format!("Profiles: the connection of a sign-in that was not kept was no longer valid at {site}."),
+        Outcome::SiteTooOld => format!("Profiles: {site} cannot end the connection of a sign-in that was not kept yet; it lapses there by itself."),
+        Outcome::NotAConnection => format!("Profiles: {site} keeps the token of a sign-in that was not kept, because it is not a sign-in connection."),
+        Outcome::NotReached(why) => format!("Profiles: the connection of a sign-in that was not kept could not be ended at {site}: {why}."),
+    }
+}
+
 /// What a removal says when the site did not end its token; nothing when it did, or the token
 /// was not valid any more.
 pub fn removal_notice(name: &str, outcome: &Outcome) -> Option<String> {

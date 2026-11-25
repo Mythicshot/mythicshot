@@ -54,6 +54,8 @@ pub enum AfterEnd {
     Notice,
     /// A "Sign in again": silent for the person, one line in the app's log.
     Log,
+    /// A sign-in that was not kept: silent for the person, one line in the app's log.
+    Abandoned,
 }
 
 /// A change of the profiles, run on a background thread.
@@ -182,25 +184,44 @@ fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings
         let busy = then_end.as_ref().map(|_| (Busy::new(&endings.busy), Busy::new(in_flight())));
         *lock(&slot) = Some(done);
         let Some((ending, after)) = then_end else { return };
-        // A job that started with this token runs to its end first.
-        shelf.holds().wait_free(&ending.id);
-        let sending = Busy::new(&endings.sending);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
-        match (after, outcome) {
-            // Held here again meanwhile: nothing was sent, and nothing is said.
-            (_, None) => {}
-            (AfterEnd::Notice, Some(outcome)) => {
-                if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
-                    endings.say(text);
-                }
-            }
-            (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
-        }
-        drop(sending);
-        // The token's copy is wiped here.
-        drop(ending);
+        end_counted(&*shelf, &endings, ending, after);
         drop(busy);
     });
+}
+
+/// End `ending`'s token at its site on a thread of its own, counted as running work while it
+/// is: the connection of a sign-in that was not kept. Silent for the person on every answer.
+fn spawn_abandon(shelf: &Arc<dyn Shelf>, endings: &Endings, ending: Ending) {
+    let (shelf, endings) = (shelf.clone(), endings.clone());
+    let busy = (Busy::new(&endings.busy), Busy::new(in_flight()));
+    std::thread::spawn(move || {
+        end_counted(&*shelf, &endings, ending, AfterEnd::Abandoned);
+        drop(busy);
+    });
+}
+
+/// Once no running job holds `ending`'s token ([`Holds::wait_free`]), and only if nothing here
+/// holds it then (asked again under the change lock, [`Shelf::held`]), ask its site to end it;
+/// then say or log what came of it, as `after` says. Never on the UI thread.
+fn end_counted(shelf: &dyn Shelf, endings: &Endings, ending: Ending, after: AfterEnd) {
+    // A job that started with this token runs to its end first.
+    shelf.holds().wait_free(&ending.id);
+    let sending = Busy::new(&endings.sending);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if shelf.held(&ending) { None } else { Some(shelf.end(&ending)) })).unwrap_or_else(|_| Some(Outcome::NotReached("the request failed".into())));
+    match (after, outcome) {
+        // Held here again meanwhile: nothing was sent, and nothing is said.
+        (_, None) => {}
+        (AfterEnd::Notice, Some(outcome)) => {
+            if let Some(text) = profiles::removal_notice(&ending.name, &outcome) {
+                endings.say(text);
+            }
+        }
+        (AfterEnd::Log, Some(outcome)) => eprintln!("{}", profiles::renewal_log_line(&ending.server, &outcome)),
+        (AfterEnd::Abandoned, Some(outcome)) => eprintln!("{}", profiles::abandoned_log_line(&ending.server, &outcome)),
+    }
+    drop(sending);
+    // The token's copy is wiped here.
+    drop(ending);
 }
 
 // ---- The dropdown ----
@@ -483,8 +504,12 @@ pub struct AddFlow {
     /// The check of a pasted token, running on its thread, and its end.
     pasted: Arc<Mutex<Option<Result<Candidate, String>>>>,
     checking_paste: bool,
-    /// The token a renewal replaced, being ended at its site.
+    /// The token a renewal replaced, or the connection of a sign-in that was not kept, being
+    /// ended at its site.
     endings: Endings,
+    /// The candidate the form holds came from a browser sign-in (not from a pasted token, which
+    /// is the site's own setup token and is never ended here).
+    signed_in: bool,
     shelf: Arc<dyn Shelf>,
     open: Opener,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -498,7 +523,7 @@ impl Drop for AddFlow {
 
 impl AddFlow {
     pub fn new(purpose: Purpose, address: String, shelf: Arc<dyn Shelf>, open: Opener, clock: Arc<dyn Clock + Send + Sync>) -> AddFlow {
-        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, endings: Endings::default(), shelf, open, clock }
+        AddFlow { purpose, address, step: Step::Address, sign_in: None, slot: Arc::default(), working: false, done: Arc::default(), error: None, pasting: false, paste: String::new(), pasted: Arc::default(), checking_paste: false, endings: Endings::default(), signed_in: false, shelf, open, clock }
     }
 
     /// The form for the app's own profiles, the real browser and the real clock.
@@ -553,6 +578,7 @@ impl AddFlow {
         self.sign_in = None;
         let candidate = lock(&self.slot).take();
         if let (SignInAction::Connected(_), Some(candidate)) = (action, candidate) {
+            self.signed_in = true;
             self.accept(candidate);
         }
     }
@@ -648,7 +674,7 @@ impl AddFlow {
             self.purpose = Purpose::Renew(id);
             self.accept(candidate);
         } else {
-            drop(candidate);
+            self.abandon(candidate);
             self.shelf.switch(&id);
             self.step = Step::Finished;
         }
@@ -658,7 +684,7 @@ impl AddFlow {
     /// unstored, as on Cancel, and a fresh browser sign-in starts for the same address.
     pub fn try_different_account(&mut self) {
         let Step::Same { candidate, .. } = std::mem::replace(&mut self.step, Step::Address) else { return };
-        drop(candidate);
+        self.abandon(candidate);
         *lock(&self.slot) = None;
         self.begin_sign_in();
     }
@@ -719,8 +745,24 @@ impl AddFlow {
         }
         publish_ui::wipe(&mut self.paste);
         self.sign_in = None;
-        *lock(&self.slot) = None;
-        self.step = Step::Finished;
+        // A sign-in that passed and is left here is ended at its site; nothing was stored.
+        if let Some(candidate) = lock(&self.slot).take() {
+            self.signed_in = true;
+            self.abandon(candidate);
+        }
+        if let Step::Checked { candidate, .. } | Step::Same { candidate, .. } | Step::Renew { candidate, .. } = std::mem::replace(&mut self.step, Step::Finished) {
+            self.abandon(candidate);
+        }
+    }
+
+    /// The connection `candidate`'s sign-in made, which is not kept: ended at its site in the
+    /// background, silently. A pasted token is only dropped (wiped).
+    fn abandon(&self, candidate: Candidate) {
+        if self.signed_in
+            && let Some(ending) = candidate.into_ending()
+        {
+            spawn_abandon(&self.shelf, &self.endings, ending);
+        }
     }
 
     /// Take in a save or renewal that ended.
@@ -737,6 +779,7 @@ impl AddFlow {
                 Ok(_) if self.is_finished() => {}
                 Ok(candidate) => {
                     self.pasting = false;
+                    self.signed_in = false;
                     self.accept(candidate);
                 }
                 Err(e) => self.error = Some(e),
