@@ -15,7 +15,7 @@ use eframe::egui::{self, RichText};
 use crate::theme;
 use crate::home_ui::{self, HomeState};
 use crate::menu_bar::{self, AppRequest, Entry};
-use crate::open_image::OpenImage;
+use crate::open_image::{DropState, OpenImage};
 use crate::platform::{WindowId, WindowKind};
 use crate::project::ProjectKey;
 use crate::publish_ui::{self, TokenStatus};
@@ -212,6 +212,8 @@ pub struct Shared {
     /// A picture file to open, asked for by the Open image tile; the app opens it in an editor
     /// and the window stays.
     pub open_image: Option<OpenImage>,
+    /// A drag of files over the window: what it holds, for the overlay.
+    pub drop: DropState,
     /// A capture or recording is going on: the tiles are greyed out.
     pub busy: bool,
     /// What the menu bar asked of the app, in order; the app takes them on its next frame.
@@ -225,7 +227,7 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -402,7 +404,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         }
         !std::mem::replace(&mut s.title_dark, true)
     };
-    let builder = egui::ViewportBuilder::default().with_title(TITLE).with_inner_size(SIZE).with_min_inner_size(MIN_SIZE).with_icon(icon);
+    let builder = builder(icon);
     let shared = shared.clone();
     ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
         let mut guard = shared.lock().expect("main window state");
@@ -426,6 +428,13 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         theme::dark_title_bar(ctx, viewport_id());
     }
     ctx.request_repaint_of(viewport_id());
+}
+
+/// The window's viewport. It takes files dropped on it (a picture opens in the editor). Windows
+/// lets every window of the app take drops already, as the platform default; it is said here so
+/// this window does not depend on that, and no other window is changed.
+fn builder(icon: Arc<egui::IconData>) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default().with_title(TITLE).with_inner_size(SIZE).with_min_inner_size(MIN_SIZE).with_icon(icon).with_drag_and_drop(true)
 }
 
 /// The window's contents: the menu on the left, the selected page beside it.
@@ -455,6 +464,11 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
     }
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), workspace, &mut out));
     egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| theme::page(ui, |ui| page_ui(ui, s, tours_conn, workspace, &mut out)));
+    // A picture file dragged over the window, on any page: the overlay over the whole window
+    // while it is there, and the file opened when it is dropped.
+    if let Some(path) = s.drop.frame_from_input(ui.ctx(), ui.ctx().content_rect()) {
+        out.open_image = Some(OpenImage::Dropped(path));
+    }
     s.take(out);
 }
 
@@ -1301,5 +1315,113 @@ pub(crate) mod tests {
             assert_eq!(s.capture, None);
             assert!(s.nav.is_open() && s.app_requests.is_empty());
         }
+    }
+
+    /// One frame of the window with files dragged over it and dropped on it.
+    fn drag_frame(ctx: &egui::Context, s: &mut Shared, size: egui::Vec2, hovered: &[std::path::PathBuf], dropped: &[std::path::PathBuf], events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(ctx.input(|i| i.time) + 0.5),
+            hovered_files: hovered.iter().map(|p| egui::HoveredFile { path: Some(p.clone()), mime: String::new() }).collect(),
+            dropped_files: dropped.iter().map(|p| Arc::new(crate::open_image::tests::Dropped(p.clone())) as egui::DroppedFileHandle).collect(),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| window_ui(ui, s));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// On every page, a picture file dragged over the window shows the overlay that takes it;
+    /// anything else, or several files, the one that refuses; no drag, none. A dropped picture
+    /// reaches the app as a file to open, the same open as the tile's; anything else does nothing.
+    #[test]
+    fn a_picture_dragged_over_the_window_shows_the_overlay_and_a_drop_opens_it() {
+        use crate::open_image::{DROP_TO_OPEN, ONLY_PICTURES};
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = tmp.path().join("Shot 1.JPEG");
+        std::fs::write(&pic, "x").unwrap();
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let has = |out: &egui::FullOutput, text: &str| crate::share_ui::tests::text_rect(out, text).is_some();
+        for page in Page::ALL {
+            let ctx = crate::theme::test_context();
+            let mut s = shared(tmp.path());
+            s.nav.request(page);
+            let out = drag_frame(&ctx, &mut s, size, &[], &[], vec![]);
+            assert!(!has(&out, DROP_TO_OPEN) && !has(&out, ONLY_PICTURES), "{page:?}: no drag, no overlay");
+            let out = drag_frame(&ctx, &mut s, size, std::slice::from_ref(&pic), &[], vec![]);
+            assert!(has(&out, DROP_TO_OPEN) && !has(&out, ONLY_PICTURES), "{page:?}");
+            for refused in [vec![notes.clone()], vec![pic.clone(), pic.clone()], vec![tmp.path().to_path_buf()]] {
+                let out = drag_frame(&ctx, &mut s, size, &refused, &[], vec![]);
+                assert!(has(&out, ONLY_PICTURES) && !has(&out, DROP_TO_OPEN), "{page:?} {refused:?}");
+            }
+            // The drag leaves: the overlay goes.
+            let out = drag_frame(&ctx, &mut s, size, &[], &[], vec![]);
+            assert!(!has(&out, DROP_TO_OPEN) && !has(&out, ONLY_PICTURES), "{page:?}");
+            drag_frame(&ctx, &mut s, size, std::slice::from_ref(&notes), &[], vec![]);
+            drag_frame(&ctx, &mut s, size, &[], std::slice::from_ref(&notes), vec![]);
+            assert_eq!(s.open_image, None, "{page:?}: a drop of something else does nothing");
+            drag_frame(&ctx, &mut s, size, &[], &[pic.clone(), pic.clone()], vec![]);
+            assert_eq!(s.open_image, None, "{page:?}: nor does a drop of several");
+            drag_frame(&ctx, &mut s, size, std::slice::from_ref(&pic), &[], vec![]);
+            let out = drag_frame(&ctx, &mut s, size, &[], std::slice::from_ref(&pic), vec![]);
+            assert!(!has(&out, DROP_TO_OPEN));
+            assert_eq!(s.open_image, Some(OpenImage::Dropped(pic.clone())), "{page:?}");
+            assert!(s.capture.is_none() && s.nav.is_open() && s.nav.page() == page);
+        }
+    }
+
+    /// The overlay is only painted: with a drag over the window a click still reaches the page.
+    #[test]
+    fn the_overlay_never_takes_a_click() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = tmp.path().join("shot.png");
+        std::fs::write(&pic, "x").unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.request(Page::Home);
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let at = egui::pos2(NAV_WIDTH + 60.0, 100.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        for events in [vec![], vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![]] {
+            drag_frame(&ctx, &mut s, size, std::slice::from_ref(&pic), &[], events);
+        }
+        assert_eq!(s.capture, Some(Command::Region), "the first tile took the click");
+    }
+
+    /// The overlay fits the window at its smallest and usual sizes at 100% and 200%: its words
+    /// inside the frame, on one or more lines.
+    #[test]
+    fn the_overlay_fits_the_window_at_every_size_and_scale() {
+        use crate::open_image::{DROP_TO_OPEN, ONLY_PICTURES};
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = tmp.path().join("shot.png");
+        std::fs::write(&pic, "x").unwrap();
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        for size in [SIZE, MIN_SIZE] {
+            for ppp in [1.0, 2.0] {
+                for (file, text) in [(&pic, DROP_TO_OPEN), (&notes, ONLY_PICTURES)] {
+                    let ctx = crate::theme::test_context();
+                    ctx.set_pixels_per_point(ppp);
+                    let mut s = shared(tmp.path());
+                    s.nav.request(Page::Home);
+                    let size = egui::vec2(size[0], size[1]);
+                    drag_frame(&ctx, &mut s, size, std::slice::from_ref(file), &[], vec![]);
+                    let out = drag_frame(&ctx, &mut s, size, std::slice::from_ref(file), &[], vec![]);
+                    let words = crate::share_ui::tests::text_rect(&out, text).unwrap();
+                    let inner = egui::Rect::from_min_size(egui::Pos2::ZERO, size).shrink(theme::PAGE_PAD);
+                    assert!(inner.contains_rect(words), "{size:?} at {ppp}: {words:?} outside {inner:?}");
+                }
+            }
+        }
+    }
+
+    /// The main window's viewport takes dropped files, said outright rather than left to the platform.
+    #[test]
+    fn the_main_windows_viewport_takes_dropped_files() {
+        assert_eq!(builder(Arc::new(egui::IconData::default())).drag_and_drop, Some(true));
     }
 }

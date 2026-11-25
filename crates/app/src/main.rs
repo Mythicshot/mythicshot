@@ -1093,12 +1093,18 @@ impl App {
 
     fn open_file(&mut self) {
         let Some(path) = open_image::pick(&self.settings.output_dir) else { return };
-        match image::open(&path) {
+        self.open_image_file(&path);
+    }
+
+    /// Open the picture file at `path` in an editor, read within [`open_image::load`]'s limits,
+    /// or say it could not be opened. Read here, on the app's thread, as it always was.
+    fn open_image_file(&mut self, path: &Path) {
+        match open_image::load(path) {
             Ok(img) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.open_editor(img.to_rgba8(), title);
+                self.open_editor(img, title);
             }
-            Err(e) => self.notify(format!("Could not open {}: {e}", path.display())),
+            Err(e) => self.notify(open_image::could_not_open(path, &e)),
         }
     }
 
@@ -1432,9 +1438,11 @@ impl App {
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
             (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take())
         };
-        // The Open image tile: exactly what the tray's "Open image from file…" runs. The window stays.
+        // The Open image tile: exactly what the tray's "Open image from file…" runs. A picture
+        // dropped on the window opens the same way as one picked there. The window stays.
         match open {
             Some(open_image::OpenImage::Pick) => self.run(ctx, Command::OpenFile),
+            Some(open_image::OpenImage::Dropped(path)) => self.open_image_file(&path),
             None => {}
         }
         for request in requests {

@@ -522,6 +522,16 @@ fn roomy_renders() {
             f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
             f.s.nav.request(Page::Tours);
             crate::publish_ui::with_test_book(tour_book(), || save(&mut f, "tours-with-profile", false, &tours_conn));
+            // The drop overlay over the Home page: a picture that will open, and anything else.
+            for (label, accept) in [("drop-picture", true), ("drop-refused", false)] {
+                let mut f = fixture(Kind::Add);
+                f.s.nav.request(Page::Home);
+                let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| {
+                    window_ui_given(ui, &mut f.s, &tours_conn, None);
+                    crate::open_image::paint_overlay(ui.ctx(), ui.ctx().content_rect(), accept);
+                });
+                assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{suffix}")), 0, "{label}");
+            }
             // The update line, in each of its states, over the Home page.
             for state in ["available", "downloading", "checked", "waiting", "mismatch"] {
                 let mut f = fixture(Kind::Add);
