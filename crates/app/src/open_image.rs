@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, FontId, Rect, Shape, Stroke, pos2, vec2};
+use eframe::egui::{self, Color32, FontId, Rect, Shape, Stroke, pos2, vec2};
 use image::error::{ImageFormatHint, LimitError, LimitErrorKind, UnsupportedError, UnsupportedErrorKind};
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, RgbaImage};
 
@@ -224,6 +224,9 @@ pub struct DropState {
     judged: Option<(Vec<Option<PathBuf>>, Verdict)>,
     /// A drop of several files is landing: what else of it arrives is refused too.
     refusing_drop: bool,
+    /// A picture of the window with the overlay up, without a drag: the renders.
+    #[cfg(test)]
+    pub(crate) shown_for_render: Option<bool>,
 }
 
 impl DropState {
@@ -247,6 +250,10 @@ impl DropState {
         self.refusing_drop = false;
         if hovered.is_empty() {
             self.judged = None;
+            #[cfg(test)]
+            if let Some(accept) = self.shown_for_render {
+                paint_overlay(ctx, area, accept);
+            }
             return None;
         }
         let verdict = match &self.judged {
@@ -268,26 +275,44 @@ impl DropState {
     }
 }
 
-/// The overlay over `area` while files are dragged over the window: a dashed frame with the
-/// Open image icon and what a drop would do, in the purple selection tint when it would open a
-/// picture and in the danger tint when it would not. It is painted on a layer of its own above
+/// The overlay's see-through tints over the page, from the theme's selection and danger tints:
+/// the page stays faintly visible under them.
+pub const ACCEPT_TINT: Color32 = Color32::from_rgba_unmultiplied_const(theme::SELECTION.r(), theme::SELECTION.g(), theme::SELECTION.b(), 205);
+pub const REFUSE_TINT: Color32 = Color32::from_rgba_unmultiplied_const(theme::DANGER_TINT.r(), theme::DANGER_TINT.g(), theme::DANGER_TINT.b(), 205);
+
+/// The overlay's colours: the see-through tint over the page, the dashed frame, the solid chip
+/// the icon and words stand on, and the words. The words are measured against the solid chip,
+/// never against the see-through tint, so whatever the page shows through cannot lower their
+/// contrast.
+pub fn overlay_colours(accept: bool) -> (Color32, Color32, Color32, Color32) {
+    if accept { (ACCEPT_TINT, theme::PRIMARY_TEXT, theme::SELECTION, theme::TEXT) } else { (REFUSE_TINT, theme::DANGER_BORDER, theme::DANGER_TINT, theme::DANGER_TEXT) }
+}
+
+/// The overlay over `area` (the window below its menu bar) while files are dragged over the
+/// window: a see-through tint over the page, a dashed frame, and on a solid chip in the middle
+/// the Open image icon and what a drop would do, in the purple selection tint when it would open
+/// a picture and in the danger tint when it would not. It is painted on a layer of its own above
 /// the page and takes no input, so clicks still reach the page.
-pub(crate) fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool) {
+fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("open-image-drop")));
-    let (fill, edge, ink, text) = if accept { (theme::SELECTION, theme::PRIMARY_TEXT, theme::TEXT, DROP_TO_OPEN) } else { (theme::DANGER_TINT, theme::DANGER_BORDER, theme::DANGER_TEXT, ONLY_PICTURES) };
-    p.rect_filled(area, 0.0, theme::SCRIM_STRONG);
+    let (tint, edge, chip, ink) = overlay_colours(accept);
+    let text = if accept { DROP_TO_OPEN } else { ONLY_PICTURES };
+    p.rect_filled(area, 0.0, tint);
     let frame = area.shrink(theme::PAGE_PAD.min(area.width() / 4.0).min(area.height() / 4.0));
-    p.rect_filled(frame, 0.0, fill);
     let corners = vec![frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom(), frame.left_top()];
     p.extend(Shape::dashed_line(&corners, Stroke::new(2.0, edge), 10.0, 6.0));
-    let wrap = (frame.width() - 2.0 * theme::PAGE_PAD).max(40.0);
+    let pad = theme::CARD_PAD_X;
+    let wrap = (frame.width() - 4.0 * pad).max(40.0);
     // Centred lines: the galley's x of 0 is the middle of each line.
     let mut job = egui::text::LayoutJob::simple(text.to_string(), FontId::proportional(theme::STRONG_SIZE), ink, wrap);
     job.halign = egui::Align::Center;
     let galley = p.layout_job(job);
-    let icon = 40.0_f32.min(frame.height() / 3.0);
+    let icon = 40.0_f32.min(frame.height() / 4.0);
     let gap = theme::ITEM_GAP * 1.5;
-    let top = frame.center().y - (icon + gap + galley.size().y) / 2.0;
+    let block = vec2(galley.size().x.max(icon), icon + gap + galley.size().y);
+    let chip_rect = Rect::from_center_size(frame.center(), block + vec2(2.0 * pad, 2.0 * pad));
+    p.rect(chip_rect, egui::CornerRadius::same(theme::CARD_RADIUS), chip, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    let top = chip_rect.top() + pad;
     icons::paint(&p, Rect::from_center_size(pos2(frame.center().x, top + icon / 2.0), vec2(icon, icon)), Icon::OpenImage, ink);
     p.galley(pos2(frame.center().x, top + icon + gap), galley, ink);
 }

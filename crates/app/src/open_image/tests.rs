@@ -375,6 +375,18 @@ fn the_verdict_is_kept_while_the_same_files_are_dragged() {
     assert_eq!(got, None);
 }
 
+/// The words stand on a solid chip, so their contrast is measured against it whatever the
+/// see-through tint lets show of the page: at least 4.5:1, and the tints are see-through.
+#[test]
+fn the_overlay_words_keep_their_contrast_on_a_solid_chip() {
+    for accept in [true, false] {
+        let (tint, _, chip, ink) = overlay_colours(accept);
+        assert_eq!(chip.a(), 255, "the chip is solid");
+        assert!(theme::contrast(ink, chip) >= 4.5, "{accept}: {}", theme::contrast(ink, chip));
+        assert!(tint.a() > 0 && tint.a() < 255, "the page shows faintly through");
+    }
+}
+
 /// An editor is a window of its own and does not read dragged or dropped files: no overlay is
 /// drawn there and a drop on it asks nothing of the app.
 #[test]

@@ -526,10 +526,8 @@ fn roomy_renders() {
             for (label, accept) in [("drop-picture", true), ("drop-refused", false)] {
                 let mut f = fixture(Kind::Add);
                 f.s.nav.request(Page::Home);
-                let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| {
-                    window_ui_given(ui, &mut f.s, &tours_conn, None);
-                    crate::open_image::paint_overlay(ui.ctx(), ui.ctx().content_rect(), accept);
-                });
+                f.s.drop.shown_for_render = Some(accept);
+                let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
                 assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{suffix}")), 0, "{label}");
             }
             // The update line, in each of its states, over the Home page.

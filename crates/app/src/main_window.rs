@@ -455,7 +455,8 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
     theme::window_background(ui);
     let mut out = PageOut::default();
     let menu = s.menu_state();
-    if let Some(entry) = menu_bar::bar(ui, "main-menu-bar", &menu).picked {
+    let bar = menu_bar::bar(ui, "main-menu-bar", &menu);
+    if let Some(entry) = bar.picked {
         s.menu_entry(entry, &mut out);
     }
     // A newer version, its download or its install: one line under the menu bar, on every page.
@@ -464,9 +465,11 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
     }
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), workspace, &mut out));
     egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| theme::page(ui, |ui| page_ui(ui, s, tours_conn, workspace, &mut out)));
-    // A picture file dragged over the window, on any page: the overlay over the whole window
-    // while it is there, and the file opened when it is dropped.
-    if let Some(path) = s.drop.frame_from_input(ui.ctx(), ui.ctx().content_rect()) {
+    // A picture file dragged over the window, on any page: the overlay over the window below
+    // its menu bar while it is there, and the file opened when it is dropped.
+    let mut below_bar = ui.ctx().content_rect();
+    below_bar.min.y = bar.rect.bottom();
+    if let Some(path) = s.drop.frame_from_input(ui.ctx(), below_bar) {
         out.open_image = Some(OpenImage::Dropped(path));
     }
     s.take(out);
@@ -1414,6 +1417,11 @@ pub(crate) mod tests {
                     let words = crate::share_ui::tests::text_rect(&out, text).unwrap();
                     let inner = egui::Rect::from_min_size(egui::Pos2::ZERO, size).shrink(theme::PAGE_PAD);
                     assert!(inner.contains_rect(words), "{size:?} at {ppp}: {words:?} outside {inner:?}");
+                    // The see-through tint covers the window below the menu bar, never the bar.
+                    let (tint, ..) = crate::open_image::overlay_colours(text == DROP_TO_OPEN);
+                    let tinted = crate::theme::checks::fills(&out).into_iter().find(|(_, c, _)| *c == tint).map(|(r, _, _)| r).expect("the tint is painted");
+                    let file = crate::share_ui::tests::text_rect(&out, "File").unwrap();
+                    assert!(tinted.top() >= file.bottom() && tinted.bottom() >= size.y - 0.5 && tinted.width() >= size.x - 0.5, "{size:?} at {ppp}: {tinted:?}");
                 }
             }
         }
