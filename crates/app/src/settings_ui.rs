@@ -144,20 +144,19 @@ fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hoo
     ui.horizontal(|ui| {
         for tab in Tab::ALL {
             let selected = state.tab == tab;
-            if ui.add(egui::Button::selectable(selected, tab.label()).min_size(vec2(96.0, 30.0))).clicked() {
+            if ui.add(egui::Button::selectable(selected, tab.label()).min_size(vec2(theme::TAB_WIDTH, theme::CONTROL_HEIGHT))).clicked() {
                 state.tab = tab;
                 out.push(UiAction::StopListening);
             }
         }
     });
     ui.separator();
-    ui.add_space(6.0);
     // The settings file could not be used as it was at start-up.
     if let Some(problem) = &view.settings.load_problem {
         theme::caution_box(ui, |ui| {
             ui.add(egui::Label::new(RichText::new(problem.sentence()).color(theme::CAUTION_TEXT)).wrap());
         });
-        ui.add_space(8.0);
+        theme::block_gap(ui);
     }
     // A limit that was typed and then left by the click on another tab: its row is not drawn
     // again to see the field lose its focus, so what stands in the field is saved here.
@@ -175,30 +174,32 @@ fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hoo
 fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     let s = view.settings;
     ui.heading("General");
-    ui.add_space(12.0);
-    let mut autostart = view.autostart;
-    if ui.checkbox(&mut autostart, "Start Mythicshot when I sign in").changed() {
-        out.push(UiAction::SetAutostart(autostart));
-    }
-    if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
-        out.push(UiAction::SettingsChanged);
-    }
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.label("Left-click on the tray icon");
-        for choice in TrayLeftClick::ALL {
-            if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            let mut autostart = view.autostart;
+            if ui.checkbox(&mut autostart, "Start Mythicshot when I sign in").changed() {
+                out.push(UiAction::SetAutostart(autostart));
+            }
+            if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
                 out.push(UiAction::SettingsChanged);
             }
-        }
+        });
+        rows.full(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Left-click on the tray icon").color(theme::MUTED));
+                for choice in TrayLeftClick::ALL {
+                    if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
+                        out.push(UiAction::SettingsChanged);
+                    }
+                }
+            });
+        });
     });
-    ui.add_space(16.0);
     if ui.button("Open settings folder").clicked() {
         out.push(UiAction::OpenSettingsFolder);
     }
     // Which build this is.
-    ui.add_space(16.0);
-    ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(12.0).color(theme::MUTED));
+    theme::caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
 }
 
 fn output_tab(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, hooks: &mut Hooks<'_>, out: &mut Vec<UiAction>) {
@@ -221,122 +222,142 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     let s = view.settings;
     let mut changed = false;
     ui.heading("Output");
-    ui.add_space(10.0);
 
-    section_label(ui, "After capture");
-    ui.label(RichText::new("Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.").color(theme::MUTED).size(12.0));
-    ui.add_space(4.0);
-    for d in DestId::ALL {
-        let mut on = s.has_destination(*d);
-        if ui.checkbox(&mut on, d.label()).on_hover_text(d.help()).changed() {
-            s.toggle_destination(*d);
-            changed = true;
-        }
-    }
-
-    ui.add_space(14.0);
-    section_label(ui, "Saving");
-    ui.add_space(4.0);
-    ui.label("Captures folder");
-    ui.horizontal(|ui| {
-        let mut dir = s.output_dir.display().to_string();
-        if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(ui.available_width() - 90.0)).changed() {
-            s.output_dir = dir.into();
-            changed = true;
-        }
-        if ui.button("Browse…").clicked() {
-            if let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
-                s.output_dir = p;
-                changed = true;
-            }
-        }
-    });
-    ui.add_space(8.0);
-    ui.label("File name pattern");
-    ui.horizontal(|ui| {
-        if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(ui.available_width() - 90.0).font(egui::TextStyle::Monospace)).changed() {
-            changed = true;
-        }
-        if ui.button("Default").clicked() {
-            s.filename_pattern = DEFAULT_PATTERN.to_string();
-            changed = true;
-        }
-    });
-    let example = expand_pattern(&s.filename_pattern, "Window title", chrono::Local::now());
-    ui.label(RichText::new(format!("Example: {example}.{}", s.image_format.extension())).color(theme::MUTED).size(12.0));
-    ui.label(RichText::new("Tokens: ${YYYY} ${MM} ${DD} ${hh} ${mm} ${ss} ${title} ${user}. Use / for subfolders.").color(theme::MUTED).size(12.0));
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label("Format");
-        changed |= ui.radio_value(&mut s.image_format, ImageFormat::Png, "PNG").changed();
-        changed |= ui.radio_value(&mut s.image_format, ImageFormat::Jpeg, "JPEG").changed();
-        if s.image_format == ImageFormat::Jpeg {
-            changed |= ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100).text("quality")).changed();
-        }
-    });
-
-    ui.add_space(14.0);
-    section_label(ui, "Recording");
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("Frame rate");
-        egui::ComboBox::from_id_salt("record-fps").width(90.0).selected_text(format!("{} fps", s.record_fps)).show_ui(ui, |ui| {
-            for fps in [10, 15, 24, 30] {
-                changed |= ui.selectable_value(&mut s.record_fps, fps, format!("{fps} fps")).changed();
-            }
-        });
-        ui.add_space(12.0);
-        ui.label("Countdown");
-        egui::ComboBox::from_id_salt("countdown").width(90.0).selected_text(if s.countdown_secs == 0 { "None".to_string() } else { format!("{} s", s.countdown_secs) }).show_ui(ui, |ui| {
-            for secs in [0, 3, 5, 10] {
-                let label = if secs == 0 { "None".to_string() } else { format!("{secs} s") };
-                changed |= ui.selectable_value(&mut s.countdown_secs, secs, label).changed();
+    theme::section_heading(ui, "After capture");
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            theme::caption(ui, "Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.");
+            for d in DestId::ALL {
+                let mut on = s.has_destination(*d);
+                if ui.checkbox(&mut on, d.label()).on_hover_text(d.help()).changed() {
+                    s.toggle_destination(*d);
+                    changed = true;
+                }
             }
         });
     });
-    changed |= ui.checkbox(&mut s.record_keys, "Record key presses for the key overlay").on_hover_text("Off by default: the log could include anything you type, passwords too. It stays in memory and is deleted with the recording.").changed();
-    ui.horizontal(|ui| {
-        use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
-        ui.label("Show keys as");
-        egui::ComboBox::from_id_salt("overlay-keys").width(130.0).selected_text(key_style_label(s.overlays.keys)).show_ui(ui, |ui| {
-            for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
-                changed |= ui.selectable_value(&mut s.overlays.keys, k, key_style_label(k)).changed();
-            }
-        });
-        ui.label("clicks as");
-        egui::ComboBox::from_id_salt("overlay-clicks").width(130.0).selected_text(click_style_label(s.overlays.clicks)).show_ui(ui, |ui| {
-            for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
-                changed |= ui.selectable_value(&mut s.overlays.clicks, c, click_style_label(c)).changed();
-            }
-        });
-    });
-    ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut s.overlays.pointer, "Show the mouse pointer").changed();
-        changed |= ui.checkbox(&mut s.overlays.halo, "Highlight it").changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("GIF quality");
-        changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
-    });
-    ui.label(RichText::new("GIFs are saved to the captures folder with the file name pattern above.").color(theme::MUTED).size(12.0));
 
-    ui.add_space(14.0);
-    section_label(ui, "Tour publishing");
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(TOUR_SITE_MOVED);
-        if ui.link(OPEN_WORKSPACE).clicked() {
-            out.push(UiAction::OpenWorkspace);
-        }
+    theme::section_heading(ui, "Saving");
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            ui.label("Captures folder");
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Browse…").clicked() {
+                        if let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
+                            s.output_dir = p;
+                            changed = true;
+                        }
+                    }
+                    let mut dir = s.output_dir.display().to_string();
+                    if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(ui.available_width())).changed() {
+                        s.output_dir = dir.into();
+                        changed = true;
+                    }
+                });
+            });
+        });
+        rows.full(|ui| {
+            ui.label("File name pattern");
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Default").clicked() {
+                        s.filename_pattern = DEFAULT_PATTERN.to_string();
+                        changed = true;
+                    }
+                    if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(ui.available_width()).font(egui::TextStyle::Monospace)).changed() {
+                        changed = true;
+                    }
+                });
+            });
+            let example = expand_pattern(&s.filename_pattern, "Window title", chrono::Local::now());
+            theme::caption(ui, format!("Example: {example}.{}", s.image_format.extension()));
+            theme::caption(ui, "Tokens: ${YYYY} ${MM} ${DD} ${hh} ${mm} ${ss} ${title} ${user}. Use / for subfolders.");
+        });
+        rows.row(
+            "Format",
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.radio_value(&mut s.image_format, ImageFormat::Png, "PNG").changed();
+                    changed |= ui.radio_value(&mut s.image_format, ImageFormat::Jpeg, "JPEG").changed();
+                    if s.image_format == ImageFormat::Jpeg {
+                        changed |= ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100).text("quality")).changed();
+                    }
+                });
+            },
+            |_| {},
+        );
     });
-    ui.add_space(8.0);
+
+    theme::section_heading(ui, "Recording");
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Frame rate");
+                egui::ComboBox::from_id_salt("record-fps").width(theme::COMBO_WIDTH).selected_text(format!("{} fps", s.record_fps)).show_ui(ui, |ui| {
+                    for fps in [10, 15, 24, 30] {
+                        changed |= ui.selectable_value(&mut s.record_fps, fps, format!("{fps} fps")).changed();
+                    }
+                });
+                ui.add_space(theme::SPACE_2);
+                ui.label("Countdown");
+                egui::ComboBox::from_id_salt("countdown").width(theme::COMBO_WIDTH).selected_text(if s.countdown_secs == 0 { "None".to_string() } else { format!("{} s", s.countdown_secs) }).show_ui(ui, |ui| {
+                    for secs in [0, 3, 5, 10] {
+                        let label = if secs == 0 { "None".to_string() } else { format!("{secs} s") };
+                        changed |= ui.selectable_value(&mut s.countdown_secs, secs, label).changed();
+                    }
+                });
+            });
+        });
+        rows.full(|ui| {
+            changed |= ui.checkbox(&mut s.record_keys, "Record key presses for the key overlay").on_hover_text("Off by default: the log could include anything you type, passwords too. It stays in memory and is deleted with the recording.").changed();
+            ui.horizontal_wrapped(|ui| {
+                use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
+                ui.label("Show keys as");
+                egui::ComboBox::from_id_salt("overlay-keys").width(theme::COMBO_WIDTH_WIDE).selected_text(key_style_label(s.overlays.keys)).show_ui(ui, |ui| {
+                    for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
+                        changed |= ui.selectable_value(&mut s.overlays.keys, k, key_style_label(k)).changed();
+                    }
+                });
+                ui.label("clicks as");
+                egui::ComboBox::from_id_salt("overlay-clicks").width(theme::COMBO_WIDTH_WIDE).selected_text(click_style_label(s.overlays.clicks)).show_ui(ui, |ui| {
+                    for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
+                        changed |= ui.selectable_value(&mut s.overlays.clicks, c, click_style_label(c)).changed();
+                    }
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui.checkbox(&mut s.overlays.pointer, "Show the mouse pointer").changed();
+                changed |= ui.checkbox(&mut s.overlays.halo, "Highlight it").changed();
+            });
+        });
+        rows.full(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("GIF quality");
+                changed |= ui.add(egui::Slider::new(&mut s.gif_quality, 50..=100)).on_hover_text("Lower is smaller; 90 looks clean for screen recordings").changed();
+            });
+            theme::caption(ui, "GIFs are saved to the captures folder with the file name pattern above.");
+        });
+    });
+
+    theme::section_heading(ui, "Tour publishing");
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            // The sentence, then its link on a line of its own, so a narrow window wraps only the sentence.
+            ui.add(egui::Label::new(TOUR_SITE_MOVED).wrap());
+            if ui.link(OPEN_WORKSPACE).clicked() {
+                out.push(UiAction::OpenWorkspace);
+            }
+        });
+    });
+    // The saved recordings keep the page's width: their list is a card of its own.
     // Turning the switch off deletes nothing: the section under it stays as it is.
     changed |= ui.checkbox(&mut s.keep_published_recordings, KEEP_RECORDING).changed();
     // The rest belongs to the switch: it stands under the switch's label.
     let mut under = ui.available_rect_before_wrap();
     under.min.x += ui.spacing().icon_width + ui.spacing().icon_spacing;
     ui.scope_builder(egui::UiBuilder::new().max_rect(under), |ui| changed |= saved_section(ui, s, saved, hooks));
-    ui.add_space(8.0);
+    theme::block_gap(ui);
     if changed {
         out.push(UiAction::SettingsChanged);
     }
@@ -446,7 +467,7 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
         let reveal = std::mem::take(&mut saved.reveal);
         let Some(listing) = saved.shown.as_ref().filter(|l| !l.rows.is_empty()) else { return };
         let (asking, busy) = (saved.asking.as_deref(), saved.removing.is_some());
-        theme::card_frame().inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+        theme::card_box().inner_margin(egui::Margin::symmetric(theme::SPACE_2 as i8, theme::SPACE_1 as i8)).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("saved-recordings").max_height(LIST_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
                 for row in &listing.rows {
                     // A row and its question are widgets of their own, so the keyboard focus
@@ -873,7 +894,7 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
             }
         });
     });
-    ui.add_space(8.0);
+    theme::block_gap(ui);
 
     if cfg!(windows) {
         let mut take = view.settings.take_print_screen;
@@ -885,7 +906,7 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
             view.settings.take_print_screen = take;
             out.push(UiAction::SetTakePrintScreen(take));
         }
-        ui.add_space(8.0);
+        theme::block_gap(ui);
     }
     let prtsc_failed = Action::ALL
         .iter()
@@ -902,84 +923,84 @@ fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out
                 ui.label(RichText::new("Another screenshot tool is probably running. Close it or turn off its shortcuts, then restart Mythicshot, or pick other keys below.").color(theme::CAUTION_TEXT));
             }
         });
-        ui.add_space(8.0);
+        theme::block_gap(ui);
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        let mut current_group = "";
+        // Each group of shortcuts is a card under its heading, in the order of the list.
+        let mut groups: Vec<(&str, Vec<Action>)> = Vec::new();
         for &action in Action::ALL {
-            if action.group() != current_group {
-                current_group = action.group();
-                group_title(ui, current_group);
+            match groups.last_mut() {
+                Some((group, actions)) if *group == action.group() => actions.push(action),
+                _ => groups.push((action.group(), vec![action])),
             }
-            row(ui, state, &view, Bind::Global(action), view.settings.binding(action), out);
         }
-        group_title(ui, "Editor");
-        ui.label(RichText::new("These work inside the editor window only.").color(theme::MUTED).size(12.0));
-        ui.add_space(4.0);
-        for &action in EditorAction::ALL {
-            row(ui, state, &view, Bind::Editor(action), view.settings.editor_binding(action), out);
-        }
-    });
-}
-
-fn group_title(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    section_label(ui, title);
-    ui.add_space(4.0);
-}
-
-/// The label over a section of the page, in sentence case.
-fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(theme::SMALL_SIZE).color(theme::MUTED).bold());
-}
-
-fn row(ui: &mut egui::Ui, state: &mut SettingsState, view: &View<'_>, action: Bind, binding: &str, out: &mut Vec<UiAction>) {
-    let listening = state.listening == Some(action);
-    let error = view.errors.get(&action);
-    let fill = if listening {
-        theme::SELECTION
-    } else if error.is_some() {
-        theme::CAUTION_TINT
-    } else {
-        theme::SURFACE
-    };
-    egui::Frame::new().fill(fill).corner_radius(CornerRadius::same(theme::RADIUS_MD)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.set_min_height(34.0);
-            ui.label(RichText::new(action.label()).size(14.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_sized([56.0, 32.0], egui::Button::new("Reset")).on_hover_text("Reset to default").clicked() {
-                    out.push(UiAction::SetBinding(action, action.default_binding().to_string()));
-                }
-                let text = if listening {
-                    "Press new keys…".to_string()
-                } else if binding.is_empty() {
-                    "Not set".to_string()
-                } else {
-                    hotkeys::display(binding)
-                };
-                let stroke = if listening {
-                    Stroke::new(1.0, theme::ACCENT)
-                } else if error.is_some() {
-                    Stroke::new(1.0, theme::CAUTION_BORDER)
-                } else {
-                    Stroke::new(1.0, theme::BORDER_STRONG)
-                };
-                let button = egui::Button::new(RichText::new(text).monospace()).stroke(stroke).min_size(vec2(170.0, 32.0));
-                if ui.add(button).on_hover_text("Click, then press the new shortcut").clicked() {
-                    out.push(if listening { UiAction::StopListening } else { UiAction::Listen(action) });
-                }
-                if listening {
-                    ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(12.0));
-                } else if let Some(e) = error {
-                    theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
+        for (group, actions) in groups {
+            theme::section_heading(ui, group);
+            theme::card(ui, |rows| {
+                for action in actions {
+                    row(rows, state, &view, Bind::Global(action), view.settings.binding(action), out);
                 }
             });
+        }
+        theme::section_heading(ui, "Editor");
+        theme::caption(ui, "These work inside the editor window only.");
+        theme::card(ui, |rows| {
+            for &action in EditorAction::ALL {
+                row(rows, state, &view, Bind::Editor(action), view.settings.editor_binding(action), out);
+            }
         });
     });
-    ui.add_space(4.0);
+}
+
+/// One shortcut, a row of its group's card: its name, then Reset and the keys at the right. A
+/// shortcut waiting for its keys is on the selection fill, one that could not be set on the
+/// caution tint.
+fn row(rows: &mut theme::CardRows<'_>, state: &mut SettingsState, view: &View<'_>, action: Bind, binding: &str, out: &mut Vec<UiAction>) {
+    let listening = state.listening == Some(action);
+    let error = view.errors.get(&action);
+    let tint = if listening {
+        Some(theme::SELECTION)
+    } else if error.is_some() {
+        Some(theme::CAUTION_TINT)
+    } else {
+        None
+    };
+    rows.row_tinted(
+        "",
+        tint,
+        |ui| {
+            ui.add(egui::Label::new(RichText::new(action.label()).color(theme::TEXT)).truncate());
+        },
+        |ui| {
+            if ui.button("Reset").on_hover_text("Reset to default").clicked() {
+                out.push(UiAction::SetBinding(action, action.default_binding().to_string()));
+            }
+            let text = if listening {
+                "Press new keys…".to_string()
+            } else if binding.is_empty() {
+                "Not set".to_string()
+            } else {
+                hotkeys::display(binding)
+            };
+            let stroke = if listening {
+                Stroke::new(1.0, theme::ACCENT)
+            } else if error.is_some() {
+                Stroke::new(1.0, theme::CAUTION_BORDER)
+            } else {
+                Stroke::new(1.0, theme::BORDER_STRONG)
+            };
+            let button = egui::Button::new(RichText::new(text).monospace()).stroke(stroke).min_size(vec2(theme::KEYS_WIDTH, theme::CONTROL_HEIGHT));
+            if ui.add(button).on_hover_text("Click, then press the new shortcut").clicked() {
+                out.push(if listening { UiAction::StopListening } else { UiAction::Listen(action) });
+            }
+            if listening {
+                ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(theme::SMALL_SIZE));
+            } else if let Some(e) = error {
+                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
+            }
+        },
+    );
 }
 
 #[cfg(test)]

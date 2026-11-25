@@ -1415,6 +1415,7 @@ impl ResultDialog {
         let mut action = None;
         let copied = self.copied_left().is_some();
         share_ui::modal(egui::Id::unique("publish-tour-result")).frame(share_ui::window_frame(ctx)).show(ctx, |ui| {
+            theme::roomy(ui);
             ui.set_width(share_ui::WINDOW_WIDTH);
             share_ui::heading_label(ui, self.heading());
             ui.label(RichText::new(self.line()).color(theme::MUTED)).on_hover_text(&self.title);
@@ -1977,9 +1978,10 @@ impl Picker {
         let who_shown = self.who_shown(&shown);
         let mut outcome = None;
         let (mut retry, mut pick, mut row) = (false, None, None);
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
         share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
+            theme::roomy(ui);
+            ui.set_width(theme::DIALOG_WIDTH);
             ui.horizontal(|ui| {
                 ui.heading("Publish tour");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2357,9 +2359,10 @@ impl Picker {
         }
         self.sync_site();
         let enter = !self.who.typing(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
         share_ui::modal(egui::Id::unique("publish-tour-picker")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
+            theme::roomy(ui);
+            ui.set_width(theme::DIALOG_WIDTH);
             ui.horizontal(|ui| {
                 ui.heading("Publish tour");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

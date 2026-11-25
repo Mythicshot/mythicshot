@@ -413,6 +413,14 @@ pub fn window_ui(ui: &mut egui::Ui, s: &mut Shared) {
 
 /// [`window_ui`] with the Tours page's site connection given: tests draw the window this way.
 fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn) {
+    window_ui_given(ui, s, tours_conn, None);
+}
+
+/// The active profile and its connection, as a test gives them to the Workspace page.
+type WorkspaceGiven = (Option<crate::profiles::Profile>, workspace_ui::Conn);
+
+/// [`window_ui_with`] with the Workspace page's active profile and connection given too.
+fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, workspace: Option<&WorkspaceGiven>) {
     theme::window_background(ui);
     let mut out = PageOut::default();
     let menu = s.menu_state();
@@ -420,14 +428,16 @@ fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn
         s.menu_entry(entry, &mut out);
     }
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
-    egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, tours_conn, &mut out));
+    egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(0)).show(ui, |ui| theme::page(ui, |ui| page_ui(ui, s, tours_conn, workspace, &mut out)));
     s.take(out);
 }
 
 fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
-    ui.add_space(8.0);
+    theme::roomy(ui);
+    ui.add_space(theme::ITEM_GAP);
+    ui.spacing_mut().item_spacing.y = theme::GRID;
     for page in Page::ALL {
-        if ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(current == page, page.label())).clicked() {
+        if theme::nav_item(ui, page.label(), current == page).clicked() {
             out.go_to = Some(page);
         }
     }
@@ -441,32 +451,27 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
         ui.add_space(8.0);
         match host {
             Some(host) => {
-                ui.add(egui::Label::new(RichText::new(host).size(12.0).color(theme::MUTED)).truncate());
-                ui.label(RichText::new("Connected to").size(12.0).color(theme::MUTED));
+                ui.add(egui::Label::new(RichText::new(host).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                ui.label(RichText::new("Connected to").size(theme::SMALL_SIZE).color(theme::MUTED));
             }
             None => {
-                ui.label(RichText::new("Not connected").size(12.0).color(theme::MUTED));
+                ui.label(RichText::new("Not connected").size(theme::SMALL_SIZE).color(theme::MUTED));
             }
         }
     });
 }
 
 /// Draw the selected page. Each page gets the part of [`Shared`] it owns and a [`PageOut`].
-fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: &mut PageOut) {
+fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, workspace: Option<&WorkspaceGiven>, out: &mut PageOut) {
     match s.nav.page() {
         Page::Home => home_ui::ui(ui, &mut s.home, &s.prefs.settings, s.busy, out),
         Page::Tours => tours_ui::ui(ui, &mut s.tours, tours_conn, out),
         Page::Workspace => {
-            // The profiles first: the dropdown, the notices, the add form or the list. The rows
-            // below are the active profile's, at its own address.
+            // The profiles first: the title, the active profile's card, the notices, the add
+            // form or the list. The cards below are the active profile's, at its own address.
             let request = publish_ui::take_profiles_request();
-            if s.profiles.ui(ui, request) == crate::profiles_ui::Below::Details
-                && let Some(active) = publish_ui::book().active().cloned()
-            {
-                s.workspace.profile_mode = true;
-                let mut address = active.server;
-                workspace_ui::ui(ui, &mut s.workspace, &mut address, &workspace_ui::Conn::current());
-            }
+            let (active, conn) = workspace.cloned().unwrap_or_else(|| (publish_ui::book().active().cloned(), workspace_ui::Conn::current()));
+            workspace_page(ui, &mut s.profiles, &mut s.workspace, request, active, &conn, out);
         }
         Page::Preferences => {
             let p = &mut s.prefs;
@@ -482,10 +487,32 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: 
     }
 }
 
+/// The Workspace page: the profiles' part (the title, the active profile's card, the notices,
+/// the add form or the list), then the cards of the active profile, `active`, at its own address.
+fn workspace_page(ui: &mut egui::Ui, profiles: &mut crate::profiles_ui::Panel, workspace: &mut WorkspaceState, request: Option<publish_ui::ProfilesRequest>, active: Option<crate::profiles::Profile>, conn: &workspace_ui::Conn, out: &mut PageOut) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let server = active.as_ref().map(|a| a.server.clone()).unwrap_or_default();
+        let below = profiles.ui(ui, request, &mut || workspace_ui::status_pill(workspace, &server, conn));
+        if below == crate::profiles_ui::Below::Details
+            && let Some(active) = active
+        {
+            workspace.profile_mode = true;
+            workspace.profile_account = active.account.clone();
+            workspace.profile_workspace = active.workspace.clone();
+            let mut address = active.server;
+            if workspace_ui::ui(ui, workspace, &mut address, conn).open_tours {
+                out.go_to = Some(Page::Tours);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::settings::Settings;
+
+    mod roomy;
 
     #[test]
     fn an_edit_request_reaches_the_app_once() {

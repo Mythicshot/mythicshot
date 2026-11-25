@@ -52,6 +52,10 @@ pub const NAME_MAX: usize = 60;
 pub const ACTIVE: &str = "Active";
 pub const SIGN_IN_AGAIN: &str = "Sign in again";
 pub const ADD_PROFILE: &str = "+ Add profile…";
+/// The Workspace page's button beside its title: what "+ Add profile…" does.
+pub const ADD_PROFILE_BUTTON: &str = "Add profile";
+/// The profile card's button that opens the profile list.
+pub const SWITCH_PROFILE: &str = "Switch profile";
 pub const MANAGE_PROFILES: &str = "Manage profiles…";
 pub const SITE_ADDRESS: &str = "Site address";
 pub const SIGN_IN: &str = "Sign in";

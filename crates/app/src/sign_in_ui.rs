@@ -379,9 +379,10 @@ impl SignInDialog {
         let mut pressed = escape.then(|| self.escape_button());
         let mut open_page = false;
         let view = self.view();
-        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(22.0);
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
         crate::share_ui::modal(egui::Id::unique("sign-in-window")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
+            theme::roomy(ui);
+            ui.set_width(theme::DIALOG_WIDTH);
             ui.label(RichText::new(CAPTION).color(theme::MUTED).size(12.0));
             ui.add_space(4.0);
             ui.heading(&view.heading);

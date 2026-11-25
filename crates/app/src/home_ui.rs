@@ -206,8 +206,7 @@ impl HomeState {
 /// Draw the page. `busy` greys the tiles out while a capture or recording is already going on.
 pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: bool, out: &mut PageOut) {
     ui.heading("Capture");
-    ui.add_space(10.0);
-    let gap = 10.0;
+    let gap = theme::ITEM_GAP;
     let width = ((ui.available_width() - gap * (TILES.len() - 1) as f32) / TILES.len() as f32).max(96.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
@@ -217,12 +216,9 @@ pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: b
             }
         }
     });
-    ui.add_space(10.0);
-    ui.label(RichText::new(RECORD_A_TOUR).color(theme::MUTED).size(12.0));
-
-    ui.add_space(18.0);
+    theme::caption(ui, RECORD_A_TOUR);
+    theme::block_gap(ui);
     ui.heading("Recent");
-    ui.add_space(8.0);
     match state.recent(&settings.output_dir) {
         RecentView::Reading => {
             ui.label(RichText::new(READING_RECENT).color(theme::MUTED));
@@ -235,9 +231,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut HomeState, settings: &Settings, busy: b
         }
         RecentView::Files(files) => {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for f in &files {
-                    recent_row(ui, f);
-                }
+                theme::card(ui, |rows| {
+                    for f in &files {
+                        rows.full(|ui| recent_row(ui, f));
+                    }
+                });
             });
         }
     }
@@ -260,25 +258,21 @@ fn tile(ui: &mut egui::Ui, t: &Tile, hotkey: &str, width: f32, enabled: bool) ->
     resp.clicked()
 }
 
+/// One recent capture, a row of the Recent card: its name, then Open and Show in folder at the right.
 fn recent_row(ui: &mut egui::Ui, f: &Recent) {
-    egui::Frame::new().fill(theme::SURFACE).corner_radius(CornerRadius::same(theme::RADIUS_LG)).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.set_min_height(30.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Show in folder").clicked() {
-                    platform::reveal(&f.path);
-                }
-                if ui.button("Open").clicked() {
-                    platform::open_path(&f.path);
-                }
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add(egui::Label::new(RichText::new(&f.name).size(14.0)).truncate());
-                });
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Show in folder").clicked() {
+                platform::reveal(&f.path);
+            }
+            if ui.button("Open").clicked() {
+                platform::open_path(&f.path);
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                theme::value(ui, &f.name);
             });
         });
     });
-    ui.add_space(4.0);
 }
 
 #[cfg(test)]

@@ -813,6 +813,7 @@ impl ShareDialog {
         let online = matches!(self.stage, Stage::Online { .. });
         let can_switch = self.can_switch();
         modal(egui::Id::unique("share-window")).frame(window_frame(ctx)).show(ctx, |ui| {
+            theme::roomy(ui);
             ui.set_width(WINDOW_WIDTH);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(view.caption).color(theme::MUTED).size(12.0));

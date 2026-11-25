@@ -44,6 +44,17 @@ pub const THIS_COMPUTER: &str = "This computer";
 pub const SIGN_OUT: &str = "Sign out";
 /// After "Signed in as …": the same as Sign out, for a code someone else confirmed.
 pub const NOT_YOU: &str = "Not you? Sign out";
+pub const OPEN_SITE: &str = "Open site";
+pub const TEST_CONNECTION: &str = "Test connection";
+/// The heading of the card with the site's rows.
+pub const CONNECTION: &str = "Connection";
+/// The profile card's status pill when the site answered for the token.
+pub const CONNECTED: &str = "Connected";
+/// After "Site version": the plain success of the last check.
+pub const CHECKED_NOW: &str = "Checked just now";
+/// The row of the Tours card, and its button.
+pub const ON_THIS_SITE: &str = "On this site";
+pub const OPEN_TOURS: &str = "Open Tours";
 /// The most characters of an account name "Signed in as" shows.
 pub const ACCOUNT_SHOWN_MAX: usize = 30;
 
@@ -119,12 +130,10 @@ pub struct Info {
     pub tours: Option<Counts>,
 }
 
-/// The "Tours" row: "2 (1 public, 1 draft)".
-pub fn tours_summary(c: Counts) -> String {
-    match c.public + c.draft {
-        0 => "0".to_string(),
-        total => format!("{total} ({} public, {} draft)", c.public, c.draft),
-    }
+/// The "On this site" row: "1 public, 0 drafts".
+pub fn tours_count(c: Counts) -> String {
+    let drafts = if c.draft == 1 { "draft" } else { "drafts" };
+    format!("{} public, {} {drafts}", c.public, c.draft)
 }
 
 /// The "Site version" row: the version, or "unknown" for a site that does not tell.
@@ -348,6 +357,10 @@ pub struct WorkspaceState {
     /// The page shows the active profile: its address cannot be edited here, and signing in
     /// (again) and the profile's token are the profiles panel's above (see `profiles_ui`).
     pub profile_mode: bool,
+    /// In profile mode: the account and the workspace the profile was last told of, for the
+    /// Account and Workspace rows. Set by the window each frame.
+    pub profile_account: Option<String>,
+    pub profile_workspace: Option<String>,
 }
 
 impl Default for WorkspaceState {
@@ -370,6 +383,8 @@ impl Default for WorkspaceState {
             clock: Arc::new(connect::RealClock::new()),
             note: Arc::new(publish_ui::note_check),
             profile_mode: false,
+            profile_account: None,
+            profile_workspace: None,
         }
     }
 }
@@ -403,7 +418,7 @@ fn ask(site: &Site, token: &str, note: &Note) -> Result<Info, String> {
 impl WorkspaceState {
     /// A page whose checks get the token from `token` instead of the credential store.
     #[cfg(test)]
-    fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
+    pub(crate) fn with_token(token: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) -> Self {
         Self { token: Arc::new(move |pin: &crate::profiles::Pin| token(&pin.server)), ..Default::default() }
     }
 
@@ -531,16 +546,27 @@ fn token_field(ui: &mut egui::Ui, p: &mut WorkspaceState, hint: &str, width: f32
     resp
 }
 
-/// Draw the page. `server` is the site address in the settings; returns whether it changed.
-pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: &Conn) -> bool {
+/// What the page found for this frame: the address it works with, what the site said, and which
+/// rows it shows.
+struct View {
+    effective: String,
+    site: Option<Site>,
+    problem: Option<String>,
+    checking: bool,
+    info: Option<Info>,
+    asked: bool,
+    refused: bool,
+    rows: Rows,
+}
+
+/// Work out what the page shows. On opening the page, and after a token was saved, this also
+/// asks the site once, without a click.
+fn view(p: &mut WorkspaceState, server: &str, conn: &Conn) -> View {
     let busy = p.is_busy();
-    let mut changed = false;
     // The address this page works with: the test hook's when set, else the saved one.
-    let effective = conn.test_server.clone().unwrap_or_else(|| server.clone());
+    let effective = conn.test_server.clone().unwrap_or_else(|| server.to_string());
     let site = conn.site(&effective);
     let problem = conn.binding_problem(&effective);
-
-    // On opening the page, and after a token was saved: ask the site once, without a click.
     if let Some(site) = &site
         && p.auto.as_ref() != Some(site)
         && !busy
@@ -555,12 +581,48 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     // A token the site refused is not a connection, whatever an earlier answer said.
     let refused = conn.refused || lock(&p.check).rejected(site.as_ref());
     let info = info.filter(|_| !refused);
-    let connected = info.is_some();
-    let mut rows = rows(&conn.token, connected, checking, refused, problem.is_none());
+    let mut rows = rows(&conn.token, info.is_some(), checking, refused, problem.is_none());
     if p.profile_mode {
         // A profile is signed in (again) only through its check, in the panel above.
         rows.sign_in = false;
     }
+    View { effective, site, problem, checking, info, asked, refused, rows }
+}
+
+/// The status pill of the profile card: "Checking…", "Connected" or "Not connected", and its tone.
+pub fn pill_for(token: &TokenStatus, checking: bool, connected: bool) -> (&'static str, theme::Tone) {
+    if *token == TokenStatus::Checking || (checking && *token == TokenStatus::Saved) {
+        (CHECKING, theme::Tone::Neutral)
+    } else if connected {
+        (CONNECTED, theme::Tone::Success)
+    } else {
+        (NOT_CONNECTED, theme::Tone::Warning)
+    }
+}
+
+/// The status pill of the active profile, for the profile card above the page. Asks the site
+/// once on opening, as drawing the page does.
+pub fn status_pill(p: &mut WorkspaceState, server: &str, conn: &Conn) -> (&'static str, theme::Tone) {
+    p.profile_mode = true;
+    let v = view(p, server, conn);
+    pill_for(&conn.token, v.checking, v.info.is_some())
+}
+
+/// What the page asks of the window, and whether the address changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Out {
+    /// The address in the field was changed.
+    pub changed: bool,
+    /// "Open Tours" was pressed.
+    pub open_tours: bool,
+}
+
+/// Draw the page. `server` is the site address in the settings.
+pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: &Conn) -> Out {
+    let View { effective, site, problem, checking, info, asked, refused, rows } = view(p, server, conn);
+    let busy = p.is_busy();
+    let mut out = Out::default();
+    let connected = info.is_some();
     // "Signed in as" belongs to the token the sign-in saved, and goes when it changes.
     if conn.token != TokenStatus::Checking
         && let Some((_, epoch)) = p.account.as_mut()
@@ -576,124 +638,135 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
     }
 
     if !p.profile_mode {
-        ui.heading("Workspace");
-        ui.add_space(12.0);
+        theme::page_title(ui, "Workspace", |_| {});
     }
 
-    let row = |ui: &mut egui::Ui, name: &str| {
-        ui.label(RichText::new(name).color(theme::MUTED));
-    };
-    let value = |ui: &mut egui::Ui, text: Option<String>| {
-        ui.label(text.unwrap_or_else(|| NOTHING.to_string()));
-    };
-    egui::Grid::new("workspace-rows").num_columns(2).spacing([18.0, 12.0]).show(ui, |ui| {
-        row(ui, "Site");
-        ui.vertical(|ui| {
-            match &conn.test_server {
-                Some(t) => {
-                    let mut shown = t.clone();
-                    ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
-                    ui.label(RichText::new("Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.").color(theme::MUTED).size(12.0));
-                }
-                None if p.profile_mode => {
+    theme::section_heading(ui, CONNECTION);
+    theme::card(ui, |rows_ui| {
+        let link = site_link(&effective);
+        let mut open_failed = None;
+        rows_ui.row(
+            "Site",
+            |ui| {
+                match &conn.test_server {
+                    Some(t) => {
+                        let mut shown = t.clone();
+                        ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(ui.available_width()));
+                        theme::caption(ui, "Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.");
+                    }
                     // The address is the profile's own.
-                    let mut shown = server.clone();
-                    ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(340.0));
-                }
-                None => {
-                    if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(340.0)).changed() {
-                        changed = true;
-                        p.clear_message();
-                        // A typed address is never asked on its own; see the module's first lines.
-                        if let Some(typed) = conn.site(server) {
-                            p.auto = Some(typed);
+                    None if p.profile_mode => {
+                        theme::value(ui, crate::profiles::site_label(server));
+                    }
+                    None => {
+                        if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(ui.available_width())).changed() {
+                            out.changed = true;
+                            p.clear_message();
+                            // A typed address is never asked on its own; see the module's first lines.
+                            if let Some(typed) = conn.site(server) {
+                                p.auto = Some(typed);
+                            }
                         }
                     }
                 }
-            }
-            if !effective.trim().is_empty()
-                && let Err(e) = publish::check_server(&effective)
-            {
-                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
-            }
-        });
-        ui.end_row();
-
-        row(ui, "Status");
-        ui.vertical(|ui| {
-            let label = status(&conn.token, checking && conn.token == TokenStatus::Saved, info.as_ref().map(|i| i.workspace.as_str()));
-            let (fg, bg) = if is_connected_status(&label) { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
-            egui::Frame::new().fill(bg).corner_radius(egui::CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
-                ui.label(RichText::new(label).color(fg));
-            });
-            if refused && conn.token == TokenStatus::Saved {
-                theme::caution_line(ui, publish::REJECTED_TOKEN, theme::SMALL_SIZE, theme::Fit::Wrap);
-            }
-            if let Some(line) = p.account.as_ref().and_then(|(name, _)| signed_in_as(name)) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(line).color(theme::MUTED).size(12.0));
-                    if ui.add_enabled(!busy, egui::Link::new(RichText::new(NOT_YOU).size(12.0))).clicked() {
-                        sign_out(ui.ctx(), p);
-                    }
-                });
-            }
-        });
-        ui.end_row();
-
-        if rows.this_computer {
-            row(ui, THIS_COMPUTER);
-            ui.horizontal(|ui| {
-                ui.label(connect::device_name());
-                ui.label(RichText::new("·").color(theme::MUTED));
-                // Today's "forget the token": it is removed from this computer; nothing changes on the site.
-                if ui.add_enabled(!busy, egui::Link::new(SIGN_OUT)).clicked() {
-                    sign_out(ui.ctx(), p);
+                if !effective.trim().is_empty()
+                    && let Err(e) = publish::check_server(&effective)
+                {
+                    theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Wrap);
                 }
+            },
+            |ui| {
+                if ui.add_enabled(link.is_some(), egui::Button::new(OPEN_SITE)).clicked()
+                    && let Some(link) = &link
+                    && let Err(e) = mythicshot_destinations::open_url(link)
+                {
+                    open_failed = Some(format!("Could not open the site: {e}."));
+                }
+            },
+        );
+        if let Some(text) = open_failed.take() {
+            *lock(&p.message) = Some(Outcome { text, ok: false, server: None });
+        }
+
+        if !p.profile_mode {
+            rows_ui.row(
+                "Status",
+                |ui| {
+                    let label = status(&conn.token, checking && conn.token == TokenStatus::Saved, info.as_ref().map(|i| i.workspace.as_str()));
+                    let tone = if is_connected_status(&label) { theme::Tone::Success } else { theme::Tone::Neutral };
+                    ui.horizontal(|ui| theme::pill(ui, &label, tone));
+                    if refused && conn.token == TokenStatus::Saved {
+                        theme::caution_line(ui, publish::REJECTED_TOKEN, theme::SMALL_SIZE, theme::Fit::Wrap);
+                    }
+                    if let Some(line) = p.account.as_ref().and_then(|(name, _)| signed_in_as(name)) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(line).color(theme::MUTED).size(theme::SMALL_SIZE));
+                            if ui.add_enabled(!busy, egui::Link::new(RichText::new(NOT_YOU).size(theme::SMALL_SIZE))).clicked() {
+                                sign_out(ui.ctx(), p);
+                            }
+                        });
+                    }
+                },
+                |_| {},
+            );
+        } else if refused && conn.token == TokenStatus::Saved {
+            rows_ui.full(|ui| {
+                theme::caution_line(ui, publish::REJECTED_TOKEN, theme::SMALL_SIZE, theme::Fit::Wrap);
             });
-            ui.end_row();
         }
 
+        let account = if p.profile_mode { p.profile_account.clone() } else { p.account.as_ref().map(|(name, _)| name.clone()) };
+        if let Some(account) = account.as_deref().and_then(shown_name) {
+            rows_ui.row("Account", |ui| drop(theme::value(ui, account)), |_| {});
+        }
+        let workspace = info.as_ref().map(|i| i.workspace.clone()).or_else(|| p.profile_mode.then(|| p.profile_workspace.clone()).flatten());
+        if let Some(workspace) = workspace.as_deref().and_then(shown_name) {
+            rows_ui.row("Workspace", |ui| drop(theme::value(ui, workspace)), |_| {});
+        }
+        if rows.this_computer {
+            rows_ui.row(THIS_COMPUTER, |ui| drop(theme::value(ui, connect::device_name())), |_| {});
+        }
         if rows.sign_in && conn.token != TokenStatus::Checking {
-            row(ui, SIGN_IN);
-            if ui.add_enabled(sign_in_enabled(busy, p.sign_in.is_some(), &effective), egui::Button::new(SIGN_IN)).clicked() {
-                p.begin_sign_in(ui.ctx(), &effective);
-            }
-            ui.end_row();
+            rows_ui.row(
+                SIGN_IN,
+                |_| {},
+                |ui| {
+                    if ui.add_enabled(sign_in_enabled(busy, p.sign_in.is_some(), &effective), egui::Button::new(SIGN_IN)).clicked() {
+                        p.begin_sign_in(ui.ctx(), &effective);
+                    }
+                },
+            );
         }
-
         if (rows.sign_in || conn.token == TokenStatus::Checking) && !p.profile_mode {
-            row(ui, "Token");
-            ui.vertical(|ui| token_ui(ui, p, conn, &effective, busy));
-            ui.end_row();
+            rows_ui.row("Token", |ui| token_ui(ui, p, conn, &effective, busy), |_| {});
         }
 
-        if rows.details {
-            row(ui, "Tours");
-            value(ui, info.as_ref().and_then(|i| i.tours).map(tours_summary));
-            ui.end_row();
-
-            row(ui, "Site version");
-            value(ui, info.as_ref().map(|i| version_label(i.version.as_deref())));
-            ui.end_row();
-        }
-    });
-
-    // The token was saved for another address: say so, and send nothing until the user decides.
-    if let Some(problem) = problem.as_ref().filter(|_| !p.profile_mode) {
-        ui.add_space(10.0);
-        theme::caution_line(ui, problem.as_str(), theme::BODY_SIZE, theme::Fit::Wrap);
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new(publish_ui::USE_IT_HERE)).clicked() {
-                (p.bind)(publish::check_server(&effective).ok());
-                p.clear_message();
-            }
-        });
-        ui.add(egui::Label::new(RichText::new(publish_ui::USE_IT_HERE_MEANS).color(theme::MUTED).size(12.0)).wrap());
-    }
-
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        if ui.add_enabled(!busy && !checking, egui::Button::new("Test connection")).clicked() {
+        let result = p.current_message(&effective);
+        let mut test = false;
+        rows_ui.row(
+            "Site version",
+            |ui| {
+                theme::value(ui, info.as_ref().map_or_else(|| NOTHING.to_string(), |i| version_label(i.version.as_deref())));
+                // The result of the last check.
+                if busy || checking {
+                    ui.add(egui::Spinner::new());
+                } else if let Some((text, ok)) = result {
+                    if ok {
+                        ui.add(egui::Label::new(RichText::new(text).color(theme::SUCCESS_TEXT).size(theme::SMALL_SIZE)).wrap());
+                    } else {
+                        theme::caution_line(ui, text, theme::SMALL_SIZE, theme::Fit::Wrap);
+                    }
+                } else if connected {
+                    ui.add(egui::Label::new(RichText::new(CHECKED_NOW).color(theme::SUCCESS_TEXT).size(theme::SMALL_SIZE)).truncate());
+                } else if site.is_some() && !asked {
+                    theme::caption(ui, PRESS_TEST);
+                }
+            },
+            |ui| {
+                test = ui.add_enabled(!busy && !checking, egui::Button::new(TEST_CONNECTION)).clicked();
+            },
+        );
+        if test {
             let tested = effective.clone();
             match publish::check_server(&tested) {
                 Ok(_) if problem.is_some() => *lock(&p.message) = Some(Outcome { text: problem.clone().unwrap_or_default(), ok: false, server: Some(tested) }),
@@ -705,31 +778,52 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 Err(e) => *lock(&p.message) = Some(Outcome { text: e, ok: false, server: Some(tested) }),
             }
         }
-        let link = site_link(&effective);
-        if ui.add_enabled(link.is_some(), egui::Button::new("Open site")).clicked()
-            && let Some(link) = link
-            && let Err(e) = mythicshot_destinations::open_url(&link)
-        {
-            *lock(&p.message) = Some(Outcome { text: format!("Could not open the site: {e}."), ok: false, server: None });
-        }
-        if busy || checking {
-            ui.add(egui::Spinner::new());
-        } else if let Some((text, ok)) = p.current_message(&effective) {
-            if ok {
-                ui.add(egui::Label::new(RichText::new(text).color(theme::SUCCESS_TEXT)).wrap());
-            } else {
-                theme::caution_line(ui, text, theme::BODY_SIZE, theme::Fit::Wrap);
-            }
-        } else if site.is_some() && !asked {
-            ui.label(RichText::new(PRESS_TEST).color(theme::MUTED).size(12.0));
+
+        // The token was saved for another address: say so, and send nothing until the user decides.
+        if let Some(problem) = problem.as_ref().filter(|_| !p.profile_mode) {
+            rows_ui.full(|ui| {
+                theme::caution_line(ui, problem.as_str(), theme::BODY_SIZE, theme::Fit::Wrap);
+                if ui.add_enabled(!busy, egui::Button::new(publish_ui::USE_IT_HERE)).clicked() {
+                    (p.bind)(publish::check_server(&effective).ok());
+                    p.clear_message();
+                }
+                theme::caption(ui, publish_ui::USE_IT_HERE_MEANS);
+            });
         }
     });
-    ui.add_space(6.0);
-    if rows.sign_in && conn.token != TokenStatus::Checking {
-        ui.add(egui::Label::new(RichText::new(SIGN_IN_HINT).color(theme::MUTED).size(12.0)).wrap());
+
+    if connected {
+        theme::section_heading(ui, "Tours");
+        theme::card(ui, |rows_ui| {
+            rows_ui.row(
+                ON_THIS_SITE,
+                |ui| drop(theme::value(ui, info.as_ref().and_then(|i| i.tours).map_or_else(|| NOTHING.to_string(), tours_count))),
+                |ui| {
+                    if ui.button(OPEN_TOURS).clicked() {
+                        out.open_tours = true;
+                    }
+                },
+            );
+        });
     }
-    if conn.token == TokenStatus::Saved || (p.pasting && !p.profile_mode) {
-        ui.label(RichText::new(TOKEN_NOTE).color(theme::MUTED).size(12.0));
+
+    if rows.sign_in && conn.token != TokenStatus::Checking {
+        theme::caption(ui, SIGN_IN_HINT);
+    }
+    // The last line: where the token is kept, and Sign out.
+    let note = conn.token == TokenStatus::Saved || (p.pasting && !p.profile_mode);
+    if note || rows.this_computer {
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(egui::vec2(width, theme::CONTROL_HEIGHT), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(width, theme::CONTROL_HEIGHT));
+            // Today's "forget the token": it is removed from this computer; nothing changes on the site.
+            if rows.this_computer && ui.add_enabled(!busy, theme::danger_outline_button(SIGN_OUT)).clicked() {
+                sign_out(ui.ctx(), p);
+            }
+            if note {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| theme::caption(ui, TOKEN_NOTE));
+            }
+        });
     }
 
     // The "Sign in" window, over the page.
@@ -745,7 +839,19 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
             }
         }
     }
-    changed
+    out
+}
+
+/// A name the site gave, as the page shows it: plain text, at most [`ACCOUNT_SHOWN_MAX`]
+/// characters. None when nothing is left.
+fn shown_name(name: &str) -> Option<String> {
+    let name = publish::share::plain_text(name);
+    (!name.is_empty()).then(|| publish_ui::short_title(&name, ACCOUNT_SHOWN_MAX))
+}
+
+/// "Signed in as alex", under the profile's name. None when the site named no account.
+pub fn signed_in_line(account: Option<&str>) -> Option<String> {
+    account.and_then(shown_name).map(|name| format!("Signed in as {name}"))
 }
 
 /// Sign out (and "Not you? Sign out"): today's "forget the token". It is removed from this
@@ -934,10 +1040,10 @@ mod tests {
 
     #[test]
     fn the_rows_say_what_the_site_said_and_unknown_for_an_older_site() {
-        assert_eq!(tours_summary(Counts { public: 1, draft: 1 }), "2 (1 public, 1 draft)");
-        assert_eq!(tours_summary(Counts { public: 3, draft: 0 }), "3 (3 public, 0 draft)");
-        assert_eq!(tours_summary(Counts { public: 0, draft: 1 }), "1 (0 public, 1 draft)");
-        assert_eq!(tours_summary(Counts { public: 0, draft: 0 }), "0");
+        assert_eq!(tours_count(Counts { public: 1, draft: 0 }), "1 public, 0 drafts");
+        assert_eq!(tours_count(Counts { public: 1, draft: 1 }), "1 public, 1 draft");
+        assert_eq!(tours_count(Counts { public: 3, draft: 2 }), "3 public, 2 drafts");
+        assert_eq!(tours_count(Counts { public: 0, draft: 0 }), "0 public, 0 drafts");
         assert_eq!(version_label(Some("0.1.1")), "0.1.1");
         assert_eq!(version_label(None), "unknown");
         let t = |status: &str| RemoteTour { id: "t".into(), title: "T".into(), status: status.into(), chapters: 1, steps: 1, link: None, updated_at: None, published_at: None, unpublished_changes: false };
@@ -1111,7 +1217,7 @@ mod tests {
         assert!(has_line(&first, "Workspace") && (has_line(&first, CHECKING) || has_line(&first, "Connected to Acme")), "{first}");
         let text = until(&ctx, &mut p, &mut server, &c, connected);
         let computer = connect::device_name();
-        for word in ["Workspace", "Site", "Status", "Connected to Acme", THIS_COMPUTER, computer.as_str(), SIGN_OUT, "Tours", "2 (1 public, 1 draft)", "Site version", "0.1.1", "Test connection", "Open site", TOKEN_NOTE] {
+        for word in ["Workspace", "Site", "Status", "Connected to Acme", THIS_COMPUTER, computer.as_str(), SIGN_OUT, "Tours", "1 public, 1 draft", "Site version", "0.1.1", "Test connection", "Open site", TOKEN_NOTE] {
             assert!(has_line(&text, word), "the page is missing {word:?} in:\n{text}");
         }
         // Connected: no Sign in, no token field, nothing of the token.
@@ -1139,7 +1245,7 @@ mod tests {
         let s = site_stub(r#"{"workspace":"Acme"}"#);
         let (ctx, mut p, mut server, c) = (crate::theme::test_context(), page(), s.base.clone(), bound_to(&s, TokenStatus::Saved));
         let text = until(&ctx, &mut p, &mut server, &c, connected);
-        assert!(has_line(&text, "Connected to Acme") && has_line(&text, "unknown") && has_line(&text, "2 (1 public, 1 draft)"), "{text}");
+        assert!(has_line(&text, "Connected to Acme") && has_line(&text, "unknown") && has_line(&text, "1 public, 1 draft"), "{text}");
     }
 
     #[test]
@@ -1153,7 +1259,7 @@ mod tests {
             assert!(has_line(&text, word), "the page is missing {word:?} in:\n{text}");
         }
         assert_eq!(text.lines().filter(|l| *l == SIGN_IN).count(), 2, "the row and its button: {text}");
-        for word in ["Save", SIGN_OUT, THIS_COMPUTER, "Forget", "Tours", "Site version", "Acme", "unknown", TOKEN_NOTE] {
+        for word in ["Save", SIGN_OUT, THIS_COMPUTER, "Forget", "Tours", ON_THIS_SITE, "Acme", "unknown", TOKEN_NOTE] {
             assert!(!has_line(&text, word), "the page shows {word:?} in:\n{text}");
         }
         // "Paste a token instead": today's paste field, unchanged, and the note on where it is kept.
@@ -1193,7 +1299,7 @@ mod tests {
         let refused = Conn { refused: true, ..c.clone() };
         let text = drawn(&ctx, &mut p, &mut server, &refused);
         assert!(has_line(&text, NOT_CONNECTED) && has_line(&text, publish::REJECTED_TOKEN) && has_line(&text, SIGN_IN) && !connected(&text), "{text}");
-        assert!(!has_line(&text, "Tours") && !has_line(&text, "Site version"), "{text}");
+        assert!(!has_line(&text, "Tours") && !has_line(&text, ON_THIS_SITE) && has_line(&text, NOTHING), "{text}");
     }
 
     #[test]
@@ -1289,12 +1395,16 @@ mod tests {
         let run = |p: &mut WorkspaceState, server: &mut String, events: Vec<egui::Event>| {
             let mut changed = false;
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let mut out = ctx.run_ui(input, |ui| changed = super::ui(ui, p, server, &c));
+            let mut out = ctx.run_ui(input, |ui| changed = super::ui(ui, p, server, &c).changed);
             out.textures_delta.clear();
             changed
         };
-        // Click into the address field (the first field on the page), then paste the address.
-        let at = egui::pos2(260.0, 52.0);
+        // Click into the address field (the first field on the page, where its hint is drawn), then paste the address.
+        let mut first = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            super::ui(ui, &mut p, &mut server, &c);
+        });
+        first.textures_delta.clear();
+        let at = crate::share_ui::tests::text_rect(&first, "https://tours.example.com").expect("the address field's hint").center();
         let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
         for events in [vec![], vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![]] {
             assert!(!run(&mut p, &mut server, events));

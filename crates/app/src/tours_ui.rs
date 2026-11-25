@@ -1860,8 +1860,8 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     let mut clicks = Vec::new();
 
     ui.horizontal(|ui| {
+        ui.set_min_height(theme::CONTROL_HEIGHT);
         ui.heading("Tours");
-        ui.add_space(8.0);
         // The profile the list, the storage use and every action here belong to.
         if crate::profiles_ui::dropdown(ui, "tours", true) {
             ui.ctx().request_repaint();
@@ -1875,19 +1875,19 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                 clicks.push(Click::Refresh);
             }
             if m.is_loading() && m.loaded_at.is_some() {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
             }
         });
     });
-    ui.add_space(10.0);
+    theme::block_gap(ui);
 
     if let Some(text) = publish_ui::migrated_notice() {
         crate::profiles_ui::note(ui, crate::profiles_ui::Tone::Ok, &text);
-        ui.add_space(8.0);
+        theme::block_gap(ui);
     }
     if let Some(problem) = publish_ui::migration_problem() {
         theme::caution_line(ui, problem, theme::BODY_SIZE, theme::Fit::Wrap);
-        ui.add_space(8.0);
+        theme::block_gap(ui);
     }
     if let Some(notice) = m.notice().cloned() {
         notice_ui(ui, &notice, &mut clicks);
@@ -1902,7 +1902,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
     match view {
         View::NotConnected(why) => {
             ui.add(egui::Label::new(RichText::new(why).color(theme::MUTED)).wrap());
-            ui.add_space(8.0);
+            theme::block_gap(ui);
             if ui.button(OPEN_WORKSPACE).clicked() {
                 clicks.push(Click::Workspace);
             }
@@ -1912,13 +1912,13 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
         }
         View::Loading => {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
                 ui.label(RichText::new(LOADING).color(theme::MUTED));
             });
         }
         View::Failed(e) => {
             ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT)).wrap());
-            ui.add_space(8.0);
+            theme::block_gap(ui);
             if ui.add_enabled(!m.is_loading(), egui::Button::new("Retry")).clicked() {
                 clicks.push(Click::Refresh);
             }
@@ -1935,8 +1935,8 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
                 for t in &m.tours {
                     row_ui(ui, &m, t, &mut edit, &today, now, &mut clicks);
                 }
-                ui.add_space(4.0);
-                ui.label(RichText::new(footer_text).color(theme::MUTED).size(12.0));
+                ui.add_space(theme::SPACE_1);
+                ui.label(RichText::new(footer_text).color(theme::MUTED).size(theme::SMALL_SIZE));
             });
             m.edit = edit;
         }
@@ -2025,14 +2025,14 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
 }
 
 fn notice_ui(ui: &mut egui::Ui, notice: &Notice, clicks: &mut Vec<Click>) {
-    if notice.error { theme::danger_frame() } else { theme::card_frame().stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(9.0) }.show(ui, |ui| {
+    if notice.error { theme::danger_frame() } else { theme::card_box().inner_margin(theme::SPACE_3) }.show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(RichText::new(&notice.text).color(if notice.error { theme::DANGER_TEXT } else { theme::MUTED })).wrap());
         if ui.button("Dismiss").clicked() {
             clicks.push(Click::DismissNotice);
         }
     });
-    ui.add_space(8.0);
+    theme::block_gap(ui);
 }
 
 /// The block of one unfinished delete: what is left, and the button that carries on, or its progress.
@@ -2043,7 +2043,7 @@ fn unfinished_ui(ui: &mut egui::Ui, entry: &UnfinishedDelete, work: Option<Work>
         match work {
             Some(work) => {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
                     ui.label(RichText::new(work_message(work)).color(theme::MUTED));
                 });
             }
@@ -2054,7 +2054,7 @@ fn unfinished_ui(ui: &mut egui::Ui, entry: &UnfinishedDelete, work: Option<Work>
             }
         }
     });
-    ui.add_space(8.0);
+    theme::block_gap(ui);
 }
 
 /// One tour: its title and badge, the detail line, and its buttons, or what is running on it.
@@ -2064,7 +2064,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
     let choosing = matches!(edit, Edit::ChoosingChapter { id } if *id == t.id);
     let asking_publish = matches!(edit, Edit::ConfirmPublish { id } if *id == t.id);
     let saved = m.saved(&t.id);
-    theme::card_frame().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+    theme::card_box().inner_margin(egui::Margin::symmetric(theme::CARD_PAD_X as i8, theme::SPACE_3 as i8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         if renaming {
             if let Edit::Renaming { text, .. } = edit {
@@ -2083,7 +2083,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                         clicks.push(Click::CancelEdit);
                     }
                 });
-                ui.label(RichText::new(RENAME_NOTE).color(theme::MUTED).size(12.0));
+                ui.label(RichText::new(RENAME_NOTE).color(theme::MUTED).size(theme::SMALL_SIZE));
             }
         } else {
             ui.horizontal(|ui| {
@@ -2095,11 +2095,11 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                 });
             });
         }
-        ui.add(egui::Label::new(RichText::new(detail_line(t, saved, m.converting(), today)).color(theme::MUTED).size(12.0)).wrap());
-        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(detail_line(t, saved, m.converting(), today)).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
+        ui.add_space(theme::SPACE_1);
         if let Some(work) = m.work(&t.id) {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
                 ui.label(RichText::new(work_message(work)).color(theme::MUTED));
                 // Expanding a long recording takes minutes: it can be stopped.
                 if matches!(work, Work::Opening(_)) && ui.button("Cancel").clicked() {
@@ -2110,7 +2110,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
             theme::danger_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.add(egui::Label::new(RichText::new(delete_question(t, saved.len())).color(theme::DANGER_TEXT)).wrap());
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_1);
                 ui.horizontal(|ui| {
                     if ui.button("Keep it").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         clicks.push(Click::CancelEdit);
@@ -2126,7 +2126,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
                 ui.set_width(ui.available_width());
                 ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_HEADING).bold()).wrap());
                 ui.add(egui::Label::new(RichText::new(crate::share_ui::who::CONFIRM_TEXT).color(theme::MUTED)).wrap());
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_1);
                 ui.horizontal(|ui| {
                     let keys = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter));
                     for (label, default) in confirm_publish_buttons() {
@@ -2142,7 +2142,7 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
             });
         } else if choosing {
             ui.label(RichText::new(WHICH_CHAPTER).color(theme::MUTED));
-            ui.add_space(2.0);
+            ui.add_space(theme::SPACE_1 / 2.0);
             ui.horizontal_wrapped(|ui| {
                 for p in usable(saved) {
                     if ui.button(chapter_label(p)).clicked() {
@@ -2168,22 +2168,23 @@ fn row_ui(ui: &mut egui::Ui, m: &Model, t: &RemoteTour, edit: &mut Edit, today: 
             });
         }
         if let Some(e) = m.error(&t.id) {
-            ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT).size(12.0)).wrap());
+            ui.add(egui::Label::new(RichText::new(e).color(theme::DANGER_TEXT).size(theme::SMALL_SIZE)).wrap());
         }
     });
-    ui.add_space(6.0);
+    theme::block_gap(ui);
 }
 
 fn badge_ui(ui: &mut egui::Ui, t: &RemoteTour) {
     let (fg, bg) = if t.is_public() { (theme::SUCCESS_TEXT, theme::SUCCESS_TINT) } else { (theme::MUTED, theme::CHIP) };
-    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
-        ui.label(RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE));
+    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(theme::RADIUS_FULL)).inner_margin(egui::Margin::symmetric(theme::SPACE_2 as i8, theme::SPACE_1 as i8 / 2)).show(ui, |ui| {
+        // As high as its text, not as a control.
+        ui.with_layout(Layout::top_down(Align::Min), |ui| ui.label(RichText::new(badge(t)).color(fg).size(theme::SMALL_SIZE)));
     });
 }
 
 /// The Refresh button: a circular arrow, drawn here.
 fn refresh_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), if enabled { Sense::click() } else { Sense::hover() });
+    let (rect, resp) = ui.allocate_exact_size(vec2(theme::CONTROL_HEIGHT, theme::CONTROL_HEIGHT), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if enabled && resp.hovered() {
         p.rect_filled(rect, CornerRadius::same(theme::control_radius(rect.height())), theme::RAISED);
