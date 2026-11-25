@@ -1086,7 +1086,7 @@ impl Panel {
         let working = self.working;
         let (token, refused) = (self.token_state)();
         theme::page_title(ui, "Workspace", |ui| {
-            if ui.add_enabled(!working, egui::Button::new(profiles::ADD_PROFILE_BUTTON)).clicked() {
+            if ui.add_enabled_ui(!working, |ui| theme::icon_button(ui, profiles::ADD_PROFILE_BUTTON, crate::icons::Icon::Plus, theme::IconSide::Leading)).inner.clicked() {
                 pick = Some(Pick::Add);
             }
         });
@@ -1257,7 +1257,7 @@ fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str,
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = theme::ITEM_GAP;
-                    let button = ui.add_enabled(enabled, egui::Button::new(profiles::SWITCH_PROFILE));
+                    let button = ui.add_enabled_ui(enabled, |ui| theme::icon_button(ui, profiles::SWITCH_PROFILE, crate::icons::Icon::ChevronDown, theme::IconSide::Trailing)).inner;
                     egui::Popup::menu(&button).show(|ui| profile_menu(ui, rows, &mut pick));
                     if let Some((text, tone)) = pill {
                         theme::pill(ui, text, tone);

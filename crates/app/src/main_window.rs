@@ -55,6 +55,16 @@ impl Page {
         }
     }
 
+    /// The page's icon in the left menu.
+    pub fn icon(self) -> crate::icons::Icon {
+        match self {
+            Page::Home => crate::icons::Icon::Home,
+            Page::Tours => crate::icons::Icon::Tours,
+            Page::Workspace => crate::icons::Icon::Workspace,
+            Page::Preferences => crate::icons::Icon::Preferences,
+        }
+    }
+
 }
 
 /// A request to show the main window.
@@ -444,7 +454,7 @@ fn nav_ui(ui: &mut egui::Ui, current: Page, out: &mut PageOut) {
     ui.add_space(theme::ITEM_GAP);
     ui.spacing_mut().item_spacing.y = theme::GRID;
     for page in Page::ALL {
-        if theme::nav_item(ui, page.label(), current == page).clicked() {
+        if theme::nav_item(ui, page.label(), Some(page.icon()), current == page).clicked() {
             out.go_to = Some(page);
         }
     }

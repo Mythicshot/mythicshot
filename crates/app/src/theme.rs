@@ -299,6 +299,11 @@ pub const PAGE_PAD: f32 = 20.0;
 pub const NAV_ITEM_HEIGHT: f32 = 36.0;
 /// The gap between a navigation item's icon and its label.
 pub const NAV_ICON_GAP: f32 = 10.0;
+/// A navigation item's icon.
+pub const NAV_ICON_SIZE: f32 = 18.0;
+/// The icon on a button beside its label, and the gap between them.
+pub const BUTTON_ICON_SIZE: f32 = 14.0;
+pub const BUTTON_ICON_GAP: f32 = 8.0;
 /// The space before a navigation item's label (or its icon).
 pub const NAV_PAD_X: f32 = 12.0;
 /// The space left and right inside a status pill or chip.
@@ -594,11 +599,11 @@ pub fn initials_badge(ui: &mut egui::Ui, name: &str) -> egui::Response {
     resp
 }
 
-/// An item of the left navigation, [`NAV_ITEM_HEIGHT`] high across the width: the label from
-/// the left, on the purple selection fill with the label in accent-text when `selected` (the
-/// treatment of egui's selectable buttons), on surface-raised while hovered. The app ships no
-/// icon font with glyphs for the pages, so the items carry no icon.
-pub fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+/// An item of the left navigation, [`NAV_ITEM_HEIGHT`] high across the width: its icon (when it
+/// has one, [`NAV_ICON_SIZE`] square) and [`NAV_ICON_GAP`] after it the label, from the left; on
+/// the purple selection fill with icon and label in accent-text when `selected` (the treatment
+/// of egui's selectable buttons), on surface-raised while hovered.
+pub fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<crate::icons::Icon>, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), NAV_ITEM_HEIGHT), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label));
     let p = ui.painter();
@@ -610,8 +615,48 @@ pub fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respons
     if resp.has_focus() {
         p.rect_stroke(rect, CONTROL_RADIUS, Stroke::new(FOCUS_WIDTH, FOCUS), egui::StrokeKind::Inside);
     }
-    let galley = ui.fonts_mut(|f| f.layout(label.to_string(), FontId::proportional(CONTROL_TEXT_SIZE), if selected { ACCENT } else { TEXT }, rect.width() - 2.0 * NAV_PAD_X));
-    p.galley(egui::pos2(rect.left() + NAV_PAD_X, rect.center().y - galley.size().y / 2.0), galley, TEXT);
+    let colour = if selected { ACCENT } else { TEXT };
+    let mut x = rect.left() + NAV_PAD_X;
+    if let Some(icon) = icon {
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.center().y - NAV_ICON_SIZE / 2.0), egui::vec2(NAV_ICON_SIZE, NAV_ICON_SIZE));
+        crate::icons::paint(p, r, icon, colour);
+        x += NAV_ICON_SIZE + NAV_ICON_GAP;
+    }
+    let galley = ui.fonts_mut(|f| f.layout(label.to_string(), FontId::proportional(CONTROL_TEXT_SIZE), colour, (rect.right() - NAV_PAD_X - x).max(0.0)));
+    p.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, colour);
+    resp
+}
+
+/// Which side of a button's label its icon stands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconSide {
+    /// Before the label: what the button does (Add profile).
+    Leading,
+    /// After the label: where it leads (a list opens: Switch profile).
+    Trailing,
+}
+
+/// A secondary button with an icon beside its label: [`CONTROL_HEIGHT`] high, the control's
+/// padding and corners, egui's own looks for each state.
+pub fn icon_button(ui: &mut egui::Ui, text: &str, icon: crate::icons::Icon, side: IconSide) -> egui::Response {
+    let font = FontId::proportional(CONTROL_TEXT_SIZE);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, TEXT));
+    let size = egui::vec2(2.0 * CONTROL_PAD_X + BUTTON_ICON_SIZE + BUTTON_ICON_GAP + galley.size().x, CONTROL_HEIGHT.max(ui.spacing().interact_size.y));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), text));
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        let p = ui.painter();
+        p.rect(rect, CONTROL_RADIUS, v.weak_bg_fill, v.bg_stroke, egui::StrokeKind::Inside);
+        let colour = v.text_color();
+        let (icon_x, text_x) = match side {
+            IconSide::Leading => (rect.left() + CONTROL_PAD_X, rect.left() + CONTROL_PAD_X + BUTTON_ICON_SIZE + BUTTON_ICON_GAP),
+            IconSide::Trailing => (rect.right() - CONTROL_PAD_X - BUTTON_ICON_SIZE, rect.left() + CONTROL_PAD_X),
+        };
+        let icon_rect = egui::Rect::from_min_size(egui::pos2(icon_x, rect.center().y - BUTTON_ICON_SIZE / 2.0), egui::vec2(BUTTON_ICON_SIZE, BUTTON_ICON_SIZE));
+        crate::icons::paint(p, icon_rect, icon, colour);
+        p.galley(egui::pos2(text_x, rect.center().y - galley.size().y / 2.0), galley, colour);
+    }
     resp
 }
 

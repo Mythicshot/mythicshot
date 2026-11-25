@@ -226,6 +226,16 @@ fn the_workspace_page_is_laid_out_as_approved_on_the_roomy_sizes() {
     // Add profile at the right of the title, on its line.
     let (title, add) = (on_page(&out, "Workspace"), holder(&out, profiles::ADD_PROFILE_BUTTON));
     assert!(add.left() > title.right() && (add.center().y - title.center().y).abs() < 2.0, "{title:?} {add:?}");
+    // The icons: the plus before "Add profile", the chevron after "Switch profile", and each
+    // menu item's icon before its label.
+    let (add_text, add_box) = (text_rect(&out, profiles::ADD_PROFILE_BUTTON).unwrap(), holder(&out, profiles::ADD_PROFILE_BUTTON));
+    assert!((add_text.left() - add_box.left() - (theme::CONTROL_PAD_X + theme::BUTTON_ICON_SIZE + theme::BUTTON_ICON_GAP)).abs() < 1.0, "{add_text:?} {add_box:?}");
+    let (switch_text, switch_box) = (text_rect(&out, profiles::SWITCH_PROFILE).unwrap(), holder(&out, profiles::SWITCH_PROFILE));
+    assert!((switch_text.left() - switch_box.left() - theme::CONTROL_PAD_X).abs() < 1.0 && switch_box.right() - switch_text.right() >= theme::CONTROL_PAD_X + theme::BUTTON_ICON_SIZE, "{switch_text:?} {switch_box:?}");
+    for page in Page::ALL {
+        let label = text_rect(&out, page.label()).unwrap();
+        assert!(label.left() >= theme::NAV_PAD_X + theme::NAV_ICON_SIZE + theme::NAV_ICON_GAP - 0.5, "{page:?}: {label:?}");
+    }
     // Every control is 36 points high, with radius-md corners.
     for b in [profiles::ADD_PROFILE_BUTTON, profiles::SWITCH_PROFILE, workspace_ui::OPEN_SITE, workspace_ui::TEST_CONNECTION, workspace_ui::OPEN_TOURS, workspace_ui::SIGN_OUT] {
         let r = holder(&out, b);
