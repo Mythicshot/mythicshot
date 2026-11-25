@@ -394,6 +394,104 @@ fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
     assert!(shelf.writes().is_empty());
 }
 
+/// Every text one frame of the add form draws.
+fn form_texts(f: &mut AddFlow) -> Vec<String> {
+    fn collect(shape: &egui::Shape, into: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => into.push(t.galley.text().replace('\n', " ")),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+            _ => {}
+        }
+    }
+    let ctx = crate::theme::test_context();
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 500.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| f.ui(ui));
+        out.textures_delta.clear();
+        texts.clear();
+        out.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
+    }
+    texts
+}
+
+/// The browser was still signed in as an account that has a profile: the form says so and why,
+/// offers "Switch to it" first and a fresh sign-in second.
+#[test]
+fn the_profile_is_there_already_form_says_why_and_offers_a_different_account() {
+    let s = ids_site("acc-c");
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    assert!(matches!(f.step(), Step::Same { .. }));
+    let texts = form_texts(&mut f);
+    let joined = texts.join(" ");
+    assert!(joined.contains("You already have a profile for this account: \"customer1 test\"."), "{texts:?}");
+    assert!(joined.contains(&profiles::exists_why()), "{texts:?}");
+    assert_eq!(profiles::exists_why(), "The browser was signed in as that account. To add a different user, start again and choose \"Use a different account\" in the browser.");
+    let switch = texts.iter().position(|t| t == profiles::SWITCH_TO_IT).expect("Switch to it");
+    let other = texts.iter().position(|t| t == profiles::TRY_DIFFERENT_ACCOUNT).expect("Try a different account");
+    assert!(switch < other, "Switch to it comes first: {texts:?}");
+    assert_eq!(profiles::TRY_DIFFERENT_ACCOUNT, "Try a different account");
+}
+
+#[test]
+fn try_a_different_account_signs_in_again_at_the_same_address_and_stores_nothing() {
+    // The first sign-in is the account that has a profile; the second another one.
+    let me = |seen: usize| if seen == 0 { format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-c"}}"#) } else { format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-d"}}"#) };
+    let s = stub(move |req, seen| match req.line.as_str() {
+        "POST /api/v1/connect/start" => reply(201, &format!(r#"{{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"{CODE}","verify_url":"/connections","expires_in":600,"interval":5}}"#)),
+        "POST /api/v1/connect/token" => connected(ACCOUNT),
+        "GET /api/v1/me" => reply(200, &me(seen)),
+        _ => reply(404, r#"{"error":"not_found"}"#),
+    });
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let book = Book { legacy: None, list: vec![pc], active: Some("pc".into()) };
+    let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let opened: Arc<Mutex<Vec<String>>> = Arc::default();
+    let record = opened.clone();
+    let dyn_shelf: Arc<dyn Shelf> = shelf.clone();
+    let mut f = AddFlow::new(Purpose::New, s.base.clone(), dyn_shelf, Arc::new(move |url: &str| { lock(&record).push(url.to_string()); Ok(()) }), Arc::new(FakeClock::default()));
+    sign_in(&mut f);
+    assert!(matches!(f.step(), Step::Same { .. }));
+    f.try_different_account();
+    assert!(f.is_signing_in(), "a fresh sign-in started");
+    assert!(matches!(f.step(), Step::Address), "the form waits again");
+    assert_eq!(f.sign_in_dialog().map(|d| d.server().to_string()), Some(s.base.clone()), "for the same address");
+    assert_eq!(shelf.book().list, book.list, "nothing stored from the first sign-in");
+    assert_eq!(shelf.keys(), vec![("profile-pc".to_string(), TOKEN_B.to_string())]);
+    // The second sign-in comes back as another account: the name step, as usual.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.is_signing_in() {
+        assert!(Instant::now() < deadline, "the second sign-in did not end");
+        f.poll_sign_in();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(f.step(), Step::Checked { .. }), "on to the name");
+    assert_eq!(lock(&opened).len(), 2, "the browser was opened twice");
+    assert_eq!(s.lines().iter().filter(|l| *l == "POST /api/v1/connect/start").count(), 2, "a new code");
+    assert!(shelf.writes().is_empty());
+}
+
+#[test]
+fn try_a_different_account_that_comes_back_as_the_same_one_shows_the_same_dead_end() {
+    let s = site(|_| connected(ACCOUNT), (200, Box::leak(format!(r#"{{"workspace":"customer1","workspace_id":"{WS_ID}","account_id":"acc-c"}}"#).into_boxed_str())));
+    let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
+    let shelf = TestShelf::with(Book { legacy: None, list: vec![pc], active: Some("pc".into()) }, FakeKeys::with(&[("profile-pc", TOKEN_B)]));
+    let mut f = flow(&shelf, Purpose::New, &s.base);
+    sign_in(&mut f);
+    f.try_different_account();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while f.is_signing_in() {
+        assert!(Instant::now() < deadline, "the second sign-in did not end");
+        f.poll_sign_in();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(f.step(), Step::Same { .. }), "the same account again");
+    assert!(shelf.writes().is_empty() && shelf.book().list.len() == 1);
+}
+
 #[test]
 fn switch_to_it_for_a_profile_waiting_for_a_sign_in_renews_it() {
     let s = ids_site("acc-c");

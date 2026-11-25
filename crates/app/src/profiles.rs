@@ -89,6 +89,15 @@ pub fn exists(name: &str) -> String {
     format!("You already have a profile for this account: \"{name}\".")
 }
 
+/// The button beside "Switch to it" that signs in afresh.
+pub const TRY_DIFFERENT_ACCOUNT: &str = "Try a different account";
+
+/// The second sentence under [`exists`], saying why the sign-in came back as an account that
+/// has a profile.
+pub fn exists_why() -> String {
+    "The browser was signed in as that account. To add a different user, start again and choose \"Use a different account\" in the browser.".to_string()
+}
+
 /// ""customer1 test" needs you to sign in again. Nothing can be uploaded with it until you do."
 pub fn needs_sign_in(name: &str) -> String {
     format!("\"{name}\" needs you to sign in again. Nothing can be uploaded with it until you do.")

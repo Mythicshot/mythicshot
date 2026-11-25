@@ -637,6 +637,15 @@ impl AddFlow {
         }
     }
 
+    /// "Try a different account": the sign-in that came back as an account with a profile goes,
+    /// unstored, as on Cancel, and a fresh browser sign-in starts for the same address.
+    pub fn try_different_account(&mut self) {
+        let Step::Same { candidate, .. } = std::mem::replace(&mut self.step, Step::Address) else { return };
+        drop(candidate);
+        *lock(&self.slot) = None;
+        self.begin_sign_in();
+    }
+
     /// Whether Cancel can be pressed: not while a save or renewal runs (it would not stop it).
     #[cfg(test)]
     pub fn can_cancel(&self) -> bool {
@@ -839,11 +848,14 @@ impl AddFlow {
                 });
             }
             Step::Same { name, .. } => {
-                note(ui, Tone::Warn, &profiles::exists(name));
+                note(ui, Tone::Warn, &format!("{}\n{}", profiles::exists(name), profiles::exists_why()));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, theme::primary_button(profiles::SWITCH_TO_IT)).clicked() {
                         pressed = Some(profiles::SWITCH_TO_IT);
+                    }
+                    if ui.add_enabled(!self.working, egui::Button::new(profiles::TRY_DIFFERENT_ACCOUNT)).clicked() {
+                        pressed = Some(profiles::TRY_DIFFERENT_ACCOUNT);
                     }
                     if ui.button(profiles::CANCEL).clicked() {
                         pressed = Some(profiles::CANCEL);
@@ -855,6 +867,7 @@ impl AddFlow {
             Some(profiles::SIGN_IN) => self.begin_sign_in(),
             Some(profiles::SAVE_PROFILE) => self.save(),
             Some(profiles::SWITCH_TO_IT) => self.switch_to_it(),
+            Some(profiles::TRY_DIFFERENT_ACCOUNT) => self.try_different_account(),
             Some(profiles::CANCEL) => self.cancel(),
             Some(CHECK_PASTE) => self.check_paste(),
             _ => {}

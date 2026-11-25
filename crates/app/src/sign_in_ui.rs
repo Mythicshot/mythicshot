@@ -257,6 +257,12 @@ impl SignInDialog {
         &self.stage
     }
 
+    /// The site address the sign-in is for.
+    #[cfg(test)]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
     #[cfg(test)]
     pub fn job(&self) -> Option<&SignInJob> {
         self.job.as_ref()
