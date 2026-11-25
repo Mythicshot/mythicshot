@@ -809,3 +809,34 @@ fn base64_is_read_strictly() {
     let all: Vec<u8> = (0..=255).collect();
     assert_eq!(base64_decode(&b64(&all)), Some(all));
 }
+
+/// The known answer shared with the website: fixed seed and fields, and the exact public key and
+/// signature they give. The website computes the same two values on its own; if either side's
+/// signed bytes ever change, one of these fails.
+#[test]
+fn the_known_answer_shared_with_the_website() {
+    let seed: Vec<u8> = (0u8..32).collect();
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let sha = "a".repeat(64);
+    let r = Release::for_test(v("1.2.3"), 2_097_152, sha.clone());
+    let msg = signed_message(&r);
+    assert_eq!(msg, format!("mythicshot-release-v1
+version=1.2.3
+file=Mythicshot-1.2.3-x64.msi
+size=2097152
+sha256={sha}
+"));
+    let public = b64(pair.public_key().as_ref());
+    let signature = b64(pair.sign(msg.as_bytes()).as_ref());
+    assert_eq!(public, "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=");
+    assert_eq!(signature, "yBPf4ipl60e9/+3NDIMKrszycx42NNxuXW7R8fwx4TaJmDGXxHKtatKl35uQnSDdiNuRv4lAyTt2GgbdpenSAQ==");
+    // Through the production parse path, with a key list holding only that public key.
+    let keys = Keys::test(&[pair.public_key().as_ref()]);
+    let text = with_signature("1.2.3", "Mythicshot-1.2.3-x64.msi", 2_097_152, &sha, &signature);
+    let got = parse_release(text.as_bytes(), &keys).unwrap();
+    assert_eq!((got.version(), got.size(), got.sha256()), (v("1.2.3"), 2_097_152, sha.as_str()));
+    // The same, read from the literals alone.
+    let keys = Keys::from_list(&[("known answer", "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=")]);
+    let text = with_signature("1.2.3", "Mythicshot-1.2.3-x64.msi", 2_097_152, &sha, "yBPf4ipl60e9/+3NDIMKrszycx42NNxuXW7R8fwx4TaJmDGXxHKtatKl35uQnSDdiNuRv4lAyTt2GgbdpenSAQ==");
+    assert!(parse_release(text.as_bytes(), &keys).is_ok());
+}
