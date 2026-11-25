@@ -179,7 +179,7 @@ pub const HANDLE_FILL: Color32 = Color32::WHITE;
 /// Lines, handles and outlines drawn over the user's picture, and the number of the countdown.
 pub const ON_PICTURE: Color32 = Color32::WHITE;
 /// The pixel grid lines of the magnifier, over the desktop.
-pub const PICTURE_GUIDE: Color32 = Color32::from_rgba_unmultiplied_const(0xf5, 0xb8, 0x41, 120);
+pub const PICTURE_GUIDE: Color32 = Color32::from_rgba_unmultiplied_const(DARK.gold.r(), DARK.gold.g(), DARK.gold.b(), 120);
 /// Behind a picture while it loads, or around one that does not fill its box.
 pub const PICTURE_BACKDROP: Color32 = Color32::BLACK;
 /// A texture drawn as it is (egui multiplies a picture by this).
@@ -1258,5 +1258,14 @@ pub(crate) mod tests {
         for (file, snippet, why) in ALLOWED {
             assert!(found.iter().any(|(f, _, l)| f == file && l.contains(snippet)), "an allowance nothing uses any more: {file} {snippet} ({why})");
         }
+    }
+
+    #[test]
+    fn the_picture_guide_is_the_palettes_gold() {
+        let g = DARK.gold;
+        assert_eq!(PICTURE_GUIDE, Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), 120));
+        // Taken from the palette, not typed a second time.
+        let line = include_str!("theme.rs").lines().find(|l| l.starts_with("pub const PICTURE_GUIDE")).unwrap();
+        assert!(line.contains("DARK.gold") && !line.contains("0xf5"), "{line}");
     }
 }
