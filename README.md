@@ -1,6 +1,6 @@
 # Mythicshot
 
-A light, fast screenshot tool in the spirit of [Greenshot](https://github.com/greenshot/greenshot), with GIF recording and key and click overlays. Written in Rust; the editor and the exported files are drawn by the same renderer, so what you see is what you save.
+Mythicshot records screenshots, screen recordings and click-through tours on Windows, and you can share each one with a link. Written in Rust; the editor and the exported files are drawn by the same renderer, so what you see is what you save.
 
 Status: 0.1.1, built and tested on Windows 11. A CI workflow builds macOS and Linux too, but it has not run yet and neither has been tested by hand.
 
