@@ -655,7 +655,7 @@ impl App {
     fn close_for_update(&mut self, release: update::Release, path: PathBuf) {
         match update::open_verified(&path, &release) {
             Ok(held) => {
-                update::log(&format!("install: {} checked again, Mythicshot closes", release.version));
+                update::log(&format!("install: {} checked again, Mythicshot closes", release.version()));
                 self.save_settings();
                 if let Ok(mut s) = self.window.lock() {
                     s.update.set_waiting(false);

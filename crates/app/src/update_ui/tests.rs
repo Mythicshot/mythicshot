@@ -44,7 +44,7 @@ impl Net for FakeNet {
     }
     fn download(&self, release: &Release, _attempt: u64, done: &AtomicU64, cancel: &AtomicBool) -> Downloaded {
         self.downloads.fetch_add(1, Ordering::SeqCst);
-        done.store(release.size / 4, Ordering::SeqCst);
+        done.store(release.size() / 4, Ordering::SeqCst);
         for _ in 0..2000 {
             if cancel.load(Ordering::SeqCst) {
                 self.saw_cancel.store(true, Ordering::SeqCst);
@@ -276,7 +276,7 @@ fn a_verified_download_waits_for_running_work_and_cancel_update_deletes_it() {
     u.press(Button::UpdateNow);
     settle(&mut u);
     let (r, path) = u.ready().unwrap();
-    assert_eq!((r.version, path.as_path()), (v("0.2.35"), Path::new("C:/x/Mythicshot-0.2.35-x64.msi")));
+    assert_eq!((r.version(), path.as_path()), (v("0.2.35"), Path::new("C:/x/Mythicshot-0.2.35-x64.msi")));
     u.set_waiting(true);
     assert_eq!(text(&u).as_deref(), Some(WAITING));
     assert_eq!(buttons(&u), [Button::CancelUpdate]);

@@ -377,8 +377,8 @@ impl Updater {
                 }
             }
             Checked::Newer(release) => {
-                self.net.log(&format!("check: {} offered", release.version));
-                self.last = Some(LastCheck { at: now, outcome: Outcome::Newer(release.version) });
+                self.net.log(&format!("check: {} offered", release.version()));
+                self.last = Some(LastCheck { at: now, outcome: Outcome::Newer(release.version()) });
                 if matches!(self.flow, Flow::Idle | Flow::Mismatch | Flow::Failed) {
                     self.available = Some(release);
                 }
@@ -393,7 +393,7 @@ impl Updater {
 
     /// The tray menu's first entry, while an update is available.
     pub fn tray_label(&self) -> Option<String> {
-        self.available.as_ref().map(|r| tray_text(r.version))
+        self.available.as_ref().map(|r| tray_text(r.version()))
     }
 
     /// The tray entry: what Update now (or Try again) does. True when a download started.
@@ -409,7 +409,7 @@ impl Updater {
         self.attempts += 1;
         let (done, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
         let (net, r, d, c, attempt) = (self.net.clone(), release.clone(), done.clone(), cancel.clone(), self.attempts);
-        self.net.log(&format!("download: {} started", release.version));
+        self.net.log(&format!("download: {} started", release.version()));
         let slot = spawn(&self.wake, move || net.download(&r, attempt, &d, &c), Downloaded::Failed("the download broke off".into()));
         self.flow = Flow::Downloading { release, done, cancel, slot };
         true
@@ -420,7 +420,7 @@ impl Updater {
         match button {
             Button::WhatsNew => {
                 if let Some(r) = &self.available {
-                    self.asks.push(Ask::Open(update::CHANGES_PAGE, update::changes_anchor(r.version)));
+                    self.asks.push(Ask::Open(update::CHANGES_PAGE, update::changes_anchor(r.version())));
                 }
             }
             Button::OpenDownloadPage => self.asks.push(Ask::Open(update::DOWNLOAD_PAGE, String::new())),
@@ -487,15 +487,15 @@ impl Updater {
         let line = |text: String, buttons: Vec<Button>| Some(Banner { text, progress: None, buttons });
         match &self.flow {
             Flow::Downloading { release, done, .. } => {
-                let done = done.load(Ordering::SeqCst).min(release.size);
-                Some(Banner { text: downloading_text(release.version, done, release.size), progress: Some(done as f32 / release.size.max(1) as f32), buttons: vec![Button::Cancel] })
+                let done = done.load(Ordering::SeqCst).min(release.size());
+                Some(Banner { text: downloading_text(release.version(), done, release.size()), progress: Some(done as f32 / release.size().max(1) as f32), buttons: vec![Button::Cancel] })
             }
             Flow::Ready { .. } if self.waiting => line(WAITING.to_string(), vec![Button::CancelUpdate]),
-            Flow::Ready { release, .. } => line(closing_text(release.version), vec![]),
+            Flow::Ready { release, .. } => line(closing_text(release.version()), vec![]),
             Flow::Mismatch => line(MISMATCH.to_string(), vec![Button::TryAgain, Button::OpenDownloadPage]),
             Flow::Failed => line(DOWNLOAD_FAILED.to_string(), vec![Button::TryAgain, Button::OpenDownloadPage]),
             Flow::Idle => match &self.available {
-                Some(r) if !self.later => line(available_text(r.version, self.running), vec![Button::WhatsNew, Button::Later, Button::UpdateNow]),
+                Some(r) if !self.later => line(available_text(r.version(), self.running), vec![Button::WhatsNew, Button::Later, Button::UpdateNow]),
                 _ => None,
             },
         }

@@ -765,6 +765,27 @@ fn the_placeholder_key_can_never_verify_so_a_build_without_real_keys_refuses_eve
     assert!(Keys::official().is_empty());
 }
 
+/// The test that stays once the real keys are in: a mistyped key would otherwise be dropped
+/// without a word. Every entry but the placeholder is base64 of exactly 32 bytes, so the usable
+/// keys are as many as the real entries (none while only the placeholder is listed).
+#[test]
+fn every_release_key_but_the_placeholder_is_a_usable_key() {
+    let real: Vec<&(&str, &str)> = RELEASE_KEYS.iter().filter(|e| **e != RELEASE_KEY_PLACEHOLDER).collect();
+    for (id, b64key) in &real {
+        assert!(base64_decode(b64key).is_some_and(|k| k.len() == 32), "release key {id} is not standard base64 of 32 bytes");
+    }
+    assert_eq!(Keys::official().0.len(), real.len(), "every real entry is a usable key");
+    assert!(Keys::from_list(&[RELEASE_KEY_PLACEHOLDER]).is_empty(), "the placeholder is never one");
+    let ids: std::collections::BTreeSet<&str> = RELEASE_KEYS.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids.len(), RELEASE_KEYS.len(), "each key has its own id");
+}
+
+#[test]
+fn a_release_is_read_only_through_its_getters() {
+    let r = parse_release(release_json("0.2.35", FILE, 2_000_000, SHA).as_bytes(), &test_keys()).unwrap();
+    assert_eq!((r.version(), r.size(), r.sha256()), (v("0.2.35"), 2_000_000, SHA));
+}
+
 #[test]
 fn the_test_keys_are_not_release_keys() {
     let official = Keys::official();

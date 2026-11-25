@@ -117,14 +117,28 @@ pub fn changes_url(version: Version) -> String {
 /// from a file whose signature verified under a release key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
-    pub version: Version,
-    pub size: u64,
+    version: Version,
+    size: u64,
     /// 64 lowercase hex digits.
-    pub sha256: String,
+    sha256: String,
     verified: (),
 }
 
 impl Release {
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The installer's size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The installer's SHA-256, 64 lowercase hex digits.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     pub fn file_name(&self) -> String {
         installer_name(self.version)
     }
@@ -214,7 +228,7 @@ impl Keys {
 /// `mythicshot-release-v1`, `version=`, `file=`, `size=` (decimal) and `sha256=` lines, each
 /// ending in `\n`. Nothing of the file's own layout (spacing, order, other fields) is in it.
 fn signed_message(release: &Release) -> String {
-    format!("mythicshot-release-v1\nversion={}\nfile={}\nsize={}\nsha256={}\n", release.version, release.file_name(), release.size, release.sha256)
+    format!("mythicshot-release-v1\nversion={}\nfile={}\nsize={}\nsha256={}\n", release.version(), release.file_name(), release.size(), release.sha256())
 }
 
 /// Standard base64 with padding, read strictly: the 64-letter alphabet, a length that is a
@@ -383,7 +397,7 @@ fn check_with(origin: &Origin, keys: &Keys, running: Version, t: Timeouts) -> Re
     let body = resp.body_mut().with_config().limit(MAX_RELEASE_BYTES).read_to_vec().map_err(|e| failed(&e))?;
     // Size cap above, then the fields, then the signature; only then the versions are compared.
     let release = parse_release(&body, keys)?;
-    Ok(if release.version > running { Checked::Newer(release) } else { Checked::UpToDate })
+    Ok(if release.version() > running { Checked::Newer(release) } else { Checked::UpToDate })
 }
 
 // ---- The download ----
@@ -451,12 +465,12 @@ fn fetch_into(origin: &Origin, release: &Release, partial: &Path, done: &AtomicU
     }
     // A length that is not the listed size: not the file the release file lists.
     let announced = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
-    if announced.is_some_and(|n| n != release.size) {
+    if announced.is_some_and(|n| n != release.size()) {
         return Err(Downloaded::Mismatch);
     }
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(partial).map_err(|_| Downloaded::Failed("the download could not be written".into()))?;
     // One byte past the listed size is enough to know it is not the file.
-    let mut body = resp.into_body().into_with_config().limit(release.size).reader();
+    let mut body = resp.into_body().into_with_config().limit(release.size()).reader();
     let mut hasher = sha2::Sha256::new();
     let mut piece = vec![0u8; 64 * 1024];
     let mut len = 0u64;
@@ -473,7 +487,7 @@ fn fetch_into(origin: &Origin, release: &Release, partial: &Path, done: &AtomicU
             }
         };
         len += n as u64;
-        if len > release.size {
+        if len > release.size() {
             return Err(Downloaded::Mismatch);
         }
         hasher.update(&piece[..n]);
@@ -483,7 +497,7 @@ fn fetch_into(origin: &Origin, release: &Release, partial: &Path, done: &AtomicU
     if cancel.load(Ordering::SeqCst) {
         return Err(Downloaded::Cancelled);
     }
-    if len != release.size || hex(hasher.finalize()) != release.sha256 {
+    if len != release.size() || hex(hasher.finalize()) != release.sha256() {
         return Err(Downloaded::Mismatch);
     }
     file.sync_all().map_err(|_| Downloaded::Failed("the download could not be written".into()))?;
@@ -605,7 +619,7 @@ pub fn open_verified(path: &Path, release: &Release) -> Result<Verified, &'stati
     }
     let mut file = options.open(path).map_err(|_| "the installer could not be opened")?;
     let meta = file.metadata().map_err(|_| "the installer could not be read")?;
-    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != release.size {
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != release.size() {
         return Err("the installer is not the file that was checked");
     }
     let mut hasher = sha2::Sha256::new();
@@ -619,7 +633,7 @@ pub fn open_verified(path: &Path, release: &Release) -> Result<Verified, &'stati
         len += n as u64;
         hasher.update(&piece[..n]);
     }
-    if len != release.size || hex(hasher.finalize()) != release.sha256 {
+    if len != release.size() || hex(hasher.finalize()) != release.sha256() {
         return Err("the installer is not the file that was checked");
     }
     Ok(Verified { _file: file, path: path.to_path_buf() })
