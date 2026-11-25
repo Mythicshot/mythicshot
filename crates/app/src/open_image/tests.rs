@@ -511,3 +511,25 @@ impl egui::DroppedFile for Dropped {
         panic!("the app never reads a dropped file through egui")
     }
 }
+
+/// The production read of one real picture named by `MYTHICSHOT_TEST_PICTURE`, for checking by
+/// hand a file this machine has (one in a cloud-synced folder, say). It prints the file's
+/// attributes, reads only that file and writes nothing. Run with
+/// `MYTHICSHOT_TEST_PICTURE=<path> cargo test -p mythicshot a_picture_named_by_the_environment_opens -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the picture named by MYTHICSHOT_TEST_PICTURE"]
+fn a_picture_named_by_the_environment_opens() {
+    let Some(path) = std::env::var_os("MYTHICSHOT_TEST_PICTURE").map(PathBuf::from) else {
+        eprintln!("skipped: MYTHICSHOT_TEST_PICTURE is not set");
+        return;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let attributes = std::fs::symlink_metadata(&path).unwrap().file_attributes();
+        eprintln!("{}: attributes 0x{attributes:08x}, reparse point: {}", path.display(), attributes & 0x400 != 0);
+    }
+    let img = load(&path).unwrap_or_else(|e| panic!("{}", could_not_open(&path, &e)));
+    eprintln!("opened: {} x {}", img.width(), img.height());
+    assert!(img.width() > 0 && img.height() > 0);
+}
