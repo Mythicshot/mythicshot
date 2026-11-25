@@ -7,6 +7,7 @@
   Build, from installer\:
   wix build mythicshot.wxs ui.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=0.1.1 -d Exe=<path to mythicshot.exe> -o ..\dist\Mythicshot-0.1.1-x64.msi
   Silent install without start at sign-in or taking Print Screen: msiexec /i Mythicshot-0.1.1-x64.msi /qn AUTOSTART=0 TAKEPRTSC=0
+  The app's own update runs: msiexec /i <installer> /passive /norestart MYTHICSHOT_RELAUNCH=1
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Mythicshot"
@@ -17,8 +18,9 @@
            Compressed="yes">
     <SummaryInformation Description="Mythicshot - screenshots and GIF recordings" />
 
-    <!-- Installing this or a newer version replaces the old one. -->
-    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
+    <!-- Installing this or a newer version replaces the old one. The old version is removed inside
+         the install's own transaction, so an install that fails or is cancelled puts it back as it was. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="MythicshotIcon" SourceFile="..\assets\mythicshot.ico" />
@@ -39,7 +41,17 @@
     -->
     <CustomAction Id="TakePrintScreen" FileRef="MythicshotExe" ExeCommand="--installer prtsc-off" Execute="deferred" Impersonate="yes" Return="ignore" />
     <CustomAction Id="AskPrintScreen" FileRef="MythicshotExe" ExeCommand="--installer prtsc-ask" Execute="immediate" Return="ignore" />
+    <!--
+      An update started from the app (MYTHICSHOT_RELAUNCH=1, which only the app passes) opens
+      Mythicshot again once the install has succeeded: the action comes after InstallFinalize, so
+      an install that failed, was cancelled or rolled back never gets there. It starts the program
+      and does not wait for it; nothing is left running. A plain install never sets the property,
+      so it behaves as before.
+    -->
+    <Property Id="MYTHICSHOT_RELAUNCH" Secure="yes" />
+    <CustomAction Id="RelaunchAfterUpdate" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]mythicshot.exe&quot;" Return="asyncNoWait" />
     <InstallExecuteSequence>
+      <Custom Action="RelaunchAfterUpdate" After="InstallFinalize" Condition="MYTHICSHOT_RELAUNCH = 1 AND NOT REMOVE" />
       <Custom Action="TakePrintScreen" After="InstallFiles" Condition="TAKEPRTSC = 1 AND NOT REMOVE" />
       <Custom Action="AskPrintScreen" After="InstallInitialize" Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 2" />
     </InstallExecuteSequence>

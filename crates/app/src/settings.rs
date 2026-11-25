@@ -113,6 +113,9 @@ pub struct Settings {
     /// The profile the one connection of earlier versions became (recordings linked before
     /// profiles belong to it); None when there was none to carry over.
     pub legacy_profile: Option<String>,
+    /// Ask mythicshot.com once at start whether a newer version exists. On by default, also for
+    /// a file without the key. Off: no request is made at start (Check now still works).
+    pub check_for_updates: bool,
     /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
     #[serde(skip)]
     pub load_problem: Option<LoadProblem>,
@@ -399,6 +402,7 @@ impl Default for Settings {
             active_profile: None,
             profiles_migrated: false,
             legacy_profile: None,
+            check_for_updates: true,
             load_problem: None,
             open_editor: None,
             save_to_file: None,
@@ -727,6 +731,7 @@ impl Settings {
             keep_published_recordings,
             store_recordings_as_video,
             saved_recordings_warn_gb,
+            check_for_updates,
             // Not edited by a page.
             take_print_screen: _,
             last_region: _,
@@ -762,6 +767,7 @@ impl Settings {
         self.keep_published_recordings = *keep_published_recordings;
         self.store_recordings_as_video = *store_recordings_as_video;
         self.saved_recordings_warn_gb = *saved_recordings_warn_gb;
+        self.check_for_updates = *check_for_updates;
     }
 
     pub fn dest_context(&self, title: &str) -> Context {
@@ -986,6 +992,37 @@ publish_server = \"https://tours.example.com\"
         assert!(load_at(&path).store_recordings_as_video);
         // It is its own switch: keeping recordings is not touched by it.
         assert!(!load_at(&path).keep_published_recordings);
+    }
+
+    #[test]
+    fn the_update_check_is_on_by_default_and_turning_it_off_is_remembered() {
+        assert!(Settings::default().check_for_updates);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A file from before the setting existed, and an empty one: on.
+        std::fs::write(&path, "magnifier = false
+").unwrap();
+        let old = load_at(&path);
+        assert!(old.load_problem.is_none() && old.check_for_updates && !old.magnifier);
+        std::fs::write(&path, "").unwrap();
+        assert!(load_at(&path).check_for_updates);
+        // Off, saved and read again: off, under the name the file uses.
+        let mut s = old;
+        s.check_for_updates = false;
+        s.save_to(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("check_for_updates = false"));
+        assert!(!load_at(&path).check_for_updates);
+        // A value that is not on or off costs only this setting.
+        let s = Settings::parse("check_for_updates = \"sometimes\"
+magnifier = false
+publish_server = \"https://tours.example.com\"
+").unwrap();
+        assert!(s.check_for_updates && !s.magnifier && s.publish_server == "https://tours.example.com");
+        // The Preferences page's copy carries it over.
+        let mut mine = Settings::default();
+        let edited = Settings { check_for_updates: false, ..Settings::default() };
+        mine.take_edited(&edited);
+        assert!(!mine.check_for_updates);
     }
 
     #[test]

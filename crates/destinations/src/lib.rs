@@ -244,6 +244,17 @@ pub fn open_url(url: &str) -> Result<(), String> {
     platform::open_url(url)
 }
 
+/// Open a web address at a place on its page: `url` as [`open_url`] takes it, then `#` and
+/// `anchor`, which is 1 to 32 lowercase letters, digits and dashes and nothing else. The address
+/// itself still has no fragment of its own, so nothing in it can mean anything to the system.
+pub fn open_url_at(url: &str, anchor: &str) -> Result<(), String> {
+    let plain_anchor = (1..=32).contains(&anchor.len()) && anchor.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !is_web_link(url) || !plain_anchor {
+        return Err("that is not a web address that can be opened".to_string());
+    }
+    platform::open_url(&format!("{url}#{anchor}"))
+}
+
 /// A new, unused path in the captures folder from the file name pattern.
 /// The pattern may contain `/` or `\` to make subfolders.
 pub fn new_path(ctx: &Context) -> Result<PathBuf, String> {
@@ -396,6 +407,13 @@ mod tests {
             let e = open_url(bad).unwrap_err();
             assert_eq!(e, "that is not a web address that can be opened");
             assert!(!e.contains(bad));
+        }
+    }
+
+    #[test]
+    fn open_url_at_takes_only_a_plain_anchor_on_a_plain_web_link() {
+        for (url, anchor) in [("https://x.dev/changes/", "v0-2-35#b"), ("https://x.dev/changes/", ""), ("https://x.dev/changes/", "V0"), ("https://x.dev/changes/", "a b"), ("https://x.dev/changes/", "a&calc"), ("https://x.dev/changes/", &"a".repeat(33)), ("https://x.dev/t/a?b=1", "v0"), ("calc.exe", "v0"), ("https://x.dev/t/a#b", "v0")] {
+            assert_eq!(open_url_at(url, anchor).unwrap_err(), "that is not a web address that can be opened", "{url} {anchor}");
         }
     }
 

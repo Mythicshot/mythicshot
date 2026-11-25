@@ -200,13 +200,16 @@ pub struct Shared {
     pub busy: bool,
     /// What the menu bar asked of the app, in order; the app takes them on its next frame.
     pub app_requests: Vec<AppRequest>,
+    /// Updates: the line under the menu bar and the Preferences section. The app hands in the
+    /// real one at start and drives it each frame.
+    pub update: crate::update_ui::Updater,
     /// The open window's title bar was told to be dark; a closed window is made anew, so it is told again.
     title_dark: bool,
 }
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -396,7 +399,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -418,6 +421,10 @@ fn window_ui_with(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn
     let menu = s.menu_state();
     if let Some(entry) = menu_bar::bar(ui, "main-menu-bar", &menu).picked {
         s.menu_entry(entry, &mut out);
+    }
+    // A newer version, its download or its install: one line under the menu bar, on every page.
+    if s.update.banner().is_some() {
+        egui::Panel::top("update-line").resizable(false).frame(egui::Frame::new()).show(ui, |ui| crate::update_ui::banner_ui(ui, &mut s.update));
     }
     egui::Panel::left("main-nav").resizable(false).exact_size(NAV_WIDTH).frame(egui::Frame::side_top_panel(ui.style()).fill(theme::SURFACE)).show(ui, |ui| nav_ui(ui, s.nav.page(), &mut out));
     egui::CentralPanel::default().show(ui, |ui| page_ui(ui, s, tours_conn, &mut out));
@@ -470,7 +477,7 @@ fn page_ui(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Conn, out: 
         }
         Page::Preferences => {
             let p = &mut s.prefs;
-            let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart };
+            let view = settings_ui::View { settings: &mut p.settings, errors: &p.errors, snipping_tool: p.snipping_tool, autostart: p.autostart, updates: Some(&mut s.update) };
             for action in settings_ui::ui(ui, &mut p.state, view) {
                 match action {
                     // The Output tab's link: a page switch, which is the window's own business.
@@ -851,7 +858,10 @@ pub(crate) mod tests {
         choose(&mut s, "Help", "About Mythicshot");
         assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, settings_ui::Tab::General));
         let version = window_frame(&ctx, &mut s, size, vec![]);
-        assert!(crate::share_ui::tests::text_rect(&version, concat!("Version ", env!("CARGO_PKG_VERSION"))).is_some(), "the version is on the page");
+        // The Updates section's status line starts with it.
+        let status = s.update.status_line(chrono::Local::now().naive_local());
+        assert!(status.starts_with(concat!("Version ", env!("CARGO_PKG_VERSION"), ".")), "{status}");
+        assert!(crate::share_ui::tests::text_rect(&version, &status).is_some(), "the version is on the page");
 
         // Capture region and Record region: the window goes, then the capture, as from the Home tiles.
         for (entry, cmd) in [("Capture region", Command::Region), ("Record region", Command::Record)] {

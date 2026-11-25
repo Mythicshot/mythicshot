@@ -43,6 +43,8 @@ mod site_ui;
 mod snapshot;
 mod theme;
 mod tray;
+mod update;
+mod update_ui;
 mod tour;
 mod tour_cards;
 mod tour_view;
@@ -222,7 +224,18 @@ struct App {
     quitting: bool,
     /// The capture waiting in `hide_then_run` came from an editor's menu bar, for the capture log.
     menu_capture: bool,
+    /// The update check at start was handed to the updater (on the first frame, once the UI is up).
+    update_started: bool,
+    /// The quit that runs is the update's: the verified installer it closes the app for.
+    update_quit: Option<(update::Release, PathBuf)>,
+    /// The installer, checked again and held open so nothing can change it, and when the app
+    /// closes for it: msiexec is started on it as the very last thing the app does.
+    install_on_exit: Option<update::Verified>,
+    update_close_at: Option<Instant>,
 }
+
+/// How long "Checked. Mythicshot will close..." stands before the app closes for the installer.
+const UPDATE_CLOSE_AFTER: Duration = Duration::from_millis(1500);
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -306,6 +319,12 @@ impl App {
             state: SettingsState::default(),
             actions: Vec::new(),
         })));
+        // Updates: mythicshot.com, the app's own updates folder and capture.log. Nothing is asked
+        // before the first frame (see `tick_update`).
+        if let Ok(mut s) = window.lock() {
+            let wake = ctx.clone();
+            s.update = update_ui::Updater::new(Arc::new(update_ui::Official), update::Version::running()).with_wake(move || wake.request_repaint());
+        }
         // Deletes a past run could not finish: the Tours page offers to carry them on.
         if let Ok(s) = window.lock() {
             // A delete is noted in the file before its first request, on the job's own thread.
@@ -353,6 +372,10 @@ impl App {
             opening: None,
             quitting: false,
             menu_capture: false,
+            update_started: false,
+            update_quit: None,
+            install_on_exit: None,
+            update_close_at: None,
             wake: {
                 let (wake, woken) = mpsc::channel::<()>();
                 let relay = ctx.clone();
@@ -484,6 +507,15 @@ impl App {
             // The main window, on Home or on Preferences. Already open, it comes to the front on that page.
             Command::OpenApp | Command::Preferences => self.window_request = main_window::request_for(cmd),
             Command::OpenFolder => platform::open_folder(&self.settings.output_dir),
+            Command::Update => {
+                if let Ok(mut s) = self.window.lock() {
+                    s.update.tray_update();
+                }
+                // The main window comes forward with its line, unless a capture is on screen.
+                if tray::allowed(Command::OpenApp, self.activity()) {
+                    self.window_request = Some(main_window::Request::Open);
+                }
+            }
             Command::Exit => self.quit(ctx),
         }
     }
@@ -515,10 +547,122 @@ impl App {
         drop(guards);
         match progress {
             editor_ui::QuitProgress::Waiting => ctx.request_repaint_after(Duration::from_millis(200)),
-            editor_ui::QuitProgress::Cancelled => self.quitting = false,
+            editor_ui::QuitProgress::Cancelled => {
+                self.quitting = false;
+                // A Cancel in an editor's question calls the update off: nothing is closed or lost.
+                if self.update_quit.take().is_some()
+                    && let Ok(mut s) = self.window.lock()
+                {
+                    s.update.quit_cancelled();
+                }
+            }
             editor_ui::QuitProgress::Exit => {
                 self.quitting = false;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                match self.update_quit.take() {
+                    Some((release, path)) => self.close_for_update(release, path),
+                    None => ctx.send_viewport_cmd(ViewportCommand::Close),
+                }
+            }
+        }
+    }
+
+    /// What an update waits for: a recording or its countdown, a GIF being saved, a capture on
+    /// screen or a picker waiting, a recording being opened, a publish, update, share or Tours
+    /// job (each holds its profile), a tour export, an add to a site, an editor that exports or
+    /// publishes, and an editor of a saved recording, whose edits not sent to the site a close
+    /// would drop. An editor with unsaved changes asks its own question when the app closes.
+    fn work_running(&self) -> bool {
+        self.session.is_some()
+            || !self.encoding.is_empty()
+            || self.opening.is_some()
+            || self.activity().busy()
+            || profiles::holds::global().any_held()
+            || publish_ui::any_running()
+            || site::adds_in_flight() > 0
+            || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| !e.closed && (e.exporting() || e.may_hold_unsent_edits())))
+    }
+
+    /// Updates, every frame: start the check once the UI is up, take in what the background work
+    /// ended with, open what the line asked for, keep the tray entry, and once the installer is
+    /// verified and nothing runs, close the app for it the way Quit does.
+    fn tick_update(&mut self, ctx: &egui::Context) {
+        let running = self.work_running();
+        let (asks, label, ready) = {
+            let Ok(mut s) = self.window.lock() else { return };
+            if !std::mem::replace(&mut self.update_started, true) {
+                s.update.start(self.settings.check_for_updates);
+            }
+            s.update.poll(chrono::Local::now().naive_local());
+            if self.install_on_exit.is_none() {
+                s.update.set_waiting(running);
+            }
+            (std::mem::take(&mut s.update.asks), s.update.tray_label(), s.update.ready())
+        };
+        for update_ui::Ask::Open(page, anchor) in asks {
+            let opened = if anchor.is_empty() { dest::open_url(page) } else { dest::open_url_at(page, &anchor) };
+            if let Err(e) = opened {
+                self.notify(e);
+            }
+        }
+        self.tray.set_update(label);
+        match (self.update_close_at, ready) {
+            // The line said it closes; now it does, unless something started meanwhile.
+            (Some(at), ready) if Instant::now() >= at => {
+                self.update_close_at = None;
+                let mut guards: Vec<_> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok()).collect();
+                let start = editor_ui::start_quit(&mut guards, running);
+                drop(guards);
+                match start {
+                    editor_ui::QuitStart::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                    // Something to lose or something running after all: the installer is let go and waits again.
+                    editor_ui::QuitStart::Asked | editor_ui::QuitStart::StillRunning => {
+                        self.install_on_exit = None;
+                        if matches!(start, editor_ui::QuitStart::Asked) {
+                            self.quitting = true;
+                            self.update_quit = ready;
+                        }
+                        update::log("install: put off, something started");
+                    }
+                }
+            }
+            (Some(_), _) => ctx.request_repaint_after(Duration::from_millis(100)),
+            (None, Some((release, path))) if !running && !self.quitting && self.install_on_exit.is_none() => {
+                let mut guards: Vec<_> = self.editors.iter().filter_map(|(w, _)| w.editor.lock().ok()).collect();
+                let start = editor_ui::start_quit(&mut guards, false);
+                drop(guards);
+                match start {
+                    editor_ui::QuitStart::Exit => self.close_for_update(release, path),
+                    // Editors with unsaved changes ask first, as for Quit; see `tick_quit`.
+                    editor_ui::QuitStart::Asked => {
+                        self.quitting = true;
+                        self.update_quit = Some((release, path));
+                    }
+                    editor_ui::QuitStart::StillRunning => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check the installer once more and hold it open, save the settings, and close shortly:
+    /// msiexec starts on the held file in `on_exit`. A file that no longer matches is deleted
+    /// and the line says the download did not match.
+    fn close_for_update(&mut self, release: update::Release, path: PathBuf) {
+        match update::open_verified(&path, &release) {
+            Ok(held) => {
+                update::log(&format!("install: {} checked again, Mythicshot closes", release.version));
+                self.save_settings();
+                if let Ok(mut s) = self.window.lock() {
+                    s.update.set_waiting(false);
+                }
+                self.install_on_exit = Some(held);
+                self.update_close_at = Some(Instant::now() + UPDATE_CLOSE_AFTER);
+            }
+            Err(e) => {
+                update::log(&format!("install: refused ({e})"));
+                if let Ok(mut s) = self.window.lock() {
+                    s.update.install_refused();
+                }
             }
         }
     }
@@ -1404,6 +1548,16 @@ impl eframe::App for App {
         self.save_publish_state(true);
         // An add to a site was cancelled above; one already swapping its tour in finishes or rolls back first.
         site::wait_for_adds(std::time::Duration::from_secs(30));
+        // Closing for an update: msiexec starts on the installer checked and held open since, as
+        // the very last thing. The handle stays open until the process has gone, so the file
+        // cannot be changed, moved or deleted before then.
+        if let Some(held) = self.install_on_exit.take() {
+            match update::start_installer(&held, &update::WindowsLaunch) {
+                Ok(()) => update::log("install: msiexec started"),
+                Err(e) => update::log(&format!("install: not started ({e})")),
+            }
+            std::mem::forget(held);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1425,6 +1579,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
         self.handle_events(&ctx);
+        self.tick_update(&ctx);
 
         // Test hook: open an image file in the editor at start.
         #[cfg(debug_assertions)]
