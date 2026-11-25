@@ -280,6 +280,8 @@ mod tests {
             assert_eq!(var(light, name), l, "light --{name}");
             assert_eq!(var(dark, name), hex(d), "dark --{name}");
         }
+        // The index ships as it is, so its comments name roles and no internal file.
+        assert!(!INDEX_TEMPLATE.contains(".json") && !INDEX_TEMPLATE.contains(".rs"));
         assert!(INDEX_TEMPLATE.contains(".tour:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }"));
         assert!(!INDEX_TEMPLATE.contains("outline: none") && !INDEX_TEMPLATE.contains("outline: 0"));
         for theme in [light, dark] {

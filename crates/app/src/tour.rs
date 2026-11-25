@@ -264,6 +264,14 @@ const SINGLE_IMG_SRC: &str = "img-src data:;";
 // are cut from the same page and can never drift from it. The preview and the single file drop the
 // markers, so their bytes are exactly what they were without them.
 const CSS_BEGIN: &str = "/*PLAYER_CSS_BEGIN*/";
+// The player's own colours (its chrome) are the block between `/*CHROME_BEGIN*/` and `/*CHROME_END*/` at the
+// top of the player's styles. Each copies a brand token from the brand's `tokens.json`, dark values because
+// the player is always dark, which are the app's palette `theme::DARK`; the exported comment names only the
+// token. `--chrome-gold-soft`, `-pulse` and `-gone` are gold at .18, .6 and 0 (an older tour's hotspot ring
+// and its pulse), `--chrome-end-scrim` is ground at .72 (an older tour's end card), and `--chrome-focus-light`
+// is the light value of `focus`, for focus inside a light card. A tour's accent, card style, backdrop and
+// logo are the author's and are not in the block. `the_player_chrome_is_the_brand_and_the_accent_is_the_authors`
+// pins every value. A site's index copies both values of each neutral token the same way (see `site::pages`).
 const CSS_END: &str = "/*PLAYER_CSS_END*/";
 const HTML_BEGIN: &str = "<!--PLAYER_HTML_BEGIN-->";
 const HTML_END: &str = "<!--PLAYER_HTML_END-->";
@@ -1122,6 +1130,24 @@ mod tests {
         assert!(css.contains("body:not(.v3) #ring:focus-visible { outline: 2px solid var(--chrome-text); outline-offset: 2px; }"), "{css}");
         let c = contrast(colour(var(css, "chrome-text")), colour(var(css, "chrome-ground")));
         assert!(c >= 3.0, "older hotspot focus ring on ground: {c:.2}");
+    }
+
+    /// The chrome block ships in every exported page, so its comments name only each colour's role; the
+    /// mapping to the brand's files is documented beside `CHROME_BEGIN` in this file. Nothing in the
+    /// page's styles names an internal file.
+    #[test]
+    fn the_exported_chrome_block_names_only_roles() {
+        let block = player_css().split_once("/*CHROME_BEGIN*/").unwrap().1.split_once("/*CHROME_END*/").unwrap().0;
+        let roles = ["ground", "surface", "border", "border-strong", "text", "text-muted", "gold", "accent-text", "focus"];
+        let comments: Vec<&str> = block.split("/*").skip(1).map(|c| c.split_once("*/").unwrap().0.trim()).collect();
+        assert!(!comments.is_empty());
+        for c in comments {
+            assert!(roles.iter().any(|r| c == *r || c.starts_with(&format!("{r} "))), "a comment that is not a role: {c}");
+        }
+        let style = PREVIEW_TEMPLATE.split_once("</style>").unwrap().0;
+        for (part, text) in [("chrome block", block), ("the page's head and styles", style)] {
+            assert!(!text.contains(".json") && !text.contains(".rs"), "{part} names an internal file");
+        }
     }
 
 
@@ -2225,7 +2251,7 @@ mod tests {
         // brand's colours.
         use sha2::Digest;
         let hash: String = sha2::Sha256::digest(html.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hash, "3753a0a67a7895fa1ed0225303197a5a4e612199b07a472ec9989dff88233ec6");
+        assert_eq!(hash, "6e86be5fe474ece609edda308e50253a356dcf2a95f6c129764f4fb9d97afeeb");
         // Text in a manifest that looks like a marker stays as it is.
         let page = preview_page(r#"{"title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->"}"#);
         assert!(page.contains(r#""title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->""#));

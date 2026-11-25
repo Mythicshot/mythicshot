@@ -6,10 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Tour preview</title>
 <style>/*PLAYER_CSS_BEGIN*/
-  /* The player's own chrome: bars, buttons, labels, the focus ring and the older players' hotspot and end card.
-     Each is a copy of the brand token named beside it (tokens.json, dark values: the player is always dark),
-     the same values as the app's palette in theme.rs, so a brand change is this block. A tour's accent, card
-     style, backdrop and logo are the author's and are not here. */
+  /* The player's own colours, each named by its role. A tour's accent, card style, backdrop and logo are not here. */
   /*CHROME_BEGIN*/:root {
     --chrome-ground: #16121c;                     /* ground */
     --chrome-surface: #1e1928;                    /* surface */
@@ -18,15 +15,15 @@
     --chrome-text: #ede8f5;                       /* text */
     --chrome-muted: #b2a8c6;                      /* text-muted */
     --chrome-gold: #f5b841;                       /* gold */
-    --chrome-gold-soft: rgba(245, 184, 65, .18);  /* gold, as the older players' hotspot fill */
-    --chrome-gold-pulse: rgba(245, 184, 65, .6);  /* gold, where that hotspot's pulse starts */
-    --chrome-gold-gone: rgba(245, 184, 65, 0);    /* gold, where it ends */
+    --chrome-gold-soft: rgba(245, 184, 65, .18);  /* gold at .18 */
+    --chrome-gold-pulse: rgba(245, 184, 65, .6);  /* gold at .6 */
+    --chrome-gold-gone: rgba(245, 184, 65, 0);    /* gold at 0 */
     --chrome-gold-text: #f5b841;                  /* accent-text */
     --chrome-focus: #f5b841;                      /* focus */
     --chrome-focus-light: #8a5a00;                /* focus on light */
-    --chrome-end-scrim: rgba(22, 18, 28, .72);    /* ground, behind the older players' end card */
+    --chrome-end-scrim: rgba(22, 18, 28, .72);    /* ground at .72 */
   }/*CHROME_END*/
-  :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse; the editor's Tour view uses the same as PULSE_PERIOD in tour_view.rs. */ --pulse-period: 1.9s; }
+  :root { color-scheme: dark; --accent: #5dcaa5; --on-accent: #0c1d17; --accent-soft: rgba(93, 202, 165, .18); --ease: cubic-bezier(.22,.8,.26,1); /* One hotspot pulse. */ --pulse-period: 1.9s; }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body { display: flex; flex-direction: column; background: var(--chrome-ground); color: var(--chrome-text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
