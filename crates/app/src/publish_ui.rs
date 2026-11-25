@@ -757,6 +757,11 @@ impl Run {
     }
 }
 
+/// Whether a publish or a tour export is running now. An app update waits for it.
+pub fn any_running() -> bool {
+    !runs().is_empty()
+}
+
 /// On quit: cancel every publish, give them up to `wait` to send their abort, then
 /// remove the temporary folder of any that is still running.
 pub fn shutdown(wait: Duration) {

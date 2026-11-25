@@ -2988,6 +2988,7 @@ dependencies = [
  "raw-window-handle",
  "rdev",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

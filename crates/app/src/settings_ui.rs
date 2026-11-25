@@ -105,6 +105,8 @@ pub struct View<'a> {
     pub errors: &'a HashMap<Bind, String>,
     pub snipping_tool: Option<bool>,
     pub autostart: bool,
+    /// The Updates section's status and Check now; None draws only the version.
+    pub updates: Option<&'a mut crate::update_ui::Updater>,
 }
 
 /// Draw the page: the three tabs in a row, and the selected one under them.
@@ -198,8 +200,19 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     if ui.button("Open settings folder").clicked() {
         out.push(UiAction::OpenSettingsFolder);
     }
-    // Which build this is.
-    theme::caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
+    theme::block_gap(ui);
+    match view.updates {
+        // The status line of the Updates section says which build this is.
+        Some(updates) => {
+            if crate::update_ui::prefs_ui(ui, updates, s, chrono::Local::now().naive_local()) {
+                out.push(UiAction::SettingsChanged);
+            }
+        }
+        // Which build this is.
+        None => {
+            theme::caption(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
+        }
+    }
 }
 
 fn output_tab(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, hooks: &mut Hooks<'_>, out: &mut Vec<UiAction>) {
@@ -1194,7 +1207,7 @@ mod tests {
             let (fake, reads, removals, answer, ffmpeg, epoch) = (&self.fake, &mut self.reads, &mut self.removals, &self.answer, self.ffmpeg, self.epoch);
             let ctx = self.ctx.clone();
             let mut out = self.ctx.run_ui(input, |ui| {
-                let view = View { settings: &mut *settings, errors: &errors, snipping_tool: None, autostart: false };
+                let view = View { settings: &mut *settings, errors: &errors, snipping_tool: None, autostart: false, updates: None };
                 let hooks = Hooks {
                     open_folder: &mut |folder| opened.push(folder.to_path_buf()),
                     ffmpeg,
