@@ -137,6 +137,18 @@ impl Endings {
     }
 }
 
+/// Tokens being ended at their sites in this process, waiting for a job or being sent, whatever
+/// page or form started them: an app update counts them as running work and waits.
+fn in_flight() -> &'static Arc<AtomicUsize> {
+    static IN_FLIGHT: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Arc::default)
+}
+
+/// Whether a token is being ended at its site now (waiting for a job, or being sent).
+pub fn endings_in_flight() -> bool {
+    in_flight().load(Ordering::SeqCst) > 0
+}
+
 /// One token on its way to its site: counted while it is, whichever way the thread ends.
 struct Busy(Arc<AtomicUsize>);
 
@@ -167,7 +179,7 @@ fn spawn_change(shelf: &Arc<dyn Shelf>, slot: &Arc<Mutex<Option<Done>>>, endings
             done => (done, None),
         };
         // Counted before the change's end is handed over, so nobody sees it idle in between.
-        let busy = then_end.as_ref().map(|_| Busy::new(&endings.busy));
+        let busy = then_end.as_ref().map(|_| (Busy::new(&endings.busy), Busy::new(in_flight())));
         *lock(&slot) = Some(done);
         let Some((ending, after)) = then_end else { return };
         // A job that started with this token runs to its end first.

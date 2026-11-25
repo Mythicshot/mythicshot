@@ -463,13 +463,28 @@ fn a_test_build_keeps_its_updates_folder_in_its_own_temp_folder() {
 fn old_installers_are_removed_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    for name in ["Mythicshot-0.2.34-x64.msi", "Mythicshot-0.2.35-x64.msi", "Mythicshot-0.2.35-x64.msi.3.partial", "notes.txt", "Mythicshot-0.2.35-x64.msi.txt", "other.msi", "Mythicshot-evil-x64.msi", "Mythicshot-0.02.35-x64.msi"] {
+    for name in ["Mythicshot-0.2.33-x64.msi", "Mythicshot-0.2.35-x64.msi", "Mythicshot-0.2.35-x64.msi.3.partial", "notes.txt", "Mythicshot-0.2.35-x64.msi.txt", "other.msi", "Mythicshot-evil-x64.msi", "Mythicshot-0.02.35-x64.msi"] {
         std::fs::write(d.join(name), b"x").unwrap();
     }
-    std::fs::create_dir(d.join("Mythicshot-0.2.33-x64.msi")).unwrap();
-    assert_eq!(clean(d), 3);
-    assert_eq!(names(d), ["Mythicshot-0.02.35-x64.msi", "Mythicshot-0.2.33-x64.msi", "Mythicshot-0.2.35-x64.msi.txt", "Mythicshot-evil-x64.msi", "notes.txt", "other.msi"]);
-    assert_eq!(clean(&d.join("missing")), 0);
+    std::fs::create_dir(d.join("Mythicshot-0.2.32-x64.msi")).unwrap();
+    assert_eq!(clean(d, v("0.2.34")), 3);
+    assert_eq!(names(d), ["Mythicshot-0.02.35-x64.msi", "Mythicshot-0.2.32-x64.msi", "Mythicshot-0.2.35-x64.msi.txt", "Mythicshot-evil-x64.msi", "notes.txt", "other.msi"]);
+    assert_eq!(clean(&d.join("missing"), v("0.2.34")), 0);
+}
+
+#[test]
+fn the_installer_of_the_running_version_is_kept_for_a_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for name in ["Mythicshot-0.2.34-x64.msi", "Mythicshot-0.2.34-x64.msi.2.partial", "Mythicshot-0.2.33-x64.msi", "Mythicshot-0.2.35-x64.msi"] {
+        std::fs::write(d.join(name), b"x").unwrap();
+    }
+    // Every partial file goes, and every installer of another version, older or newer.
+    assert_eq!(clean(d, v("0.2.34")), 3);
+    assert_eq!(names(d), ["Mythicshot-0.2.34-x64.msi"]);
+    // Once another version runs, it goes too.
+    assert_eq!(clean(d, v("0.2.35")), 1);
+    assert!(names(d).is_empty());
 }
 
 // ---- Starting the installer ----

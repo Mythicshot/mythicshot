@@ -394,23 +394,24 @@ fn prepare_dir(dir: &Path) -> Result<(), &'static str> {
     }
 }
 
-/// Whether `name` is one this module gives a file: an installer or a partial download.
-fn is_ours(name: &str) -> bool {
+/// Whether `name` is one this module gives a file and [`clean`] removes: a partial download, or
+/// an installer of another version than `running`. The installer of the running version stays:
+/// msiexec may still be finishing with it, and a Repair from Settings › Apps may ask for it.
+fn is_removable(name: &str, running: Version) -> bool {
     let Some(rest) = name.strip_prefix("Mythicshot-") else { return false };
     let Some((version, tail)) = rest.split_once("-x64.msi") else { return false };
-    if Version::parse(version).is_none() {
-        return false;
-    }
-    tail.is_empty() || tail.strip_prefix('.').and_then(|t| t.strip_suffix(".partial")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    let Some(version) = Version::parse(version) else { return false };
+    let partial = tail.strip_prefix('.').and_then(|t| t.strip_suffix(".partial")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    partial || (tail.is_empty() && version != running)
 }
 
-/// Remove the installers and partial downloads in `dir`: only plain files with a name this module
-/// gives. How many were removed.
-pub fn clean(dir: &Path) -> usize {
+/// Remove the partial downloads and the installers of other versions than `running` in `dir`:
+/// only plain files with a name this module gives. How many were removed.
+pub fn clean(dir: &Path, running: Version) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     entries
         .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(is_ours))
+        .filter(|e| e.file_name().to_str().is_some_and(|n| is_removable(n, running)))
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter(|e| std::fs::remove_file(e.path()).is_ok())
         .count()

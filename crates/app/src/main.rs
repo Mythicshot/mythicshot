@@ -579,6 +579,7 @@ impl App {
             || profiles::holds::global().any_held()
             || publish_ui::any_running()
             || site::adds_in_flight() > 0
+            || profiles_ui::endings_in_flight()
             || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| !e.closed && (e.exporting() || e.may_hold_unsent_edits())))
     }
 
@@ -595,6 +596,10 @@ impl App {
             s.update.poll(chrono::Local::now().naive_local());
             if self.install_on_exit.is_none() {
                 s.update.set_waiting(running);
+            }
+            // While the installer waits for running work, look again about once a second.
+            if let Some(after) = s.update.wake_after() {
+                ctx.request_repaint_after(after);
             }
             (std::mem::take(&mut s.update.asks), s.update.tray_label(), s.update.ready())
         };

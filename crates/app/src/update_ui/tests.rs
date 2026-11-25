@@ -57,7 +57,7 @@ impl Net for FakeNet {
         }
         Downloaded::Failed("the test never let it end".into())
     }
-    fn clean(&self) -> usize {
+    fn clean(&self, _running: Version) -> usize {
         self.cleans.fetch_add(1, Ordering::SeqCst);
         0
     }
@@ -345,6 +345,24 @@ fn the_tray_entry_starts_what_update_now_starts() {
     let net = Arc::new(FakeNet::default());
     let mut none = updater(&net);
     assert!(!none.tray_update(), "nothing to update to");
+}
+
+#[test]
+fn only_an_installer_that_waits_for_running_work_asks_to_be_woken() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = offered(&net);
+    assert_eq!(u.wake_after(), None, "an offer alone does not");
+    *net.download_end.lock().unwrap() = Some(Downloaded::Ready(PathBuf::from("C:/x/Mythicshot-0.2.35-x64.msi")));
+    net.release_download.store(true, Ordering::SeqCst);
+    u.press(Button::UpdateNow);
+    settle(&mut u);
+    u.set_waiting(true);
+    assert_eq!(u.wake_after(), Some(Duration::from_secs(1)), "about once a second while it waits");
+    u.set_waiting(false);
+    assert_eq!(u.wake_after(), None, "nothing to wait for: the app closes for it");
+    u.set_waiting(true);
+    u.press(Button::CancelUpdate);
+    assert_eq!(u.wake_after(), None, "called off");
 }
 
 // ---- Drawing ----

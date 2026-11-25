@@ -178,8 +178,8 @@ pub fn status_text(running: Version, checking: bool, last: Option<&LastCheck>, n
 pub trait Net: Send + Sync {
     fn check(&self, running: Version) -> Result<Checked, String>;
     fn download(&self, release: &Release, attempt: u64, done: &AtomicU64, cancel: &AtomicBool) -> Downloaded;
-    /// Remove old installers; how many.
-    fn clean(&self) -> usize;
+    /// Remove partial downloads and the installers of other versions than `running`; how many.
+    fn clean(&self, running: Version) -> usize;
     /// Delete a downloaded installer that will not be used.
     fn discard(&self, path: &Path);
     /// One `capture.log` line.
@@ -199,8 +199,8 @@ impl Net for Official {
             None => Downloaded::Failed("there is no folder for updates".into()),
         }
     }
-    fn clean(&self) -> usize {
-        update::updates_dir().map_or(0, |dir| update::clean(&dir))
+    fn clean(&self, running: Version) -> usize {
+        update::updates_dir().map_or(0, |dir| update::clean(&dir, running))
     }
     fn discard(&self, path: &Path) {
         // Only a file in the updates folder, under a name the app gave it.
@@ -223,7 +223,7 @@ impl Net for Nowhere {
     fn download(&self, _release: &Release, _attempt: u64, _done: &AtomicU64, _cancel: &AtomicBool) -> Downloaded {
         Downloaded::Failed("not connected".into())
     }
-    fn clean(&self) -> usize {
+    fn clean(&self, _running: Version) -> usize {
         0
     }
     fn discard(&self, _path: &Path) {}
@@ -322,7 +322,7 @@ impl Updater {
         self.start_slot = Some(spawn(
             &self.wake,
             move || {
-                let removed = net.clean();
+                let removed = net.clean(running);
                 net.log(&format!("clean: {removed} old installers removed"));
                 check.then(|| net.check(running))
             },
@@ -496,6 +496,13 @@ impl Updater {
             self.net.log("install: waits for a recording, upload or editor");
         }
         self.waiting = waiting;
+    }
+
+    /// How soon the app should look again by itself: about once a second while a verified
+    /// installer waits for running work, so the install starts when the work ends even with the
+    /// main window closed to the tray; otherwise never.
+    pub fn wake_after(&self) -> Option<std::time::Duration> {
+        (matches!(self.flow, Flow::Ready { .. }) && self.waiting).then_some(std::time::Duration::from_secs(1))
     }
 
     /// The installer did not match any more just before it was to start: deleted, nothing installed.

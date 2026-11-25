@@ -644,6 +644,7 @@ fn a_slow_site_never_holds_up_the_local_removal() {
     let took = remove_now(&mut panel, "pa");
     assert!(took < Duration::from_secs(2), "the removal waited for the site: {took:?}");
     assert!(panel.is_ending(), "the site is still being asked");
+    assert!(crate::profiles_ui::endings_in_flight(), "an app update counts an ending being sent as running work");
     assert!(shelf.book().list.is_empty() && shelf.keys().is_empty(), "the list is updated already");
     assert!(panel.notices().is_empty());
     let started = Instant::now();
@@ -1067,6 +1068,7 @@ fn an_ending_that_waits_for_a_job_asks_for_no_repaint_and_wakes_the_page_once_fo
     remove_now(&mut panel, "pa");
     std::thread::sleep(Duration::from_millis(200));
     assert!(panel.is_ending(), "still waiting for the job");
+    assert!(crate::profiles_ui::endings_in_flight(), "an app update counts it as running work");
     assert!(!panel.wants_repaint(), "an idle page does not repaint while only waiting");
     assert_eq!(woken.load(Ordering::SeqCst), 0);
     drop(held);
