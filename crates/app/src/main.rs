@@ -1239,6 +1239,15 @@ impl App {
                     self.window_request = Some(main_window::Request::Page(main_window::Page::Preferences));
                 }
             }
+            // As Preferences is shown from an editor, with the check its Check now starts.
+            AppRequest::CheckForUpdates => {
+                if tray::allowed(Command::Preferences, self.activity()) {
+                    if let Ok(mut s) = self.window.lock() {
+                        s.check_for_updates();
+                    }
+                    self.window_request = Some(main_window::Request::Page(main_window::Page::Preferences));
+                }
+            }
             AppRequest::LogFolder => {
                 // `crash.log` and `capture.log` are beside the settings file.
                 if let Some(dir) = Settings::path().parent() {

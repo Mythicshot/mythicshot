@@ -293,6 +293,9 @@ pub struct Updater {
     started: bool,
     /// The work at start: cleaning, and the check when the setting is on (None when it is off).
     start_slot: Option<Slot<Option<Result<Checked, String>>>>,
+    /// The work at start includes a check (the setting was on). A clean alone is no check: Check
+    /// now runs beside it.
+    start_checks: bool,
     /// A Check now that runs.
     asked: Option<Slot<Result<Checked, String>>>,
     last: Option<LastCheck>,
@@ -325,7 +328,7 @@ impl Default for Updater {
 
 impl Updater {
     pub fn new(net: Arc<dyn Net>, running: Version) -> Updater {
-        Updater { net, running, wake: Arc::new(|| {}), started: false, start_slot: None, asked: None, last: None, available: None, later: false, flow: Flow::Idle, attempts: 0, waiting: true, asks: Vec::new(), notice: None }
+        Updater { net, running, wake: Arc::new(|| {}), started: false, start_slot: None, start_checks: false, asked: None, last: None, available: None, later: false, flow: Flow::Idle, attempts: 0, waiting: true, asks: Vec::new(), notice: None }
     }
 
     /// Wake the app when background work ends.
@@ -340,6 +343,7 @@ impl Updater {
         if std::mem::replace(&mut self.started, true) {
             return;
         }
+        self.start_checks = check;
         let (net, running) = (self.net.clone(), self.running);
         self.start_slot = Some(spawn(
             &self.wake,
@@ -352,9 +356,11 @@ impl Updater {
         ));
     }
 
-    /// Check now: works whatever the setting says. One at a time.
+    /// Check now: works whatever the setting says. One at a time: none starts while one runs,
+    /// the check at start included (the button is greyed out then, and Help › Check for updates
+    /// asks through here).
     pub fn check_now(&mut self) {
-        if self.asked.is_some() {
+        if self.checking() {
             return;
         }
         let (net, running) = (self.net.clone(), self.running);
@@ -367,8 +373,9 @@ impl Updater {
         self.start_slot.is_some() || self.asked.is_some() || matches!(self.flow, Flow::Downloading { .. })
     }
 
+    /// A check is running: a Check now, or the check at start (not a clean alone).
     fn checking(&self) -> bool {
-        self.asked.is_some() || self.start_slot.is_some()
+        self.asked.is_some() || (self.start_checks && self.start_slot.is_some())
     }
 
     /// Take in what background work ended with. `now` is the time a check that ended is noted at.

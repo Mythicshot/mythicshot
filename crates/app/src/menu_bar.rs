@@ -49,6 +49,8 @@ pub enum Entry {
     Troubleshooting,
     LogFolder,
     DownloadPage,
+    /// Preferences at the Updates section, and the check its Check now starts.
+    CheckForUpdates,
     About,
 }
 
@@ -73,6 +75,8 @@ impl Entry {
             Entry::Troubleshooting => "Troubleshooting",
             Entry::LogFolder => "Open the log folder",
             Entry::DownloadPage => "Download page",
+            // The owner's wording.
+            Entry::CheckForUpdates => "Check for updates",
             Entry::About => "About Mythicshot",
         }
     }
@@ -92,6 +96,7 @@ impl Entry {
             Entry::Troubleshooting => AppRequest::Troubleshooting,
             Entry::LogFolder => AppRequest::LogFolder,
             Entry::DownloadPage => AppRequest::DownloadPage,
+            Entry::CheckForUpdates => AppRequest::CheckForUpdates,
             Entry::Save | Entry::Export | Entry::PublishTour | Entry::CloseWindow | Entry::Undo | Entry::Redo | Entry::Copy | Entry::Delete | Entry::Properties => return None,
         })
     }
@@ -112,6 +117,9 @@ pub enum AppRequest {
     LogFolder,
     /// Open [`DOWNLOAD_PAGE`] in the browser.
     DownloadPage,
+    /// Show the main window on Preferences at the Updates section and check now, as its Check
+    /// now button does (`main_window::Shared::check_for_updates`).
+    CheckForUpdates,
 }
 
 /// What the app says when "Troubleshooting" finds no README beside the program (a build that was
@@ -216,7 +224,9 @@ pub fn menus(state: &State) -> Vec<Menu> {
         edit.push(vec![Item { checked: Some(open), ..item(Entry::Properties, enabled, "") }]);
     }
     let prefs = vec![Tab::ALL.iter().map(|t| item(Entry::Preferences(*t), true, "")).collect(), vec![item(Entry::Workspace, true, "")]];
-    let help = vec![vec![item(Entry::Troubleshooting, true, ""), item(Entry::LogFolder, true, ""), item(Entry::DownloadPage, true, "")], vec![item(Entry::About, true, "")]];
+    // Check for updates is always usable: with a check running it starts none, and only shows the
+    // section, whose status line says so.
+    let help = vec![vec![item(Entry::Troubleshooting, true, ""), item(Entry::LogFolder, true, ""), item(Entry::DownloadPage, true, "")], vec![item(Entry::CheckForUpdates, true, "")], vec![item(Entry::About, true, "")]];
     TITLES.into_iter().zip([file, edit, prefs, help]).map(|(title, groups)| Menu { title, groups }).collect()
 }
 
@@ -376,7 +386,7 @@ pub(crate) mod tests {
         assert_eq!(labels(&all[1]), vec![vec!["Undo", "Redo"], vec!["Copy", "Delete"], vec!["Properties"]]);
         // The Preferences page's own section names, then the page that holds the sign-in.
         assert_eq!(labels(&all[2]), vec![vec!["General", "Output", "Hotkeys"], vec!["Workspace"]]);
-        assert_eq!(labels(&all[3]), vec![vec!["Troubleshooting", "Open the log folder", "Download page"], vec!["About Mythicshot"]]);
+        assert_eq!(labels(&all[3]), vec![vec!["Troubleshooting", "Open the log folder", "Download page"], vec!["Check for updates"], vec!["About Mythicshot"]]);
         // A window without the panel has no Properties entry.
         let main = menus(&State::default());
         assert_eq!(labels(&main[1]), vec![vec!["Undo", "Redo"], vec!["Copy", "Delete"]]);
@@ -389,7 +399,7 @@ pub(crate) mod tests {
             assert!(!find(&none, e).enabled, "{e:?}");
         }
         // What is always there: capture, record, the pages, closing and quitting, and the help.
-        for e in [Entry::CaptureRegion, Entry::RecordRegion, Entry::OpenTours, Entry::CloseWindow, Entry::Quit, Entry::Workspace, Entry::Troubleshooting, Entry::LogFolder, Entry::DownloadPage, Entry::About] {
+        for e in [Entry::CaptureRegion, Entry::RecordRegion, Entry::OpenTours, Entry::CloseWindow, Entry::Quit, Entry::Workspace, Entry::Troubleshooting, Entry::LogFolder, Entry::DownloadPage, Entry::CheckForUpdates, Entry::About] {
             assert!(find(&none, e).enabled, "{e:?}");
         }
         for t in Tab::ALL {
@@ -415,7 +425,7 @@ pub(crate) mod tests {
         // A shortcut the user cleared shows nothing, and every entry without one shows nothing.
         let none = Keys::from(|_| String::new(), |_| String::new());
         assert!(menus(&State { keys: none, ..Default::default() }).iter().flat_map(|m| m.items()).all(|i| i.shortcut.is_empty()));
-        for e in [Entry::OpenTours, Entry::Export, Entry::PublishTour, Entry::CloseWindow, Entry::Quit, Entry::About] {
+        for e in [Entry::OpenTours, Entry::Export, Entry::PublishTour, Entry::CloseWindow, Entry::Quit, Entry::CheckForUpdates, Entry::About] {
             assert!(find(&all, e).shortcut.is_empty(), "{e:?}");
         }
     }
@@ -435,11 +445,32 @@ pub(crate) mod tests {
         assert_eq!(Entry::Troubleshooting.app_request(), Some(AppRequest::Troubleshooting));
         assert_eq!(Entry::LogFolder.app_request(), Some(AppRequest::LogFolder));
         assert_eq!(Entry::DownloadPage.app_request(), Some(AppRequest::DownloadPage));
+        assert_eq!(Entry::CheckForUpdates.app_request(), Some(AppRequest::CheckForUpdates), "from an editor, the app opens the section and checks");
         for e in [Entry::Save, Entry::Export, Entry::PublishTour, Entry::CloseWindow, Entry::Undo, Entry::Redo, Entry::Copy, Entry::Delete, Entry::Properties] {
             assert_eq!(e.app_request(), None, "{e:?} is the window's own");
         }
         assert_eq!(DOWNLOAD_PAGE, "https://mythicshot.com/download/");
         assert!(mythicshot_destinations::is_web_link(DOWNLOAD_PAGE), "a link the browser is asked to open");
+    }
+
+    /// The owner's wording, once, in a group of its own between the help and About, always usable
+    /// (a check already running is not started twice: the entry then only shows the section).
+    #[test]
+    fn check_for_updates_is_in_the_help_menu_once_above_about() {
+        for state in [State::default(), State { busy: true, properties: Some((true, false)), ..Default::default() }] {
+            let all = menus(&state);
+            let help = all.iter().find(|m| m.title == "Help").unwrap();
+            let everywhere: Vec<&Item> = all.iter().flat_map(|m| m.items()).filter(|i| i.entry.label() == "Check for updates").collect();
+            assert_eq!(everywhere.len(), 1, "once in all the menus");
+            assert_eq!(everywhere[0].entry, Entry::CheckForUpdates);
+            let at = help.groups.iter().position(|g| g.iter().any(|i| i.entry == Entry::CheckForUpdates)).unwrap();
+            assert_eq!(help.groups[at].len(), 1, "a group of its own");
+            assert!(help.groups[at + 1].iter().any(|i| i.entry == Entry::About), "right above About");
+            assert!(help.groups[at - 1].iter().any(|i| i.entry == Entry::DownloadPage), "under the help and the download page");
+            let it = find(&all, Entry::CheckForUpdates);
+            assert!(it.enabled && it.checked.is_none() && it.shortcut.is_empty(), "{it:?}");
+        }
+        assert_eq!(Entry::CheckForUpdates.label(), "Check for updates");
     }
 
     #[test]

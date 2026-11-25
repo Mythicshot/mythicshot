@@ -73,6 +73,9 @@ pub struct SettingsState {
     pub listening: Option<Bind>,
     /// What the Output tab knows about the saved recordings.
     pub saved: SavedRecordings,
+    /// Bring the Updates section's status line and Check now into view the next time General is
+    /// drawn (Help › Check for updates); once.
+    pub reveal_updates: bool,
 }
 
 pub enum UiAction {
@@ -166,14 +169,26 @@ fn ui_with(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, mut hoo
         out.push(UiAction::SettingsChanged);
     }
     match state.tab {
-        Tab::General => general(ui, view, &mut out),
+        Tab::General => general(ui, view, &mut state.reveal_updates, &mut out),
         Tab::Output => output_tab(ui, view, &mut state.saved, &mut hooks, &mut out),
         Tab::Hotkeys => hotkeys_tab(ui, state, view, &mut out),
     }
     out
 }
 
-fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
+/// The General tab. It scrolls, as Output does: in a small window the Updates section is below
+/// the bottom edge. `reveal_updates` scrolls to that section's status line and Check now, once.
+fn general(ui: &mut egui::Ui, view: View<'_>, reveal_updates: &mut bool, out: &mut Vec<UiAction>) {
+    egui::ScrollArea::vertical().id_salt("general-tab").show(ui, |ui| {
+        general_page(ui, view, out);
+        if std::mem::take(reveal_updates) {
+            // The section is the last thing on the page: its bottom edge to the window's.
+            ui.scroll_to_cursor(Some(egui::Align::Max));
+        }
+    });
+}
+
+fn general_page(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     let s = view.settings;
     ui.heading("General");
     theme::card(ui, |rows| {
@@ -1226,7 +1241,7 @@ mod tests {
 
     impl Page {
         fn new(root: Option<PathBuf>) -> Page {
-            let state = SettingsState { tab: Tab::Output, listening: None, saved: SavedRecordings::at(root) };
+            let state = SettingsState { tab: Tab::Output, listening: None, saved: SavedRecordings::at(root), reveal_updates: false };
             Page {
                 ctx: crate::theme::test_context(),
                 settings: Settings::default(),
