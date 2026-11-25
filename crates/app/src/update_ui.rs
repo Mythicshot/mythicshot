@@ -352,9 +352,11 @@ impl Updater {
         ));
     }
 
-    /// Check now: works whatever the setting says. One at a time.
+    /// Check now: works whatever the setting says. One at a time: none starts while one runs,
+    /// the check at start included (the button is greyed out then, and Help › Check for updates
+    /// asks through here).
     pub fn check_now(&mut self) {
-        if self.asked.is_some() {
+        if self.checking() {
             return;
         }
         let (net, running) = (self.net.clone(), self.running);

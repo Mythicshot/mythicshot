@@ -268,6 +268,15 @@ impl Shared {
         self.nav.go(Page::Preferences);
     }
 
+    /// Help › Check for updates: Preferences at the tab with the Updates section (General),
+    /// scrolled to its status line, and the check that section's Check now starts. One at a time:
+    /// with a check running, only the section is shown.
+    pub fn check_for_updates(&mut self) {
+        self.open_preferences(settings_ui::Tab::General);
+        self.prefs.state.reveal_updates = true;
+        self.update.check_now();
+    }
+
     /// What the menu bar shows in this window: no editor, so nothing to save, undo or copy, and
     /// no Properties panel. Capture and record are greyed out like the Home tiles while busy.
     fn menu_state(&self) -> menu_bar::State {
@@ -287,6 +296,7 @@ impl Shared {
             Entry::Workspace => out.go_to = Some(Page::Workspace),
             Entry::Preferences(tab) => self.open_preferences(tab),
             Entry::About => self.open_preferences(settings_ui::Tab::General),
+            Entry::CheckForUpdates => self.check_for_updates(),
             Entry::CloseWindow => self.close_window(),
             entry => {
                 if let Some(request) = entry.app_request() {
@@ -625,6 +635,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::settings::Settings;
 
+    mod check_for_updates;
     mod roomy;
 
     #[test]
@@ -995,6 +1006,17 @@ pub(crate) mod tests {
         let status = s.update.status_line(chrono::Local::now().naive_local());
         assert!(status.starts_with(concat!("Version ", env!("CARGO_PKG_VERSION"), ".")), "{status}");
         assert!(crate::share_ui::tests::text_rect(&version, &status).is_some(), "the version is on the page");
+        // Check for updates: the same section, and the check its Check now starts, in the window
+        // itself (see tests/check_for_updates.rs for the rest).
+        let mut s = fresh(Page::Home);
+        let (u, net) = crate::update_ui::tests::on_fake_net(Some(crate::update::Checked::UpToDate));
+        s.update = u;
+        s.prefs.state.tab = settings_ui::Tab::Hotkeys;
+        choose(&mut s, "Help", "Check for updates");
+        assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, settings_ui::Tab::General));
+        assert!(s.app_requests.is_empty(), "nothing for the app to do");
+        crate::update_ui::tests::settle_for_test(&mut s.update);
+        assert_eq!(net.checks(), 1);
 
         // Capture region and Record region: the window goes, then the capture, as from the Home tiles.
         for (entry, cmd) in [("Capture region", Command::Region), ("Record region", Command::Record)] {
