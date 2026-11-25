@@ -577,7 +577,7 @@ impl App {
     }
 
     /// What an update waits for: a recording or its countdown, a GIF being saved, a capture on
-    /// screen or a picker waiting, a recording being opened, a publish, update, share or Tours
+    /// screen or a picker waiting, a recording or a picture file being opened, a publish, update, share or Tours
     /// job (each holds its profile), a tour export, an add to a site, an editor that exports or
     /// publishes, and an editor of a saved recording, whose edits not sent to the site a close
     /// would drop. An editor with unsaved changes asks its own question when the app closes.
@@ -585,6 +585,7 @@ impl App {
         self.session.is_some()
             || !self.encoding.is_empty()
             || self.opening.is_some()
+            || self.images.pending()
             || self.activity().busy()
             || profiles::holds::global().any_held()
             || publish_ui::any_running()

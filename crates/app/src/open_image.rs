@@ -180,6 +180,8 @@ pub struct ImageLoads {
     newest: u64,
     running: usize,
     waiting: Option<ReadJob>,
+    /// The newest request has been answered.
+    answered: bool,
 }
 
 impl ImageLoads {
@@ -187,6 +189,7 @@ impl ImageLoads {
     /// (it starts when one ends, unless a newer request replaces it first).
     pub fn request(&mut self, path: PathBuf) -> Option<ReadJob> {
         self.newest += 1;
+        self.answered = false;
         if self.running < MAX_READS {
             self.running += 1;
             Some((self.newest, path))
@@ -207,11 +210,19 @@ impl ImageLoads {
         if generation != self.newest {
             return (Settled::Superseded, next);
         }
+        self.answered = true;
         let settled = match result {
             Ok(img) => Settled::Open(img, path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
             Err(e) => Settled::Failed(could_not_open(path, &e)),
         };
         (settled, next)
+    }
+
+    /// Whether the newest request is still being read, or waits to be: an update holds back so
+    /// the app is not closed between the read and the editor opening. A superseded read still
+    /// running holds nothing back.
+    pub fn pending(&self) -> bool {
+        self.newest > 0 && !self.answered
     }
 }
 

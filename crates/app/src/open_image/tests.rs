@@ -286,12 +286,15 @@ fn gone() -> ImageError {
 fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
     let (a, b) = (PathBuf::from("C:/p/a.png"), PathBuf::from("C:/p/b.png"));
     let mut loads = ImageLoads::default();
+    assert!(!loads.pending(), "nothing asked for yet");
     let (ga, _) = loads.request(a.clone()).expect("starts at once");
     let (gb, _) = loads.request(b.clone()).expect("a second read runs beside the first");
+    assert!(loads.pending());
     // The newer one ends first and opens.
     let (settled, next) = loads.finished(gb, &b, Ok(RgbaImage::new(4, 4)));
     assert!(matches!(settled, Settled::Open(ref img, ref title) if img.dimensions() == (4, 4) && title == "b.png"), "{settled:?}");
     assert!(next.is_none());
+    assert!(!loads.pending(), "the newest is answered");
     // The older one ends later: dropped, picture and all, nothing said.
     let (settled, _) = loads.finished(ga, &a, Ok(RgbaImage::new(2, 2)));
     assert!(matches!(settled, Settled::Superseded));
@@ -299,12 +302,14 @@ fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
     let (gc, _) = loads.request(a.clone()).unwrap();
     let (gd, _) = loads.request(b.clone()).unwrap();
     assert!(matches!(loads.finished(gc, &a, Err(gone())).0, Settled::Superseded));
+    assert!(loads.pending(), "the newest is still being read");
     // The newest failing says the usual sentence.
     let (settled, _) = loads.finished(gd, &b, Err(gone()));
     match settled {
         Settled::Failed(sentence) => assert_eq!(sentence, could_not_open(&b, &gone())),
         other => panic!("{other:?}"),
     }
+    assert!(!loads.pending());
 }
 
 #[test]
@@ -320,11 +325,13 @@ fn at_most_two_reads_run_and_only_the_newest_waiting_request_is_kept() {
     assert!(matches!(settled, Settled::Superseded));
     let (g4, path) = next.expect("the waiting request starts");
     assert_eq!(path, p("4"));
+    assert!(loads.pending(), "an update waits for it");
     // The other old one ends: nothing waits, nothing starts.
     let (settled, next) = loads.finished(g2, &p("2"), Err(gone()));
     assert!(matches!(settled, Settled::Superseded) && next.is_none());
     let (settled, _) = loads.finished(g4, &p("4"), Ok(RgbaImage::new(1, 1)));
     assert!(matches!(settled, Settled::Open(..)));
+    assert!(!loads.pending(), "an update may close the app now");
 }
 
 #[test]
