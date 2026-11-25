@@ -989,3 +989,174 @@ fn the_parts_of_a_row_stand_on_one_line() {
     let placeholder = shapes_of(&out).into_iter().any(|s| matches!(s, egui::Shape::Circle(c) if c.fill == theme::CHIP && (c.radius - theme::BADGE_SIZE / 2.0).abs() < 0.5));
     assert!(placeholder, "the badge's place is kept");
 }
+
+
+/// Where the window cannot be tall enough for the Workspace page (1080p at 200%: 437 points high),
+/// the page scrolls, and scrolled to its end it shows the Sign out row whole inside the window,
+/// with the page's own margin under it and nothing overlapping.
+#[test]
+fn the_workspace_page_scrolls_to_sign_out_where_the_window_is_too_low() {
+    let ppp = 2.0;
+    let size = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, ppp)), 1.0).size;
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    let (ctx, mut f, out) = settled(Kind::Connected, size, ppp);
+    assert!(text_rect(&out, workspace_ui::SIGN_OUT).is_none_or(|r| !window.contains_rect(r)), "{size:?}: Sign out needs scrolling to");
+    let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -200.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+    let over_page = egui::pos2(NAV_WIDTH + 200.0, size.y / 2.0);
+    let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+    let mut draw = |events: Vec<egui::Event>| {
+        let input = egui::RawInput { screen_rect: Some(window), events, time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
+        out.textures_delta.clear();
+        out
+    };
+    draw(vec![egui::Event::PointerMoved(over_page)]);
+    for _ in 0..10 {
+        draw(vec![wheel.clone()]);
+    }
+    draw(vec![]);
+    let out = draw(vec![]);
+    let button = holder(&out, workspace_ui::SIGN_OUT);
+    assert!(window.contains_rect(button), "{size:?}: {button:?}");
+    assert!(size.y - button.bottom() >= theme::PAGE_PAD - 0.5, "{size:?}: {} points under {button:?}", size.y - button.bottom());
+    assert!(button.contains_rect(text_rect(&out, workspace_ui::SIGN_OUT).unwrap()));
+    // Its row's note too, at the left.
+    let note = text_rect(&out, workspace_ui::TOKEN_NOTE).unwrap();
+    assert!(window.contains_rect(note) && (note.center().y - button.center().y).abs() < 2.0, "{note:?}");
+    theme::checks::assert_no_overlaps(&out, "Workspace scrolled at 1080p 200%");
+    assert_inside_across(&out, window, "Workspace scrolled at 1080p 200%");
+}
+
+/// The lowest thing drawn on the page beside the menu: text, or a box, a line or a control.
+fn page_bottom(out: &egui::FullOutput) -> f32 {
+    let mut low = 0.0f32;
+    for c in &out.shapes {
+        let mut all = Vec::new();
+        fn collect<'a>(s: &'a egui::Shape, into: &mut Vec<&'a egui::Shape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, into)),
+                s => into.push(s),
+            }
+        }
+        collect(&c.shape, &mut all);
+        for s in all {
+            match s {
+                egui::Shape::Text(t) if t.pos.x > NAV_WIDTH && !t.galley.text().trim().is_empty() => low = low.max(t.visual_bounding_rect().bottom()),
+                egui::Shape::Rect(r) if r.rect.left() > NAV_WIDTH && r.rect.height() < 1000.0 && (r.fill.a() > 0 || r.stroke.width > 0.0) => low = low.max(r.rect.bottom()),
+                _ => {}
+            }
+        }
+    }
+    low
+}
+
+/// Draw a page of a fixture with no profile (or `page` Workspace with a connected one) at
+/// `size` and `ppp`, settled.
+fn page_out(page: Page, tab: Option<settings_ui::Tab>, size: egui::Vec2, ppp: f32) -> egui::FullOutput {
+    if page == Page::Workspace {
+        return settled(Kind::Connected, size, ppp).2;
+    }
+    let ctx = crate::theme::test_context();
+    ctx.set_pixels_per_point(ppp);
+    let mut f = fixture(Kind::Add);
+    if page == Page::Tours {
+        f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
+    }
+    f.s.nav.request(page);
+    if let Some(tab) = tab {
+        f.s.prefs.state.tab = tab;
+    }
+    let tours = crate::tours_ui::tests::conn(TokenStatus::Saved);
+    let mut last = None;
+    for _ in 0..4 {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, None));
+        out.textures_delta.clear();
+        last = Some(out);
+    }
+    last.unwrap()
+}
+
+/// At the default size every page shows whole without scrolling (drawn far taller, nothing goes
+/// below the default's bottom), except Preferences' Output and Hotkeys tabs, which hold more than
+/// any window of about this size can show. The Workspace page of a connected profile keeps about
+/// 150 points clear under its last row, as in the owner's picture.
+#[test]
+fn every_page_but_two_preferences_tabs_shows_whole_at_the_default_size() {
+    let tall = egui::vec2(SIZE[0], 3000.0);
+    let mut pages: Vec<(Page, Option<settings_ui::Tab>)> = vec![(Page::Home, None), (Page::Tours, None), (Page::Workspace, None)];
+    pages.extend(settings_ui::Tab::ALL.map(|t| (Page::Preferences, Some(t))));
+    for (page, tab) in pages {
+        let bottom = page_bottom(&page_out(page, tab, tall, 1.0));
+        let scrolls = matches!(tab, Some(settings_ui::Tab::Output | settings_ui::Tab::Hotkeys));
+        assert_eq!(bottom > SIZE[1] - theme::PAGE_PAD, scrolls, "{page:?} {tab:?}: its content ends at {bottom}, the window at {}", SIZE[1]);
+        if page == Page::Workspace {
+            assert!((140.0..=170.0).contains(&(SIZE[1] - bottom)), "{} points clear under Sign out", SIZE[1] - bottom);
+        }
+    }
+}
+
+/// The Workspace page of a connected profile, at the size the window opens at on a 1080p and on
+/// a 4K monitor, at 100%, 125%, 150% and 200%: Sign out, its last row, drawn whole inside the
+/// window with space under it, and nothing overlapping. On 1080p at 200% (a work area of
+/// 960×492 points) the window cannot be tall enough, and Sign out is reached by scrolling.
+#[test]
+fn the_workspace_page_shows_sign_out_whole_at_the_opening_size_on_1080p_and_4k() {
+    for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+        for (name, w, h) in [("1080p", 1920u32, 1080u32), ("4K", 3840, 2160)] {
+            let work = super::super::opening::tests::work(w, h, ppp);
+            let size = super::super::opening::opening(None, Some(work), 1.0).size;
+            let what = format!("{name} at {ppp}: {size:?}");
+            let (_ctx, _f, out) = settled(Kind::Connected, size, ppp);
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            theme::checks::assert_no_overlaps(&out, &what);
+            assert_inside_across(&out, window, &what);
+            let sign_out = text_rect(&out, workspace_ui::SIGN_OUT).filter(|r| window.contains_rect(*r));
+            if name == "1080p" && ppp == 2.0 {
+                // Too low to show the page whole: see the test below, which scrolls to Sign out.
+                assert!(size.y < 589.0, "{what}: too low to show the page whole");
+                continue;
+            }
+            let sign_out = sign_out.unwrap_or_else(|| panic!("{what}: Sign out is not drawn inside the window"));
+            let button = holder(&out, workspace_ui::SIGN_OUT);
+            assert!(window.contains_rect(button), "{what}: {button:?}");
+            assert!(size.y - button.bottom() >= theme::PAGE_PAD, "{what}: {} points under {button:?}", size.y - button.bottom());
+            assert!(button.contains_rect(sign_out));
+        }
+    }
+}
+
+/// Pictures of every page at the window's default size at 100%, the Workspace page with a
+/// connected profile, and the Workspace page at the size the window opens at on a 1080p monitor
+/// at 150%, at that scale. Run with
+/// `MYTHICSHOT_SNAPSHOTS=<absolute folder> cargo test -p mythicshot window_size_renders -- --ignored`.
+#[test]
+#[ignore = "writes pictures: MYTHICSHOT_SNAPSHOTS=<folder>"]
+fn window_size_renders() {
+    let default = egui::vec2(SIZE[0], SIZE[1]);
+    let fitted = super::super::opening::opening(None, Some(super::super::opening::tests::work(1920, 1080, 1.5)), 1.0).size;
+    let missing = crate::tours_ui::tests::conn(TokenStatus::Missing);
+    for (label, size, ppp) in [("size-workspace-default-1x", default, 1.0f32), ("size-workspace-1080p-150", fitted, 1.5)] {
+        let (_ctx, mut f, _) = settled(Kind::Connected, size, ppp);
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| {
+            let ws = f.given.clone();
+            window_ui_given(ui, &mut f.s, &missing, Some(&ws));
+        });
+        assert_eq!(crate::snapshot::save(&shot, label), 0, "{label}");
+    }
+    let tours_conn = crate::tours_ui::tests::conn(TokenStatus::Saved);
+    let mut pages: Vec<(String, Page, Option<settings_ui::Tab>)> = vec![("home".into(), Page::Home, None), ("tours".into(), Page::Tours, None)];
+    pages.extend(settings_ui::Tab::ALL.map(|t| (format!("preferences-{}", t.label().to_lowercase()), Page::Preferences, Some(t))));
+    for (label, page, tab) in pages {
+        let mut f = fixture(Kind::Add);
+        if page == Page::Tours {
+            f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
+        }
+        f.s.nav.request(page);
+        if let Some(tab) = tab {
+            f.s.prefs.state.tab = tab;
+        }
+        let shot = crate::snapshot::shot(&crate::theme::test_context(), default, 1.0, 3, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
+        assert_eq!(crate::snapshot::save(&shot, &format!("size-{label}-default-1x")), 0, "{label}");
+    }
+}

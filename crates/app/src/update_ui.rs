@@ -678,7 +678,8 @@ pub fn prefs_ui(ui: &mut egui::Ui, u: &mut Updater, settings: &mut crate::settin
             // The helper text stands under the checkbox's label, a line's gap below it.
             ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
             changed = theme::choices(ui, |ui| ui.checkbox(&mut settings.check_for_updates, CHECKBOX).changed());
-            ui.horizontal(|ui| {
+            // Its top at the top of the line: centred, one line of it stood lower in the line's height.
+            ui.horizontal_top(|ui| {
                 ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
                 theme::caption(ui, HELPER);
             });

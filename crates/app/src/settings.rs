@@ -62,6 +62,10 @@ pub struct Settings {
     pub overlays: OverlayStyle,
     /// Last captured region in desktop pixels: x, y, width, height.
     pub last_region: Option<[i32; 4]>,
+    /// The main window's inner size in points, as the user last left it by hand (never a
+    /// maximized size, nor the size one opening was cut down to). None until then, and in files
+    /// from before it existed. A value that cannot be used is ignored when the window opens.
+    pub main_window_size: Option<[f32; 2]>,
     /// Action → shortcut in `global-hotkey` syntax, for example `shift+PrintScreen`.
     /// An empty string means the action has no shortcut.
     pub hotkeys: BTreeMap<Action, String>,
@@ -402,6 +406,7 @@ impl Default for Settings {
             record_keys: false,
             overlays: OverlayStyle { keys: KeyStyle::Chips, ..OverlayStyle::default() },
             last_region: None,
+            main_window_size: None,
             hotkeys: Action::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor_keys: EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect(),
             editor: EditorPrefs::default(),
@@ -758,6 +763,7 @@ impl Settings {
             // Not edited by a page.
             take_print_screen: _,
             last_region: _,
+            main_window_size: _,
             hotkeys: _,
             editor_keys: _,
             editor: _,
@@ -839,6 +845,7 @@ mod tests {
         edited.editor_keys.clear();
         edited.take_print_screen = !mine.take_print_screen;
         edited.last_region = Some([1, 2, 3, 4]);
+        edited.main_window_size = Some([1000.0, 800.0]);
         edited.editor_keys_version = 99;
         edited.publish_saved_for = Some("https://elsewhere.example.com".to_string());
         edited.publish_binding_settled = !mine.publish_binding_settled;
@@ -860,6 +867,7 @@ mod tests {
         assert_eq!((&mine.hotkeys, &mine.editor_keys), (&before.hotkeys, &before.editor_keys));
         assert_eq!(mine.binding(Action::ALL[0]), "control+KeyQ");
         assert_eq!((mine.take_print_screen, mine.last_region, mine.editor_keys_version), (before.take_print_screen, before.last_region, before.editor_keys_version));
+        assert_eq!(mine.main_window_size, before.main_window_size, "the window's size is the app's own");
         assert_eq!((&mine.publish_saved_for, mine.publish_binding_settled), (&before.publish_saved_for, before.publish_binding_settled));
         // Taken twice is taken once, and an unchanged copy changes nothing.
         let once = toml::to_string(&mine).unwrap();
@@ -1223,6 +1231,81 @@ publish_server = \"https://tours.example.com\"
         // An action no version knew still costs only itself, as before.
         assert!(toml::from_str::<Settings>("[editor_keys]\nsculpt = \"KeyS\"\n").is_err());
         assert!(toml::from_str::<Settings>("[editor_keys]\ncross = \"KeyZ\"\nselect = \"KeyQ\"\n").is_ok());
+    }
+
+    /// The main window's size: saved and read back as it was; a file from before it existed reads
+    /// as none; whole numbers read as sizes; a value of the wrong kind costs only itself, as any
+    /// other setting's does.
+    #[test]
+    fn the_main_windows_size_round_trips_and_older_files_have_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mine = Settings { main_window_size: Some([1012.5, 803.25]), publish_server: "https://tours.example.com".into(), ..Settings::default() };
+        mine.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("main_window_size = [1012.5, 803.25]") || text.contains("main_window_size = [
+"), "{text}");
+        let s = Settings::load_with(&path, |p| std::fs::read(p), |_, _| panic!("a copy was made of a file that loaded whole"));
+        assert!(s.load_problem.is_none());
+        assert_eq!((s.main_window_size, s.publish_server.as_str()), (Some([1012.5, 803.25]), "https://tours.example.com"));
+        // None is not written at all.
+        let none = toml::to_string(&Settings::default()).unwrap();
+        assert!(!none.contains("main_window_size"), "{none}");
+        // A file from 0.2.39 and before: no such key.
+        let old: Settings = toml::from_str("publish_server = \"https://tours.example.com\"
+magnifier = false
+").unwrap();
+        assert_eq!((old.main_window_size, old.magnifier), (None, false));
+        // Whole numbers, as a person might type them.
+        assert_eq!(toml::from_str::<Settings>("main_window_size = [1000, 800]
+").unwrap().main_window_size, Some([1000.0, 800.0]));
+        // Numbers that are no size load as they are; the window ignores them when it opens.
+        for (text, read) in [("main_window_size = [nan, 800.0]
+", None), ("main_window_size = [-5.0, 0.0]
+", Some([-5.0, 0.0])), ("main_window_size = [1e30, 800.0]
+", Some([1e30, 800.0])), ("main_window_size = [inf, -inf]
+", Some([f32::INFINITY, f32::NEG_INFINITY]))] {
+            let got = toml::from_str::<Settings>(text).unwrap_or_else(|e| panic!("{text}: {e}")).main_window_size;
+            match read {
+                None => assert!(got.is_some_and(|[w, _]| w.is_nan()), "{text}: {got:?}"),
+                Some(r) => assert_eq!(got, Some(r), "{text}"),
+            }
+        }
+        // The wrong kind of value, or the wrong number of them: only that value is lost.
+        for text in ["main_window_size = \"big\"
+magnifier = false
+", "main_window_size = [1000.0]
+magnifier = false
+", "main_window_size = [\"a\", \"b\"]
+magnifier = false
+"] {
+            assert!(toml::from_str::<Settings>(text).is_err(), "{text}");
+            let s = Settings::parse(text).unwrap_or_else(|| panic!("{text} still loads")).upgrade();
+            assert_eq!((s.main_window_size, s.magnifier), (None, false), "{text}");
+        }
+        // A third number is passed over, as the file format reads a list into a pair.
+        assert_eq!(toml::from_str::<Settings>("main_window_size = [1000.0, 800.0, 3.0]
+").unwrap().main_window_size, Some([1000.0, 800.0]));
+    }
+
+    /// A file this version writes loads in 0.2.39 after a downgrade: that version reads the file
+    /// with the same rules as this one (no key is refused for being unknown), so a key it does not
+    /// know, as `main_window_size` is to it, is passed over and the file loads whole, with no copy
+    /// made and nothing reported.
+    #[test]
+    fn a_key_a_version_does_not_know_is_passed_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "publish_server = \"https://tours.example.com\"
+window_size_from_a_newer_version = [1000.0, 800.0]
+magnifier = false
+
+[hotkeys]
+capture_region = \"control+KeyQ\"
+").unwrap();
+        let s = Settings::load_with(&path, |p| std::fs::read(p), |_, _| panic!("a copy was made of a file that loaded whole"));
+        assert!(s.load_problem.is_none());
+        assert_eq!((s.publish_server.as_str(), s.magnifier, s.binding(Action::CaptureRegion)), ("https://tours.example.com", false, "control+KeyQ"));
     }
 
     fn when() -> chrono::NaiveDateTime {

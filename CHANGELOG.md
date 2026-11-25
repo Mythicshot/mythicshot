@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.41 (2026-11-25)
+
+- The Mythicshot window opens larger: 920 by 740 instead of 760 by 520, so the Workspace page shows whole with room under it. Home, Tours and Preferences › General fit without scrolling too.
+- It opens fitted to the screen and centred on the main monitor. Where Windows scaling leaves less room, as on a 1080p screen at 150%, it opens as tall as fits and is never partly off the screen.
+- It remembers the size you give it, for the next opening and after a restart. A maximized, minimized or snapped window is not remembered: the next opening uses the size from before. It never opens maximized.
+- Zooming with Ctrl and plus or minus does not change the remembered size.
+
 ## 0.2.40 (2026-11-25)
 
 - The Help menu has "Check for updates". It opens Preferences at the Updates section and runs the same check as "Check now", so the result shows in the line that is already there. With a check already running it opens the section and starts no second one. The entry is in the main window and in every editor window.
