@@ -440,6 +440,13 @@ fn temp_path(path: &std::path::Path) -> PathBuf {
 /// flushed to the disk, and then takes the file's place in one rename. A crash or a failure
 /// at any point leaves the settings file whole, as it was or as it should be.
 fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    write_whole(path, text.as_bytes())
+}
+
+/// Write `bytes` to `path` the way the settings file is written ([`write_file`]): to a temporary
+/// file beside it, flushed to the disk, then renamed over it, so the file at `path` is always
+/// whole. For the other small files the app keeps beside the settings file.
+pub(crate) fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -447,7 +454,7 @@ fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let write = |tmp: &std::path::Path| {
         // A temporary file left by a crash is written over from its start.
         let mut f = std::fs::File::create(tmp)?;
-        f.write_all(text.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()
     };
     replace_with(path, write, |from, to| std::fs::rename(from, to), RENAME_TRIES, || std::thread::sleep(RENAME_WAIT))

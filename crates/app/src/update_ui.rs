@@ -1,5 +1,5 @@
 //! Updates as the person sees them: the line under the main window's menu bar, the Updates
-//! section of Preferences, and the tray entry. The network, the files and the installer are
+//! section of Preferences, the tray entry, and the popup at the start after an in-app update. The network, the files and the installer are
 //! `update`'s; this holds what is going on ([`Updater`]) and draws it.
 //!
 //! The work runs on threads of its own and lands in slots that [`Updater::poll`] takes in on the
@@ -15,6 +15,7 @@ use chrono::NaiveDateTime;
 use eframe::egui::{self, RichText};
 
 use crate::theme;
+use crate::update::pending::AfterUpdate;
 use crate::update::{self, Checked, Downloaded, Release, Version};
 
 // ---- Approved wording ----
@@ -89,6 +90,51 @@ impl Button {
 /// Approved: the line in the main window when the download broke off or stalled, with "Try
 /// again" and "Open download page".
 pub const DOWNLOAD_FAILED: &str = "The download from mythicshot.com did not finish, so nothing was installed.";
+
+/// Approved: the popup's title at the start after an in-app update that worked.
+pub const UPDATED_TITLE: &str = "Mythicshot is up to date";
+/// Approved: the popup's title when the version updated from is still the one running.
+pub const NOT_FINISHED_TITLE: &str = "The update did not finish";
+/// Approved: the popup's button that closes it.
+pub const OK: &str = "OK";
+
+/// Approved: the popup's line after an update that worked.
+pub fn updated_text(from: Version, to: Version) -> String {
+    format!("Updated from {from} to {to}.")
+}
+
+/// Approved: the popup's line when the update did not finish. The approved second sentence
+/// pointed to Settings; the update controls are in Preferences › Updates (and the line under the
+/// menu bar, and the tray), so only the first sentence is used until the owner words another.
+pub fn not_finished_text(from: Version) -> String {
+    format!("Mythicshot is still {from}.")
+}
+
+/// The popup's buttons, each with its approved label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeButton {
+    /// Opens the changes page, then closes the popup.
+    WhatsNew,
+    /// The primary: closes the popup.
+    Ok,
+}
+
+impl NoticeButton {
+    pub fn label(self) -> &'static str {
+        match self {
+            NoticeButton::WhatsNew => WHATS_NEW,
+            NoticeButton::Ok => OK,
+        }
+    }
+}
+
+/// The popup for `after`: its title, its line, and its buttons left to right (the primary last).
+pub fn notice_view(after: AfterUpdate) -> (&'static str, String, &'static [NoticeButton]) {
+    match after {
+        AfterUpdate::Updated { from, to } => (UPDATED_TITLE, updated_text(from, to), &[NoticeButton::WhatsNew, NoticeButton::Ok]),
+        AfterUpdate::NotFinished { from } => (NOT_FINISHED_TITLE, not_finished_text(from), &[NoticeButton::Ok]),
+    }
+}
 
 // ---- The status line ----
 
@@ -259,6 +305,16 @@ pub struct Updater {
     waiting: bool,
     /// What the app is asked to open, oldest first; it takes them.
     pub asks: Vec<Ask>,
+    /// The popup at the start after an in-app update, until it is closed.
+    notice: Option<Notice>,
+}
+
+/// The popup at the start after an in-app update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Notice {
+    after: AfterUpdate,
+    /// The main window was opened only to show it: it closes with it.
+    close_window: bool,
 }
 
 impl Default for Updater {
@@ -269,7 +325,7 @@ impl Default for Updater {
 
 impl Updater {
     pub fn new(net: Arc<dyn Net>, running: Version) -> Updater {
-        Updater { net, running, wake: Arc::new(|| {}), started: false, start_slot: None, asked: None, last: None, available: None, later: false, flow: Flow::Idle, attempts: 0, waiting: true, asks: Vec::new() }
+        Updater { net, running, wake: Arc::new(|| {}), started: false, start_slot: None, asked: None, last: None, available: None, later: false, flow: Flow::Idle, attempts: 0, waiting: true, asks: Vec::new(), notice: None }
     }
 
     /// Wake the app when background work ends.
@@ -482,6 +538,32 @@ impl Updater {
         self.drop_ready(Flow::Idle, "install: cancelled in an editor, installer deleted");
     }
 
+    /// Show the popup for `after` in the main window; `opened_window` says the window was opened
+    /// only for it, so it closes with the popup.
+    pub fn set_notice(&mut self, after: AfterUpdate, opened_window: bool) {
+        self.notice = Some(Notice { after, close_window: opened_window });
+    }
+
+    /// The popup that is up, if one is.
+    pub fn notice(&self) -> Option<AfterUpdate> {
+        self.notice.map(|n| n.after)
+    }
+
+    /// A button of the popup was pressed: it closes, and What's new asks for the changes page.
+    /// True when the main window was opened only for the popup and should close with it.
+    pub fn press_notice(&mut self, button: NoticeButton) -> bool {
+        let Some(notice) = self.notice.take() else { return false };
+        if button == NoticeButton::WhatsNew {
+            self.asks.push(Ask::Open(update::CHANGES_PAGE, String::new()));
+        }
+        notice.close_window
+    }
+
+    /// The main window was closed with the popup up: it was seen, and does not come back.
+    pub fn dismiss_notice(&mut self) {
+        self.notice = None;
+    }
+
     /// The line in the main window, or None for no line.
     pub fn banner(&self) -> Option<Banner> {
         let line = |text: String, buttons: Vec<Button>| Some(Banner { text, progress: None, buttons });
@@ -537,6 +619,38 @@ pub fn banner_ui(ui: &mut egui::Ui, u: &mut Updater) {
     if let Some(b) = pressed {
         u.press(b);
     }
+}
+
+/// The popup at the start after an in-app update, over the main window, as every dialog of the
+/// app is drawn ([`crate::share_ui::modal`]): the title, the line, and the buttons on the right,
+/// the primary last. Enter and Escape are OK. True when the window should close with it.
+pub fn notice_ui(ctx: &egui::Context, u: &mut Updater) -> bool {
+    let Some(after) = u.notice() else { return false };
+    let (title, text, buttons) = notice_view(after);
+    let mut pressed = None;
+    // Enter is OK unless a button has keyboard focus: then it presses that button.
+    let free = ctx.memory(|m| m.focused().is_none());
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) || (free && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))) {
+        pressed = Some(NoticeButton::Ok);
+    }
+    let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(theme::DIALOG_PAD);
+    crate::share_ui::modal(egui::Id::unique("update-done-notice")).frame(frame).show(ctx, |ui| {
+        theme::roomy(ui);
+        ui.set_width(theme::DIALOG_WIDTH);
+        ui.heading(title);
+        ui.add(egui::Label::new(RichText::new(text).color(theme::TEXT)).wrap());
+        theme::block_gap(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right to left: the primary first, at the right edge.
+            for b in buttons.iter().rev() {
+                let button = if *b == NoticeButton::Ok { theme::primary_button(b.label()) } else { egui::Button::new(b.label()) };
+                if ui.add(button).clicked() {
+                    pressed = Some(*b);
+                }
+            }
+        });
+    });
+    pressed.is_some_and(|b| u.press_notice(b))
 }
 
 /// The Updates section of Preferences: the setting, its helper text, the status line and Check

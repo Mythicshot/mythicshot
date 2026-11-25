@@ -92,6 +92,17 @@ pub fn start_request(args: impl IntoIterator<Item = String>) -> Option<Request> 
     args.into_iter().any(|a| a == "--settings").then_some(Request::Page(Page::Preferences))
 }
 
+/// What to open at start-up when the popup after an in-app update is to be shown, given what
+/// [`start_request`] asked for. The relaunch after an install starts the app to the tray, where a
+/// popup would be seen by nobody, so the window opens on Home to hold it; and whether it was
+/// opened only for the popup, so that it closes with it.
+pub fn notice_request(start: Option<Request>) -> (Request, bool) {
+    match start {
+        Some(request) => (request, false),
+        None => (Request::Open, true),
+    }
+}
+
 /// Which page is up and whether the window is open, without any drawing.
 #[derive(Debug, Default)]
 pub struct Nav {
@@ -285,6 +296,12 @@ impl Shared {
         }
     }
 
+    /// Close the window, as its close button does: the popup after an update goes with it.
+    pub fn close_window(&mut self) {
+        self.nav.close();
+        self.update.dismiss_notice();
+    }
+
     /// Drop a page's unfinished input once the page has been left. Settings themselves are
     /// saved as they are changed, so the only things that can be left half done are a shortcut
     /// waiting for its keys on Preferences (cancelled) and a token typed but not saved on
@@ -415,7 +432,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         }
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             // Only the window goes; the app stays in the tray.
-            s.nav.close();
+            s.close_window();
         }
         window_ui(ui, s);
         s.settle(ui.ctx());
@@ -473,6 +490,10 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
         out.open_image = Some(OpenImage::Dropped(path));
     }
     s.take(out);
+    // The popup at the start after an in-app update, over everything else in the window.
+    if crate::update_ui::notice_ui(ui.ctx(), &mut s.update) {
+        s.nav.close();
+    }
 }
 
 /// The lines at the foot of the left menu: "Signed in to" and the host when this computer holds
@@ -1004,6 +1025,48 @@ pub(crate) mod tests {
             crate::menu_bar::tests::assert_inside(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, size), &format!("the window at {ppp}"));
             assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| window_ui(ui, &mut s)), 0, "at {ppp}");
         }
+    }
+
+    #[test]
+    fn a_popup_after_an_update_opens_the_window_when_the_app_starts_to_the_tray() {
+        // The relaunch after an install starts the app with no argument: to the tray.
+        assert_eq!(start_request(["mythicshot.exe".to_string()]), None);
+        assert_eq!(notice_request(None), (Request::Open, true), "opened for the popup, on Home");
+        // Asked for Preferences anyway: that page, and the window stays after the popup.
+        assert_eq!(notice_request(Some(Request::Page(Page::Preferences))), (Request::Page(Page::Preferences), false));
+        let mut nav = Nav::default();
+        nav.apply(notice_request(None).0);
+        assert!(nav.is_open() && nav.take_focus(), "it comes to the front");
+        assert_eq!(nav.page(), Page::Home);
+    }
+
+    #[test]
+    fn the_popup_stands_over_the_window_and_ok_closes_a_window_opened_for_it() {
+        use crate::update::pending::AfterUpdate;
+        let v = |s: &str| crate::update::Version::parse(s).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        for opened_for_it in [true, false] {
+            let mut s = shared(tmp.path());
+            let (request, _) = notice_request(None);
+            s.nav.apply(request);
+            s.update.set_notice(AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }, opened_for_it);
+            window_frame(&ctx, &mut s, size, vec![]);
+            let out = window_frame(&ctx, &mut s, size, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&out, crate::update_ui::UPDATED_TITLE).is_some(), "the popup is in the window");
+            window_frame(&ctx, &mut s, size, vec![enter.clone()]);
+            assert_eq!(s.update.notice(), None);
+            assert_eq!(s.nav.is_open(), !opened_for_it, "opened for it: {opened_for_it}");
+        }
+        // Closed by hand with the popup up: the popup goes too.
+        let mut s = shared(tmp.path());
+        s.nav.apply(Request::Open);
+        s.update.set_notice(AfterUpdate::NotFinished { from: v("0.2.38") }, true);
+        s.close_window();
+        assert!(!s.nav.is_open());
+        assert_eq!(s.update.notice(), None);
     }
 
     #[test]

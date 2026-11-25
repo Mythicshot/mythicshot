@@ -534,6 +534,11 @@ fn the_installer_of_the_running_version_is_kept_for_a_repair() {
 struct FakeLaunch {
     system: Option<PathBuf>,
     started: Mutex<Vec<(PathBuf, Vec<OsString>)>>,
+    /// The note for the next start, as it was on disk at the moment msiexec was started.
+    note: Option<PathBuf>,
+    note_at_spawn: Mutex<Vec<Option<String>>>,
+    /// Starting msiexec fails.
+    fail: bool,
 }
 
 impl Launch for FakeLaunch {
@@ -541,8 +546,11 @@ impl Launch for FakeLaunch {
         self.system.clone()
     }
     fn spawn(&self, program: &Path, args: &[OsString]) -> std::io::Result<()> {
+        if let Some(note) = &self.note {
+            self.note_at_spawn.lock().unwrap().push(std::fs::read_to_string(note).ok());
+        }
         self.started.lock().unwrap().push((program.to_path_buf(), args.to_vec()));
-        Ok(())
+        if self.fail { Err(std::io::Error::other("no msiexec in a test")) } else { Ok(()) }
     }
 }
 
@@ -560,7 +568,7 @@ fn msiexec_from_the_system_folder_gets_the_verified_file_as_real_arguments() {
     let sys = dir.path().join("System32");
     let launch = FakeLaunch { system: Some(sys.clone()), ..Default::default() };
     let held = open_verified(&path, &r).unwrap();
-    start_installer(&held, &launch).unwrap();
+    start_installer(&held, v("0.2.34"), &dir.path().join(pending::FILE_NAME), &launch).unwrap();
     let started = launch.started.lock().unwrap().clone();
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].0, sys.join("msiexec.exe"));
@@ -589,13 +597,55 @@ fn a_file_that_changed_since_it_was_checked_is_never_started() {
 
 #[test]
 fn without_a_full_system_folder_nothing_is_started() {
-    let (_dir, path, r) = verified_on_disk(&installer_bytes(5000));
+    let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
     let held = open_verified(&path, &r).unwrap();
+    let note = dir.path().join(pending::FILE_NAME);
     for system in [None, Some(PathBuf::from("System32"))] {
         let launch = FakeLaunch { system, ..Default::default() };
-        assert!(start_installer(&held, &launch).is_err());
+        assert!(start_installer(&held, v("0.2.34"), &note, &launch).is_err());
         assert!(launch.started.lock().unwrap().is_empty());
+        assert!(!note.exists(), "no note for an update that never started");
     }
+}
+
+#[test]
+fn the_note_for_the_next_start_is_written_once_just_before_msiexec_starts() {
+    let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
+    let note = dir.path().join("config").join(pending::FILE_NAME);
+    let launch = FakeLaunch { system: Some(dir.path().join("System32")), note: Some(note.clone()), ..Default::default() };
+    let held = open_verified(&path, &r).unwrap();
+    assert!(!note.exists());
+    assert_eq!(start_installer(&held, v("0.2.34"), &note, &launch), Ok(true));
+    // On disk, whole, by the time msiexec was started, and started once.
+    let want = pending::Pending { from: v("0.2.34"), to: r.version() }.text();
+    assert_eq!(*launch.note_at_spawn.lock().unwrap(), vec![Some(want.clone())]);
+    assert_eq!(launch.started.lock().unwrap().len(), 1);
+    // Left for the next start: from the running version to the version of the checked file.
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), want);
+    assert_eq!(held.version(), r.version());
+}
+
+#[test]
+fn when_msiexec_cannot_be_started_the_note_is_taken_back() {
+    let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
+    let note = dir.path().join(pending::FILE_NAME);
+    let launch = FakeLaunch { system: Some(dir.path().join("System32")), note: Some(note.clone()), fail: true, ..Default::default() };
+    let held = open_verified(&path, &r).unwrap();
+    assert!(start_installer(&held, v("0.2.34"), &note, &launch).is_err());
+    assert_eq!(launch.note_at_spawn.lock().unwrap().len(), 1, "it was there when msiexec was tried");
+    assert!(!note.exists(), "and is gone once that failed: the next start shows nothing");
+}
+
+#[test]
+fn a_note_that_cannot_be_written_does_not_stop_the_update() {
+    let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
+    // A folder stands where the note's folder would be made.
+    std::fs::write(dir.path().join("config"), b"a file, not a folder").unwrap();
+    let note = dir.path().join("config").join(pending::FILE_NAME);
+    let launch = FakeLaunch { system: Some(dir.path().join("System32")), ..Default::default() };
+    let held = open_verified(&path, &r).unwrap();
+    assert_eq!(start_installer(&held, v("0.2.34"), &note, &launch), Ok(false));
+    assert_eq!(launch.started.lock().unwrap().len(), 1, "the install still starts");
 }
 
 #[cfg(windows)]
