@@ -277,6 +277,8 @@ pub const CONTROL_RADIUS: u8 = RADIUS_MD;
 pub const ITEM_GAP: f32 = 8.0;
 /// The gap between two lines of text that belong together (a name and the line under it).
 pub const LINE_GAP: f32 = 2.0;
+/// One line of a stacked list of checkboxes or radio buttons: more compact than a control.
+pub const CHOICE_HEIGHT: f32 = 28.0;
 /// The least height of a row in a card.
 pub const ROW_HEIGHT: f32 = 44.0;
 /// The width of a row's label column.
@@ -343,6 +345,17 @@ pub fn roomy_style(style: &mut Style) {
 pub fn block_gap(ui: &mut egui::Ui) {
     let spacing = ui.spacing().item_spacing.y;
     ui.add_space((CARD_GAP - spacing).max(0.0));
+}
+
+/// Checkboxes and radio buttons stacked one under the other, [`CHOICE_HEIGHT`] apart, as `add`
+/// draws them. Only for the choices themselves: a button drawn in here would be that low too.
+pub fn choices<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = CHOICE_HEIGHT;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        add(ui)
+    })
+    .inner
 }
 
 /// Put `ui` (and what is drawn in it from now on) on the roomy sizes.
@@ -1507,6 +1520,34 @@ pub(crate) mod tests {
             checks::assert_texts_fit(&out, &format!("the card at {ppp}"));
             checks::assert_no_overlaps(&out, &format!("the card at {ppp}"));
         }
+    }
+
+    /// Stacked checkboxes and radio buttons are CHOICE_HEIGHT apart on a page; its buttons stay 36.
+    #[test]
+    fn stacked_choices_are_compact_and_buttons_stay_36() {
+        let ctx = test_context();
+        let (mut a, mut b) = (true, false);
+        let mut out = None;
+        for _ in 0..2 {
+            let mut o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                page(ui, |ui| {
+                    choices(ui, |ui| {
+                        ui.checkbox(&mut a, "First");
+                        ui.checkbox(&mut b, "Second");
+                        let _ = ui.radio(true, "Third");
+                    });
+                    let _ = ui.button("Save");
+                });
+            });
+            o.textures_delta.clear();
+            out = Some(o);
+        }
+        let out = out.unwrap();
+        let at = |t: &str| crate::share_ui::tests::text_rect(&out, t).unwrap().center().y;
+        assert!((at("Second") - at("First") - CHOICE_HEIGHT).abs() < 0.6 && (at("Third") - at("Second") - CHOICE_HEIGHT).abs() < 0.6, "{} {} {}", at("First"), at("Second"), at("Third"));
+        let save = checks::fills(&out).into_iter().filter(|(r, _, radius)| *radius == CONTROL_RADIUS && r.width() > 30.0).map(|(r, ..)| r).next().expect("the button");
+        assert!((save.height() - CONTROL_HEIGHT).abs() < 0.6, "{save:?}");
+        assert_eq!(CHOICE_HEIGHT % GRID, 0.0);
     }
 
     #[test]

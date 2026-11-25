@@ -178,13 +178,15 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
     ui.heading("General");
     theme::card(ui, |rows| {
         rows.full(|ui| {
-            let mut autostart = view.autostart;
-            if ui.checkbox(&mut autostart, "Start Mythicshot when I sign in").changed() {
-                out.push(UiAction::SetAutostart(autostart));
-            }
-            if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
-                out.push(UiAction::SettingsChanged);
-            }
+            theme::choices(ui, |ui| {
+                let mut autostart = view.autostart;
+                if ui.checkbox(&mut autostart, "Start Mythicshot when I sign in").changed() {
+                    out.push(UiAction::SetAutostart(autostart));
+                }
+                if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
+                    out.push(UiAction::SettingsChanged);
+                }
+            });
         });
         rows.full(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -240,13 +242,15 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     theme::card(ui, |rows| {
         rows.full(|ui| {
             theme::caption(ui, "Every ticked destination runs, in this order. \"Ask every time\" shows a menu instead.");
-            for d in DestId::ALL {
-                let mut on = s.has_destination(*d);
-                if ui.checkbox(&mut on, d.label()).on_hover_text(d.help()).changed() {
-                    s.toggle_destination(*d);
-                    changed = true;
+            theme::choices(ui, |ui| {
+                for d in DestId::ALL {
+                    let mut on = s.has_destination(*d);
+                    if ui.checkbox(&mut on, d.label()).on_hover_text(d.help()).changed() {
+                        s.toggle_destination(*d);
+                        changed = true;
+                    }
                 }
-            }
+            });
         });
     });
 
@@ -301,8 +305,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
             "Format",
             |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    changed |= ui.radio_value(&mut s.image_format, ImageFormat::Png, "PNG").changed();
-                    changed |= ui.radio_value(&mut s.image_format, ImageFormat::Jpeg, "JPEG").changed();
+                    changed |= theme::choices(ui, |ui| ui.radio_value(&mut s.image_format, ImageFormat::Png, "PNG").changed() | ui.radio_value(&mut s.image_format, ImageFormat::Jpeg, "JPEG").changed());
                     if s.image_format == ImageFormat::Jpeg {
                         changed |= ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100).text("quality")).changed();
                     }
@@ -333,7 +336,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
             });
         });
         rows.full(|ui| {
-            changed |= ui.checkbox(&mut s.record_keys, "Record key presses for the key overlay").on_hover_text("Off by default: the log could include anything you type, passwords too. It stays in memory and is deleted with the recording.").changed();
+            changed |= theme::choices(ui, |ui| ui.checkbox(&mut s.record_keys, "Record key presses for the key overlay").on_hover_text("Off by default: the log could include anything you type, passwords too. It stays in memory and is deleted with the recording.").changed());
             ui.horizontal_wrapped(|ui| {
                 use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
                 ui.label("Show keys as");
@@ -349,9 +352,11 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
                     }
                 });
             });
-            ui.horizontal_wrapped(|ui| {
-                changed |= ui.checkbox(&mut s.overlays.pointer, "Show the mouse pointer").changed();
-                changed |= ui.checkbox(&mut s.overlays.halo, "Highlight it").changed();
+            theme::choices(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut s.overlays.pointer, "Show the mouse pointer").changed();
+                    changed |= ui.checkbox(&mut s.overlays.halo, "Highlight it").changed();
+                });
             });
         });
         rows.full(|ui| {
@@ -375,7 +380,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
     });
     // The saved recordings keep the page's width: their list is a card of its own.
     // Turning the switch off deletes nothing: the section under it stays as it is.
-    changed |= ui.checkbox(&mut s.keep_published_recordings, KEEP_RECORDING).changed();
+    changed |= theme::choices(ui, |ui| ui.checkbox(&mut s.keep_published_recordings, KEEP_RECORDING).changed());
     // The rest belongs to the switch: it stands under the switch's label.
     let mut under = ui.available_rect_before_wrap();
     under.min.x += ui.spacing().icon_width + ui.spacing().icon_spacing;
@@ -390,7 +395,7 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
 /// ffmpeg, the limit, what the saved recordings take, and the list. True when a setting was
 /// changed. Nothing here reads the disk, and no switch removes or converts anything.
 fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecordings, hooks: &mut Hooks<'_>) -> bool {
-    let mut changed = ui.checkbox(&mut s.store_recordings_as_video, STORE_AS_VIDEO).changed();
+    let mut changed = theme::choices(ui, |ui| ui.checkbox(&mut s.store_recordings_as_video, STORE_AS_VIDEO).changed());
     // The line promises compression, so it is there only while the switch is on.
     if s.store_recordings_as_video {
         ui.horizontal(|ui| {

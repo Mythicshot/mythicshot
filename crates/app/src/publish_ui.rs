@@ -2107,7 +2107,7 @@ impl Picker {
             // 3. New tour, with its title.
             ui.add_space(8.0);
             let new_chosen = choice == Some(EditChoice::NewTour);
-            if ui.radio(new_chosen, NEW_TOUR_LABEL).clicked() {
+            if theme::choices(ui, |ui| ui.radio(new_chosen, NEW_TOUR_LABEL)).clicked() {
                 pick = Some(EditChoice::NewTour);
             }
             ui.horizontal(|ui| {
@@ -2378,7 +2378,7 @@ impl Picker {
             let into = self.goes();
             let restricted = self.who_shown(&Shown::OnlyNew(None)) == WhoShown::Choice && self.who.chosen() != who::Choice::Anyone;
             for mode in Mode::ALL {
-                if ui.radio(self.mode == mode, mode.label()).clicked() {
+                if theme::choices(ui, |ui| ui.radio(self.mode == mode, mode.label())).clicked() {
                     self.mode = mode;
                 }
                 if let Some(hint) = self.hint_line(mode, into, restricted) {
@@ -2391,7 +2391,7 @@ impl Picker {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            if ui.radio(self.choice == Choice::New, "New tour").clicked() {
+            if theme::choices(ui, |ui| ui.radio(self.choice == Choice::New, "New tour")).clicked() {
                 self.choice = Choice::New;
             }
             ui.horizontal(|ui| {
