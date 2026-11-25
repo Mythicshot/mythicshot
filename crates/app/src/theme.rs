@@ -190,6 +190,10 @@ pub const METER_USED: Color32 = DARK.primary;
 pub const METER_OVER: Color32 = DARK.caution_border;
 /// A neutral status chip's fill (a draft, an idle connection): the border colour, so it shows on a card.
 pub const CHIP: Color32 = DARK.border;
+/// Behind the row of a menu or dropdown under the pointer: the border role as a fill, as a neutral
+/// chip has it. Lighter than surface-raised, so it shows on a menu, and grey where the selection
+/// is purple, so a hovered row is told from the selected one.
+pub const MENU_HOVER: Color32 = DARK.border;
 /// The recording indicator and the frames cut from a recording: a functional red from the danger role.
 pub const RECORD: Color32 = DARK.danger_border;
 /// The recording dot while paused: the brand's gold, near the amber it replaces.
@@ -281,6 +285,10 @@ pub const LINE_GAP: f32 = 2.0;
 pub const CHOICE_HEIGHT: f32 = 28.0;
 /// The least height of a row in a card.
 pub const ROW_HEIGHT: f32 = 44.0;
+/// The least height of a row in a menu or dropdown: the compact choice height.
+pub const MENU_ROW_HEIGHT: f32 = CHOICE_HEIGHT;
+/// The space left and right inside a row of a menu or dropdown.
+pub const MENU_ROW_PAD_X: f32 = SPACE_2;
 /// The width of a row's label column.
 pub const LABEL_WIDTH: f32 = 120.0;
 /// A card's corners.
@@ -324,6 +332,8 @@ pub const KEYS_WIDTH: f32 = 170.0;
 /// The profile dropdown's selected profile, and the list it opens.
 pub const PROFILE_DROPDOWN_WIDTH: f32 = 240.0;
 pub const PROFILE_LIST_WIDTH: f32 = 300.0;
+/// The least the profile dropdown's list shows before it scrolls, however little room is below it.
+pub const PROFILE_LIST_MIN_HEIGHT: f32 = 120.0;
 /// The narrowest the profile dropdown gets on a narrow line.
 pub const PROFILE_DROPDOWN_MIN_WIDTH: f32 = 96.0;
 /// The space inside a dialog (a question over a page), all round.
@@ -874,6 +884,104 @@ pub fn popup_frame() -> egui::Frame {
     egui::Frame::new().fill(RAISED).stroke(Stroke::new(1.0, BORDER_STRONG)).corner_radius(RADIUS_LG)
 }
 
+/// The buttons of a menu bar: egui's menu look (no edge, no fill at rest), with the row under the
+/// pointer and the menu that is open on [`MENU_HOVER`], the hand over what can be clicked, and the
+/// gold focus ring on what has the keyboard's focus. egui's own menu look leaves the hovered row
+/// on surface-raised, the menu's own colour, so nothing shows where the pointer is.
+pub fn menu_bar_style(style: &mut Style) {
+    egui::containers::menu::menu_style(style);
+    let w = &mut style.visuals.widgets;
+    for v in [&mut w.hovered, &mut w.open] {
+        v.weak_bg_fill = MENU_HOVER;
+        v.bg_fill = MENU_HOVER;
+        v.bg_stroke = Stroke::NONE;
+        v.corner_radius = CornerRadius::same(RADIUS_SM);
+    }
+    w.active.bg_stroke = Stroke::new(FOCUS_WIDTH, FOCUS);
+    style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+}
+
+/// The inside of every menu, dropdown list and context menu: [`menu_bar_style`] with rows at least
+/// [`MENU_ROW_HEIGHT`] high and [`MENU_ROW_PAD_X`] inside them. Given to each of them where it is
+/// made (`Popup::menu(..).style`, `ComboBox::popup_style`, the menu bar's config); a guard test
+/// finds one that is not.
+pub fn menu_style(style: &mut Style) {
+    menu_bar_style(style);
+    style.spacing.button_padding = egui::vec2(MENU_ROW_PAD_X, 0.0);
+    style.spacing.interact_size.y = MENU_ROW_HEIGHT;
+}
+
+/// What a submenu opened from a menu is given, and a menu button out of a menu bar.
+pub fn menu_config() -> egui::containers::menu::MenuConfig {
+    egui::containers::menu::MenuConfig::new().style(menu_style)
+}
+
+/// A row of a menu or dropdown list that the app draws itself: what `add` draws, from the left and
+/// centred on the line, across the menu's width and at least [`MENU_ROW_HEIGHT`] high. The whole
+/// row is the click target: under the pointer it is on [`MENU_HOVER`] with radius-sm and the hand
+/// shows; with the keyboard's focus it has the gold focus ring; `selected` puts it on the
+/// selection fill (it keeps its own marks besides). A row that is not `enabled` is faded by egui,
+/// and shows neither the hover nor the hand. `label` names the row to assistive technology.
+pub fn menu_row(ui: &mut egui::Ui, enabled: bool, selected: bool, label: &str, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let behind = ui.painter().add(egui::Shape::Noop);
+        let id = ui.auto_id_with("menu-row");
+        // While a menu measures itself, a row asks only for what it holds; after that it takes
+        // the menu's width.
+        let width = if ui.is_sizing_pass() { 0.0 } else { ui.available_width() };
+        let shown = ui.allocate_ui_with_layout(egui::vec2(width, MENU_ROW_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(width, MENU_ROW_HEIGHT));
+            ui.style_mut().interaction.selectable_labels = false;
+            ui.add_space(MENU_ROW_PAD_X);
+            add(ui);
+        });
+        let rect = shown.response.rect;
+        let resp = ui.interact(rect, id, egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label));
+        let fill = if selected {
+            Some(SELECTION)
+        } else if resp.hovered() {
+            Some(MENU_HOVER)
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().set(behind, egui::Shape::rect_filled(rect, RADIUS_SM, fill));
+        }
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect, RADIUS_SM, Stroke::new(FOCUS_WIDTH, FOCUS), egui::StrokeKind::Inside);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    })
+    .inner
+}
+
+/// A row of a menu with a check mark (an entry that is on or off): [`menu_row`] with a box before
+/// `label` (a border-strong edge, the check in the text colour when `checked`) and `shortcut` at
+/// the right in the secondary colour.
+pub fn menu_check(ui: &mut egui::Ui, enabled: bool, checked: bool, label: &str, shortcut: &str) -> egui::Response {
+    menu_row(ui, enabled, false, label, |ui| {
+        let side = ui.spacing().icon_width;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_stroke(rect, RADIUS_SM, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Inside);
+        if checked {
+            let r = rect.shrink(side * 0.22);
+            p.line(vec![egui::pos2(r.left(), r.center().y), egui::pos2(r.center().x - r.width() * 0.1, r.bottom()), egui::pos2(r.right(), r.top())], Stroke::new(2.0, TEXT));
+        }
+        ui.add(egui::Label::new(label).extend());
+        if !shortcut.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(MENU_ROW_PAD_X);
+                ui.label(RichText::new(shortcut).color(MUTED));
+            });
+        }
+    })
+}
+
 /// Paint the whole window in ground before its panels: where two panels meet, egui softens both
 /// edges, and without this the seam between them lets a little of the desktop through.
 pub fn window_background(ui: &egui::Ui) {
@@ -1247,6 +1355,19 @@ pub(crate) mod tests {
             ("text on selection", TEXT, SELECTION, 4.5),
             ("accent-text on selection (selected label)", ACCENT, SELECTION, 4.5),
             ("primary-text on selection (initials badge)", PRIMARY_TEXT, SELECTION, 4.5),
+            ("text on a hovered menu row", TEXT, MENU_HOVER, 4.5),
+            ("text-muted on a hovered menu row (a profile's detail, a shortcut)", MUTED, MENU_HOVER, 4.5),
+            ("gold on a hovered menu row (+ Add profile…)", GOLD, MENU_HOVER, 4.5),
+            ("caution-text on a hovered menu row (Sign in again)", CAUTION_TEXT, MENU_HOVER, 4.5),
+            ("text-muted on a selected menu row (Active)", MUTED, SELECTION, 4.5),
+            ("caution-text on a selected menu row", CAUTION_TEXT, SELECTION, 4.5),
+            // The warning icon and the amber dot of a profile that needs a sign-in never stand
+            // alone: the words "Sign in again" in caution-text (above) carry what they mean.
+            // They are told apart from the row, as they are on the selection fill.
+            ("caution-border (beside its words) on a hovered menu row", CAUTION_BORDER, MENU_HOVER, 2.5),
+            ("caution-border (beside its words) on a selected menu row", CAUTION_BORDER, SELECTION, 2.5),
+            ("the success dot on a hovered menu row", SUCCESS_BORDER, MENU_HOVER, 3.0),
+            ("the focus ring on a hovered menu row", FOCUS, MENU_HOVER, 3.0),
             ("success-text on success-tint", SUCCESS_TEXT, SUCCESS_TINT, 4.5),
             ("caution-text on caution-tint", CAUTION_TEXT, CAUTION_TINT, 4.5),
             ("danger-text on danger-tint", DANGER_TEXT, DANGER_TINT, 4.5),
@@ -1592,6 +1713,158 @@ pub(crate) mod tests {
         let save = checks::fills(&out).into_iter().filter(|(r, _, radius)| *radius == CONTROL_RADIUS && r.width() > 30.0).map(|(r, ..)| r).next().expect("the button");
         assert!((save.height() - CONTROL_HEIGHT).abs() < 0.6, "{save:?}");
         assert_eq!(CHOICE_HEIGHT % GRID, 0.0);
+    }
+
+    /// Frames of a menu on surface-raised, as a popup draws it: three rows the app draws itself
+    /// (one that can be clicked, one that cannot, one selected), then a row of egui's own (a
+    /// selectable value, as a dropdown lists it), a button with a shortcut (as the menu bar lists
+    /// it) and a check row. The pointer moves to `at` in the first frame (when there is one) and
+    /// `events` come in the second.
+    fn menu_frames(ctx: &egui::Context, at: Option<egui::Pos2>, events: Vec<egui::Event>) -> egui::FullOutput {
+        let mut out = None;
+        for frame in 0..3 {
+            let mut evs = Vec::new();
+            if frame == 0
+                && let Some(at) = at
+            {
+                evs.push(egui::Event::PointerMoved(at));
+            }
+            if frame == 1 {
+                evs.extend(events.iter().cloned());
+            }
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), events: evs, ..Default::default() };
+            let mut o = ctx.run_ui(input, |ui| {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, RAISED);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(240.0, 360.0))).layout(egui::Layout::top_down_justified(egui::Align::Min)), |ui| {
+                    menu_style(ui.style_mut());
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    menu_row(ui, true, false, "Sandbox admin", |ui| drop(ui.label("Sandbox admin")));
+                    menu_row(ui, false, false, "Not now", |ui| drop(ui.label("Not now")));
+                    menu_row(ui, true, true, "Alex", |ui| drop(ui.label("Alex")));
+                    let mut fps = 30;
+                    ui.selectable_value(&mut fps, 30, "30 fps");
+                    ui.selectable_value(&mut fps, 60, "60 fps");
+                    let _ = ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C"));
+                    menu_check(ui, true, true, "Properties", "F4");
+                });
+            });
+            o.textures_delta.clear();
+            out = Some(o);
+        }
+        out.unwrap()
+    }
+
+    /// The fill painted around `text`'s middle in `colour`, if there is one.
+    fn fill_at(out: &egui::FullOutput, text: &str, colour: Color32) -> Option<(egui::Rect, u8)> {
+        let at = crate::share_ui::tests::text_rect(out, text).unwrap_or_else(|| panic!("{text} was not drawn")).center();
+        checks::fills(out).into_iter().find(|(r, c, _)| *c == colour && r.contains(at)).map(|(r, _, radius)| (r, radius))
+    }
+
+    fn row_middle(ctx: &egui::Context, text: &str) -> egui::Pos2 {
+        crate::share_ui::tests::text_rect(&menu_frames(ctx, None, vec![]), text).unwrap().center()
+    }
+
+    /// The row under the pointer is lit across the menu's width with radius-sm, on a fill text
+    /// reads on, and the pointer is the hand; the whole row is the target (the pointer at its right
+    /// end, away from the words, lights it too). A row that cannot be clicked is neither lit nor
+    /// the hand. The selected row keeps the selection fill, hovered or not, which is not the hover's.
+    #[test]
+    fn the_menu_row_under_the_pointer_is_lit_across_the_menu_with_the_hand() {
+        let ctx = test_context();
+        // Nothing hovered: no row is lit, the selected one is on the selection fill.
+        let out = menu_frames(&ctx, None, vec![]);
+        assert!(checks::fills(&out).iter().all(|(_, c, _)| *c != MENU_HOVER), "nothing is lit with no pointer");
+        assert!(fill_at(&out, "Alex", SELECTION).is_some(), "the selected row");
+        // Every row is at least the compact choice height.
+        let a = row_middle(&ctx, "Sandbox admin");
+        let b = row_middle(&ctx, "Not now");
+        assert!(b.y - a.y >= MENU_ROW_HEIGHT - 0.5, "{a:?} {b:?}");
+        for (text, at) in [("Sandbox admin", a), ("Sandbox admin", egui::pos2(250.0, a.y)), ("60 fps", row_middle(&ctx, "60 fps")), ("Copy", row_middle(&ctx, "Copy")), ("Properties", egui::pos2(200.0, row_middle(&ctx, "Properties").y))] {
+            let ctx = test_context();
+            let out = menu_frames(&ctx, Some(at), vec![]);
+            let (rect, radius) = fill_at(&out, text, MENU_HOVER).unwrap_or_else(|| panic!("{text} under the pointer at {at:?} is not lit: {:?}", checks::fills(&out)));
+            assert!((rect.left() - 20.0).abs() < 0.6 && (rect.right() - 260.0).abs() < 0.6, "{text}: lit across the menu's width, not {rect:?}");
+            assert!(rect.height() >= MENU_ROW_HEIGHT - 0.5, "{text}: {rect:?}");
+            assert_eq!(radius, RADIUS_SM, "{text}");
+            assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::PointingHand, "{text}");
+            // Only that row.
+            assert_eq!(checks::fills(&out).iter().filter(|(_, c, _)| *c == MENU_HOVER).count(), 1, "{text}");
+        }
+        // A row that cannot be clicked.
+        let ctx = test_context();
+        let out = menu_frames(&ctx, Some(b), vec![]);
+        assert!(checks::fills(&out).iter().all(|(_, c, _)| *c != MENU_HOVER), "a disabled row is not lit");
+        assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::PointingHand);
+        // The selected row under the pointer stays on the selection fill: told from a hovered one.
+        let ctx = test_context();
+        let out = menu_frames(&ctx, Some(row_middle(&test_context(), "Alex")), vec![]);
+        assert!(fill_at(&out, "Alex", SELECTION).is_some() && fill_at(&out, "Alex", MENU_HOVER).is_none());
+        assert_ne!(MENU_HOVER, SELECTION);
+    }
+
+    /// A click anywhere on a row the app draws picks it; on a disabled row it does nothing.
+    #[test]
+    fn a_click_anywhere_on_a_menu_row_picks_it() {
+        for (y_of, x, want) in [("Sandbox admin", 240.0, true), ("Not now", 240.0, false)] {
+            let ctx = test_context();
+            let at = egui::pos2(x, row_middle(&ctx, y_of).y);
+            let mut clicked = false;
+            for events in [vec![egui::Event::PointerMoved(at)], vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }], vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]] {
+                let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), events, ..Default::default() };
+                let mut o = ctx.run_ui(input, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(240.0, 360.0))).layout(egui::Layout::top_down_justified(egui::Align::Min)), |ui| {
+                        menu_style(ui.style_mut());
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let target = |ui: &mut egui::Ui, enabled: bool, text: &str| menu_row(ui, enabled, false, text, |ui| drop(ui.label(text))).clicked() && text == y_of;
+                        clicked |= target(ui, true, "Sandbox admin");
+                        clicked |= target(ui, false, "Not now");
+                    });
+                });
+                o.textures_delta.clear();
+            }
+            assert_eq!(clicked, want, "{y_of}");
+        }
+    }
+
+    /// The keyboard's focus on a menu row shows the gold focus ring, on the app's rows and on egui's.
+    #[test]
+    fn a_focused_menu_row_shows_the_focus_ring() {
+        let ctx = test_context();
+        let tab = egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let out = menu_frames(&ctx, None, vec![tab]);
+        let ring = crate::share_ui::tests::shapes_of(&out).into_iter().find_map(|s| match s {
+            egui::Shape::Rect(r) if r.stroke.color == FOCUS && (r.stroke.width - FOCUS_WIDTH).abs() < 0.01 => Some(r.rect),
+            _ => None,
+        });
+        let ring = ring.expect("the focus ring");
+        assert!(ring.contains(crate::share_ui::tests::text_rect(&out, "Sandbox admin").unwrap().center()), "{ring:?}");
+        // egui's own rows in a menu: pressed or focused, the ring (egui's menu look drops it).
+        let mut style = style();
+        menu_style(&mut style);
+        assert_eq!(style.visuals.widgets.active.bg_stroke, Stroke::new(FOCUS_WIDTH, FOCUS));
+        assert_eq!(style.visuals.widgets.hovered.weak_bg_fill, MENU_HOVER);
+        assert_eq!(style.visuals.interact_cursor, Some(egui::CursorIcon::PointingHand));
+        assert!(style.spacing.interact_size.y >= MENU_ROW_HEIGHT);
+    }
+
+    /// Every menu, dropdown list and context menu of the app is given the theme's menu look where
+    /// it is made: egui's own leaves the row under the pointer in the menu's colour.
+    #[test]
+    fn every_menu_and_dropdown_is_given_the_menu_look() {
+        let makers = ["ComboBox::from_id_salt(", "ComboBox::from_label(", "ComboBox::new(", "Popup::menu(", "Popup::context_menu(", ".context_menu(", "MenuBar::new(", "MenuButton::new(", "Popup::from_response(", "Popup::new("];
+        let mut bare = Vec::new();
+        for (file, lines) in production_sources() {
+            if file == "theme.rs" {
+                continue;
+            }
+            for (i, (n, line)) in lines.iter().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if makers.iter().any(|m| code.contains(m)) && !lines[i..(i + 4).min(lines.len())].iter().any(|(_, l)| l.contains("theme::menu_style") || l.contains("theme::menu_bar_style") || l.contains("theme::menu_config")) {
+                    bare.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(bare.is_empty(), "menus without the theme's menu look:\n{}", bare.join("\n"));
     }
 
     #[test]

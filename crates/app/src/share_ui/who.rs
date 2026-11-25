@@ -370,7 +370,7 @@ pub fn draw_part(ui: &mut egui::Ui, part: &Part, form: &mut Form, muted: Color32
         Part::Choice { offered, chosen } => {
             ui.label(RichText::new(LABEL).bold());
             let mut choice = *chosen;
-            egui::ComboBox::from_id_salt("who-can-view").width(220.0).selected_text(chosen.label()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("who-can-view").popup_style(crate::theme::menu_style.into()).width(220.0).selected_text(chosen.label()).show_ui(ui, |ui| {
                 for c in offered {
                     ui.selectable_value(&mut choice, *c, c.label());
                 }

@@ -1244,7 +1244,7 @@ impl Editor {
             if std::mem::take(&mut self.open_export) {
                 egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&exp));
             }
-            egui::Popup::menu(&exp).show(|ui| self.export_menu(ui));
+            egui::Popup::menu(&exp).style(theme::menu_bar_style).show(|ui| self.export_menu(ui));
             if icons::button(ui, Icon::Copy, ICON, false, "Copy this frame").clicked() {
                 self.copy_frame();
             }
@@ -1262,7 +1262,7 @@ impl Editor {
                 self.copy();
             }
             let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
-            egui::Popup::menu(&send).show(|ui| {
+            egui::Popup::menu(&send).style(theme::menu_style).show(|ui| {
                 for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
                     if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
                         self.send(d);
@@ -1290,7 +1290,7 @@ impl Editor {
         ui.separator();
         if self.video.is_none() {
             let fx = icons::button(ui, Icon::Effects, ICON, false, EFFECTS_HINT);
-            egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
+            egui::Popup::menu(&fx).style(theme::menu_style).show(|ui| self.effects_menu(ui));
             ui.separator();
         }
         self.properties_row(ui);
@@ -1405,6 +1405,7 @@ impl Editor {
             let salt = if place == Place::Toolbar { "obfuscate-mode" } else { "obfuscate-mode-panel" };
             in_row(ui, place, "Hide as", |ui| {
                 egui::ComboBox::from_id_salt(salt)
+                    .popup_style(theme::menu_style.into())
                     .width(80.0)
                     .selected_text(if self.obfuscate == ObfuscateMode::Pixelate { "Pixelate" } else { "Blur" })
                     .show_ui(ui, |ui| {
@@ -1512,7 +1513,7 @@ impl Editor {
     fn zoom_choice(&mut self, ui: &mut egui::Ui, salt: &str) {
         let z = self.zoom.unwrap_or(self.last_canvas.zoom);
         let label = if self.zoom.is_none() { format!("Fit {:.0}%", z * 100.0) } else { format!("{:.0}%", z * 100.0) };
-        egui::ComboBox::from_id_salt(salt).width(84.0).selected_text(label).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(salt).popup_style(theme::menu_style.into()).width(84.0).selected_text(label).show_ui(ui, |ui| {
             if ui.selectable_label(self.zoom.is_none(), "Fit to window").clicked() {
                 self.zoom = None;
             }
@@ -1743,7 +1744,7 @@ impl Editor {
                         self.menu_at = Some(p);
                     }
                 }
-                resp.context_menu(|ui| self.context_menu(ui));
+                egui::Popup::context_menu(&resp).style(theme::menu_style).show(|ui| self.context_menu(ui));
                 self.draw_chrome(ui, img_rect, z, &to_scr);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(self.cursor(resp.hover_pos().map(to_img), z));

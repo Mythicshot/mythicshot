@@ -105,17 +105,18 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, selected: bool, tip: &str) -> 
     resp.on_hover_text(tip)
 }
 
-/// An icon followed by a label, for menu rows.
+/// An icon followed by a label, for menu rows: a row of the app's own menus
+/// ([`theme::menu_row`]), the whole row the click target and lit under the pointer. The icon's
+/// middle is 18 points from the row's left, the label 38.
 pub fn menu_row(ui: &mut Ui, icon: Icon, label: &str) -> Response {
-    let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, f32::from(theme::RADIUS_SM), theme::RAISED);
-    }
-    let icon_rect = Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
-    paint(ui.painter(), icon_rect, icon, theme::TEXT);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), theme::TEXT);
-    resp
+    theme::menu_row(ui, true, false, label, |ui| {
+        let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(14.0), theme::TEXT));
+        let lead = 38.0 - theme::MENU_ROW_PAD_X;
+        let (rect, _) = ui.allocate_exact_size(vec2(lead + galley.size().x, 30.0), Sense::hover());
+        let icon_rect = Rect::from_center_size(pos2(rect.left() + 18.0 - theme::MENU_ROW_PAD_X, rect.center().y), Vec2::splat(16.0));
+        paint(ui.painter(), icon_rect, icon, theme::TEXT);
+        ui.painter().galley(pos2(rect.left() + lead, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
+    })
 }
 
 pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {

@@ -328,14 +328,14 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
         rows.full(|ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Frame rate");
-                egui::ComboBox::from_id_salt("record-fps").width(theme::COMBO_WIDTH).selected_text(format!("{} fps", s.record_fps)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("record-fps").popup_style(theme::menu_style.into()).width(theme::COMBO_WIDTH).selected_text(format!("{} fps", s.record_fps)).show_ui(ui, |ui| {
                     for fps in [10, 15, 24, 30] {
                         changed |= ui.selectable_value(&mut s.record_fps, fps, format!("{fps} fps")).changed();
                     }
                 });
                 ui.add_space(theme::SPACE_2);
                 ui.label("Countdown");
-                egui::ComboBox::from_id_salt("countdown").width(theme::COMBO_WIDTH).selected_text(if s.countdown_secs == 0 { "None".to_string() } else { format!("{} s", s.countdown_secs) }).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("countdown").popup_style(theme::menu_style.into()).width(theme::COMBO_WIDTH).selected_text(if s.countdown_secs == 0 { "None".to_string() } else { format!("{} s", s.countdown_secs) }).show_ui(ui, |ui| {
                     for secs in [0, 3, 5, 10] {
                         let label = if secs == 0 { "None".to_string() } else { format!("{secs} s") };
                         changed |= ui.selectable_value(&mut s.countdown_secs, secs, label).changed();
@@ -348,13 +348,13 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
             ui.horizontal_wrapped(|ui| {
                 use mythicshot_editor::overlays::{ClickStyle, KeyStyle};
                 ui.label("Show keys as");
-                egui::ComboBox::from_id_salt("overlay-keys").width(theme::COMBO_WIDTH_WIDE).selected_text(key_style_label(s.overlays.keys)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("overlay-keys").popup_style(theme::menu_style.into()).width(theme::COMBO_WIDTH_WIDE).selected_text(key_style_label(s.overlays.keys)).show_ui(ui, |ui| {
                     for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
                         changed |= ui.selectable_value(&mut s.overlays.keys, k, key_style_label(k)).changed();
                     }
                 });
                 ui.label("clicks as");
-                egui::ComboBox::from_id_salt("overlay-clicks").width(theme::COMBO_WIDTH_WIDE).selected_text(click_style_label(s.overlays.clicks)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("overlay-clicks").popup_style(theme::menu_style.into()).width(theme::COMBO_WIDTH_WIDE).selected_text(click_style_label(s.overlays.clicks)).show_ui(ui, |ui| {
                     for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
                         changed |= ui.selectable_value(&mut s.overlays.clicks, c, click_style_label(c)).changed();
                     }
