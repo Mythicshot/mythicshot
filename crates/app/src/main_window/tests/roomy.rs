@@ -58,6 +58,10 @@ enum Kind {
     Add,
     /// The list with Remove.
     Manage,
+    /// Profiles, none of them active.
+    NoActive,
+    /// Profiles, and an active id that is none of theirs.
+    GoneActive,
 }
 
 fn site() -> Stub {
@@ -85,6 +89,8 @@ fn fixture(kind: Kind) -> Fixture {
     let book = match kind {
         Kind::Add => Book::default(),
         Kind::NoAccount => Book { list: vec![profile("pa", "Sandbox test", None)], active: Some("pa".into()), legacy: None },
+        Kind::NoActive => Book { list: vec![profile("pa", "Sandbox test", Some(ACCOUNT)), profile("pb", "Customer demo", None)], active: None, legacy: None },
+        Kind::GoneActive => Book { list: vec![profile("pa", "Sandbox test", Some(ACCOUNT)), profile("pb", "Customer demo", None)], active: Some("gone".into()), legacy: None },
         _ => Book { list: vec![profile("pa", "Sandbox test", Some(ACCOUNT)), profile("pb", "Customer demo", None)], active: Some("pa".into()), legacy: None },
     };
     let active = book.active().cloned();
@@ -294,7 +300,7 @@ fn switch_profile_opens_the_profile_list_with_manage_profiles() {
 /// and at the window's smallest size; the controls stay 36 points high and the left menu's items 36.
 #[test]
 fn every_workspace_state_fits_the_smallest_window_at_every_scale() {
-    for kind in [Kind::Connected, Kind::NoAccount, Kind::SignInAgain, Kind::Add, Kind::Manage] {
+    for kind in [Kind::Connected, Kind::NoAccount, Kind::SignInAgain, Kind::Add, Kind::Manage, Kind::NoActive, Kind::GoneActive] {
         for (name, size) in SIZES {
             for ppp in [1.0, 2.0] {
                 let what = format!("{kind:?} {name} at {ppp}");
@@ -496,6 +502,34 @@ fn tab_goes_from_each_field_to_its_button() {
         let seen = focus_walk(&ctx, 60, &mut draw);
         for (a, b, what) in pairs {
             assert_before(&seen, a, b, what);
+        }
+    }
+}
+
+/// With profiles but none active (or an active id that is none of theirs), the card is still
+/// there: "Not connected" in its pill, and Switch profile opens the list with Manage profiles.
+#[test]
+fn the_profile_card_stays_when_no_profile_is_active() {
+    for kind in [Kind::NoActive, Kind::GoneActive] {
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let (ctx, mut f, out) = settled(kind, size, 1.0);
+        let t = texts(&out);
+        // In the card's pill, not only at the foot of the left menu.
+        let pill = on_page(&out, workspace_ui::NOT_CONNECTED);
+        assert!((pill.center().y - holder(&out, profiles::SWITCH_PROFILE).center().y).abs() < 2.0, "{kind:?}: {t:?}");
+        let at = holder(&out, profiles::SWITCH_PROFILE).center();
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let mut last = None;
+        for events in [vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![], vec![]] {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+            let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+            let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        let t = texts(&last.unwrap());
+        for word in [profiles::MANAGE_PROFILES, profiles::ADD_PROFILE, "Sandbox test", "Customer demo"] {
+            assert!(t.iter().any(|x| x == word), "{kind:?}: {word:?} not in the list: {t:?}");
         }
     }
 }

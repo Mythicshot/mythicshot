@@ -1092,16 +1092,15 @@ impl Panel {
         });
         // The active profile: who it is signed in as, how it stands, and the list to switch from.
         let rows = entries(&book, refused);
-        if let Some(active) = book.active() {
-            let waiting = needs_sign_in(active, refused, &token);
-            let pill = if waiting {
-                Some((profiles::SIGN_IN_AGAIN, theme::Tone::Warning))
-            } else if matches!(self.mode, Mode::Details) {
-                Some(status())
-            } else {
-                None
+        // With profiles but none of them active, the card stays, so the list stays one click away.
+        if !book.list.is_empty() {
+            let pill = match book.active() {
+                None => Some((crate::workspace_ui::NOT_CONNECTED, theme::Tone::Warning)),
+                Some(active) if needs_sign_in(active, refused, &token) => Some((profiles::SIGN_IN_AGAIN, theme::Tone::Warning)),
+                Some(_) if matches!(self.mode, Mode::Details) => Some(status()),
+                Some(_) => None,
             };
-            if let Some(p) = profile_card(ui, active, pill, &rows, !working) {
+            if let Some(p) = profile_card(ui, book.active(), pill, &rows, !working) {
                 pick = Some(p);
             }
         }
@@ -1247,13 +1246,15 @@ impl Panel {
 /// The active profile's card: the badge with its initials, its name, "Signed in as" when the site
 /// named an account, the status `pill`, and "Switch profile", which opens the profile list.
 /// What was picked in that list.
-fn profile_card(ui: &mut egui::Ui, active: &Profile, pill: Option<(&str, theme::Tone)>, rows: &[Entry], enabled: bool) -> Option<Pick> {
+fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str, theme::Tone)>, rows: &[Entry], enabled: bool) -> Option<Pick> {
     let mut pick = None;
     theme::card(ui, |card| {
         card.full(|ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = theme::SPACE_3;
-                theme::initials_badge(ui, &active.name);
+                if let Some(active) = active {
+                    theme::initials_badge(ui, &active.name);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = theme::ITEM_GAP;
                     let button = ui.add_enabled(enabled, egui::Button::new(profiles::SWITCH_PROFILE));
@@ -1261,13 +1262,15 @@ fn profile_card(ui: &mut egui::Ui, active: &Profile, pill: Option<(&str, theme::
                     if let Some((text, tone)) = pill {
                         theme::pill(ui, text, tone);
                     }
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.add(egui::Label::new(theme::strong(RichText::new(&active.name).size(theme::STRONG_SIZE))).truncate());
-                        if let Some(line) = crate::workspace_ui::signed_in_line(active.account.as_deref()) {
-                            ui.add(egui::Label::new(RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
-                        }
-                    });
+                    if let Some(active) = active {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+                            ui.add(egui::Label::new(theme::strong(RichText::new(&active.name).size(theme::STRONG_SIZE))).truncate());
+                            if let Some(line) = crate::workspace_ui::signed_in_line(active.account.as_deref()) {
+                                ui.add(egui::Label::new(RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                            }
+                        });
+                    }
                 });
             });
         });
