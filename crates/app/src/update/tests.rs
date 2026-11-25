@@ -759,10 +759,9 @@ fn the_placeholder_key_can_never_verify_so_a_build_without_real_keys_refuses_eve
         let text = with_signature("0.2.35", FILE, 2_000_000, SHA, &sign(&key(k), &message("0.2.35", FILE, 2_000_000, SHA)));
         assert!(refused(&text, &only_placeholder), "key {k}");
     }
-    // Today's release list is exactly that, so a build shipped before the real keys refuses
-    // every release file. When the real keys go in, this line goes with the placeholder.
-    assert_eq!(RELEASE_KEYS, [RELEASE_KEY_PLACEHOLDER]);
-    assert!(Keys::official().is_empty());
+    // The real keys are in: the release list holds usable keys and no placeholder.
+    assert!(!Keys::official().is_empty());
+    assert!(!RELEASE_KEYS.contains(&RELEASE_KEY_PLACEHOLDER));
 }
 
 /// The test that stays once the real keys are in: a mistyped key would otherwise be dropped

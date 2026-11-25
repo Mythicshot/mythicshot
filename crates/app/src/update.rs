@@ -176,7 +176,10 @@ struct RawRelease {
 /// version and removing the old one in a later version. Then delete the line that checks the
 /// placeholder in `update/tests.rs` (`assert_eq!(RELEASE_KEYS, [RELEASE_KEY_PLACEHOLDER])`).
 /// Nothing (no setting, no environment variable, no debug switch) adds to or skips this list.
-pub const RELEASE_KEYS: &[(&str, &str)] = &[RELEASE_KEY_PLACEHOLDER];
+pub const RELEASE_KEYS: &[(&str, &str)] = &[
+    ("primary", "v8SQJVA9CaiFcBQkcsZ6I+Kh7caBv74L+SMF8BhN1hA="),
+    ("backup", "7ZYdjH8mnVUOJeqR78A2XAHONIAwQ8rgdv5YfaRIrZ0="),
+];
 
 /// Stands in the list until the real keys exist: not base64 of 32 bytes, so it is never a key.
 pub const RELEASE_KEY_PLACEHOLDER: (&str, &str) = ("placeholder: no release key yet", "NOT-A-KEY-REPLACE-WITH-THE-OWNERS-PUBLIC-KEY");
