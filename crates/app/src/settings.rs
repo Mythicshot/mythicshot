@@ -133,8 +133,6 @@ pub struct Settings {
 /// The size past which saved recordings are warned about until the user sets another, in GB.
 const DEFAULT_WARN_GB: u32 = 5;
 
-/// The warning limit as the settings file holds it: a whole number no larger than the field in
-/// Preferences can hold. Anything else is refused, which costs only this value (see [`Settings::parse`]).
 /// Editor actions this version no longer has: the tools taken off the editor's rail (Cross,
 /// Asterisk and Donut). Every file written before they went names them (the defaults are written
 /// out), so their entries are left out without a word and the file loads whole.
@@ -150,6 +148,8 @@ fn editor_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<Editor
         .collect()
 }
 
+/// The warning limit as the settings file holds it: a whole number no larger than the field in
+/// Preferences can hold. Anything else is refused, which costs only this value (see [`Settings::parse`]).
 fn warn_gb<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let gb = u32::deserialize(d)?;
     if gb > crate::project::LIMIT_MAX_GB {

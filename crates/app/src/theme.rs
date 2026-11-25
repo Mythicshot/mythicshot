@@ -287,6 +287,8 @@ pub const CHOICE_HEIGHT: f32 = 28.0;
 pub const ROW_HEIGHT: f32 = 44.0;
 /// The least height of a row in a menu or dropdown: the compact choice height.
 pub const MENU_ROW_HEIGHT: f32 = CHOICE_HEIGHT;
+/// The bar at the left edge of the selected row of a list (the active profile), in primary-text.
+pub const ACTIVE_BAR_WIDTH: f32 = 3.0;
 /// The space left and right inside a row of a menu or dropdown.
 pub const MENU_ROW_PAD_X: f32 = SPACE_2;
 /// The width of a row's label column.
@@ -1360,6 +1362,8 @@ pub(crate) mod tests {
             ("gold on a hovered menu row (+ Add profile…)", GOLD, MENU_HOVER, 4.5),
             ("caution-text on a hovered menu row (Sign in again)", CAUTION_TEXT, MENU_HOVER, 4.5),
             ("text-muted on a selected menu row (Active)", MUTED, SELECTION, 4.5),
+            ("the active row's bar on the selection fill", PRIMARY_TEXT, SELECTION, 3.0),
+            ("the active row's bar beside a hovered row", PRIMARY_TEXT, MENU_HOVER, 3.0),
             ("caution-text on a selected menu row", CAUTION_TEXT, SELECTION, 4.5),
             // The warning icon and the amber dot of a profile that needs a sign-in never stand
             // alone: the words "Sign in again" in caution-text (above) carry what they mean.

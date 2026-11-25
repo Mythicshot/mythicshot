@@ -188,6 +188,22 @@ fn dropdown_frames(ctx: &egui::Context, rows: &[Entry], size: egui::Vec2, steps:
     (last.unwrap(), picked)
 }
 
+/// The active profile's row, the one holding `name`, has its bar: [`theme::ACTIVE_BAR_WIDTH`]
+/// wide in primary-text at the row's left edge, inside the row's rounded shape (clear of its
+/// corners), and no other row has one.
+pub(crate) fn assert_active_bar(out: &egui::FullOutput, name: &str, what: &str) {
+    let at = crate::menu_bar::tests::last_text_rect(out, name).unwrap_or_else(|| panic!("{what}: {name}")).center();
+    let fills = crate::theme::checks::fills(out);
+    let row = fills.iter().filter(|(r, c, _)| *c == theme::SELECTION && r.contains(at)).map(|(r, ..)| *r).min_by(|a, b| a.area().total_cmp(&b.area())).unwrap_or_else(|| panic!("{what}: the active row"));
+    let bars: Vec<egui::Rect> = fills.iter().filter(|(r, c, _)| *c == theme::PRIMARY_TEXT && (r.width() - theme::ACTIVE_BAR_WIDTH).abs() < 0.01).map(|(r, ..)| *r).collect();
+    assert_eq!(bars.len(), 1, "{what}: one bar, on the active row: {bars:?}");
+    let bar = bars[0];
+    let radius = f32::from(theme::RADIUS_SM);
+    assert!((bar.left() - row.left()).abs() < 0.01, "{what}: at the row's left edge: {bar:?} {row:?}");
+    assert!(bar.top() >= row.top() + radius - 0.01 && bar.bottom() <= row.bottom() - radius + 0.01, "{what}: clear of the rounded corners: {bar:?} {row:?}");
+    assert!(bar.height() >= row.height() - 2.0 * radius - 0.01, "{what}: as high as the row allows: {bar:?} {row:?}");
+}
+
 fn press(at: egui::Pos2, pressed: bool) -> egui::Event {
     egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
 }
@@ -236,6 +252,7 @@ fn the_profile_list_lights_the_row_under_the_pointer_and_takes_a_click_anywhere_
             let selected = crate::theme::checks::fills(&lit).into_iter().find(|(r, c, _)| *c == theme::SELECTION && r.contains(active_name.center()) && r.contains(active.center()));
             assert!(selected.is_some(), "{what}: the active row is on the selection fill");
             assert!(!row.intersects(selected.unwrap().0.shrink(1.0)), "{what}: the lit row and the active one are apart");
+            assert_active_bar(&lit, "Sandbox test", &what);
             // Nothing overlaps or sticks out of the window.
             theme::checks::assert_no_overlaps(&lit, &what);
             theme::checks::assert_texts_fit(&lit, &what);

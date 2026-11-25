@@ -315,6 +315,13 @@ fn profile_menu(ui: &mut egui::Ui, rows: &[Entry], pick: &mut Option<Pick>) {
                 ui.add_space(theme::SPACE_1);
             });
         });
+        if e.active {
+            // A bar at its left edge, clear of the row's rounded corners, so the active row is
+            // told from the hovered one by more than its fill.
+            let inset = f32::from(theme::RADIUS_SM);
+            let bar = egui::Rect::from_min_max(egui::pos2(row.rect.left(), row.rect.top() + inset), egui::pos2(row.rect.left() + theme::ACTIVE_BAR_WIDTH, row.rect.bottom() - inset));
+            ui.painter().rect_filled(bar, 0.0, theme::PRIMARY_TEXT);
+        }
         if row.clicked() && !e.active {
             *pick = Some(Pick::Switch(e.id.clone()));
         }
@@ -1354,4 +1361,4 @@ pub fn needs_sign_in(p: &Profile, refused: bool, token: &publish_ui::TokenStatus
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
