@@ -383,11 +383,11 @@ impl SignInDialog {
         crate::share_ui::modal(egui::Id::unique("sign-in-window")).frame(frame).show(ctx, |ui| {
             theme::roomy(ui);
             ui.set_width(theme::DIALOG_WIDTH);
-            ui.label(RichText::new(CAPTION).color(theme::MUTED).size(12.0));
-            ui.add_space(4.0);
+            ui.label(RichText::new(CAPTION).color(theme::MUTED).size(theme::SMALL_SIZE));
+            ui.add_space(theme::SPACE_1);
             ui.heading(&view.heading);
             for (i, line) in view.lines.iter().enumerate() {
-                ui.add_space(6.0);
+                ui.add_space(theme::SPACE_1 + theme::SPACE_1 / 2.0);
                 match line {
                     Line::Text(t) => {
                         ui.add(egui::Label::new(t.as_str()).wrap());
@@ -418,7 +418,7 @@ impl SignInDialog {
                     ui.add_space(10.0);
                     let mut shown = code.as_str();
                     ui.add(egui::TextEdit::singleline(&mut shown).font(egui::FontId::monospace(30.0)).desired_width(f32::INFINITY));
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SPACE_1);
                 }
             }
             ui.add_space(16.0);

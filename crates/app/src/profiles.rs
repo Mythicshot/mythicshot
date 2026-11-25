@@ -277,6 +277,14 @@ pub fn site_label(server: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
+/// The site's address as the Workspace page shows it: [`site_label`]'s host, and the path when
+/// the site lives under one ("tours.example.com/demo").
+pub fn site_address_label(server: &str) -> String {
+    let s = publish::check_server(server).unwrap_or_else(|_| server.trim().to_string());
+    let rest = s.split_once("://").map_or(s.as_str(), |(_, r)| r);
+    rest.trim_end_matches('/').to_string()
+}
+
 /// The site as a default profile name writes it: [`site_label`] without a leading `www.` or
 /// `app.` ("mythicshot.com" for app.mythicshot.com).
 pub fn name_host(server: &str) -> String {

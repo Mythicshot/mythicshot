@@ -321,6 +321,9 @@ pub const COMBO_WIDTH: f32 = 96.0;
 pub const COMBO_WIDTH_WIDE: f32 = 136.0;
 /// The button that shows a shortcut's keys.
 pub const KEYS_WIDTH: f32 = 170.0;
+/// The profile dropdown's selected profile, and the list it opens.
+pub const PROFILE_DROPDOWN_WIDTH: f32 = 240.0;
+pub const PROFILE_LIST_WIDTH: f32 = 300.0;
 /// The space inside a dialog (a question over a page), all round.
 pub const DIALOG_PAD: f32 = SPACE_6;
 /// A dialog's width.
@@ -490,18 +493,28 @@ impl CardRows<'_> {
         }
     }
 
-    /// A row with no label: what `add` draws, across the card's width.
+    /// A row with no label: what `add` draws, across the card's width, with the same space
+    /// above and below it (at least [`ITEM_GAP`]; more when it is lower than [`ROW_HEIGHT`], so
+    /// it sits in the middle). Its height is the one it took when last drawn.
     pub fn full(&mut self, add: impl FnOnce(&mut egui::Ui)) {
         self.hairline();
         let spacing = self.spacing;
         let ui = &mut *self.ui;
         let width = ui.available_width();
+        let id = ui.next_auto_id().with("full-row");
+        let known: Option<f32> = ui.data(|d| d.get_temp(id));
         ui.allocate_ui_with_layout(egui::vec2(width, ROW_HEIGHT), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_min_size(egui::vec2(width, ROW_HEIGHT));
+            ui.set_min_width(width);
             ui.spacing_mut().item_spacing = spacing;
-            ui.add_space(ITEM_GAP);
-            add(ui);
-            ui.add_space(ITEM_GAP / 2.0);
+            let pad = known.map_or(ITEM_GAP, |h| ((ROW_HEIGHT - h) / 2.0).max(ITEM_GAP));
+            ui.add_space(pad);
+            let taken = ui.scope(add).response.rect.height();
+            // The layout leaves its gap after the content already.
+            ui.add_space((pad - spacing.y).max(0.0));
+            if known.is_none_or(|h| (h - taken).abs() > 0.5) {
+                ui.data_mut(|d| d.insert_temp(id, taken));
+                ui.ctx().request_repaint();
+            }
         });
     }
 }

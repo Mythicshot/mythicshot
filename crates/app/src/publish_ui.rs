@@ -1425,24 +1425,24 @@ impl ResultDialog {
             share_ui::heading_label(ui, self.heading());
             ui.label(RichText::new(self.line()).color(theme::MUTED)).on_hover_text(&self.title);
             if let Some((note, is_error)) = self.note() {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 ui.add(egui::Label::new(RichText::new(note).color(if is_error { theme::DANGER_TEXT } else { theme::MUTED })).wrap());
             }
             // Not an error of the upload: the tour is on the site either way.
             if let Some(note) = self.kept_line() {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED)).wrap());
             }
             // A line of its own under it: the recording was kept, and nothing is removed.
             if let Some(note) = self.over_line() {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED)).wrap());
             }
             let url = self.url().map(str::to_string);
             if let Some(url) = &url {
                 share_ui::gap(ui, share_ui::BLOCK_GAP);
                 if self.link_is_older() {
-                    ui.label(RichText::new("The public version's link:").color(theme::MUTED).size(12.0));
+                    ui.label(RichText::new("The public version's link:").color(theme::MUTED).size(theme::SMALL_SIZE));
                 }
                 if share_ui::link_row(ui, url, COPY, copied).clicked() {
                     ctx.copy_text(url.clone());
@@ -1452,7 +1452,7 @@ impl ResultDialog {
                 }
             }
             if let Some(lock) = self.lock() {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 who::lock_line(ui, &lock, theme::MUTED);
             }
             share_ui::gap(ui, share_ui::BLOCK_GAP);
@@ -1610,7 +1610,7 @@ fn refusal_parts(why: &str) -> Refusal<'_> {
 /// Draw why the last upload did not start, under the dialog's choices.
 fn show_refusal(ui: &mut egui::Ui, why: &str) {
     let r = refusal_parts(why);
-    ui.add_space(8.0);
+    ui.add_space(theme::SPACE_2);
     if let Some(heading) = r.heading {
         ui.add(egui::Label::new(RichText::new(heading).color(theme::DANGER_TEXT).bold()).wrap());
         ui.add_space(2.0);
@@ -1618,7 +1618,7 @@ fn show_refusal(ui: &mut egui::Ui, why: &str) {
     ui.add(egui::Label::new(RichText::new(r.body).color(theme::DANGER_TEXT)).wrap());
     if let Some(note) = r.note {
         ui.add_space(2.0);
-        ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED).size(12.0)).wrap());
+        ui.add(egui::Label::new(RichText::new(note).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
     }
 }
 
@@ -1993,11 +1993,11 @@ impl Picker {
                     crate::profiles_ui::dropdown(ui, "publish-picker", true);
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_1);
             let hint = |ui: &mut egui::Ui, text: &str| {
                 ui.horizontal(|ui| {
                     ui.add_space(24.0);
-                    ui.add(egui::Label::new(RichText::new(text).color(theme::MUTED).size(12.0)).wrap());
+                    ui.add(egui::Label::new(RichText::new(text).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
                 });
             };
             // Publish now or a draft: for a new chapter or a new tour. An update keeps the tour as
@@ -2015,7 +2015,7 @@ impl Picker {
             }
             ui.add_space(12.0);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_2);
             // Why "Replace this chapter" cannot be chosen, when it cannot.
             match &shown {
                 Shown::Asking => {
@@ -2038,7 +2038,7 @@ impl Picker {
             }
             // 1. Replace this chapter: shown while the site is asked (it cannot be chosen yet) and when it is offered.
             if matches!(shown, Shown::Asking | Shown::Update { .. }) {
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_1);
                 let offered = matches!(shown, Shown::Update { .. });
                 if ui.add_enabled(offered, egui::RadioButton::new(replacing, REPLACE_LABEL)).clicked() {
                     pick = Some(EditChoice::Update);
@@ -2052,7 +2052,7 @@ impl Picker {
                 }
             }
             // 2. Add as a new chapter to one of the workspace's tours.
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_2);
             let chapter = choice == Some(EditChoice::Chapter);
             let listed = matches!(self.list.lock().as_deref(), Ok(ListState::Loaded(t)) if !t.is_empty());
             if ui.add_enabled(listed, egui::RadioButton::new(chapter, CHAPTER_LABEL)).clicked() {
@@ -2073,7 +2073,7 @@ impl Picker {
                                         row = Some(t.id.clone());
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(RichText::new(tour_row_detail(t)).color(theme::MUTED).size(12.0));
+                                        ui.label(RichText::new(tour_row_detail(t)).color(theme::MUTED).size(theme::SMALL_SIZE));
                                     });
                                 });
                             }
@@ -2105,7 +2105,7 @@ impl Picker {
                 }
             }
             // 3. New tour, with its title.
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_2);
             let new_chosen = choice == Some(EditChoice::NewTour);
             if theme::choices(ui, |ui| ui.radio(new_chosen, NEW_TOUR_LABEL)).clicked() {
                 pick = Some(EditChoice::NewTour);
@@ -2119,7 +2119,7 @@ impl Picker {
                 let field = egui::TextEdit::singleline(&mut self.title).char_limit(TITLE_MAX).hint_text("Tour title").desired_width(width);
                 ui.add_enabled(new_chosen, field);
                 if let Some(count) = count {
-                    ui.label(RichText::new(count).color(theme::MUTED).size(12.0));
+                    ui.label(RichText::new(count).color(theme::MUTED).size(theme::SMALL_SIZE));
                 }
             });
             hint(ui, NEW_TOUR_HINT);
@@ -2292,13 +2292,13 @@ impl Picker {
         match shown {
             WhoShown::Nothing => {}
             WhoShown::Dashboard => {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 ui.add(egui::Label::new(RichText::new(self.dashboard_line()).color(theme::MUTED)).wrap());
             }
             WhoShown::Choice => {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 for part in self.who.parts() {
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SPACE_1);
                     who::draw_part(ui, &part, &mut self.who, theme::MUTED);
                 }
             }
@@ -2374,7 +2374,7 @@ impl Picker {
                     crate::profiles_ui::dropdown(ui, "publish-picker", true);
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_1);
             let into = self.goes();
             let restricted = self.who_shown(&Shown::OnlyNew(None)) == WhoShown::Choice && self.who.chosen() != who::Choice::Anyone;
             for mode in Mode::ALL {
@@ -2384,13 +2384,13 @@ impl Picker {
                 if let Some(hint) = self.hint_line(mode, into, restricted) {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
-                        ui.add(egui::Label::new(RichText::new(hint).color(theme::MUTED).size(12.0)).wrap());
+                        ui.add(egui::Label::new(RichText::new(hint).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
                     });
                 }
             }
             ui.add_space(12.0);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_2);
             if theme::choices(ui, |ui| ui.radio(self.choice == Choice::New, "New tour")).clicked() {
                 self.choice = Choice::New;
             }
@@ -2403,12 +2403,12 @@ impl Picker {
                     self.choice = Choice::New;
                 }
                 if let Some(count) = count {
-                    ui.label(RichText::new(count).color(theme::MUTED).size(12.0));
+                    ui.label(RichText::new(count).color(theme::MUTED).size(theme::SMALL_SIZE));
                 }
             });
             ui.add_space(12.0);
             ui.label(RichText::new("Or add as a new chapter to").color(theme::MUTED));
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_1);
             // Before the list is locked: what it says is read from the list.
             let who_shown = self.who_shown(&Shown::OnlyNew(None));
             let list_lock = self.list.clone();
@@ -2440,7 +2440,7 @@ impl Picker {
                                     self.choice = Choice::Tour(t.id.clone());
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(tour_row_detail(t)).color(theme::MUTED).size(12.0));
+                                    ui.label(RichText::new(tour_row_detail(t)).color(theme::MUTED).size(theme::SMALL_SIZE));
                                 });
                             });
                         }

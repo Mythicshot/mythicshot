@@ -656,7 +656,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                     }
                     // The address is the profile's own.
                     None if p.profile_mode => {
-                        theme::value(ui, crate::profiles::site_label(server));
+                        theme::value(ui, crate::profiles::site_address_label(server));
                     }
                     None => {
                         if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(f32::INFINITY)).changed() {
@@ -904,7 +904,7 @@ fn token_ui(ui: &mut egui::Ui, p: &mut WorkspaceState, conn: &Conn, address: &st
                 }
             });
             if replacing {
-                ui.label(RichText::new("The saved token stays until the new one is saved.").color(theme::MUTED).size(12.0));
+                ui.label(RichText::new("The saved token stays until the new one is saved.").color(theme::MUTED).size(theme::SMALL_SIZE));
             }
         }
         TokenRow::Unavailable(e) => {

@@ -557,3 +557,45 @@ fn the_left_menu_says_signed_in_to_the_host_of_a_saved_connection() {
     assert!(label.right() <= NAV_WIDTH && shown.right() <= NAV_WIDTH && label.bottom() <= shown.top() + 0.5, "{t:?}");
     assert!(!t.iter().any(|x| x == "Connected to"), "{t:?}");
 }
+
+/// The Site row keeps a site's path; a name alone stands level with the badge; the tray
+/// choices wrap under the first choice; and a row of one line has as much space above as below.
+#[test]
+fn the_smaller_findings_hold() {
+    assert_eq!(profiles::site_address_label("https://tours.example.com/demo/"), "tours.example.com/demo");
+    assert_eq!(profiles::site_address_label("https://Tours.Example.com"), "tours.example.com");
+    // The name alone, level with the badge's middle.
+    let (_ctx, _f, out) = settled(Kind::NoAccount, egui::vec2(SIZE[0], 1100.0), 1.0);
+    let name = on_page(&out, "Sandbox test");
+    let badge = text_rect(&out, "ST").unwrap();
+    assert!((name.center().y - badge.center().y).abs() < 1.5, "{name:?} {badge:?}");
+    // The sign-in-again state's one-line row in the Connection card: equal space above and below.
+    let (_ctx, _f, out) = settled(Kind::SignInAgain, egui::vec2(SIZE[0], 1100.0), 1.0);
+    let line = text_rect(&out, crate::publish::REJECTED_TOKEN).unwrap();
+    let hairlines: Vec<f32> = shapes_of(&out)
+        .into_iter()
+        .filter_map(|s| match s {
+            egui::Shape::LineSegment { points, stroke } if stroke.color == theme::BORDER && (points[0].y - points[1].y).abs() < 0.1 => Some(points[0].y),
+            _ => None,
+        })
+        .collect();
+    let above = hairlines.iter().copied().filter(|y| *y <= line.top()).fold(f32::MIN, f32::max);
+    let below = hairlines.iter().copied().filter(|y| *y >= line.bottom()).fold(f32::MAX, f32::min);
+    assert!(((line.top() - above) - (below - line.bottom())).abs() < 1.5, "{above} {line:?} {below}");
+    // General at the smallest window: the second choice wraps under the first.
+    for ppp in [1.0, 2.0] {
+        let ctx = crate::theme::test_context();
+        ctx.set_pixels_per_point(ppp);
+        let mut f = fixture(Kind::Add);
+        f.s.nav.request(Page::Preferences);
+        f.s.prefs.state.tab = settings_ui::Tab::General;
+        let size = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
+        frame(&ctx, &mut f, size);
+        let out = frame(&ctx, &mut f, size);
+        let (words, first, second) = (text_rect(&out, "Left-click on the tray icon").unwrap(), text_rect(&out, "Open Mythicshot").unwrap(), text_rect(&out, "Capture a region").unwrap());
+        assert!(first.left() > words.right(), "{words:?} {first:?}");
+        if second.top() > first.bottom() {
+            assert!((second.left() - first.left()).abs() < 0.6, "wrapped under the first choice: {first:?} {second:?}");
+        }
+    }
+}

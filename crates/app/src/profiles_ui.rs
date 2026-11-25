@@ -276,7 +276,7 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
         ui.horizontal(|ui| {
             dot(ui, active.is_none_or(|a| a.waiting));
             let text = active.map_or_else(|| crate::workspace_ui::NOT_CONNECTED.to_string(), |a| a.name.clone());
-            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).width(240.0).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
+            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).width(theme::PROFILE_DROPDOWN_WIDTH).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
         });
     });
     pick
@@ -285,7 +285,7 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
 /// The list the dropdown and "Switch profile" open: every profile with its dot and state, then
 /// "+ Add profile…" and "Manage profiles…".
 fn profile_menu(ui: &mut egui::Ui, rows: &[Entry], pick: &mut Option<Pick>) {
-    ui.set_min_width(300.0);
+    ui.set_min_width(theme::PROFILE_LIST_WIDTH);
     for e in rows {
         ui.horizontal(|ui| {
             dot(ui, e.waiting);
@@ -1306,13 +1306,20 @@ fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str,
                         theme::pill(ui, text, tone);
                     }
                     if let Some(active) = active {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
-                            ui.add(egui::Label::new(theme::strong(RichText::new(&active.name).size(theme::STRONG_SIZE))).truncate());
-                            if let Some(line) = crate::workspace_ui::signed_in_line(active.account.as_deref()) {
-                                ui.add(egui::Label::new(RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                        let name = egui::Label::new(theme::strong(RichText::new(&active.name).size(theme::STRONG_SIZE))).truncate();
+                        match crate::workspace_ui::signed_in_line(active.account.as_deref()) {
+                            Some(line) => {
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+                                    ui.add(name);
+                                    ui.add(egui::Label::new(RichText::new(line).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
+                                });
                             }
-                        });
+                            // The name alone stands level with the middle of the badge.
+                            None => {
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(name));
+                            }
+                        }
                     }
                 });
             });

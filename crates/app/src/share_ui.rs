@@ -816,15 +816,15 @@ impl ShareDialog {
             theme::roomy(ui);
             ui.set_width(WINDOW_WIDTH);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(view.caption).color(theme::MUTED).size(12.0));
+                ui.label(RichText::new(view.caption).color(theme::MUTED).size(theme::SMALL_SIZE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     crate::profiles_ui::dropdown(ui, "share-window", can_switch);
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_1);
             heading_label(ui, &view.heading);
             for line in &view.lines {
-                ui.add_space(6.0);
+                ui.add_space(theme::SPACE_1 + theme::SPACE_1 / 2.0);
                 match line {
                     Line::Muted(t) => {
                         ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED)).wrap());
@@ -833,7 +833,7 @@ impl ShareDialog {
                         ui.add(egui::Label::new(t.as_str()).wrap());
                     }
                     Line::Note(t) => {
-                        ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED).size(12.0)).wrap());
+                        ui.add(egui::Label::new(RichText::new(t).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
                     }
                     Line::Warning(t) => {
                         theme::caution_box(ui, |ui| {
@@ -850,11 +850,11 @@ impl ShareDialog {
             }
             // Without a link the lock line follows the sentence; with one it goes under the link row.
             if let (None, Some(lock)) = (&view.link, &view.lock) {
-                ui.add_space(6.0);
+                ui.add_space(theme::SPACE_1 + theme::SPACE_1 / 2.0);
                 who::lock_line(ui, lock, theme::MUTED);
             }
             if let Some(p) = view.progress {
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_2);
                 ui.add(egui::ProgressBar::new(p));
             }
             if online {
@@ -864,7 +864,7 @@ impl ShareDialog {
                         pressed = Some(Button::CopyLink);
                     }
                     if let Some(lock) = &view.lock {
-                        ui.add_space(8.0);
+                        ui.add_space(theme::SPACE_2);
                         who::lock_line(ui, lock, theme::MUTED);
                     }
                 }

@@ -189,13 +189,18 @@ fn general(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
             });
         });
         rows.full(|ui| {
-            ui.horizontal_wrapped(|ui| {
+            // The choices wrap under the first choice, not under the words.
+            ui.horizontal_top(|ui| {
                 ui.label(RichText::new("Left-click on the tray icon").color(theme::MUTED));
-                for choice in TrayLeftClick::ALL {
-                    if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
-                        out.push(UiAction::SettingsChanged);
-                    }
-                }
+                ui.horizontal_wrapped(|ui| {
+                    theme::choices(ui, |ui| {
+                        for choice in TrayLeftClick::ALL {
+                            if ui.radio_value(&mut s.tray_left_click, choice, choice.label()).changed() {
+                                out.push(UiAction::SettingsChanged);
+                            }
+                        }
+                    });
+                });
             });
         });
     });
@@ -400,12 +405,12 @@ fn saved_section(ui: &mut egui::Ui, s: &mut Settings, saved: &mut SavedRecording
     if s.store_recordings_as_video {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
-            ui.add(egui::Label::new(RichText::new(ffmpeg_line(hooks.ffmpeg)).color(theme::MUTED).size(12.0)).wrap());
+            ui.add(egui::Label::new(RichText::new(ffmpeg_line(hooks.ffmpeg)).color(theme::MUTED).size(theme::SMALL_SIZE)).wrap());
         });
     }
-    ui.add_space(6.0);
+    ui.add_space(theme::SPACE_1 + theme::SPACE_1 / 2.0);
     changed |= limit_row(ui, s, saved);
-    ui.add_space(4.0);
+    ui.add_space(theme::SPACE_1);
 
     let limit = s.saved_recordings_warn_gb;
     if let Some(t) = saved.totals() {
@@ -530,9 +535,9 @@ fn saved_list(ui: &mut egui::Ui, saved: &mut SavedRecordings, hooks: &mut Hooks<
 /// would leave the title too little room, the details go under the title instead. True when
 /// the button was clicked.
 fn list_row(ui: &mut egui::Ui, row: &Row, enabled: bool) -> bool {
-    let detail = RichText::new(row.detail()).color(theme::MUTED).size(12.0);
+    let detail = RichText::new(row.detail()).color(theme::MUTED).size(theme::SMALL_SIZE);
     let button_width = text_width(ui, REMOVE_RECORDING, egui::TextStyle::Button.resolve(ui.style())) + 2.0 * ui.spacing().button_padding.x;
-    let detail_width = text_width(ui, &row.detail(), egui::FontId::proportional(12.0));
+    let detail_width = text_width(ui, &row.detail(), egui::FontId::proportional(theme::SMALL_SIZE));
     let one_line = ui.available_width() - button_width - detail_width - 2.0 * ui.spacing().item_spacing.x >= TITLE_MIN_WIDTH;
     let mut clicked = false;
     ui.horizontal(|ui| {
@@ -565,7 +570,7 @@ fn question(ui: &mut egui::Ui, row: &Row, reveal: bool) -> Option<bool> {
     let frame = theme::danger_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(RichText::new(remove_question(&row.title)).color(theme::DANGER_TEXT)).wrap());
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_1);
         ui.horizontal(|ui| {
             if ui.add(theme::danger_button(REMOVE_RECORDING)).clicked() {
                 answer = Some(true);
