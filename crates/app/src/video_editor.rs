@@ -5535,4 +5535,56 @@ mod tests {
         assert!(matches!(done.finished.outcome, Outcome::Public { .. }));
         assert!(!crate::publish_ui::restriction_unfinished(tour));
     }
+
+    // ---- A picture file dropped on a recording ----
+
+    /// A picture dropped on the recording editor is placed wherever a picture may be pasted: in
+    /// the Timeline view (shown from the current frame for a while) and in the Tour view on a step
+    /// (pinned to that step). In the Tour view without a step to pin to, a drag is refused like a
+    /// file that is no picture, and a drop places nothing.
+    #[test]
+    fn a_picture_is_placed_on_a_recording_wherever_one_may_be_pasted_and_refused_where_not() {
+        use crate::editor_ui::tests::{drop_on, file_frame, frames_until};
+        use crate::editor_ui::dialog_checks;
+        let tmp = tempfile::tempdir().unwrap();
+        let pic = crate::place_picture::tests::picture_file(tmp.path(), "logo.png", 20, 10, [255, 0, 0, 255]);
+        let ctx = crate::theme::test_context();
+        let image_items = |ed: &Editor| ed.doc.items().iter().filter(|it| matches!(it.shape, Shape::Image { .. })).cloned().collect::<Vec<_>>();
+        // The Timeline view.
+        let mut ed = video_editor_with(&tmp.path().join("timeline"), Default::default());
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        assert!(ed.can_place_picture());
+        drop_on(&mut ed, &ctx, &pic, pt(60.0, 50.0));
+        let placed = image_items(&ed);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!(placed[0].frames.is_some() && placed[0].pin.is_none(), "{:?}", placed[0]);
+        assert_eq!(ed.selected, Some(placed[0].id));
+        // The Tour view on a step: pinned to it.
+        let mut ed = video_editor_with(&tmp.path().join("tour"), Default::default());
+        ed.set_view(VideoView::Tour);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let src = ed.tour_src().expect("a step is shown");
+        drop_on(&mut ed, &ctx, &pic, pt(60.0, 50.0));
+        let placed = image_items(&ed);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].pin, Some(src as u32));
+        // The Tour view of a recording with no clicks, so no step to pin to: refused.
+        let s = Settings::default();
+        let mut ed = Editor::new_video(recorded(&tmp.path().join("no-steps")), Vec::new(), Vec::new(), TITLE.into(), Default::default(), s.dest_context(TITLE), OverlayStyle::default(), s.editor.clone()).unwrap();
+        ed.set_view(VideoView::Tour);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        assert!(!ed.can_place_picture());
+        let out = file_frame(&mut ed, &ctx, std::slice::from_ref(&pic), &[], vec![]);
+        let texts: Vec<String> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect();
+        assert!(texts.iter().any(|t| t == crate::open_image::ONLY_PICTURES) && !texts.iter().any(|t| t == crate::place_picture::PLACE_HERE), "{texts:?}");
+        file_frame(&mut ed, &ctx, &[], std::slice::from_ref(&pic), vec![]);
+        frames_until(&mut ed, &ctx, |e| !e.holds_update());
+        assert!(image_items(&ed).is_empty(), "nothing was placed");
+        // Asked for directly, nothing is read either.
+        ed.place_picture_file(pic.clone(), pt(10.0, 10.0));
+        assert!(!ed.holds_update());
+    }
 }

@@ -160,11 +160,12 @@ pub const MAX_READS: usize = 2;
 /// A read to start: its generation and the file.
 pub type ReadJob = (u64, PathBuf);
 
-/// What became of a read that has ended.
+/// What became of a read that has ended. `T` is what the read made of the picture: the picture
+/// itself for an editor to open, or the picture made ready to place on a capture.
 #[derive(Debug)]
-pub enum Settled {
-    /// The newest request's picture: open it in an editor with this title.
-    Open(RgbaImage, String),
+pub enum Settled<T = RgbaImage> {
+    /// The newest request's picture: open it in an editor with this title (or place it).
+    Open(T, String),
     /// The newest request's file could not be opened: say this sentence.
     Failed(String),
     /// A newer request came after it: its picture is dropped and nothing is said.
@@ -201,7 +202,7 @@ impl ImageLoads {
 
     /// The read numbered `generation` of `path` has ended with `result`: what to do with it, and
     /// a waiting read to start now.
-    pub fn finished(&mut self, generation: u64, path: &Path, result: Result<RgbaImage, ImageError>) -> (Settled, Option<ReadJob>) {
+    pub fn finished<T>(&mut self, generation: u64, path: &Path, result: Result<T, ImageError>) -> (Settled<T>, Option<ReadJob>) {
         self.running = self.running.saturating_sub(1);
         let next = if self.running < MAX_READS { self.waiting.take() } else { None };
         if next.is_some() {
@@ -224,13 +225,25 @@ impl ImageLoads {
     pub fn pending(&self) -> bool {
         self.newest > 0 && !self.answered
     }
+
+    /// The number of the newest request: a read of that number is the one whose result is used.
+    pub fn newest(&self) -> u64 {
+        self.newest
+    }
 }
 
 /// Read the picture at `path` on a thread of its own and hand the result to `done` there. A
 /// panic anywhere in the read still ends in a result, so the read is always counted as ended.
 pub fn spawn_load(path: PathBuf, done: impl FnOnce(PathBuf, Result<RgbaImage, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
+    spawn_load_with(path, |img| img, done)
+}
+
+/// [`spawn_load`] that also runs `prepare` on the picture read, on the same thread and inside the
+/// same panic guard, before `done` is handed the result: placing a picture resamples it there, so
+/// a large picture is never worked on by the window's thread.
+pub fn spawn_load_with<T: Send + 'static>(path: PathBuf, prepare: impl FnOnce(RgbaImage) -> T + Send + 'static, done: impl FnOnce(PathBuf, Result<T, ImageError>) + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path))).unwrap_or_else(|_| Err(not_a_picture()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path).map(prepare))).unwrap_or_else(|_| Err(not_a_picture()));
         done(path, result);
     })
 }
@@ -282,12 +295,22 @@ impl DropState {
     /// was dropped on it (`dropped`). While a drag is over the window, paints the overlay over
     /// `area`; returns the picture file to open when one was dropped.
     pub fn frame(&mut self, ctx: &egui::Context, area: Rect, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>) -> Option<PathBuf> {
+        self.frame_for(ctx, area, hovered, dropped, DROP_TO_OPEN, true)
+    }
+
+    /// [`DropState::frame`] for a window whose overlay says `accept` over a picture a drop would
+    /// take. While `allowed` is false every drag is refused like a file that is not a picture,
+    /// and a drop hands nothing over: an editor where nothing may be placed now.
+    pub fn frame_for(&mut self, ctx: &egui::Context, area: Rect, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, accept: &str, allowed: bool) -> Option<PathBuf> {
         if !dropped.is_empty() {
             // A drop of several files can arrive a file a frame: the drag before it said how many.
             // The rest of such a drop, in the frames that follow, is refused with it.
             let several = self.judged.take().is_some_and(|(paths, _)| paths.len() > 1);
             if several || self.refusing_drop {
                 self.refusing_drop = true;
+                return None;
+            }
+            if !allowed {
                 return None;
             }
             return match judge(&dropped) {
@@ -299,27 +322,39 @@ impl DropState {
         if hovered.is_empty() {
             self.judged = None;
             #[cfg(test)]
-            if let Some(accept) = self.shown_for_render {
-                paint_overlay(ctx, area, accept);
+            if let Some(shown) = self.shown_for_render {
+                paint_overlay(ctx, area, shown, accept);
             }
             return None;
         }
         let verdict = match &self.judged {
             Some((paths, verdict)) if *paths == hovered => verdict.clone(),
+            // Nothing may be placed: the disk is not looked at, and the drag is refused.
+            _ if !allowed => {
+                self.judged = Some((hovered, Verdict::Refuse));
+                Verdict::Refuse
+            }
             _ => {
                 let verdict = judge(&hovered);
                 self.judged = Some((hovered, verdict.clone()));
                 verdict
             }
         };
-        paint_overlay(ctx, area, matches!(verdict, Verdict::Accept(_)));
+        paint_overlay(ctx, area, allowed && matches!(verdict, Verdict::Accept(_)), accept);
         None
     }
 
     /// [`DropState::frame`] with the files egui says are dragged over and dropped on the window.
     pub fn frame_from_input(&mut self, ctx: &egui::Context, area: Rect) -> Option<PathBuf> {
+        self.frame_from_input_for(ctx, area, DROP_TO_OPEN, true)
+    }
+
+    /// [`DropState::frame_for`] with the files egui says are dragged over and dropped on the
+    /// window whose frame this is: each window has its own, so an overlay shows only in the
+    /// window the files are over.
+    pub fn frame_from_input_for(&mut self, ctx: &egui::Context, area: Rect, accept: &str, allowed: bool) -> Option<PathBuf> {
         let (hovered, dropped) = ctx.input(|i| (i.raw.hovered_files.iter().map(|f| f.path.clone()).collect(), i.raw.dropped_files.iter().map(|f| Some(f.path().to_path_buf())).collect()));
-        self.frame(ctx, area, hovered, dropped)
+        self.frame_for(ctx, area, hovered, dropped, accept, allowed)
     }
 }
 
@@ -336,15 +371,16 @@ pub fn overlay_colours(accept: bool) -> (Color32, Color32, Color32, Color32) {
     if accept { (ACCEPT_TINT, theme::PRIMARY_TEXT, theme::SELECTION, theme::TEXT) } else { (REFUSE_TINT, theme::DANGER_BORDER, theme::DANGER_TINT, theme::DANGER_TEXT) }
 }
 
-/// The overlay over `area` (the window below its menu bar) while files are dragged over the
-/// window: a see-through tint over the page, a dashed frame, and on a solid chip in the middle
-/// the Open image icon and what a drop would do, in the purple selection tint when it would open
-/// a picture and in the danger tint when it would not. It is painted on a layer of its own above
-/// the page and takes no input, so clicks still reach the page.
-fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool) {
+/// The overlay over `area` (the window below its menu bar, or an editor's canvas) while files are
+/// dragged over the window: a see-through tint over the page, a dashed frame, and on a solid chip
+/// in the middle the Open image icon and what a drop would do (`accept_text` when it would take
+/// the picture), in the purple selection tint when it would take a picture and in the danger
+/// tint when it would not. It is painted on a layer of its own above the page and takes no
+/// input, so clicks still reach the page.
+fn paint_overlay(ctx: &egui::Context, area: Rect, accept: bool, accept_text: &str) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("open-image-drop")));
     let (tint, edge, chip, ink) = overlay_colours(accept);
-    let text = if accept { DROP_TO_OPEN } else { ONLY_PICTURES };
+    let text = if accept { accept_text } else { ONLY_PICTURES };
     p.rect_filled(area, 0.0, tint);
     let frame = area.shrink(theme::PAGE_PAD.min(area.width() / 4.0).min(area.height() / 4.0));
     let corners = vec![frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom(), frame.left_top()];

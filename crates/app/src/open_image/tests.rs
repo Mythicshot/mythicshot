@@ -301,10 +301,10 @@ fn the_newest_request_wins_and_an_older_read_is_dropped_silently() {
     // A superseded read that fails says nothing either.
     let (gc, _) = loads.request(a.clone()).unwrap();
     let (gd, _) = loads.request(b.clone()).unwrap();
-    assert!(matches!(loads.finished(gc, &a, Err(gone())).0, Settled::Superseded));
+    assert!(matches!(loads.finished(gc, &a, Err::<RgbaImage, _>(gone())).0, Settled::Superseded));
     assert!(loads.pending(), "the newest is still being read");
     // The newest failing says the usual sentence.
-    let (settled, _) = loads.finished(gd, &b, Err(gone()));
+    let (settled, _) = loads.finished(gd, &b, Err::<RgbaImage, _>(gone()));
     match settled {
         Settled::Failed(sentence) => assert_eq!(sentence, could_not_open(&b, &gone())),
         other => panic!("{other:?}"),
@@ -327,7 +327,7 @@ fn at_most_two_reads_run_and_only_the_newest_waiting_request_is_kept() {
     assert_eq!(path, p("4"));
     assert!(loads.pending(), "an update waits for it");
     // The other old one ends: nothing waits, nothing starts.
-    let (settled, next) = loads.finished(g2, &p("2"), Err(gone()));
+    let (settled, next) = loads.finished(g2, &p("2"), Err::<RgbaImage, _>(gone()));
     assert!(matches!(settled, Settled::Superseded) && next.is_none());
     let (settled, _) = loads.finished(g4, &p("4"), Ok(RgbaImage::new(1, 1)));
     assert!(matches!(settled, Settled::Open(..)));
@@ -422,6 +422,32 @@ fn the_overlay_says_what_a_drop_would_do_and_a_drop_hands_over_only_a_picture() 
     }
 }
 
+/// An editor's overlay says its own words over a picture, the same refusal over anything else,
+/// and while nothing may be placed it refuses even a picture, and a drop hands nothing over.
+#[test]
+fn a_window_with_its_own_words_takes_a_picture_only_while_it_is_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pic = tmp.path().join("shot.png");
+    std::fs::write(&pic, "x").unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "x").unwrap();
+    let ctx = theme::test_context();
+    let mut state = DropState::default();
+    let frame = |state: &mut DropState, hovered: Vec<Option<PathBuf>>, dropped: Vec<Option<PathBuf>>, allowed: bool| {
+        let mut got = None;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| got = state.frame_for(ui.ctx(), ui.ctx().content_rect(), hovered.clone(), dropped.clone(), "Place it", allowed));
+        out.textures_delta.clear();
+        (texts(&out), got)
+    };
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], true), (vec!["Place it".to_string()], None));
+    assert_eq!(frame(&mut state, vec![Some(notes.clone())], vec![], true).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], true), (vec![], Some(pic.clone())));
+    // Not allowed now: the picture is refused, and its drop does nothing.
+    frame(&mut state, vec![], vec![], false);
+    assert_eq!(frame(&mut state, vec![Some(pic.clone())], vec![], false).0, [ONLY_PICTURES]);
+    assert_eq!(frame(&mut state, vec![], vec![Some(pic.clone())], false), (vec![], None));
+}
+
 #[test]
 fn a_drop_of_several_files_arriving_a_file_a_frame_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -475,10 +501,11 @@ fn the_overlay_words_keep_their_contrast_on_a_solid_chip() {
     }
 }
 
-/// An editor is a window of its own and does not read dragged or dropped files: no overlay is
-/// drawn there and a drop on it asks nothing of the app.
+/// An editor is a window of its own: the main window's overlay, which opens a new editor, never
+/// shows there (the editor shows its own, which places the picture on its capture), and a drop on
+/// it asks nothing of the app.
 #[test]
-fn the_overlay_never_appears_in_an_editor_and_a_drop_there_does_nothing() {
+fn the_main_windows_overlay_never_appears_in_an_editor_and_a_drop_there_asks_nothing_of_the_app() {
     let tmp = tempfile::tempdir().unwrap();
     let pic = tmp.path().join("shot.png");
     std::fs::write(&pic, png(&RgbaImage::new(1, 1))).unwrap();
@@ -487,12 +514,15 @@ fn the_overlay_never_appears_in_an_editor_and_a_drop_there_does_nothing() {
     let ctx = theme::test_context();
     let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
     let hovered = vec![egui::HoveredFile { path: Some(pic.clone()), mime: String::new() }];
+    let mut seen = Vec::new();
     for _ in 0..3 {
         let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), hovered_files: hovered.clone(), ..Default::default() }, |ui| ed.ui(ui));
         out.textures_delta.clear();
         let t = texts(&out);
-        assert!(!t.iter().any(|t| t == DROP_TO_OPEN || t == ONLY_PICTURES), "{t:?}");
+        assert!(!t.iter().any(|t| t == DROP_TO_OPEN), "{t:?}");
+        seen.extend(t);
     }
+    assert!(seen.iter().any(|t| t == crate::place_picture::PLACE_HERE), "the editor's own overlay: {seen:?}");
     let dropped: Vec<egui::DroppedFileHandle> = vec![Arc::new(Dropped(pic))];
     let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(window), dropped_files: dropped, ..Default::default() }, |ui| ed.ui(ui));
     out.textures_delta.clear();

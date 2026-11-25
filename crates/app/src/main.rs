@@ -24,6 +24,7 @@ mod main_window;
 mod menu_bar;
 mod open_image;
 mod overlay;
+mod place_picture;
 mod placement;
 mod password;
 mod platform;
@@ -578,9 +579,10 @@ impl App {
 
     /// What an update waits for: a recording or its countdown, a GIF being saved, a capture on
     /// screen or a picker waiting, a recording or a picture file being opened, a publish, update, share or Tours
-    /// job (each holds its profile), a tour export, an add to a site, an editor that exports or
-    /// publishes, and an editor of a saved recording, whose edits not sent to the site a close
-    /// would drop. An editor with unsaved changes asks its own question when the app closes.
+    /// job (each holds its profile), a tour export, an add to a site, an editor that exports,
+    /// publishes or is still reading a picture to place, and an editor of a saved recording, whose
+    /// edits not sent to the site a close would drop ([`editor_ui::Editor::holds_update`]). An
+    /// editor with unsaved changes asks its own question when the app closes.
     fn work_running(&self) -> bool {
         self.session.is_some()
             || !self.encoding.is_empty()
@@ -591,7 +593,7 @@ impl App {
             || publish_ui::any_running()
             || site::adds_in_flight() > 0
             || profiles_ui::endings_in_flight()
-            || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| !e.closed && (e.exporting() || e.may_hold_unsent_edits())))
+            || self.editors.iter().any(|(w, _)| w.editor.lock().is_ok_and(|e| e.holds_update()))
     }
 
     /// Updates, every frame: start the check once the UI is up, take in what the background work
