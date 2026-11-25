@@ -333,11 +333,10 @@ impl App {
             s.update = update_ui::Updater::new(Arc::new(update_ui::Official), update::Version::running()).with_wake(move || wake.request_repaint());
             // The note an in-app update left: read and removed now, so its popup shows once. The
             // relaunch after an install starts in the tray, so the main window opens to hold it.
-            if let Some(after) = update::pending::take(&update::pending::path(), std::time::SystemTime::now(), update::Version::running()) {
-                update::log(&format!("after update: {after:?}"));
-                let (request, opened) = main_window::notice_request(window_request);
-                window_request = Some(request);
-                s.update.set_notice(after, opened);
+            let (request, after) = s.start_with_note(window_request, &update::pending::path(), std::time::SystemTime::now(), update::Version::running());
+            window_request = request;
+            if let Some(after) = after {
+                update::log(&format!("after update: {after}"));
             }
         }
         // Deletes a past run could not finish: the Tours page offers to carry them on.
@@ -1551,7 +1550,7 @@ impl App {
         // closed afterwards, so it never comes back over the overlay or the editor.
         if let Some(cmd) = capture {
             if let Ok(mut s) = self.window.lock() {
-                s.nav.close();
+                s.close_window();
                 s.settle(ctx);
             }
             self.window_request = None;

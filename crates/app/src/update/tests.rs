@@ -639,7 +639,7 @@ fn when_msiexec_cannot_be_started_the_note_is_taken_back() {
 #[test]
 fn a_note_that_cannot_be_written_does_not_stop_the_update() {
     let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
-    // A folder stands where the note's folder would be made.
+    // A plain file stands where the note's folder would be made, so the note cannot be written.
     std::fs::write(dir.path().join("config"), b"a file, not a folder").unwrap();
     let note = dir.path().join("config").join(pending::FILE_NAME);
     let launch = FakeLaunch { system: Some(dir.path().join("System32")), ..Default::default() };
@@ -888,4 +888,18 @@ sha256={sha}
     let keys = Keys::from_list(&[("known answer", "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=")]);
     let text = with_signature("1.2.3", "Mythicshot-1.2.3-x64.msi", 2_097_152, &sha, "yBPf4ipl60e9/+3NDIMKrszycx42NNxuXW7R8fwx4TaJmDGXxHKtatKl35uQnSDdiNuRv4lAyTt2GgbdpenSAQ==");
     assert!(parse_release(text.as_bytes(), &keys).is_ok());
+}
+
+#[test]
+fn a_repair_or_an_older_installer_leaves_no_note() {
+    let (dir, path, r) = verified_on_disk(&installer_bytes(5000));
+    let note = dir.path().join(pending::FILE_NAME);
+    let held = open_verified(&path, &r).unwrap();
+    // The installer is 0.2.35: the same version (a repair) and a newer running one (a downgrade).
+    for running in ["0.2.35", "0.2.36", "1.0.0"] {
+        let launch = FakeLaunch { system: Some(dir.path().join("System32")), note: Some(note.clone()), ..Default::default() };
+        assert_eq!(start_installer(&held, v(running), &note, &launch), Ok(false), "{running}");
+        assert_eq!(*launch.note_at_spawn.lock().unwrap(), vec![None], "{running}: no note when msiexec started");
+        assert!(!note.exists(), "{running}");
+    }
 }

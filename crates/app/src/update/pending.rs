@@ -75,6 +75,16 @@ pub enum AfterUpdate {
     NotFinished { from: Version },
 }
 
+/// For the log: what the start found, in words.
+impl std::fmt::Display for AfterUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AfterUpdate::Updated { from, to } => write!(f, "updated from {from} to {to}"),
+            AfterUpdate::NotFinished { from } => write!(f, "still {from}, the update did not finish"),
+        }
+    }
+}
+
 /// What the start makes of the note: `marker` is the note's bytes (None: there is none), `age`
 /// how long ago it was written (None: not known), `running` the version that runs. Only a fresh
 /// note the app wrote whose `to` or `from` is the running version shows anything.
@@ -119,22 +129,35 @@ pub fn remove(path: &Path) {
     }
 }
 
-/// At start: read the note at `path` (no more than [`MAX_BYTES`] and one byte of it, and only a
-/// plain file, never through a link), remove it, and say what it means for `running` at `now`.
+/// At start: read the note at `path`, remove it, and say what it means for `running` at `now`.
 /// Never fails: anything that goes wrong is no popup.
 pub fn take(path: &Path, now: SystemTime, running: Version) -> Option<AfterUpdate> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    let bytes = (meta.is_file() && !meta.file_type().is_symlink()).then(|| read_capped(path)).flatten();
-    let age = meta.modified().ok().and_then(|written| age(written, now));
+    let read = read_note(path);
     remove(path);
-    decide(bytes.as_deref(), age, running)
+    let (bytes, written) = read?;
+    decide(Some(&bytes), written.and_then(|w| age(w, now)), running)
 }
 
-/// The first [`MAX_BYTES`] + 1 bytes of the file at `path`: enough to know it is too large.
-fn read_capped(path: &Path) -> Option<Vec<u8>> {
+/// The note's bytes (no more than [`MAX_BYTES`] and one, enough to know it is too large) and when
+/// it was written. Opened without following a link (on Windows) and checked through the very
+/// handle that is read, so nothing can be swapped in between: only a plain file, not too large.
+fn read_note(path: &Path) -> Option<(Vec<u8>, Option<SystemTime>)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_BYTES {
+        return None;
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    Some((bytes, meta.modified().ok()))
 }
 
 #[cfg(test)]

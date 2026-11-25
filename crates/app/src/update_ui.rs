@@ -1,6 +1,7 @@
 //! Updates as the person sees them: the line under the main window's menu bar, the Updates
-//! section of Preferences, the tray entry, and the popup at the start after an in-app update. The network, the files and the installer are
-//! `update`'s; this holds what is going on ([`Updater`]) and draws it.
+//! section of Preferences, the tray entry, and the popup at the start after an in-app update.
+//! The network, the files and the installer are `update`'s; this holds what is going on
+//! ([`Updater`]) and draws it.
 //!
 //! The work runs on threads of its own and lands in slots that [`Updater::poll`] takes in on the
 //! next frame, as `profiles_ui` does; nothing here ever waits for the network.
@@ -103,11 +104,9 @@ pub fn updated_text(from: Version, to: Version) -> String {
     format!("Updated from {from} to {to}.")
 }
 
-/// Approved: the popup's line when the update did not finish. The approved second sentence
-/// pointed to Settings; the update controls are in Preferences › Updates (and the line under the
-/// menu bar, and the tray), so only the first sentence is used until the owner words another.
+/// Approved: the popup's line when the update did not finish, naming where Check now is.
 pub fn not_finished_text(from: Version) -> String {
-    format!("Mythicshot is still {from}.")
+    format!("Mythicshot is still {from}. You can try again from Preferences › Updates.")
 }
 
 /// The popup's buttons, each with its approved label.
@@ -553,10 +552,18 @@ impl Updater {
     /// True when the main window was opened only for the popup and should close with it.
     pub fn press_notice(&mut self, button: NoticeButton) -> bool {
         let Some(notice) = self.notice.take() else { return false };
-        if button == NoticeButton::WhatsNew {
-            self.asks.push(Ask::Open(update::CHANGES_PAGE, String::new()));
+        if let (NoticeButton::WhatsNew, AfterUpdate::Updated { to, .. }) = (button, notice.after) {
+            // At the new version's entry, as the update line's What's new opens it.
+            self.asks.push(Ask::Open(update::CHANGES_PAGE, update::changes_anchor(to)));
         }
         notice.close_window
+    }
+
+    /// The person asked for the main window while the popup is up: it stays when the popup closes.
+    pub fn keep_window(&mut self) {
+        if let Some(notice) = &mut self.notice {
+            notice.close_window = false;
+        }
     }
 
     /// The main window was closed with the popup up: it was seen, and does not come back.

@@ -199,3 +199,19 @@ fn something_else_at_the_notes_place_never_stops_the_start() {
     assert_eq!(take(&at, SystemTime::now(), v("0.2.39")), None);
     assert!(at.join("inside.txt").exists(), "a folder that is not the app's note is left alone");
 }
+
+#[cfg(windows)]
+#[test]
+fn a_link_at_the_notes_place_is_never_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("elsewhere.toml");
+    write(&target, note("0.2.38", "0.2.39")).unwrap();
+    let at = dir.path().join(FILE_NAME);
+    // Making a link needs a right not every account has: without it there is nothing to test.
+    if std::os::windows::fs::symlink_file(&target, &at).is_err() {
+        return;
+    }
+    assert_eq!(take(&at, SystemTime::now(), v("0.2.39")), None, "a note reached through a link is not the app's");
+    assert!(std::fs::symlink_metadata(&at).is_err(), "the link is removed");
+    assert!(target.exists(), "what it pointed to is left alone");
+}

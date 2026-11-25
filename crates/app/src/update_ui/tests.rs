@@ -435,13 +435,14 @@ fn the_popups_words_are_the_owners() {
     assert_eq!(UPDATED_TITLE, "Mythicshot is up to date");
     assert_eq!(updated_text(v("0.2.38"), v("0.2.39")), "Updated from 0.2.38 to 0.2.39.");
     assert_eq!(NOT_FINISHED_TITLE, "The update did not finish");
-    assert_eq!(not_finished_text(v("0.2.38")), "Mythicshot is still 0.2.38.");
+    assert_eq!(not_finished_text(v("0.2.38")), "Mythicshot is still 0.2.38. You can try again from Preferences \u{203A} Updates.");
+    assert!(not_finished_text(v("0.2.38")).contains(" › "), "one character, U+203A, a space each side");
     assert_eq!(NoticeButton::WhatsNew.label(), "What's new");
     assert_eq!(NoticeButton::Ok.label(), "OK");
     assert_eq!(update::CHANGES_PAGE, "https://mythicshot.com/changes/");
     // Each popup and its buttons, OK last (the primary).
     assert_eq!(notice_view(updated()), (UPDATED_TITLE, "Updated from 0.2.38 to 0.2.39.".to_string(), &[NoticeButton::WhatsNew, NoticeButton::Ok][..]));
-    assert_eq!(notice_view(not_finished()), (NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.".to_string(), &[NoticeButton::Ok][..]));
+    assert_eq!(notice_view(not_finished()), (NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38. You can try again from Preferences › Updates.".to_string(), &[NoticeButton::Ok][..]));
 }
 
 #[test]
@@ -459,7 +460,9 @@ fn whats_new_opens_the_changes_page_and_closes_the_popup() {
     let mut u = updater(&net);
     u.set_notice(updated(), false);
     assert!(!u.press_notice(NoticeButton::WhatsNew), "the window was open already: it stays");
-    assert_eq!(u.asks, vec![Ask::Open(update::CHANGES_PAGE, String::new())]);
+    // At the new version's entry, as the update line's What's new opens it.
+    assert_eq!(u.asks, vec![Ask::Open(update::CHANGES_PAGE, update::changes_anchor(v("0.2.39")))]);
+    assert_eq!(update::changes_anchor(v("0.2.39")), "v0-2-39");
     assert_eq!(u.notice(), None);
 }
 
@@ -521,7 +524,7 @@ fn each_popup_shows_its_title_its_line_and_its_buttons() {
     u.set_notice(not_finished(), false);
     let (out, _) = notice_frames(&mut u, vec![]);
     let texts = texts_of(&out);
-    for want in [NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.", "OK"] {
+    for want in [NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38. You can try again from Preferences › Updates.", "OK"] {
         assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
     }
     assert!(!texts.iter().any(|t| t == "What's new"), "no other button: {texts:?}");
@@ -543,4 +546,24 @@ fn enter_or_escape_is_ok() {
         assert_eq!(u.notice(), None, "{key:?}");
         assert!(u.asks.is_empty(), "{key:?}");
     }
+}
+
+#[test]
+fn a_window_the_person_asked_for_is_kept_after_the_popup() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = updater(&net);
+    u.set_notice(updated(), true);
+    u.keep_window();
+    assert_eq!(u.notice(), Some(updated()), "the popup stays up");
+    assert!(!u.press_notice(NoticeButton::Ok), "and OK no longer closes the window");
+    // Without a popup it changes nothing.
+    let mut u = updater(&net);
+    u.keep_window();
+    assert_eq!(u.notice(), None);
+}
+
+#[test]
+fn the_log_says_what_the_start_found_in_words() {
+    assert_eq!(updated().to_string(), "updated from 0.2.38 to 0.2.39");
+    assert_eq!(not_finished().to_string(), "still 0.2.38, the update did not finish");
 }
