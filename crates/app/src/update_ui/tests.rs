@@ -417,3 +417,154 @@ pub(crate) fn showing(state: &str) -> (Updater, Arc<FakeNetHandle>) {
 
 /// Keeps the stand-in network of [`showing`] alive.
 pub(crate) struct FakeNetHandle(#[allow(dead_code)] Arc<FakeNet>);
+
+// ---- After an update: the popup at the next start ----
+
+use crate::update::pending::AfterUpdate;
+
+fn updated() -> AfterUpdate {
+    AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }
+}
+
+fn not_finished() -> AfterUpdate {
+    AfterUpdate::NotFinished { from: v("0.2.38") }
+}
+
+#[test]
+fn the_popups_words_are_the_owners() {
+    assert_eq!(UPDATED_TITLE, "Mythicshot is up to date");
+    assert_eq!(updated_text(v("0.2.38"), v("0.2.39")), "Updated from 0.2.38 to 0.2.39.");
+    assert_eq!(NOT_FINISHED_TITLE, "The update did not finish");
+    // The approved words, the space between the two sentences a line break.
+    assert_eq!(not_finished_text(v("0.2.38")), "Mythicshot is still 0.2.38.\nYou can try again from Preferences \u{203A} Updates.");
+    assert!(not_finished_text(v("0.2.38")).contains(" › "), "one character, U+203A, a space each side");
+    assert_eq!(NoticeButton::WhatsNew.label(), "What's new");
+    assert_eq!(NoticeButton::Ok.label(), "OK");
+    assert_eq!(update::CHANGES_PAGE, "https://mythicshot.com/changes/");
+    // Each popup and its buttons, OK last (the primary).
+    assert_eq!(notice_view(updated()), (UPDATED_TITLE, "Updated from 0.2.38 to 0.2.39.".to_string(), &[NoticeButton::WhatsNew, NoticeButton::Ok][..]));
+    assert_eq!(notice_view(not_finished()), (NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.\nYou can try again from Preferences › Updates.".to_string(), &[NoticeButton::Ok][..]));
+}
+
+#[test]
+fn there_is_no_popup_until_the_start_hands_one_in() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = updater(&net);
+    assert_eq!(u.notice(), None);
+    u.set_notice(updated(), false);
+    assert_eq!(u.notice(), Some(updated()));
+}
+
+#[test]
+fn whats_new_opens_the_changes_page_and_closes_the_popup() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = updater(&net);
+    u.set_notice(updated(), false);
+    assert!(!u.press_notice(NoticeButton::WhatsNew), "the window was open already: it stays");
+    // At the new version's entry, as the update line's What's new opens it.
+    assert_eq!(u.asks, vec![Ask::Open(update::CHANGES_PAGE, update::changes_anchor(v("0.2.39")))]);
+    assert_eq!(update::changes_anchor(v("0.2.39")), "v0-2-39");
+    assert_eq!(u.notice(), None);
+}
+
+#[test]
+fn ok_closes_the_popup_and_opens_nothing() {
+    let net = Arc::new(FakeNet::default());
+    for after in [updated(), not_finished()] {
+        let mut u = updater(&net);
+        u.set_notice(after, false);
+        assert!(!u.press_notice(NoticeButton::Ok));
+        assert_eq!(u.notice(), None);
+        assert!(u.asks.is_empty());
+    }
+}
+
+#[test]
+fn a_window_opened_only_for_the_popup_closes_with_it() {
+    let net = Arc::new(FakeNet::default());
+    for button in [NoticeButton::Ok, NoticeButton::WhatsNew] {
+        let mut u = updater(&net);
+        u.set_notice(updated(), true);
+        assert!(u.press_notice(button), "{button:?}");
+        // Once: nothing is left to close a window for.
+        assert!(!u.press_notice(button));
+    }
+    // A window closed by hand takes the popup with it, so it never shows twice.
+    let mut u = updater(&net);
+    u.set_notice(not_finished(), true);
+    u.dismiss_notice();
+    assert_eq!(u.notice(), None);
+    assert!(u.asks.is_empty());
+}
+
+/// Draw the popup over an empty window `frames` times with `events` in the last frame.
+fn notice_frames(u: &mut Updater, events: Vec<egui::Event>) -> (egui::FullOutput, bool) {
+    let ctx = crate::theme::test_context();
+    let input = |events| egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 520.0))), events, ..Default::default() };
+    let mut close = false;
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(input(vec![]), |ui| close |= notice_ui(ui.ctx(), u));
+        out.textures_delta.clear();
+    }
+    let mut out = ctx.run_ui(input(events), |ui| close |= notice_ui(ui.ctx(), u));
+    out.textures_delta.clear();
+    (out, close)
+}
+
+#[test]
+fn each_popup_shows_its_title_its_line_and_its_buttons() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = updater(&net);
+    u.set_notice(updated(), false);
+    let (out, _) = notice_frames(&mut u, vec![]);
+    let texts = texts_of(&out);
+    for want in [UPDATED_TITLE, "Updated from 0.2.38 to 0.2.39.", "What's new", "OK"] {
+        assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+    }
+    let mut u = updater(&net);
+    u.set_notice(not_finished(), false);
+    let (out, _) = notice_frames(&mut u, vec![]);
+    let texts = texts_of(&out);
+    for want in [NOT_FINISHED_TITLE, "Mythicshot is still 0.2.38.\nYou can try again from Preferences › Updates.", "OK"] {
+        assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+    }
+    assert!(!texts.iter().any(|t| t == "What's new"), "no other button: {texts:?}");
+    // Without a popup, nothing is drawn.
+    let mut u = updater(&net);
+    let (out, close) = notice_frames(&mut u, vec![]);
+    assert!(texts_of(&out).is_empty() && !close);
+}
+
+#[test]
+fn enter_or_escape_is_ok() {
+    let net = Arc::new(FakeNet::default());
+    for key in [egui::Key::Enter, egui::Key::Escape] {
+        let mut u = updater(&net);
+        u.set_notice(updated(), true);
+        let press = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let (_, close) = notice_frames(&mut u, vec![press]);
+        assert!(close, "{key:?}");
+        assert_eq!(u.notice(), None, "{key:?}");
+        assert!(u.asks.is_empty(), "{key:?}");
+    }
+}
+
+#[test]
+fn a_window_the_person_asked_for_is_kept_after_the_popup() {
+    let net = Arc::new(FakeNet::default());
+    let mut u = updater(&net);
+    u.set_notice(updated(), true);
+    u.keep_window();
+    assert_eq!(u.notice(), Some(updated()), "the popup stays up");
+    assert!(!u.press_notice(NoticeButton::Ok), "and OK no longer closes the window");
+    // Without a popup it changes nothing.
+    let mut u = updater(&net);
+    u.keep_window();
+    assert_eq!(u.notice(), None);
+}
+
+#[test]
+fn the_log_says_what_the_start_found_in_words() {
+    assert_eq!(updated().to_string(), "updated from 0.2.38 to 0.2.39");
+    assert_eq!(not_finished().to_string(), "still 0.2.38, the update did not finish");
+}

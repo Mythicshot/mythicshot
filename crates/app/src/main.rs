@@ -327,9 +327,17 @@ impl App {
         })));
         // Updates: mythicshot.com, the app's own updates folder and capture.log. Nothing is asked
         // before the first frame (see `tick_update`).
+        let mut window_request = main_window::start_request(std::env::args());
         if let Ok(mut s) = window.lock() {
             let wake = ctx.clone();
             s.update = update_ui::Updater::new(Arc::new(update_ui::Official), update::Version::running()).with_wake(move || wake.request_repaint());
+            // The note an in-app update left: read and removed now, so its popup shows once. The
+            // relaunch after an install starts in the tray, so the main window opens to hold it.
+            let (request, after) = s.start_with_note(window_request, &update::pending::path(), std::time::SystemTime::now(), update::Version::running());
+            window_request = request;
+            if let Some(after) = after {
+                update::log(&format!("after update: {after}"));
+            }
         }
         // Deletes a past run could not finish: the Tours page offers to carry them on.
         if let Ok(s) = window.lock() {
@@ -351,7 +359,7 @@ impl App {
             bar_showing: None,
             trigger: "other",
             window,
-            window_request: main_window::start_request(std::env::args()),
+            window_request,
             last_foreground: main_window::LastForeground::default(),
             hide_then_run: main_window::HideThenRun::default(),
             settings_state: SettingsState::default(),
@@ -1542,7 +1550,7 @@ impl App {
         // closed afterwards, so it never comes back over the overlay or the editor.
         if let Some(cmd) = capture {
             if let Ok(mut s) = self.window.lock() {
-                s.nav.close();
+                s.close_window();
                 s.settle(ctx);
             }
             self.window_request = None;
@@ -1609,8 +1617,9 @@ impl eframe::App for App {
         // the very last thing. The handle stays open until the process has gone, so the file
         // cannot be changed, moved or deleted before then.
         if let Some(held) = self.install_on_exit.take() {
-            match update::start_installer(&held, &update::WindowsLaunch) {
-                Ok(()) => update::log("install: msiexec started"),
+            match update::start_installer(&held, update::Version::running(), &update::pending::path(), &update::WindowsLaunch) {
+                Ok(true) => update::log("install: msiexec started"),
+                Ok(false) => update::log("install: msiexec started, the note for the next start could not be written"),
                 Err(e) => update::log(&format!("install: not started ({e})")),
             }
             std::mem::forget(held);

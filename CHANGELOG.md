@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.39 (2026-11-25)
+
+- After Mythicshot updates itself and restarts, it says so: a small window, "Mythicshot is up to date", names the version it came from and the one it is now, with a "What's new" button that opens that version's entry on the website. It shows once and then Mythicshot goes back to the tray.
+- If the installer was cancelled or did not finish, the next start says "The update did not finish" and where to try again, instead of saying nothing.
+- Installing by hand shows neither.
+
 ## 0.2.38 (2026-11-25)
 
 - A picture file can be placed on a capture: drop it on an editor window, or use the new "Picture" tool on the rail. It lands where it was dropped (the tool puts it in the middle of the view), selected, as one undo step, and from there it is the picture object the editor already had. A picture larger than the capture is scaled down to fit and kept at that size.

@@ -18,6 +18,8 @@
 //! - It is started only from that file, held open so nothing can change, move or delete it from
 //!   its check until the app has gone ([`open_verified`]), by `msiexec.exe` from the Windows
 //!   system folder, with real arguments and no shell ([`start_installer`]).
+//! - Just before msiexec starts, a note of the versions updated from and to is left for the next
+//!   start, which tells the person whether the update worked ([`pending`]).
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -27,6 +29,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use ureq::tls::{RootCerts, TlsConfig};
+
+pub mod pending;
 
 /// The one site asked. Never changed by anything at run time.
 pub const HOST: &str = "https://mythicshot.com";
@@ -590,11 +594,18 @@ pub fn check_signature(_installer: &Path) -> SignatureCheck {
 pub struct Verified {
     _file: std::fs::File,
     path: PathBuf,
+    /// The version of the release whose size and SHA-256 it matched.
+    version: Version,
 }
 
 impl Verified {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The version this installer installs.
+    pub fn version(&self) -> Version {
+        self.version
     }
 }
 
@@ -636,7 +647,7 @@ pub fn open_verified(path: &Path, release: &Release) -> Result<Verified, &'stati
     if len != release.size() || hex(hasher.finalize()) != release.sha256() {
         return Err("the installer is not the file that was checked");
     }
-    Ok(Verified { _file: file, path: path.to_path_buf() })
+    Ok(Verified { _file: file, path: path.to_path_buf(), version: release.version() })
 }
 
 /// What starting the installer needs of the system: a test hands in its own, which runs nothing.
@@ -686,14 +697,28 @@ pub fn msiexec_args(installer: &Path) -> Vec<OsString> {
     vec!["/i".into(), installer.as_os_str().to_os_string(), "/passive".into(), "/norestart".into(), "MYTHICSHOT_RELAUNCH=1".into()]
 }
 
-/// Start `msiexec.exe` from the system folder on the held, checked installer. The caller keeps
-/// `held` until the app has gone. The error is a fixed sentence for the log.
-pub fn start_installer(held: &Verified, launch: &dyn Launch) -> Result<(), &'static str> {
+/// Start `msiexec.exe` from the system folder on the held, checked installer, for an in-app
+/// update from `running`. Just before, the note for the next start ([`pending`]) is written at
+/// `note`: from `running` to the installer's version. When msiexec cannot be started the note is
+/// removed again, so the next start shows nothing. A note that cannot be written does not stop
+/// the update; Ok says whether it was written. The caller keeps `held` until the app has gone.
+/// The error is a fixed sentence for the log.
+pub fn start_installer(held: &Verified, running: Version, note: &Path, launch: &dyn Launch) -> Result<bool, &'static str> {
     if !check_signature(held.path()).allows() {
         return Err("the installer's signature was refused");
     }
     let system = launch.system_dir().filter(|d| d.is_absolute()).ok_or("the Windows system folder is not known")?;
-    launch.spawn(&system.join("msiexec.exe"), &msiexec_args(held.path())).map_err(|_| "msiexec could not be started")
+    // An update always goes to a newer version; anything else is no update to tell about.
+    let noted = running < held.version() && pending::write(note, pending::Pending { from: running, to: held.version() }).is_ok();
+    match launch.spawn(&system.join("msiexec.exe"), &msiexec_args(held.path())) {
+        Ok(()) => Ok(noted),
+        Err(_) => {
+            if noted {
+                pending::remove(note);
+            }
+            Err("msiexec could not be started")
+        }
+    }
 }
 
 // ---- The log ----

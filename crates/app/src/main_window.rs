@@ -92,6 +92,17 @@ pub fn start_request(args: impl IntoIterator<Item = String>) -> Option<Request> 
     args.into_iter().any(|a| a == "--settings").then_some(Request::Page(Page::Preferences))
 }
 
+/// What to open at start-up when the popup after an in-app update is to be shown, given what
+/// [`start_request`] asked for. The relaunch after an install starts the app to the tray, where a
+/// popup would be seen by nobody, so the window opens on Home to hold it; and whether it was
+/// opened only for the popup, so that it closes with it.
+pub fn notice_request(start: Option<Request>) -> (Request, bool) {
+    match start {
+        Some(request) => (request, false),
+        None => (Request::Open, true),
+    }
+}
+
 /// Which page is up and whether the window is open, without any drawing.
 #[derive(Debug, Default)]
 pub struct Nav {
@@ -276,13 +287,42 @@ impl Shared {
             Entry::Workspace => out.go_to = Some(Page::Workspace),
             Entry::Preferences(tab) => self.open_preferences(tab),
             Entry::About => self.open_preferences(settings_ui::Tab::General),
-            Entry::CloseWindow => self.nav.close(),
+            Entry::CloseWindow => self.close_window(),
             entry => {
                 if let Some(request) = entry.app_request() {
                     self.app_requests.push(request);
                 }
             }
         }
+    }
+
+    /// A request to show the window. One that comes while the popup after an update is up means
+    /// the person wants the window: it stays when the popup closes.
+    pub fn apply_request(&mut self, request: Request) {
+        if self.update.notice().is_some() {
+            self.update.keep_window();
+        }
+        self.nav.apply(request);
+    }
+
+    /// At start: take the note an in-app update left at `note` (read and removed, so its popup
+    /// shows once) and, when it means a popup, open the window for it now, on the page `start`
+    /// asked for or on Home ([`notice_request`]). The request left for the first frame (none once
+    /// the window is open for the popup), and what the note meant, for the log.
+    pub fn start_with_note(&mut self, start: Option<Request>, note: &std::path::Path, now: std::time::SystemTime, running: crate::update::Version) -> (Option<Request>, Option<crate::update::pending::AfterUpdate>) {
+        let Some(after) = crate::update::pending::take(note, now, running) else { return (start, None) };
+        let (request, opened) = notice_request(start);
+        // Opened here, not as a request on the first frame: a request while the popup is up
+        // would keep the window after it.
+        self.nav.apply(request);
+        self.update.set_notice(after, opened);
+        (None, Some(after))
+    }
+
+    /// Close the window, as its close button does: the popup after an update goes with it.
+    pub fn close_window(&mut self) {
+        self.nav.close();
+        self.update.dismiss_notice();
     }
 
     /// Drop a page's unfinished input once the page has been left. Settings themselves are
@@ -395,7 +435,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
     let dark_title = {
         let mut s = shared.lock().expect("main window state");
         if let Some(request) = request {
-            s.nav.apply(request);
+            s.apply_request(request);
         }
         s.settle(ctx);
         if !s.nav.is_open() {
@@ -409,16 +449,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
     ctx.show_viewport_deferred(viewport_id(), builder, move |ui, _class| {
         let mut guard = shared.lock().expect("main window state");
         let s = &mut *guard;
-        if s.nav.take_focus() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        if ui.ctx().input(|i| i.viewport().close_requested()) {
-            // Only the window goes; the app stays in the tray.
-            s.nav.close();
-        }
-        window_ui(ui, s);
-        s.settle(ui.ctx());
+        viewport_ui(ui, s);
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
         if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || s.open_image.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
@@ -428,6 +459,21 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         theme::dark_title_bar(ctx, viewport_id());
     }
     ctx.request_repaint_of(viewport_id());
+}
+
+/// One frame of the window's viewport: brought to the front when asked, closed by its close
+/// button, and its contents drawn.
+fn viewport_ui(ui: &mut egui::Ui, s: &mut Shared) {
+    if s.nav.take_focus() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+    if ui.ctx().input(|i| i.viewport().close_requested()) {
+        // Only the window goes; the app stays in the tray.
+        s.close_window();
+    }
+    window_ui(ui, s);
+    s.settle(ui.ctx());
 }
 
 /// The window's viewport. It takes files dropped on it (a picture opens in the editor). Windows
@@ -473,6 +519,10 @@ fn window_ui_given(ui: &mut egui::Ui, s: &mut Shared, tours_conn: &tours_ui::Con
         out.open_image = Some(OpenImage::Dropped(path));
     }
     s.take(out);
+    // The popup at the start after an in-app update, over everything else in the window.
+    if crate::update_ui::notice_ui(ui.ctx(), &mut s.update) {
+        s.nav.close();
+    }
 }
 
 /// The lines at the foot of the left menu: "Signed in to" and the host when this computer holds
@@ -1004,6 +1054,127 @@ pub(crate) mod tests {
             crate::menu_bar::tests::assert_inside(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, size), &format!("the window at {ppp}"));
             assert_eq!(crate::snapshot::uncovered(&crate::theme::test_context(), size, ppp, 3, |ui| window_ui(ui, &mut s)), 0, "at {ppp}");
         }
+    }
+
+    #[test]
+    fn a_popup_after_an_update_opens_the_window_when_the_app_starts_to_the_tray() {
+        // The relaunch after an install starts the app with no argument: to the tray.
+        assert_eq!(start_request(["mythicshot.exe".to_string()]), None);
+        assert_eq!(notice_request(None), (Request::Open, true), "opened for the popup, on Home");
+        // Asked for Preferences anyway: that page, and the window stays after the popup.
+        assert_eq!(notice_request(Some(Request::Page(Page::Preferences))), (Request::Page(Page::Preferences), false));
+        let mut nav = Nav::default();
+        nav.apply(notice_request(None).0);
+        assert!(nav.is_open() && nav.take_focus(), "it comes to the front");
+        assert_eq!(nav.page(), Page::Home);
+    }
+
+    #[test]
+    fn the_popup_stands_over_the_window_and_ok_closes_a_window_opened_for_it() {
+        use crate::update::pending::AfterUpdate;
+        let v = |s: &str| crate::update::Version::parse(s).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        for opened_for_it in [true, false] {
+            let mut s = shared(tmp.path());
+            let (request, _) = notice_request(None);
+            s.nav.apply(request);
+            s.update.set_notice(AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }, opened_for_it);
+            window_frame(&ctx, &mut s, size, vec![]);
+            let out = window_frame(&ctx, &mut s, size, vec![]);
+            assert!(crate::share_ui::tests::text_rect(&out, crate::update_ui::UPDATED_TITLE).is_some(), "the popup is in the window");
+            window_frame(&ctx, &mut s, size, vec![enter.clone()]);
+            assert_eq!(s.update.notice(), None);
+            assert_eq!(s.nav.is_open(), !opened_for_it, "opened for it: {opened_for_it}");
+        }
+        // Closed by hand with the popup up, through the window's own close button: the popup
+        // goes too, and does not come back on the next open.
+        let mut s = shared(tmp.path());
+        s.nav.apply(Request::Open);
+        s.update.set_notice(AfterUpdate::NotFinished { from: v("0.2.38") }, true);
+        let mut input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
+        let mut out = ctx.run_ui(input, |ui| viewport_ui(ui, &mut s));
+        out.textures_delta.clear();
+        assert!(!s.nav.is_open());
+        assert_eq!(s.update.notice(), None);
+        s.apply_request(Request::Open);
+        let out = window_frame(&ctx, &mut s, size, vec![]);
+        assert!(crate::share_ui::tests::text_rect(&out, crate::update_ui::NOT_FINISHED_TITLE).is_none());
+    }
+
+    #[test]
+    fn a_window_asked_for_while_the_popup_is_up_stays_after_ok() {
+        use crate::update::pending::AfterUpdate;
+        let v = |s: &str| crate::update::Version::parse(s).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(SIZE[0], SIZE[1]);
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        // The tray's "Open Mythicshot", a hotkey's Preferences, or the tray's update entry.
+        for request in [Request::Open, Request::Page(Page::Preferences)] {
+            let mut s = shared(tmp.path());
+            s.nav.apply(notice_request(None).0);
+            s.update.set_notice(AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }, true);
+            s.apply_request(request);
+            window_frame(&ctx, &mut s, size, vec![]);
+            window_frame(&ctx, &mut s, size, vec![enter.clone()]);
+            assert_eq!(s.update.notice(), None, "{request:?}");
+            assert!(s.nav.is_open(), "{request:?}: the window the person asked for stays");
+        }
+        // Without a popup a request is only a request.
+        let mut s = shared(tmp.path());
+        s.apply_request(Request::Page(Page::Tours));
+        assert!(s.nav.is_open() && s.nav.page() == Page::Tours);
+    }
+
+    #[test]
+    fn close_window_in_the_menu_takes_the_popup_with_it() {
+        use crate::update::pending::AfterUpdate;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = shared(tmp.path());
+        s.nav.apply(Request::Open);
+        s.update.set_notice(AfterUpdate::NotFinished { from: crate::update::Version::parse("0.2.38").unwrap() }, false);
+        let mut out = PageOut::default();
+        s.menu_entry(Entry::CloseWindow, &mut out);
+        assert!(!s.nav.is_open());
+        assert_eq!(s.update.notice(), None, "never left behind for the next open");
+    }
+
+    #[test]
+    fn the_start_takes_the_note_and_opens_the_window_for_the_popup() {
+        use crate::update::pending::{self, AfterUpdate, Pending};
+        let v = |s: &str| crate::update::Version::parse(s).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join(pending::FILE_NAME);
+        let now = std::time::SystemTime::now();
+        // Started to the tray after an update that worked.
+        pending::write(&note, Pending { from: v("0.2.38"), to: v("0.2.39") }).unwrap();
+        let mut s = shared(tmp.path());
+        let (request, after) = s.start_with_note(None, &note, now, v("0.2.39"));
+        assert_eq!(after, Some(AfterUpdate::Updated { from: v("0.2.38"), to: v("0.2.39") }));
+        assert_eq!(request, None, "nothing left for the first frame to ask");
+        assert!(s.nav.is_open() && s.nav.page() == Page::Home && s.nav.take_focus(), "open on Home, in front");
+        assert_eq!(s.update.notice(), after);
+        assert!(!note.exists(), "the note is gone");
+        // OK closes the window that was opened for it.
+        assert!(s.update.press_notice(crate::update_ui::NoticeButton::Ok));
+        // Started with --settings after an update that did not finish: that page, kept after OK.
+        pending::write(&note, Pending { from: v("0.2.38"), to: v("0.2.39") }).unwrap();
+        let mut s = shared(tmp.path());
+        let (request, after) = s.start_with_note(start_request(["mythicshot.exe".to_string(), "--settings".to_string()]), &note, now, v("0.2.38"));
+        assert_eq!(after, Some(AfterUpdate::NotFinished { from: v("0.2.38") }));
+        assert_eq!(request, None);
+        assert!(s.nav.is_open() && s.nav.page() == Page::Preferences);
+        assert!(!s.update.press_notice(crate::update_ui::NoticeButton::Ok));
+        // No note: the start is as before.
+        let mut s = shared(tmp.path());
+        assert_eq!(s.start_with_note(None, &note, now, v("0.2.39")), (None, None));
+        assert!(!s.nav.is_open() && s.update.notice().is_none());
+        let args = start_request(["mythicshot.exe".to_string(), "--settings".to_string()]);
+        assert_eq!(s.start_with_note(args, &note, now, v("0.2.39")), (args, None));
     }
 
     #[test]
