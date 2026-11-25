@@ -27,7 +27,7 @@ use crate::tray::Command;
 
 pub const TITLE: &str = "Mythicshot";
 pub const SIZE: [f32; 2] = [760.0, 520.0];
-const MIN_SIZE: [f32; 2] = [640.0, 420.0];
+pub(crate) const MIN_SIZE: [f32; 2] = [640.0, 420.0];
 const NAV_WIDTH: f32 = 170.0;
 
 /// How long after the window is closed a capture started from it waits, so the window is off the

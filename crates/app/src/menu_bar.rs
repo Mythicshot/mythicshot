@@ -237,7 +237,7 @@ pub fn bar(ui: &mut egui::Ui, id: &'static str, state: &State) -> BarOut {
     let frame = egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(4, 1));
     let (mut picked, mut open) = (None, false);
     let rect = egui::Panel::top(id).resizable(false).frame(frame).show(ui, |ui| {
-        egui::MenuBar::new().ui(ui, |ui| {
+        egui::MenuBar::new().style(theme::menu_bar_style).config(theme::menu_config()).ui(ui, |ui| {
             for menu in menus(state) {
                 open |= ui.menu_button(menu.title, |ui| {
                     ui.set_min_width(200.0);
@@ -265,10 +265,9 @@ pub fn bar(ui: &mut egui::Ui, id: &'static str, state: &State) -> BarOut {
 /// not apply. True when it was clicked.
 fn entry_ui(ui: &mut egui::Ui, it: &Item) -> bool {
     let resp = match it.checked {
-        Some(checked) => {
-            let mut shown = checked;
-            ui.add_enabled(it.enabled, egui::Checkbox::new(&mut shown, it.entry.label()))
-        }
+        // A row of its own: egui's check box draws its box in the menu's own colour, and lights
+        // only the box under the pointer, not the row.
+        Some(checked) => theme::menu_check(ui, it.enabled, checked, it.entry.label(), it.shortcut.as_str()),
         None => ui.add_enabled(it.enabled, egui::Button::new(it.entry.label()).shortcut_text(it.shortcut.as_str())),
     };
     let resp = if it.entry == Entry::Properties { resp.on_disabled_hover_text(NOTHING_TO_SET) } else { resp };

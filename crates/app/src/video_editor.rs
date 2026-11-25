@@ -2363,14 +2363,14 @@ fn overlay_controls(ui: &mut egui::Ui, o: &mut OverlayStyle, place: Place) {
     let (keys_salt, clicks_salt) = if place == Place::Toolbar { ("tl-keys", "tl-clicks") } else { ("tl-keys-panel", "tl-clicks-panel") };
     let shown = |name: &str, value: &str| if place == Place::Toolbar { format!("{name}: {value}") } else { value.to_string() };
     in_row(ui, place, "Keys", |ui| {
-        egui::ComboBox::from_id_salt(keys_salt).width(118.0).selected_text(shown("Keys", key_style_label(o.keys))).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(keys_salt).popup_style(theme::menu_style.into()).width(118.0).selected_text(shown("Keys", key_style_label(o.keys))).show_ui(ui, |ui| {
             for k in [KeyStyle::Off, KeyStyle::Chips, KeyStyle::Keyboard] {
                 ui.selectable_value(&mut o.keys, k, key_style_label(k));
             }
         });
     });
     in_row(ui, place, "Clicks", |ui| {
-        egui::ComboBox::from_id_salt(clicks_salt).width(118.0).selected_text(shown("Clicks", click_style_label(o.clicks))).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(clicks_salt).popup_style(theme::menu_style.into()).width(118.0).selected_text(shown("Clicks", click_style_label(o.clicks))).show_ui(ui, |ui| {
             for c in [ClickStyle::Off, ClickStyle::Ripple, ClickStyle::Mouse, ClickStyle::Both] {
                 ui.selectable_value(&mut o.clicks, c, click_style_label(c));
             }
@@ -2401,7 +2401,7 @@ fn frame_buttons(ui: &mut egui::Ui, v: &mut VideoState, place: Place) {
 
 /// The playback speeds: the Timeline view's controls row and the panel's "Speed".
 fn speed_choice(ui: &mut egui::Ui, salt: &str, speed: &mut f32) {
-    egui::ComboBox::from_id_salt(salt).width(64.0).selected_text(format!("{speed}×")).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(salt).popup_style(theme::menu_style.into()).width(64.0).selected_text(format!("{speed}×")).show_ui(ui, |ui| {
         for s in [0.25, 0.5, 1.0, 1.5, 2.0, 4.0] {
             ui.selectable_value(speed, s, format!("{s}×"));
         }

@@ -167,6 +167,133 @@ fn the_dropdown_lists_every_profile_with_its_state_and_the_active_one() {
     assert_eq!(out, Some(None));
 }
 
+/// The profile list open from the dropdown in a window `size` big, a frame for each of `steps`'
+/// events: the last frame and what was picked.
+fn dropdown_frames(ctx: &egui::Context, rows: &[Entry], size: egui::Vec2, steps: Vec<Vec<egui::Event>>) -> (egui::FullOutput, Option<Pick>) {
+    let mut last = None;
+    let mut picked = None;
+    for events in steps {
+        // Half a second apart, so the list has faded in.
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            crate::theme::page(ui, |ui| {
+                if let Some(p) = dropdown_with(ui, "hover", rows, true) {
+                    picked = Some(p);
+                }
+            });
+        });
+        out.textures_delta.clear();
+        last = Some(out);
+    }
+    (last.unwrap(), picked)
+}
+
+/// The active profile's row, the one holding `name`, has its bar: [`theme::ACTIVE_BAR_WIDTH`]
+/// wide in primary-text at the row's left edge, inside the row's rounded shape (clear of its
+/// corners), and no other row has one.
+pub(crate) fn assert_active_bar(out: &egui::FullOutput, name: &str, what: &str) {
+    let at = crate::menu_bar::tests::last_text_rect(out, name).unwrap_or_else(|| panic!("{what}: {name}")).center();
+    let fills = crate::theme::checks::fills(out);
+    let row = fills.iter().filter(|(r, c, _)| *c == theme::SELECTION && r.contains(at)).map(|(r, ..)| *r).min_by(|a, b| a.area().total_cmp(&b.area())).unwrap_or_else(|| panic!("{what}: the active row"));
+    let bars: Vec<egui::Rect> = fills.iter().filter(|(r, c, _)| *c == theme::PRIMARY_TEXT && (r.width() - theme::ACTIVE_BAR_WIDTH).abs() < 0.01).map(|(r, ..)| *r).collect();
+    assert_eq!(bars.len(), 1, "{what}: one bar, on the active row: {bars:?}");
+    let bar = bars[0];
+    let radius = f32::from(theme::RADIUS_SM);
+    assert!((bar.left() - row.left()).abs() < 0.01, "{what}: at the row's left edge: {bar:?} {row:?}");
+    assert!(bar.top() >= row.top() + radius - 0.01 && bar.bottom() <= row.bottom() - radius + 0.01, "{what}: clear of the rounded corners: {bar:?} {row:?}");
+    assert!(bar.height() >= row.height() - 2.0 * radius - 0.01, "{what}: as high as the row allows: {bar:?} {row:?}");
+}
+
+fn press(at: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+}
+
+fn hover_rows() -> Vec<Entry> {
+    vec![
+        Entry { id: "pa".into(), name: "Sandbox test".into(), detail: "Sandbox test · tours.example.com".into(), active: true, waiting: false },
+        Entry { id: "pb".into(), name: "Customer demo".into(), detail: "Customer demo · tours.example.com".into(), active: false, waiting: false },
+        Entry { id: "pc".into(), name: "customer1 test".into(), detail: "customer1's workspace · localhost:3000".into(), active: false, waiting: true },
+    ]
+}
+
+/// The profile list lights the row under the pointer across the list's width, with the hand,
+/// and a click anywhere on the row (not only on the name) picks it. The active row keeps its dot,
+/// its "Active" and the selection fill, hovered or not; "+ Add profile…" and "Manage profiles…"
+/// light up the same way. Nothing overlaps or sticks out, at 100% and 200%, in a window as small
+/// as the main window's smallest.
+#[test]
+fn the_profile_list_lights_the_row_under_the_pointer_and_takes_a_click_anywhere_on_it() {
+    let rows = hover_rows();
+    for ppp in [1.0, 2.0] {
+        for size in [egui::vec2(900.0, 640.0), egui::vec2(crate::main_window::MIN_SIZE[0], crate::main_window::MIN_SIZE[1])] {
+            let what = format!("{size:?} at {ppp}");
+            let ctx = crate::theme::test_context();
+            ctx.set_pixels_per_point(ppp);
+            let (out, _) = dropdown_frames(&ctx, &rows, size, vec![vec![], vec![]]);
+            let button = crate::share_ui::tests::text_rect(&out, "Sandbox test").unwrap().center();
+            let (open, _) = dropdown_frames(&ctx, &rows, size, vec![vec![egui::Event::PointerMoved(button)], vec![press(button, true)], vec![press(button, false)], vec![], vec![]]);
+            let name = crate::menu_bar::tests::last_text_rect(&open, "Customer demo").unwrap_or_else(|| panic!("{what}: the list is not open"));
+            // The pointer on the row's right end, past its words.
+            let list = crate::theme::checks::fills(&open).into_iter().filter(|(r, c, _)| *c == theme::RAISED && r.contains(name.center())).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).unwrap_or_else(|| panic!("the list frame around {name:?}: {:?}", crate::theme::checks::fills(&open))).0;
+            let at = egui::pos2(list.right() - 12.0, name.center().y);
+            let (lit, _) = dropdown_frames(&ctx, &rows, size, vec![vec![egui::Event::PointerMoved(at)], vec![], vec![]]);
+            let hovered: Vec<_> = crate::theme::checks::fills(&lit).into_iter().filter(|(_, c, _)| *c == theme::MENU_HOVER).collect();
+            assert_eq!(hovered.len(), 1, "{what}: one row is lit at {at:?}: {hovered:?} {:?}", crate::theme::checks::fills(&lit));
+            let (row, _, radius) = hovered[0];
+            let detail = crate::menu_bar::tests::last_text_rect(&lit, "Customer demo · tours.example.com").unwrap();
+            assert!(row.contains(name.center()) && row.contains(detail.center()), "{what}: the whole row, name and detail, is lit: {row:?}");
+            assert!(row.width() >= theme::PROFILE_LIST_WIDTH - 0.5 && row.left() >= list.left() && row.right() <= list.right(), "{what}: across the list: {row:?} in {list:?}");
+            assert!(row.height() >= theme::MENU_ROW_HEIGHT, "{what}: {row:?}");
+            assert_eq!(radius, theme::RADIUS_SM, "{what}");
+            assert_eq!(lit.platform_output.cursor_icon, egui::CursorIcon::PointingHand, "{what}");
+            // The active row: its dot and "Active", on the selection fill, not the hover's.
+            let active_name = crate::menu_bar::tests::last_text_rect(&lit, "Sandbox test").unwrap();
+            let active = crate::menu_bar::tests::last_text_rect(&lit, profiles::ACTIVE).unwrap_or_else(|| panic!("{what}: the active row says so"));
+            let selected = crate::theme::checks::fills(&lit).into_iter().find(|(r, c, _)| *c == theme::SELECTION && r.contains(active_name.center()) && r.contains(active.center()));
+            assert!(selected.is_some(), "{what}: the active row is on the selection fill");
+            assert!(!row.intersects(selected.unwrap().0.shrink(1.0)), "{what}: the lit row and the active one are apart");
+            assert_active_bar(&lit, "Sandbox test", &what);
+            // Nothing overlaps or sticks out of the window.
+            theme::checks::assert_no_overlaps(&lit, &what);
+            theme::checks::assert_texts_fit(&lit, &what);
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            assert!(window.contains_rect(list), "{what}: the list {list:?} is inside the window");
+            // "+ Add profile…" and "Manage profiles…" light up under the pointer too.
+            for word in [profiles::ADD_PROFILE, profiles::MANAGE_PROFILES] {
+                let at = crate::menu_bar::tests::last_text_rect(&lit, word).unwrap().center() + egui::vec2(60.0, 0.0);
+                let (o, _) = dropdown_frames(&ctx, &rows, size, vec![vec![egui::Event::PointerMoved(at)], vec![], vec![]]);
+                let w = crate::menu_bar::tests::last_text_rect(&o, word).unwrap();
+                assert!(crate::theme::checks::fills(&o).iter().any(|(r, c, _)| *c == theme::MENU_HOVER && r.contains(w.center()) && r.width() >= theme::PROFILE_LIST_WIDTH - 0.5), "{what}: {word} is lit");
+            }
+            // A click on the lit row's right end picks that profile.
+            let (_, picked) = dropdown_frames(&ctx, &rows, size, vec![vec![egui::Event::PointerMoved(at)], vec![press(at, true)], vec![press(at, false)], vec![]]);
+            assert_eq!(picked, Some(Pick::Switch("pb".into())), "{what}");
+        }
+    }
+}
+
+/// A disabled dropdown (a job of the window runs) opens no list, so no row lights up.
+#[test]
+fn a_disabled_dropdown_lights_nothing() {
+    let rows = hover_rows();
+    let ctx = crate::theme::test_context();
+    let size = egui::vec2(900.0, 640.0);
+    let draw = |events: Vec<egui::Event>| {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| crate::theme::page(ui, |ui| drop(dropdown_with(ui, "off", &rows, false))));
+        out.textures_delta.clear();
+        out
+    };
+    let at = crate::share_ui::tests::text_rect(&draw(vec![]), "Sandbox test").unwrap().center();
+    for events in [vec![egui::Event::PointerMoved(at)], vec![press(at, true)], vec![press(at, false)], vec![]] {
+        draw(events);
+    }
+    let out = draw(vec![]);
+    assert!(crate::menu_bar::tests::last_text_rect(&out, profiles::MANAGE_PROFILES).is_none(), "no list opens");
+    assert!(crate::theme::checks::fills(&out).iter().all(|(_, c, _)| *c != theme::MENU_HOVER));
+    assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::PointingHand);
+}
+
 // ---- 6. The update of another profile's tour ----
 
 #[test]

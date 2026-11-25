@@ -77,6 +77,8 @@ struct Fixture {
     given: WorkspaceGiven,
     _site: Stub,
     _dir: tempfile::TempDir,
+    /// Every texture the fixture's frames handed out, so a shot of its context shows its letters.
+    painter: crate::snapshot::Painter,
 }
 
 fn fixture(kind: Kind) -> Fixture {
@@ -110,14 +112,14 @@ fn fixture(kind: Kind) -> Fixture {
     let conn = workspace_ui::Conn { token, epoch: 1, test_server: None, bound: Some(site.base.clone()), refused, profile: Some("pa".into()) };
     s.nav.request(Page::Workspace);
     s.nav.take_focus();
-    Fixture { s, given: (active, conn), _site: site, _dir: dir }
+    Fixture { s, given: (active, conn), _site: site, _dir: dir, painter: crate::snapshot::Painter::default() }
 }
 
 fn frame(ctx: &egui::Context, f: &mut Fixture, size: egui::Vec2) -> egui::FullOutput {
     let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
     let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
     let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
-    out.textures_delta.clear();
+    f.painter.update(&mut out.textures_delta);
     out
 }
 
@@ -530,6 +532,39 @@ fn roomy_renders() {
                 let shot = crate::snapshot::shot(&crate::theme::test_context(), size, ppp, 3, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
                 assert_eq!(crate::snapshot::save(&shot, &format!("{label}-{suffix}")), 0, "{label}");
             }
+            // The profile list open, one row under the pointer: from Switch profile on the
+            // Workspace page, and from the Tours page's dropdown.
+            let (ctx, mut f, out) = settled(Kind::Connected, size, ppp);
+            switch_list_hovered(&ctx, &mut f, size, &out, "Customer demo");
+            let painter = std::mem::take(&mut f.painter);
+            let shot = crate::snapshot::shot_with(&ctx, painter, size, ppp, 2, |ui| window_ui_given(ui, &mut f.s, &missing, Some(&f.given)));
+            assert_eq!(crate::snapshot::save(&shot, &format!("workspace-profile-menu-hover-{suffix}")), 0);
+            let mut f = fixture(Kind::Add);
+            f.s.tours = crate::tours_ui::tests::page_with(Vec::new());
+            f.s.nav.request(Page::Tours);
+            crate::publish_ui::with_test_book(tour_book(), || {
+                let ctx = crate::theme::test_context();
+                ctx.set_pixels_per_point(ppp);
+                let mut painter = crate::snapshot::Painter::default();
+                let mut draw = |events: Vec<egui::Event>| {
+                    let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+                    let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
+                    painter.update(&mut out.textures_delta);
+                    out
+                };
+                draw(vec![]);
+                let at = on_page(&draw(vec![]), "Sandbox test").center();
+                let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                let mut open = None;
+                for events in [vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![], vec![]] {
+                    open = Some(draw(events));
+                }
+                let row = crate::menu_bar::tests::last_text_rect(&open.unwrap(), "Customer demo").expect("the list is open").center();
+                draw(vec![egui::Event::PointerMoved(row + egui::vec2(120.0, 0.0))]);
+                draw(vec![]);
+                let shot = crate::snapshot::shot_with(&ctx, painter, size, ppp, 2, |ui| window_ui_given(ui, &mut f.s, &tours_conn, None));
+                assert_eq!(crate::snapshot::save(&shot, &format!("tours-profile-menu-hover-{suffix}")), 0);
+            });
             // The update line, in each of its states, over the Home page.
             for state in ["available", "downloading", "checked", "waiting", "mismatch"] {
                 let mut f = fixture(Kind::Add);
@@ -661,6 +696,62 @@ fn the_profile_card_stays_when_no_profile_is_active() {
         let t = texts(&last.unwrap());
         for word in [profiles::MANAGE_PROFILES, profiles::ADD_PROFILE, "Sandbox test", "Customer demo"] {
             assert!(t.iter().any(|x| x == word), "{kind:?}: {word:?} not in the list: {t:?}");
+        }
+    }
+}
+
+/// Open the list Switch profile opens and put the pointer on the row of `hover`, near the row's
+/// right end (past its words): the frame after, with the list open and that row under the pointer.
+fn switch_list_hovered(ctx: &egui::Context, f: &mut Fixture, size: egui::Vec2, out: &egui::FullOutput, hover: &str) -> egui::FullOutput {
+    let at = holder(out, profiles::SWITCH_PROFILE).center();
+    let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    let mut draw = |events: Vec<egui::Event>| {
+        // Half a second apart, so the list has faded in.
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, time: Some(ctx.input(|i| i.time) + 0.5), ..Default::default() };
+        let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+        let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
+        f.painter.update(&mut out.textures_delta);
+        out
+    };
+    let mut open = None;
+    for events in [vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![], vec![]] {
+        open = Some(draw(events));
+    }
+    let open = open.unwrap();
+    let word = crate::menu_bar::tests::last_text_rect(&open, hover).unwrap_or_else(|| panic!("{hover:?} is not in the list"));
+    let list = theme::checks::fills(&open).into_iter().filter(|(r, c, radius)| *c == theme::RAISED && *radius == theme::RADIUS_LG && r.contains(word.center())).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).expect("the list's frame").0;
+    let to = egui::pos2(list.right() - 16.0, word.center().y);
+    draw(vec![egui::Event::PointerMoved(to)]);
+    draw(vec![])
+}
+
+/// In the list Switch profile opens, the row under the pointer is lit across the list with the
+/// hand, the active row keeps its "Active" on the selection fill, and nothing overlaps or runs
+/// off the window, at the usual and the smallest size, at 100% and 200%.
+#[test]
+fn the_switch_profile_list_lights_the_row_under_the_pointer() {
+    for (name, size) in SIZES {
+        for ppp in [1.0, 2.0] {
+            let what = format!("{name} at {ppp}");
+            let size = egui::vec2(size[0], size[1]);
+            let (ctx, mut f, out) = settled(Kind::Connected, size, ppp);
+            let lit = switch_list_hovered(&ctx, &mut f, size, &out, "Customer demo");
+            let name_at = crate::menu_bar::tests::last_text_rect(&lit, "Customer demo").unwrap();
+            let rows: Vec<_> = theme::checks::fills(&lit).into_iter().filter(|(_, c, _)| *c == theme::MENU_HOVER).collect();
+            assert_eq!(rows.len(), 1, "{what}: {rows:?}");
+            let (row, _, radius) = rows[0];
+            assert!(row.contains(name_at.center()) && row.width() >= theme::PROFILE_LIST_WIDTH - 0.5 && row.height() >= theme::MENU_ROW_HEIGHT && radius == theme::RADIUS_SM, "{what}: {row:?}");
+            assert_eq!(lit.platform_output.cursor_icon, egui::CursorIcon::PointingHand, "{what}");
+            let active = crate::menu_bar::tests::last_text_rect(&lit, profiles::ACTIVE).unwrap_or_else(|| panic!("{what}: Active"));
+            assert!(theme::checks::fills(&lit).iter().any(|(r, c, _)| *c == theme::SELECTION && r.contains(active.center())), "{what}: the active row");
+            crate::profiles_ui::tests::assert_active_bar(&lit, "Sandbox test", &what);
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            // The list stands over the page: its own texts are checked, from its frame on.
+            let frame = lit.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.fill == theme::RAISED && r.corner_radius.nw == theme::RADIUS_LG && r.rect.contains(name_at.center()))).expect("the list's frame");
+            let list = egui::FullOutput { shapes: lit.shapes[frame..].to_vec(), ..Default::default() };
+            theme::checks::assert_no_overlaps(&list, &what);
+            assert!(theme::checks::assert_texts_fit(&list, &what) >= 4, "{what}");
+            assert_inside_across(&list, window, &what);
         }
     }
 }

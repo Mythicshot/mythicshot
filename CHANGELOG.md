@@ -2,6 +2,11 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.36 (2026-11-25)
+
+- Menus and dropdowns show what the pointer is on: the row lights up across its whole width, the whole row can be clicked, and the pointer becomes a hand. This goes for the profile list, the menu bar, the editor's menus and every dropdown. In the profile list the active profile also has a bar at its left edge.
+- The cross-out (Z), asterisk (F) and ring (D) tools are gone from the editor. Pictures and tours that already hold these shapes still open, and the shapes can still be moved, restyled and deleted. The three keys are free.
+
 ## 0.2.35 (2026-11-24)
 
 - Updates: when it starts, Mythicshot asks mythicshot.com for the current version number and, if a newer one exists, says so in a line under the menu bar and in the tray menu. "Update now" downloads the installer from mythicshot.com, checks it, closes Mythicshot, installs and opens it again. Nothing about you or the computer is sent, and Preferences has a switch for the check and a "Check now" button.
