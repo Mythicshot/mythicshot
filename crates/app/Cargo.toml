@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Screenshot and GIF recording tool in the spirit of Greenshot"
+description = "Screenshots, screen recordings and click-through tours for Windows"
 
 [dependencies]
 mythicshot-capture = { path = "../capture" }
