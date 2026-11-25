@@ -1112,6 +1112,18 @@ mod tests {
         }
     }
 
+    /// Around an older player's gold hotspot ring and its gold pulse, the focus ring is the chrome's text
+    /// colour, so it is not taken for the pulse. Version 3 keeps the general rule.
+    #[test]
+    fn the_older_hotspot_ring_has_a_focus_ring_unlike_its_pulse() {
+        use crate::theme::contrast;
+        use brand_css::{colour, var};
+        let css = player_css();
+        assert!(css.contains("body:not(.v3) #ring:focus-visible { outline: 2px solid var(--chrome-text); outline-offset: 2px; }"), "{css}");
+        let c = contrast(colour(var(css, "chrome-text")), colour(var(css, "chrome-ground")));
+        assert!(c >= 3.0, "older hotspot focus ring on ground: {c:.2}");
+    }
+
 
 
     #[test]
@@ -2213,7 +2225,7 @@ mod tests {
         // brand's colours.
         use sha2::Digest;
         let hash: String = sha2::Sha256::digest(html.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hash, "717575f41df31e098206bdddd120f01016c8f92497c80de61205545279d4f51b");
+        assert_eq!(hash, "3753a0a67a7895fa1ed0225303197a5a4e612199b07a472ec9989dff88233ec6");
         // Text in a manifest that looks like a marker stays as it is.
         let page = preview_page(r#"{"title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->"}"#);
         assert!(page.contains(r#""title":"/*PLAYER_JS_END*/<!--PLAYER_HTML_BEGIN-->""#));
