@@ -112,34 +112,156 @@ pub fn changes_url(version: Version) -> String {
 
 // ---- The release file ----
 
-/// What the release file says, checked.
+/// What the release file says, checked and signature-verified. Only [`parse_release`] makes one
+/// (the private field sees to that), so every size and SHA-256 the download is held to comes
+/// from a file whose signature verified under a release key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: Version,
     pub size: u64,
     /// 64 lowercase hex digits.
     pub sha256: String,
+    verified: (),
 }
 
 impl Release {
     pub fn file_name(&self) -> String {
         installer_name(self.version)
     }
+
+    /// A release for tests that never touch the signature.
+    #[cfg(test)]
+    pub fn for_test(version: Version, size: u64, sha256: String) -> Release {
+        Release { version, size, sha256, verified: () }
+    }
 }
 
-/// The release file as it is on the site. Fields it does not list are ignored.
+/// The release file as it is on the site. Fields it does not list are ignored; a field named
+/// twice is refused.
 #[derive(Deserialize)]
 struct RawRelease {
     version: String,
     file: String,
     size: u64,
     sha256: String,
+    /// Read as optional so that a missing one is said to be a signature that did not verify.
+    signature: Option<String>,
+}
+
+// ---- The signature ----
+
+/// The public keys a release file must be signed with, at least one of them: Ed25519, each the
+/// raw 32-byte public key in standard base64 with padding (44 characters), with a short id.
+///
+/// The real keys are put in by the owner, who made them; until then the list holds only
+/// [`RELEASE_KEY_PLACEHOLDER`], which is not a key at all, so every release file is refused (a
+/// build shipped before the real keys fails closed). To put the keys in, replace the placeholder
+/// entry with one line per key, for example
+/// `("2026-main", "<44 base64 characters of the raw public key>"),`
+/// keeping a second (backup) key beside the main one; rotating means adding the new key in one
+/// version and removing the old one in a later version. Then delete the line that checks the
+/// placeholder in `update/tests.rs` (`assert_eq!(RELEASE_KEYS, [RELEASE_KEY_PLACEHOLDER])`).
+/// Nothing (no setting, no environment variable, no debug switch) adds to or skips this list.
+pub const RELEASE_KEYS: &[(&str, &str)] = &[RELEASE_KEY_PLACEHOLDER];
+
+/// Stands in the list until the real keys exist: not base64 of 32 bytes, so it is never a key.
+pub const RELEASE_KEY_PLACEHOLDER: (&str, &str) = ("placeholder: no release key yet", "NOT-A-KEY-REPLACE-WITH-THE-OWNERS-PUBLIC-KEY");
+
+/// What the log says for a release file whose signature is missing, malformed or does not
+/// verify. Nothing of the keys or the signature is in it.
+pub const SIGNATURE_FAILED: &str = "the release file's signature did not verify";
+
+/// The keys a release file is checked against. A release build can only make
+/// [`Keys::official`]; a test build can also make its own ([`Keys::test`]), the same way it can
+/// point at a stand-in site, so release behaviour never depends on a test key.
+#[derive(Debug, Clone)]
+pub struct Keys(Vec<[u8; 32]>);
+
+impl Keys {
+    /// The release keys from [`RELEASE_KEYS`].
+    pub fn official() -> Keys {
+        Keys::from_list(RELEASE_KEYS)
+    }
+
+    /// The entries of `list` that are base64 of exactly 32 bytes; anything else is no key.
+    fn from_list(list: &[(&str, &str)]) -> Keys {
+        Keys(list.iter().filter_map(|(_, b)| base64_decode(b)).filter_map(|k| <[u8; 32]>::try_from(k).ok()).collect())
+    }
+
+    #[cfg(test)]
+    pub fn test(keys: &[&[u8]]) -> Keys {
+        Keys(keys.iter().map(|k| <[u8; 32]>::try_from(*k).expect("an Ed25519 public key is 32 bytes")).collect())
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &[u8]) -> bool {
+        self.0.iter().any(|k| k.as_slice() == key)
+    }
+
+    /// Whether `signature` is a valid Ed25519 signature of `message` under at least one key.
+    fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        use ring::signature::{ED25519, UnparsedPublicKey};
+        self.0.iter().any(|k| UnparsedPublicKey::new(&ED25519, k).verify(message, signature).is_ok())
+    }
+}
+
+/// The message a release file's signature covers, built here from the checked fields: exactly
+/// `mythicshot-release-v1`, `version=`, `file=`, `size=` (decimal) and `sha256=` lines, each
+/// ending in `\n`. Nothing of the file's own layout (spacing, order, other fields) is in it.
+fn signed_message(release: &Release) -> String {
+    format!("mythicshot-release-v1\nversion={}\nfile={}\nsize={}\nsha256={}\n", release.version, release.file_name(), release.size, release.sha256)
+}
+
+/// Standard base64 with padding, read strictly: the 64-letter alphabet, a length that is a
+/// multiple of 4, `=` only as the last one or two characters, and no stray bits. None otherwise.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let quads = bytes.len() / 4;
+    for (i, quad) in bytes.chunks(4).enumerate() {
+        let pad = quad.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && i + 1 != quads) {
+            return None;
+        }
+        let mut n = 0u32;
+        for c in &quad[..4 - pad] {
+            n = n << 6 | value(*c)?;
+        }
+        n <<= 6 * pad as u32;
+        let got = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        let keep = 3 - pad;
+        // The bits the padding leaves unused must be zero, so each value has one spelling.
+        if got[keep..].iter().any(|b| *b != 0) {
+            return None;
+        }
+        out.extend_from_slice(&got[..keep]);
+    }
+    Some(out)
 }
 
 /// Read the release file: `version` three plain numbers, `file` exactly the name that version
-/// gives, `sha256` 64 lowercase hex digits, `size` from 1 MB to 64 MB. Anything else is an error,
-/// in a fixed sentence for the log.
-pub fn parse_release(bytes: &[u8]) -> Result<Release, &'static str> {
+/// gives, `sha256` 64 lowercase hex digits, `size` from 1 MB to 64 MB; then `signature`, base64
+/// of 64 bytes, must verify over [`signed_message`] under one of `keys`. Anything else is an
+/// error, in a fixed sentence for the log ([`SIGNATURE_FAILED`] for the signature).
+pub fn parse_release(bytes: &[u8], keys: &Keys) -> Result<Release, &'static str> {
     let raw: RawRelease = serde_json::from_slice(bytes).map_err(|_| "the release file is not what was expected")?;
     let version = Version::parse(&raw.version).ok_or("the release file's version is not three plain numbers")?;
     if raw.file != installer_name(version) {
@@ -151,7 +273,12 @@ pub fn parse_release(bytes: &[u8]) -> Result<Release, &'static str> {
     if !(MIN_INSTALLER_BYTES..=MAX_INSTALLER_BYTES).contains(&raw.size) {
         return Err("the release file's size is outside 1 to 64 MB");
     }
-    Ok(Release { version, size: raw.size, sha256: raw.sha256 })
+    let release = Release { version, size: raw.size, sha256: raw.sha256, verified: () };
+    let signature = raw.signature.as_deref().and_then(base64_decode).filter(|s| s.len() == 64).ok_or(SIGNATURE_FAILED)?;
+    if !keys.verify(signed_message(&release).as_bytes(), &signature) {
+        return Err(SIGNATURE_FAILED);
+    }
+    Ok(release)
 }
 
 // ---- Where requests go ----
@@ -239,10 +366,10 @@ pub enum Checked {
 /// Ask [`HOST`] once which version is current. Blocks for up to about 5 seconds: never on the UI
 /// thread. The error is a fixed sentence for the log.
 pub fn check(running: Version) -> Result<Checked, String> {
-    check_with(&Origin::official(), running, CHECK)
+    check_with(&Origin::official(), &Keys::official(), running, CHECK)
 }
 
-fn check_with(origin: &Origin, running: Version, t: Timeouts) -> Result<Checked, String> {
+fn check_with(origin: &Origin, keys: &Keys, running: Version, t: Timeouts) -> Result<Checked, String> {
     if !origin.reachable() {
         return Err("a test build sends nothing to a real site".into());
     }
@@ -254,7 +381,8 @@ fn check_with(origin: &Origin, running: Version, t: Timeouts) -> Result<Checked,
         s => return Err(format!("the site answered HTTP {s}")),
     }
     let body = resp.body_mut().with_config().limit(MAX_RELEASE_BYTES).read_to_vec().map_err(|e| failed(&e))?;
-    let release = parse_release(&body)?;
+    // Size cap above, then the fields, then the signature; only then the versions are compared.
+    let release = parse_release(&body, keys)?;
     Ok(if release.version > running { Checked::Newer(release) } else { Checked::UpToDate })
 }
 

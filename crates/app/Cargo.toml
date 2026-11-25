@@ -31,6 +31,9 @@ keyring = "4"
 tempfile = "3"
 # Content hashes in the names of a site's shared player files.
 sha2 = "0.11"
+# Verifies the Ed25519 signature of the release file before an update is offered. Pinned to the
+# version rustls already brings in, so nothing new is fetched.
+ring = { version = "=0.17.14", default-features = false }
 
 [dev-dependencies]
 # Tests never reach the desktop: the destinations' file dialog, clipboard, printer, mail and

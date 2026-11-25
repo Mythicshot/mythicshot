@@ -15,7 +15,7 @@ fn v(s: &str) -> Version {
 }
 
 fn release(s: &str) -> Release {
-    Release { version: v(s), size: 41_943_040, sha256: "0".repeat(64) }
+    Release::for_test(v(s), 41_943_040, "0".repeat(64))
 }
 
 fn at(h: u32, m: u32) -> chrono::NaiveDateTime {

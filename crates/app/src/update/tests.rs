@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ring::signature::{Ed25519KeyPair, KeyPair};
+
 use super::*;
 
 // ---- The stand-in site ----
@@ -143,8 +145,46 @@ fn v(s: &str) -> Version {
 
 const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// The signed message as the contract writes it, built here from the raw text of the fields.
+fn message(version: &str, file: &str, size: u64, sha: &str) -> String {
+    format!("mythicshot-release-v1\nversion={version}\nfile={file}\nsize={size}\nsha256={sha}\n")
+}
+
+/// A test key pair from a fixed seed. Never one of the release keys.
+fn key(seed: u8) -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
+}
+
+/// Standard base64 with padding.
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+fn sign(k: &Ed25519KeyPair, text: &str) -> String {
+    b64(k.sign(text.as_bytes()).as_ref())
+}
+
+/// The keys the tests accept: test key 1 only.
+fn test_keys() -> Keys {
+    Keys::test(&[key(1).public_key().as_ref()])
+}
+
+/// A release file signed with test key 1 over its own fields.
 fn release_json(version: &str, file: &str, size: u64, sha: &str) -> String {
-    format!(r#"{{"version":"{version}","file":"{file}","size":{size},"sha256":"{sha}"}}"#)
+    let signature = sign(&key(1), &message(version, file, size, sha));
+    with_signature(version, file, size, sha, &signature)
+}
+
+fn with_signature(version: &str, file: &str, size: u64, sha: &str, signature: &str) -> String {
+    format!(r#"{{"version":"{version}","file":"{file}","size":{size},"sha256":"{sha}","signature":"{signature}"}}"#)
 }
 
 fn sha_of(bytes: &[u8]) -> String {
@@ -157,7 +197,7 @@ fn installer_bytes(n: usize) -> Vec<u8> {
 }
 
 fn release_of(bytes: &[u8]) -> Release {
-    Release { version: v("0.2.35"), size: bytes.len() as u64, sha256: sha_of(bytes) }
+    Release::for_test(v("0.2.35"), bytes.len() as u64, sha_of(bytes))
 }
 
 /// The quick timeouts the tests use, so a site that does not answer fails within a second.
@@ -203,9 +243,10 @@ fn the_changes_page_and_the_installer_are_named_from_the_version_alone() {
 #[test]
 fn a_good_release_file_is_read_and_unknown_fields_are_ignored() {
     let text = release_json("0.2.35", "Mythicshot-0.2.35-x64.msi", 41_000_000, SHA);
-    assert_eq!(parse_release(text.as_bytes()), Ok(Release { version: v("0.2.35"), size: 41_000_000, sha256: SHA.into() }));
-    let more = r#"{"version":"0.2.35","notes":"<b>hi</b>","file":"Mythicshot-0.2.35-x64.msi","size":1048576,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","url":"https://elsewhere.example/x.msi"}"#;
-    let r = parse_release(more.as_bytes()).unwrap();
+    assert_eq!(parse_release(text.as_bytes(), &test_keys()), Ok(Release::for_test(v("0.2.35"), 41_000_000, SHA.into())));
+    let signature = sign(&key(1), &message("0.2.35", "Mythicshot-0.2.35-x64.msi", 1_048_576, SHA));
+    let more = format!(r#"{{"version":"0.2.35","notes":"<b>hi</b>","file":"Mythicshot-0.2.35-x64.msi","size":1048576,"sha256":"{SHA}","url":"https://elsewhere.example/x.msi","signature":"{signature}"}}"#);
+    let r = parse_release(more.as_bytes(), &test_keys()).unwrap();
     assert_eq!((r.size, r.file_name()), (1_048_576, "Mythicshot-0.2.35-x64.msi".to_string()));
 }
 
@@ -245,11 +286,11 @@ fn every_other_release_file_is_a_failed_check() {
         String::new(),
     ];
     for text in cases {
-        assert!(parse_release(text.as_bytes()).is_err(), "{text}");
+        assert!(parse_release(text.as_bytes(), &test_keys()).is_err(), "{text}");
     }
     // The bounds themselves are allowed.
     for size in [1_048_576, 67_108_864] {
-        assert!(parse_release(release_json("0.2.35", good_file, size, SHA).as_bytes()).is_ok(), "{size}");
+        assert!(parse_release(release_json("0.2.35", good_file, size, SHA).as_bytes(), &test_keys()).is_ok(), "{size}");
     }
 }
 
@@ -258,7 +299,7 @@ fn every_other_release_file_is_a_failed_check() {
 #[test]
 fn the_check_is_one_plain_get_that_says_nothing_but_the_version_it_runs() {
     let s = site(|_| json(200, &release_json("0.2.35", "Mythicshot-0.2.35-x64.msi", 2_000_000, SHA)));
-    assert!(matches!(check_with(&s.origin, v("0.2.34"), QUICK), Ok(Checked::Newer(_))));
+    assert!(matches!(check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK), Ok(Checked::Newer(_))));
     let seen = s.seen();
     assert_eq!(seen.len(), 1, "one request, no retry");
     assert_eq!(seen[0].line, "GET /download/release.json HTTP/1.1", "no query string");
@@ -270,15 +311,15 @@ fn the_check_is_one_plain_get_that_says_nothing_but_the_version_it_runs() {
 #[test]
 fn only_a_strictly_newer_version_is_offered() {
     let s = site(|_| json(200, &release_json("0.2.35", "Mythicshot-0.2.35-x64.msi", 2_000_000, SHA)));
-    match check_with(&s.origin, v("0.2.34"), QUICK) {
-        Ok(Checked::Newer(r)) => assert_eq!(r, Release { version: v("0.2.35"), size: 2_000_000, sha256: SHA.into() }),
+    match check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK) {
+        Ok(Checked::Newer(r)) => assert_eq!(r, Release::for_test(v("0.2.35"), 2_000_000, SHA.into())),
         other => panic!("{other:?}"),
     }
-    assert_eq!(check_with(&s.origin, v("0.2.35"), QUICK), Ok(Checked::UpToDate), "the same version");
-    assert_eq!(check_with(&s.origin, v("0.2.36"), QUICK), Ok(Checked::UpToDate), "never a downgrade");
-    assert_eq!(check_with(&s.origin, v("0.10.0"), QUICK), Ok(Checked::UpToDate), "0.10.0 is newer than 0.2.35");
+    assert_eq!(check_with(&s.origin, &test_keys(), v("0.2.35"), QUICK), Ok(Checked::UpToDate), "the same version");
+    assert_eq!(check_with(&s.origin, &test_keys(), v("0.2.36"), QUICK), Ok(Checked::UpToDate), "never a downgrade");
+    assert_eq!(check_with(&s.origin, &test_keys(), v("0.10.0"), QUICK), Ok(Checked::UpToDate), "0.10.0 is newer than 0.2.35");
     let s = site(|_| json(200, &release_json("0.2.10", "Mythicshot-0.2.10-x64.msi", 2_000_000, SHA)));
-    assert!(matches!(check_with(&s.origin, v("0.2.9"), QUICK), Ok(Checked::Newer(_))), "0.2.10 is newer than 0.2.9");
+    assert!(matches!(check_with(&s.origin, &test_keys(), v("0.2.9"), QUICK), Ok(Checked::Newer(_))), "0.2.10 is newer than 0.2.9");
 }
 
 #[test]
@@ -296,7 +337,7 @@ fn a_bad_answer_is_a_failed_check() {
     for answer in answers {
         let answer = Mutex::new(Some(answer));
         let s = site(move |_| answer.lock().unwrap().take().unwrap_or(Serve::Hang));
-        assert!(check_with(&s.origin, v("0.2.34"), QUICK).is_err());
+        assert!(check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK).is_err());
         assert_eq!(s.lines(), ["GET /download/release.json HTTP/1.1"], "a redirect is never followed");
     }
 }
@@ -305,11 +346,11 @@ fn a_bad_answer_is_a_failed_check() {
 fn a_site_that_does_not_answer_fails_the_check_within_its_time() {
     let s = site(|_| Serve::Hang);
     let started = Instant::now();
-    assert!(check_with(&s.origin, v("0.2.34"), QUICK).is_err());
+    assert!(check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK).is_err());
     assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     // Nobody listening at all.
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    assert!(check_with(&Origin::stub(&format!("http://127.0.0.1:{port}")), v("0.2.34"), QUICK).is_err());
+    assert!(check_with(&Origin::stub(&format!("http://127.0.0.1:{port}")), &test_keys(), v("0.2.34"), QUICK).is_err());
 }
 
 #[test]
@@ -323,7 +364,7 @@ fn the_real_check_has_a_short_whole_timeout_and_the_download_a_stall_timeout() {
 fn a_test_build_never_reaches_the_real_site() {
     let official = Origin::official();
     assert_eq!(official.0, HOST);
-    assert!(check_with(&official, v("0.2.34"), QUICK).is_err());
+    assert!(check_with(&official, &test_keys(), v("0.2.34"), QUICK).is_err());
     let dir = tempfile::tempdir().unwrap();
     let r = release_of(b"x");
     assert!(matches!(download_with(&official, &r, dir.path(), 1, &AtomicU64::new(0), &AtomicBool::new(false), QUICK), Downloaded::Failed(_)));
@@ -590,4 +631,160 @@ fn the_system_folder_is_asked_of_windows_as_a_full_path() {
 fn log_lines_name_the_step_and_nothing_personal() {
     let line = log_line("2026-11-24 18:13:00.000", "check: 0.2.35 offered");
     assert_eq!(line, "== 2026-11-24 18:13:00.000 update · check: 0.2.35 offered");
+}
+
+// ---- The signature ----
+
+const FILE: &str = "Mythicshot-0.2.35-x64.msi";
+
+fn refused(text: &str, keys: &Keys) -> bool {
+    parse_release(text.as_bytes(), keys) == Err(SIGNATURE_FAILED)
+}
+
+#[test]
+fn the_signed_message_is_exactly_the_contract() {
+    let r = Release::for_test(v("0.2.35"), 41_000_000, SHA.into());
+    assert_eq!(signed_message(&r), format!("mythicshot-release-v1\nversion=0.2.35\nfile=Mythicshot-0.2.35-x64.msi\nsize=41000000\nsha256={SHA}\n"));
+    assert_eq!(signed_message(&r), message("0.2.35", FILE, 41_000_000, SHA));
+}
+
+#[test]
+fn a_correctly_signed_file_is_accepted() {
+    let r = parse_release(release_json("0.2.35", FILE, 2_000_000, SHA).as_bytes(), &test_keys()).unwrap();
+    assert_eq!((r.version, r.size, r.sha256.as_str()), (v("0.2.35"), 2_000_000, SHA));
+}
+
+#[test]
+fn each_changed_field_with_the_old_signature_is_refused() {
+    let old = sign(&key(1), &message("0.2.35", FILE, 2_000_000, SHA));
+    let other_sha = SHA.replace('0', "f");
+    for text in [
+        with_signature("0.2.36", "Mythicshot-0.2.36-x64.msi", 2_000_000, SHA, &old),
+        with_signature("0.2.35", FILE, 2_000_001, SHA, &old),
+        with_signature("0.2.35", FILE, 2_000_000, &other_sha, &old),
+    ] {
+        assert!(refused(&text, &test_keys()), "{text}");
+    }
+    // A changed file name alone is already refused by the field rule, before the signature.
+    assert!(parse_release(with_signature("0.2.35", "Mythicshot-0.2.36-x64.msi", 2_000_000, SHA, &old).as_bytes(), &test_keys()).is_err());
+    assert!(!refused(&with_signature("0.2.35", FILE, 2_000_000, SHA, &old), &test_keys()), "unchanged, it verifies");
+}
+
+#[test]
+fn another_key_is_refused_and_any_listed_key_is_accepted() {
+    let by_2 = with_signature("0.2.35", FILE, 2_000_000, SHA, &sign(&key(2), &message("0.2.35", FILE, 2_000_000, SHA)));
+    assert!(refused(&by_2, &test_keys()));
+    let both = Keys::test(&[key(1).public_key().as_ref(), key(2).public_key().as_ref()]);
+    assert!(parse_release(by_2.as_bytes(), &both).is_ok(), "the second listed key");
+    assert!(parse_release(release_json("0.2.35", FILE, 2_000_000, SHA).as_bytes(), &both).is_ok(), "the first listed key");
+    assert!(refused(&by_2, &Keys::test(&[])), "no key: nothing verifies");
+}
+
+#[test]
+fn whitespace_order_and_extra_fields_do_not_change_the_signed_message() {
+    let signature = sign(&key(1), &message("0.2.35", FILE, 2_000_000, SHA));
+    let text = format!("{{\n  \"signature\" : \"{signature}\",\n\t\"sha256\": \"{SHA}\",\r\n  \"extra\": {{\"a\": [1, 2]}},\n  \"size\":2000000 , \"file\":\"{FILE}\",\"version\":\"0.2.35\"\n}}\n");
+    assert!(parse_release(text.as_bytes(), &test_keys()).is_ok(), "{text}");
+}
+
+#[test]
+fn a_duplicate_signature_key_is_refused() {
+    let signature = sign(&key(1), &message("0.2.35", FILE, 2_000_000, SHA));
+    let text = format!(r#"{{"version":"0.2.35","file":"{FILE}","size":2000000,"sha256":"{SHA}","signature":"{signature}","signature":"{signature}"}}"#);
+    assert!(parse_release(text.as_bytes(), &test_keys()).is_err());
+}
+
+#[test]
+fn a_signature_over_other_line_ends_is_refused() {
+    let crlf = message("0.2.35", FILE, 2_000_000, SHA).replace('\n', "\r\n");
+    let no_final = message("0.2.35", FILE, 2_000_000, SHA).trim_end().to_string();
+    let other_prefix = message("0.2.35", FILE, 2_000_000, SHA).replace("-v1", "-v2");
+    for signed in [crlf, no_final, other_prefix] {
+        assert!(refused(&with_signature("0.2.35", FILE, 2_000_000, SHA, &sign(&key(1), &signed)), &test_keys()), "{signed:?}");
+    }
+}
+
+#[test]
+fn a_missing_or_malformed_signature_is_refused() {
+    let good = sign(&key(1), &message("0.2.35", FILE, 2_000_000, SHA));
+    let raw = key(1).sign(message("0.2.35", FILE, 2_000_000, SHA).as_bytes());
+    let cases = [
+        String::new(),
+        "not base64!".into(),
+        good.trim_end_matches('=').to_string(),
+        format!("{good}="),
+        good.replace('+', "-").replace('/', "_"),
+        b64(&raw.as_ref()[..63]),
+        b64(&[raw.as_ref(), &[0u8]].concat()),
+        format!(" {good}"),
+    ];
+    for bad in cases {
+        assert!(refused(&with_signature("0.2.35", FILE, 2_000_000, SHA, &bad), &test_keys()), "{bad:?}");
+    }
+    let missing = format!(r#"{{"version":"0.2.35","file":"{FILE}","size":2000000,"sha256":"{SHA}"}}"#);
+    assert!(refused(&missing, &test_keys()));
+    let null = format!(r#"{{"version":"0.2.35","file":"{FILE}","size":2000000,"sha256":"{SHA}","signature":null}}"#);
+    assert!(refused(&null, &test_keys()));
+}
+
+#[test]
+fn the_size_cap_still_holds_with_the_signature_present() {
+    let base = release_json("0.2.35", FILE, 2_000_000, SHA);
+    let padded = |n: usize| format!("{},\"pad\":\"{}\"}}", &base[..base.len() - 1], "x".repeat(n));
+    let fits = padded(4096 - base.len() - 9);
+    assert_eq!(fits.len() as u64, MAX_RELEASE_BYTES);
+    let over = padded(4096 - base.len() - 8);
+    let s = site(move |_| json(200, &fits));
+    assert!(matches!(check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK), Ok(Checked::Newer(_))), "4 KB exactly is read");
+    let s = site(move |_| json(200, &over));
+    assert!(check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK).is_err(), "one byte more is not");
+}
+
+#[test]
+fn a_check_whose_signature_does_not_verify_fails_and_offers_nothing() {
+    let by_2 = with_signature("0.2.35", FILE, 2_000_000, SHA, &sign(&key(2), &message("0.2.35", FILE, 2_000_000, SHA)));
+    let s = site(move |_| json(200, &by_2));
+    let e = check_with(&s.origin, &test_keys(), v("0.2.34"), QUICK).unwrap_err();
+    assert_eq!(e, SIGNATURE_FAILED);
+    assert!(e.contains("signature did not verify") && !e.contains(&b64(key(1).public_key().as_ref())));
+    assert_eq!(s.lines(), ["GET /download/release.json HTTP/1.1"], "nothing else is asked for");
+}
+
+#[test]
+fn the_placeholder_key_can_never_verify_so_a_build_without_real_keys_refuses_everything() {
+    // A list holding only the placeholder has no usable key at all.
+    let only_placeholder = Keys::from_list(&[RELEASE_KEY_PLACEHOLDER]);
+    assert!(only_placeholder.is_empty());
+    for k in [1u8, 2, 3] {
+        let text = with_signature("0.2.35", FILE, 2_000_000, SHA, &sign(&key(k), &message("0.2.35", FILE, 2_000_000, SHA)));
+        assert!(refused(&text, &only_placeholder), "key {k}");
+    }
+    // Today's release list is exactly that, so a build shipped before the real keys refuses
+    // every release file. When the real keys go in, this line goes with the placeholder.
+    assert_eq!(RELEASE_KEYS, [RELEASE_KEY_PLACEHOLDER]);
+    assert!(Keys::official().is_empty());
+}
+
+#[test]
+fn the_test_keys_are_not_release_keys() {
+    let official = Keys::official();
+    for k in [1u8, 2, 3] {
+        assert!(!official.contains(key(k).public_key().as_ref()), "test key {k} is not a release key");
+        assert!(!RELEASE_KEYS.iter().any(|(_, b)| *b == b64(key(k).public_key().as_ref())), "test key {k} is not written in the release list");
+    }
+    // A file the tests sign is refused by the release keys.
+    assert!(refused(&release_json("0.2.35", FILE, 2_000_000, SHA), &official));
+}
+
+#[test]
+fn base64_is_read_strictly() {
+    assert_eq!(base64_decode("TWFu"), Some(b"Man".to_vec()));
+    assert_eq!(base64_decode("TWE="), Some(b"Ma".to_vec()));
+    assert_eq!(base64_decode("TQ=="), Some(b"M".to_vec()));
+    assert_eq!(base64_decode(""), Some(vec![]));
+    for bad in ["TWE", "TQ=", "T===", "TW=u", "TR==", "TWF=", "TW E", "TWFu\n", "TW-u", "TW_u", "=TWF"] {
+        assert_eq!(base64_decode(bad), None, "{bad:?}");
+    }
+    let all: Vec<u8> = (0..=255).collect();
+    assert_eq!(base64_decode(&b64(&all)), Some(all));
 }
