@@ -34,6 +34,14 @@ pub struct Painter {
 impl Painter {
     /// Take in a frame's texture changes: whole images, and patches of the font atlas.
     pub fn update(&mut self, delta: &mut egui::TexturesDelta) {
+        // Never sample white where a patch should go: a picture with blank blocks for letters
+        // would be saved without a word. (The delta is emptied first, as egui asks of every
+        // delta, also one given up on.)
+        let unknown = delta.set.iter().find(|(id, deltas)| !self.textures.contains_key(id) && deltas.first().is_some_and(|d| d.pos.is_some())).map(|(id, _)| *id);
+        if let Some(id) = unknown {
+            delta.clear();
+            panic!("a patch for texture {id:?}, which this painter never received whole: frames of this context were drawn without it (their textures_delta cleared). Keep one Painter from the context's first frame on and pass it to shot_with");
+        }
         for (id, deltas) in &delta.set {
             for d in deltas {
                 let epaint::ImageData::Color(image) = &d.image;
@@ -48,11 +56,10 @@ impl Painter {
                         );
                     }
                     Some([x0, y0]) => {
-                        if let Some(t) = self.textures.get_mut(id) {
-                            for y in 0..image.size[1] {
-                                for x in 0..image.size[0] {
-                                    t.pixels[(y0 + y) * t.size[0] + x0 + x] = image.pixels[y * image.size[0] + x];
-                                }
+                        let Some(t) = self.textures.get_mut(id) else { unreachable!("checked above") };
+                        for y in 0..image.size[1] {
+                            for x in 0..image.size[0] {
+                                t.pixels[(y0 + y) * t.size[0] + x0 + x] = image.pixels[y * image.size[0] + x];
                             }
                         }
                     }
@@ -145,9 +152,13 @@ impl Painter {
 
 /// Draw `frames` frames of `ui` in a window `size` points big, a second apart (so anything that
 /// fades in has), at `ppp` pixels per point: the textures of all of them and the shapes of the last.
-fn last_frame(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, mut ui: impl FnMut(&mut egui::Ui)) -> (Painter, Vec<epaint::ClippedShape>) {
+fn last_frame(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> (Painter, Vec<epaint::ClippedShape>) {
+    last_frame_with(ctx, Painter::default(), size, ppp, frames, ui)
+}
+
+/// [`last_frame`] with `painter`, which holds every texture the context has handed out so far.
+fn last_frame_with(ctx: &egui::Context, mut painter: Painter, size: egui::Vec2, ppp: f32, frames: usize, mut ui: impl FnMut(&mut egui::Ui)) -> (Painter, Vec<epaint::ClippedShape>) {
     ctx.set_pixels_per_point(ppp);
-    let mut painter = Painter::default();
     let mut last = None;
     for _ in 0..frames.max(1) {
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(ctx.input(|i| i.time) + 1.0), ..Default::default() };
@@ -177,7 +188,13 @@ pub struct Shot {
 /// A [`Shot`] of the last of `frames` frames of `ui`: the frame filled in over magenta (the
 /// picture) and over green, and every pixel that differs counted as uncovered.
 pub fn shot(ctx: &egui::Context, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> Shot {
-    let (painter, shapes) = last_frame(ctx, size, ppp, frames, ui);
+    shot_with(ctx, Painter::default(), size, ppp, frames, ui)
+}
+
+/// [`shot`] of a context that has drawn frames already: `painter` took in each of those frames'
+/// `textures_delta` (see [`Painter::update`]), so it holds the font atlas their text needs.
+pub fn shot_with(ctx: &egui::Context, painter: Painter, size: egui::Vec2, ppp: f32, frames: usize, ui: impl FnMut(&mut egui::Ui)) -> Shot {
+    let (painter, shapes) = last_frame_with(ctx, painter, size, ppp, frames, ui);
     let image = painter.paint_over(ctx, shapes.clone(), size, ppp, SEE_THROUGH);
     let green = painter.paint_over(ctx, shapes, size, ppp, [0, 255, 0, 255]);
     let differ: Vec<(u32, u32)> = image.enumerate_pixels().zip(green.pixels()).filter(|((_, _, p), q)| p != q).map(|((x, y, _), _)| (x, y)).collect();
@@ -215,6 +232,41 @@ mod tests {
         let p = crate::theme::PRIMARY;
         assert_eq!(image.get_pixel(20, 15).0, [p.r(), p.g(), p.b(), 255]);
         assert_eq!(image.get_pixel(2, 2).0, SEE_THROUGH, "nothing painted there");
+    }
+
+    /// Frames drawn before a painter was there, their textures thrown away, leave it a patch of
+    /// the font atlas for an atlas it never had: it says so at once, rather than painting every
+    /// letter as a blank block.
+    #[test]
+    #[should_panic(expected = "never received whole")]
+    fn a_patch_for_a_texture_never_received_whole_fails_loudly() {
+        let ctx = crate::theme::test_context();
+        let mut first = ctx.run_ui(egui::RawInput::default(), |ui| drop(ui.label("Sandbox")));
+        first.textures_delta.clear();
+        let mut painter = Painter::default();
+        let mut next = ctx.run_ui(egui::RawInput::default(), |ui| drop(ui.label("Quartz jinx · 0123456789 ÆØÅ — wavy glyphs")));
+        painter.update(&mut next.textures_delta);
+    }
+
+    /// A painter kept from a context's first frame on, through frames with input, paints the
+    /// letters of a shot of the same context: dark text on white shows pixels of both.
+    #[test]
+    fn a_painter_kept_across_frames_paints_real_letters() {
+        let ctx = crate::theme::test_context();
+        let size = egui::vec2(160.0, 40.0);
+        let draw = |ui: &mut egui::Ui| {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::Pos2::ZERO, size), 0.0, crate::theme::TEXT);
+            ui.label(egui::RichText::new("Sandbox test").color(crate::theme::GROUND));
+        };
+        let mut painter = Painter::default();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, draw);
+            painter.update(&mut out.textures_delta);
+        }
+        let shot = shot_with(&ctx, painter, size, 1.0, 2, draw);
+        let g = crate::theme::GROUND;
+        let dark = shot.image.pixels().filter(|p| p.0[..3] == [g.r(), g.g(), g.b()]).count();
+        assert!(dark > 20, "the letters are drawn: {dark} dark pixels");
     }
 
     /// A see-through fill shows as blended magenta, never as pure magenta: a shot still counts

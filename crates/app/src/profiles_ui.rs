@@ -278,7 +278,9 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
             let text = active.map_or_else(|| crate::workspace_ui::NOT_CONNECTED.to_string(), |a| a.name.clone());
             // As wide as it may be, and narrower where the line has less room.
             let width = theme::PROFILE_DROPDOWN_WIDTH.min(ui.available_width() - ui.spacing().icon_width - 2.0 * ui.spacing().button_padding.x).max(theme::PROFILE_DROPDOWN_MIN_WIDTH);
-            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).truncate().width(width).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
+            // The list shows every profile it can before it scrolls: as far down as the window goes.
+            let room = (ui.ctx().content_rect().bottom() - ui.cursor().top() - theme::CONTROL_HEIGHT - theme::SPACE_4).max(theme::PROFILE_LIST_MIN_HEIGHT);
+            egui::ComboBox::from_id_salt(("profiles", salt)).selected_text(RichText::new(text).strong()).truncate().width(width).height(room).popup_style(theme::menu_style.into()).show_ui(ui, |ui| profile_menu(ui, rows, &mut pick));
         });
     });
     pick
@@ -288,14 +290,20 @@ pub fn dropdown_with(ui: &mut egui::Ui, salt: &str, rows: &[Entry], enabled: boo
 /// "+ Add profile…" and "Manage profiles…".
 fn profile_menu(ui: &mut egui::Ui, rows: &[Entry], pick: &mut Option<Pick>) {
     ui.set_min_width(theme::PROFILE_LIST_WIDTH);
+    // Rows meet: the hover fill of one never leaves a gap or overlaps the next.
+    ui.spacing_mut().item_spacing.y = 0.0;
     for e in rows {
-        ui.horizontal(|ui| {
+        // The whole row picks the profile; the active one keeps its dot, its "Active" and the
+        // selection fill.
+        let row = theme::menu_row(ui, true, e.active, &e.name, |ui| {
             dot(ui, e.waiting);
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
+                // The name's line is as high as its text, not a control's height.
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.add_space(theme::SPACE_1);
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::selectable(e.active, RichText::new(&e.name).strong())).clicked() && !e.active {
-                        *pick = Some(Pick::Switch(e.id.clone()));
-                    }
+                    ui.label(RichText::new(&e.name).strong());
                     if e.active {
                         ui.label(RichText::new(profiles::ACTIVE).size(theme::SMALL_SIZE).color(theme::MUTED));
                     }
@@ -304,14 +312,27 @@ fn profile_menu(ui: &mut egui::Ui, rows: &[Entry], pick: &mut Option<Pick>) {
                     }
                 });
                 ui.label(RichText::new(&e.detail).size(theme::SMALL_SIZE).color(theme::MUTED));
+                ui.add_space(theme::SPACE_1);
             });
         });
+        if e.active {
+            // A bar at its left edge, clear of the row's rounded corners, so the active row is
+            // told from the hovered one by more than its fill.
+            let inset = f32::from(theme::RADIUS_SM);
+            let bar = egui::Rect::from_min_max(egui::pos2(row.rect.left(), row.rect.top() + inset), egui::pos2(row.rect.left() + theme::ACTIVE_BAR_WIDTH, row.rect.bottom() - inset));
+            ui.painter().rect_filled(bar, 0.0, theme::PRIMARY_TEXT);
+        }
+        if row.clicked() && !e.active {
+            *pick = Some(Pick::Switch(e.id.clone()));
+        }
     }
+    ui.spacing_mut().item_spacing.y = theme::SPACE_1;
     ui.separator();
-    if ui.add(egui::Button::new(RichText::new(profiles::ADD_PROFILE).color(theme::GOLD)).frame(false)).clicked() {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    if theme::menu_row(ui, true, false, profiles::ADD_PROFILE, |ui| drop(ui.label(RichText::new(profiles::ADD_PROFILE).color(theme::GOLD)))).clicked() {
         *pick = Some(Pick::Add);
     }
-    if ui.add(egui::Button::new(RichText::new(profiles::MANAGE_PROFILES).color(theme::MUTED)).frame(false)).clicked() {
+    if theme::menu_row(ui, true, false, profiles::MANAGE_PROFILES, |ui| drop(ui.label(RichText::new(profiles::MANAGE_PROFILES).color(theme::MUTED)))).clicked() {
         *pick = Some(Pick::Manage);
     }
 }
@@ -1306,7 +1327,7 @@ fn profile_card(ui: &mut egui::Ui, active: Option<&Profile>, pill: Option<(&str,
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = theme::ITEM_GAP;
                     let button = ui.add_enabled_ui(enabled, |ui| theme::icon_button(ui, profiles::SWITCH_PROFILE, crate::icons::Icon::ChevronDown, theme::IconSide::Trailing)).inner;
-                    egui::Popup::menu(&button).show(|ui| profile_menu(ui, rows, &mut pick));
+                    egui::Popup::menu(&button).style(theme::menu_style).show(|ui| profile_menu(ui, rows, &mut pick));
                     if let Some((text, tone)) = pill {
                         theme::pill(ui, text, tone);
                     }
@@ -1340,4 +1361,4 @@ pub fn needs_sign_in(p: &Profile, refused: bool, token: &publish_ui::TokenStatus
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -17,10 +17,7 @@ pub enum Icon {
     Circle,
     Group,
     Cone,
-    Donut,
     Slice,
-    Cross,
-    Asterisk,
     Text,
     Bubble,
     Step,
@@ -79,8 +76,8 @@ pub enum Icon {
 impl Icon {
     /// Every icon, for the tests that draw them all.
     #[cfg(test)]
-    pub const ALL: [Icon; 59] = [
-        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Donut, Icon::Slice, Icon::Cross, Icon::Asterisk, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences,
+    pub const ALL: [Icon; 56] = [
+        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Slice, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences,
     ];
 }
 
@@ -105,17 +102,18 @@ pub fn button(ui: &mut Ui, icon: Icon, size: f32, selected: bool, tip: &str) -> 
     resp.on_hover_text(tip)
 }
 
-/// An icon followed by a label, for menu rows.
+/// An icon followed by a label, for menu rows: a row of the app's own menus
+/// ([`theme::menu_row`]), the whole row the click target and lit under the pointer. The icon's
+/// middle is 18 points from the row's left, the label 38.
 pub fn menu_row(ui: &mut Ui, icon: Icon, label: &str) -> Response {
-    let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, f32::from(theme::RADIUS_SM), theme::RAISED);
-    }
-    let icon_rect = Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
-    paint(ui.painter(), icon_rect, icon, theme::TEXT);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), theme::TEXT);
-    resp
+    theme::menu_row(ui, true, false, label, |ui| {
+        let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(14.0), theme::TEXT));
+        let lead = 38.0 - theme::MENU_ROW_PAD_X;
+        let (rect, _) = ui.allocate_exact_size(vec2(lead + galley.size().x, 30.0), Sense::hover());
+        let icon_rect = Rect::from_center_size(pos2(rect.left() + 18.0 - theme::MENU_ROW_PAD_X, rect.center().y), Vec2::splat(16.0));
+        paint(ui.painter(), icon_rect, icon, theme::TEXT);
+        ui.painter().galley(pos2(rect.left() + lead, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
+    })
 }
 
 pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
@@ -134,10 +132,6 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
         }
         Icon::Circle => {
             p.circle_stroke(r.center(), r.width() * 0.42, s);
-        }
-        Icon::Donut => {
-            p.circle_stroke(r.center(), r.width() * 0.44, s);
-            p.circle_stroke(r.center(), r.width() * 0.2, thin);
         }
         Icon::Group => {
             let pts = vec![at(0.06, 0.12), at(0.94, 0.12), at(0.94, 0.88), at(0.06, 0.88), at(0.06, 0.12)];
@@ -158,16 +152,6 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 pts.push(pos2(apex.x + r.width() * 0.86 * a.cos(), apex.y + r.height() * 0.86 * a.sin()));
             }
             p.add(Shape::closed_line(pts, s));
-        }
-        Icon::Cross => {
-            let d = 0.13;
-            let u = [(0.0, d), (d, 0.0), (0.5, 0.5 - d), (1.0 - d, 0.0), (1.0, d), (0.5 + d, 0.5), (1.0, 1.0 - d), (1.0 - d, 1.0), (0.5, 0.5 + d), (d, 1.0), (0.0, 1.0 - d), (0.5 - d, 0.5)];
-            p.add(Shape::closed_line(u.iter().map(|(x, y)| at(0.08 + x * 0.84, 0.08 + y * 0.84)).collect(), thin));
-        }
-        Icon::Asterisk => {
-            for (x0, y0, x1, y1) in [(0.08, 0.5, 0.92, 0.5), (0.5, 0.08, 0.5, 0.92), (0.2, 0.2, 0.8, 0.8), (0.2, 0.8, 0.8, 0.2)] {
-                p.add(line(&[(x0, y0), (x1, y1)]));
-            }
         }
         Icon::Ellipse => {
             p.add(Shape::ellipse_stroke(r.center(), vec2(r.width() * 0.46, r.height() * 0.34), s));

@@ -29,12 +29,16 @@ const TOOL_BUTTON: f32 = 36.0;
 const CUE_W: f32 = 14.0;
 /// The toolbar's button for the settings panel, and the panel's heading. Approved wording.
 pub(crate) const PROPERTIES: &str = "Properties";
+/// The settings file's names of the tools taken off the rail: Cross (it had Z), Asterisk (F)
+/// and Donut (D). Shapes they made still open, draw and edit; no new ones are made, and their
+/// keys belong to nothing.
+const REMOVED_TOOLS: [&str; 3] = ["cross", "asterisk", "donut"];
 /// The rail's sections, like a mockup palette; `None` has no heading.
 /// The Spotlight and Guide card tools show only when editing a recording.
 const RAIL_GROUPS: [(Option<&str>, &[Tool]); 4] = [
     (None, &[Tool::Select]),
     (Some("Draw"), &[Tool::Freehand, Tool::Arrow, Tool::Line]),
-    (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Donut, Tool::Text, Tool::Slice, Tool::Cross, Tool::Asterisk]),
+    (Some("Shapes"), &[Tool::Circle, Tool::Group, Tool::Cone, Tool::Rectangle, Tool::Ellipse, Tool::Text, Tool::Slice]),
     (Some("More"), &[Tool::Bubble, Tool::Step, Tool::Highlight, Tool::Obfuscate, Tool::Spotlight, Tool::Card, Tool::Crop]),
 ];
 
@@ -49,10 +53,7 @@ pub enum Tool {
     Circle,
     Group,
     Cone,
-    Donut,
     Slice,
-    Cross,
-    Asterisk,
     Text,
     Bubble,
     Step,
@@ -77,10 +78,7 @@ impl Tool {
             Tool::Circle => "circle",
             Tool::Group => "group",
             Tool::Cone => "cone",
-            Tool::Donut => "donut",
             Tool::Slice => "slice",
-            Tool::Cross => "cross",
-            Tool::Asterisk => "asterisk",
             Tool::Text => "text",
             Tool::Bubble => "bubble",
             Tool::Step => "step",
@@ -96,6 +94,17 @@ impl Tool {
         Tool::ALL.into_iter().find(|t| t.key() == k)
     }
 
+    /// The tool the editor opens on for `k`, the last tool used as the settings file names it:
+    /// that tool, or Select for one of the tools taken off the rail (Cross, Asterisk and Donut),
+    /// or the Rectangle for a word no version knew. Crop, Spotlight and guide cards are never
+    /// where the editor opens.
+    fn opening(k: &str) -> Tool {
+        if REMOVED_TOOLS.contains(&k) {
+            return Tool::Select;
+        }
+        Tool::from_key(k).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle)
+    }
+
     /// The tool that draws a shape, so editing an item updates that tool's style.
     fn for_shape(s: &Shape) -> Tool {
         match s {
@@ -107,22 +116,20 @@ impl Tool {
             Shape::Circle(_) => Tool::Circle,
             Shape::Group(_) => Tool::Group,
             Shape::Cone(..) => Tool::Cone,
-            Shape::Donut(_) => Tool::Donut,
             Shape::Slice(..) => Tool::Slice,
-            Shape::Cross(_) => Tool::Cross,
-            Shape::Asterisk(_) => Tool::Asterisk,
             Shape::Text { .. } => Tool::Text,
             Shape::Bubble { .. } => Tool::Bubble,
             Shape::Step { .. } => Tool::Step,
             Shape::Highlight(_) => Tool::Highlight,
             Shape::Obfuscate { .. } => Tool::Obfuscate,
             Shape::Spotlight { .. } => Tool::Spotlight,
-            // Pasted pictures have no tool, so no style to remember.
-            Shape::Image { .. } => Tool::Select,
+            // Pasted pictures have no tool, so no style to remember; nor have the shapes whose
+            // tools left the rail, which older pictures and recordings still hold.
+            Shape::Image { .. } | Shape::Donut(_) | Shape::Cross(_) | Shape::Asterisk(_) => Tool::Select,
         }
     }
 
-    const ALL: [Tool; 21] = [
+    const ALL: [Tool; 18] = [
         Tool::Select,
         Tool::Rectangle,
         Tool::Ellipse,
@@ -132,10 +139,7 @@ impl Tool {
         Tool::Circle,
         Tool::Group,
         Tool::Cone,
-        Tool::Donut,
         Tool::Slice,
-        Tool::Cross,
-        Tool::Asterisk,
         Tool::Text,
         Tool::Bubble,
         Tool::Step,
@@ -157,10 +161,7 @@ impl Tool {
             Tool::Circle => Icon::Circle,
             Tool::Group => Icon::Group,
             Tool::Cone => Icon::Cone,
-            Tool::Donut => Icon::Donut,
             Tool::Slice => Icon::Slice,
-            Tool::Cross => Icon::Cross,
-            Tool::Asterisk => Icon::Asterisk,
             Tool::Text => Icon::Text,
             Tool::Bubble => Icon::Bubble,
             Tool::Step => Icon::Step,
@@ -183,10 +184,7 @@ impl Tool {
             Tool::Circle => EditorAction::Circle,
             Tool::Group => EditorAction::Group,
             Tool::Cone => EditorAction::Cone,
-            Tool::Donut => EditorAction::Donut,
             Tool::Slice => EditorAction::Slice,
-            Tool::Cross => EditorAction::Cross,
-            Tool::Asterisk => EditorAction::Asterisk,
             Tool::Text => EditorAction::Text,
             Tool::Bubble => EditorAction::Bubble,
             Tool::Step => EditorAction::Step,
@@ -469,7 +467,7 @@ pub fn quit_progress<G: std::ops::DerefMut<Target = Editor>>(editors: &mut [G]) 
 
 impl Editor {
     pub fn new(img: RgbaImage, title: String, keys: BTreeMap<EditorAction, String>, dest: Context, prefs: crate::settings::EditorPrefs) -> Self {
-        let tool = Tool::from_key(&prefs.tool).filter(|t| !matches!(t, Tool::Crop | Tool::Spotlight | Tool::Card)).unwrap_or(Tool::Rectangle);
+        let tool = Tool::opening(&prefs.tool);
         let panel_open = prefs.image_properties_open;
         let mut editor = Self {
             doc: Document::new(img),
@@ -1244,7 +1242,7 @@ impl Editor {
             if std::mem::take(&mut self.open_export) {
                 egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&exp));
             }
-            egui::Popup::menu(&exp).show(|ui| self.export_menu(ui));
+            egui::Popup::menu(&exp).style(theme::menu_bar_style).show(|ui| self.export_menu(ui));
             if icons::button(ui, Icon::Copy, ICON, false, "Copy this frame").clicked() {
                 self.copy_frame();
             }
@@ -1262,7 +1260,7 @@ impl Editor {
                 self.copy();
             }
             let send = icons::button(ui, Icon::Send, ICON, false, "Send to…");
-            egui::Popup::menu(&send).show(|ui| {
+            egui::Popup::menu(&send).style(theme::menu_style).show(|ui| {
                 for (d, icon) in [(DestId::Print, Icon::Print), (DestId::Email, Icon::Email), (DestId::Clipboard, Icon::Copy)] {
                     if icons::menu_row(ui, icon, d.label()).on_hover_text(d.help()).clicked() {
                         self.send(d);
@@ -1290,7 +1288,7 @@ impl Editor {
         ui.separator();
         if self.video.is_none() {
             let fx = icons::button(ui, Icon::Effects, ICON, false, EFFECTS_HINT);
-            egui::Popup::menu(&fx).show(|ui| self.effects_menu(ui));
+            egui::Popup::menu(&fx).style(theme::menu_style).show(|ui| self.effects_menu(ui));
             ui.separator();
         }
         self.properties_row(ui);
@@ -1405,6 +1403,7 @@ impl Editor {
             let salt = if place == Place::Toolbar { "obfuscate-mode" } else { "obfuscate-mode-panel" };
             in_row(ui, place, "Hide as", |ui| {
                 egui::ComboBox::from_id_salt(salt)
+                    .popup_style(theme::menu_style.into())
                     .width(80.0)
                     .selected_text(if self.obfuscate == ObfuscateMode::Pixelate { "Pixelate" } else { "Blur" })
                     .show_ui(ui, |ui| {
@@ -1512,7 +1511,7 @@ impl Editor {
     fn zoom_choice(&mut self, ui: &mut egui::Ui, salt: &str) {
         let z = self.zoom.unwrap_or(self.last_canvas.zoom);
         let label = if self.zoom.is_none() { format!("Fit {:.0}%", z * 100.0) } else { format!("{:.0}%", z * 100.0) };
-        egui::ComboBox::from_id_salt(salt).width(84.0).selected_text(label).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(salt).popup_style(theme::menu_style.into()).width(84.0).selected_text(label).show_ui(ui, |ui| {
             if ui.selectable_label(self.zoom.is_none(), "Fit to window").clicked() {
                 self.zoom = None;
             }
@@ -1743,7 +1742,7 @@ impl Editor {
                         self.menu_at = Some(p);
                     }
                 }
-                resp.context_menu(|ui| self.context_menu(ui));
+                egui::Popup::context_menu(&resp).style(theme::menu_style).show(|ui| self.context_menu(ui));
                 self.draw_chrome(ui, img_rect, z, &to_scr);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(self.cursor(resp.hover_pos().map(to_img), z));
@@ -1955,10 +1954,7 @@ impl Editor {
             Tool::Line => Shape::Line(a, b),
             Tool::Arrow => Shape::Arrow(a, b),
             Tool::Circle => Shape::Circle(square_from(a, b)),
-            Tool::Donut => Shape::Donut(square_from(a, b)),
             Tool::Group => Shape::Group(r),
-            Tool::Cross => Shape::Cross(r),
-            Tool::Asterisk => Shape::Asterisk(r),
             Tool::Cone => Shape::Cone(a, b),
             Tool::Slice => Shape::Slice(a, b),
             Tool::Highlight => Shape::Highlight(r),
@@ -2354,13 +2350,10 @@ fn keep_aspect(b: Bounds, handle: usize, aspect: f32) -> Bounds {
 }
 
 /// What a tool draws with before the user picks colours: the mockup shapes
-/// get a white outline over a see-through fill, the asterisk is solid white.
+/// get a white outline over a see-through fill.
 fn default_style(tool: Tool) -> Style {
     match tool {
-        Tool::Circle | Tool::Group | Tool::Cone | Tool::Donut | Tool::Slice | Tool::Cross => {
-            Style { stroke: Rgba::WHITE, fill: Some(Rgba([229, 72, 77, 110])), shadow: false, ..Style::default() }
-        }
-        Tool::Asterisk => Style { stroke: Rgba::WHITE, shadow: false, ..Style::default() },
+        Tool::Circle | Tool::Group | Tool::Cone | Tool::Slice => Style { stroke: Rgba::WHITE, fill: Some(Rgba([229, 72, 77, 110])), shadow: false, ..Style::default() },
         _ => Style::default(),
     }
 }
@@ -2380,10 +2373,7 @@ fn tool_hint(tool: Tool) -> &'static str {
         Tool::Circle => "Drag out a circle. It stays round.",
         Tool::Group => "Drag around an area to mark it as a group.",
         Tool::Cone => "Drag from the point of the cone to its wide end.",
-        Tool::Donut => "Drag out a ring. It stays round.",
         Tool::Slice => "Drag from the point of the slice to the middle of its curved edge.",
-        Tool::Cross => "Drag over something to cross it out.",
-        Tool::Asterisk => "Drag out an asterisk.",
         _ => "Drag on the image to draw.",
     }
 }
@@ -4272,5 +4262,213 @@ pub(crate) mod tests {
         // And the keys work again.
         dialog_checks::frame(&mut ed, &ctx, vec![key(k, m)]);
         assert_eq!(ed.tool, other);
+    }
+
+    // ---- The tools the rail no longer has: Cross (Z), Asterisk (F) and Donut (D) ----
+
+    /// The keys the three removed tools had in the settings file, and their actions' names.
+    const REMOVED_KEYS: [&str; 3] = ["cross", "asterisk", "donut"];
+
+    /// The rail lists exactly these tools, in this order; the Shapes section closes up with no
+    /// gap, filling its two columns from the top. No tool is named after a removed one.
+    #[test]
+    fn the_rail_lists_exactly_the_remaining_tools_in_order() {
+        let rail: Vec<(Option<&str>, Vec<&str>)> = RAIL_GROUPS.iter().map(|(title, tools)| (*title, tools.iter().map(|t| t.key()).collect())).collect();
+        assert_eq!(
+            rail,
+            vec![
+                (None, vec!["select"]),
+                (Some("Draw"), vec!["freehand", "arrow", "line"]),
+                (Some("Shapes"), vec!["circle", "group", "cone", "rectangle", "ellipse", "text", "slice"]),
+                (Some("More"), vec!["bubble", "step", "highlight", "obfuscate", "spotlight", "card", "crop"]),
+            ]
+        );
+        for key in REMOVED_KEYS {
+            assert!(Tool::from_key(key).is_none(), "{key} is still a tool");
+            assert!(EditorAction::ALL.iter().all(|a| !format!("{a:?}").eq_ignore_ascii_case(key)), "{key} is still an editor action");
+        }
+        // Every tool is on the rail once.
+        let on_rail: Vec<Tool> = RAIL_GROUPS.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        assert_eq!(on_rail.len(), Tool::ALL.len());
+        assert!(Tool::ALL.iter().all(|t| on_rail.contains(t)));
+        // The rail draws the Shapes section in rows of two from the top: seven tools, four rows,
+        // the last one holding Slice alone at the left.
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = EditorAction::ALL.iter().map(|a| (*a, a.default_binding().to_string())).collect();
+        dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let painted = dialog_checks::frame(&mut ed, &ctx, vec![]);
+        let corner = |key: &str| {
+            painted.editor.iter().find_map(|s| match s {
+                // Where the letter ends: it is set from its button's right edge.
+                egui::Shape::Text(t) if t.galley.text() == key && t.pos.x < RAIL => Some(t.pos + vec2(t.galley.size().x, 0.0)),
+                _ => None,
+            })
+        };
+        // Each tool's key letter sits in its button's corner.
+        let at: Vec<egui::Pos2> = ["O", "G", "C", "R", "E", "T", "U"].iter().map(|k| corner(k).unwrap_or_else(|| panic!("{k} is not on the rail"))).collect();
+        for pair in at.chunks(2) {
+            if let [a, b] = pair {
+                assert!((a.y - b.y).abs() < 0.5 && b.x > a.x, "a row of two: {pair:?}");
+            }
+        }
+        let rows: Vec<&[egui::Pos2]> = at.chunks(2).collect();
+        for w in rows.windows(2) {
+            let step = w[1][0].y - w[0][0].y;
+            assert!(step > TOOL_BUTTON - 1.0 && step < TOOL_BUTTON + 8.0, "rows one under the other with no gap: {at:?}");
+            assert!((w[1][0].x - w[0][0].x).abs() < 0.5, "the left column: {at:?}");
+        }
+        for k in ["Z", "F", "D"] {
+            assert!(corner(k).is_none(), "{k} is still on the rail");
+        }
+    }
+
+    /// Z, F and D are no tool's key any more: pressed in the editor they do nothing, whatever is
+    /// selected, and no editor action has them by default (Ctrl+Z and Ctrl+D keep theirs).
+    #[test]
+    fn z_f_and_d_do_nothing_in_the_editor() {
+        for a in EditorAction::ALL {
+            assert!(!matches!(a.default_binding(), "KeyZ" | "KeyF" | "KeyD"), "{a:?} has {}", a.default_binding());
+        }
+        assert_eq!((EditorAction::Undo.default_binding(), EditorAction::Duplicate.default_binding()), ("control+KeyZ", "control+KeyD"));
+        let ctx = crate::theme::test_context();
+        let mut ed = editor(EditorPrefs::default());
+        ed.keys = Settings::default().editor_keys;
+        let id = ed.add_item(Shape::Rect(Bounds::new(pt(5.0, 5.0), pt(20.0, 20.0))));
+        for selected in [None, Some(id)] {
+            for tool in [Tool::Rectangle, Tool::Select] {
+                ed.set_tool(tool);
+                ed.select(selected);
+                let (items, shapes) = (ed.doc.items().len(), format!("{:?}", ed.doc.items().iter().map(|i| (&i.shape, i.style)).collect::<Vec<_>>()));
+                for key in [Key::Z, Key::F, Key::D] {
+                    press(&mut ed, &ctx, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]);
+                    assert_eq!((ed.tool, ed.selected), (tool, selected), "{key:?}");
+                    assert_eq!(ed.doc.items().len(), items, "{key:?} changed the picture");
+                    assert_eq!(format!("{:?}", ed.doc.items().iter().map(|i| (&i.shape, i.style)).collect::<Vec<_>>()), shapes, "{key:?} changed the picture");
+                }
+            }
+        }
+    }
+
+    /// The Hotkeys page and the rail's tips name no removed tool.
+    #[test]
+    fn no_hotkey_label_or_tool_tip_names_a_removed_tool() {
+        let labels: Vec<&str> = EditorAction::ALL.iter().map(|a| a.label()).collect();
+        let hints: Vec<&str> = Tool::ALL.iter().map(|t| tool_hint(*t)).collect();
+        for word in ["Donut", "Cross-out", "Asterisk", "asterisk", "ring", "cross it out"] {
+            assert!(labels.iter().chain(&hints).all(|l| !l.contains(word)), "{word}: {labels:?} {hints:?}");
+        }
+    }
+
+    /// A picture 200 by 120, white, with a Donut, a Cross and an Asterisk on it, as a capture,
+    /// a recording or a project from before the tools went holds them.
+    fn editor_with_removed_kinds() -> (Editor, [u64; 3]) {
+        let s = Settings::default();
+        let mut ed = Editor::new(RgbaImage::from_pixel(200, 120, image::Rgba([255, 255, 255, 255])), "t".into(), BTreeMap::new(), s.dest_context("t"), EditorPrefs::default());
+        ed.keys = s.editor_keys;
+        let style = Style { stroke: Rgba::RED, width: 4.0, ..Style::default() };
+        let ids = [
+            ed.doc.add(Shape::Donut(Bounds::new(pt(10.0, 10.0), pt(50.0, 50.0))), style),
+            ed.doc.add(Shape::Cross(Bounds::new(pt(70.0, 10.0), pt(110.0, 50.0))), style),
+            ed.doc.add(Shape::Asterisk(Bounds::new(pt(130.0, 10.0), pt(170.0, 50.0))), style),
+        ];
+        (ed, ids)
+    }
+
+    /// Whether some pixel of `img` inside `b` is not white: the shape there was drawn.
+    fn drawn_in(img: &RgbaImage, b: Bounds) -> bool {
+        (b.y0.max(0.0) as u32..(b.y1 as u32).min(img.height())).any(|y| (b.x0.max(0.0) as u32..(b.x1 as u32).min(img.width())).any(|x| img.get_pixel(x, y).0 != [255, 255, 255, 255]))
+    }
+
+    /// A point of item `id` the editor's hit test finds, away from its handles, in picture pixels.
+    fn a_point_on(ed: &Editor, id: u64) -> Pt {
+        let b = ed.doc.item(id).unwrap().shape.rect().unwrap().norm();
+        (0..=40).flat_map(|i| (0..=40).map(move |j| pt(b.x0 + (b.x1 - b.x0) * i as f32 / 40.0, b.y0 + (b.y1 - b.y0) * j as f32 / 40.0))).find(|p| ed.hit(*p, 1.0) == Some(id) && ed.handle_at(id, *p, ed.last_canvas.zoom).is_none()).expect("a point on the shape")
+    }
+
+    /// A drag on the canvas from `a` to `b` (picture pixels), as a mouse makes it.
+    fn drag(ed: &mut Editor, ctx: &egui::Context, a: Pt, b: Pt) {
+        let c = ed.last_canvas;
+        let at = |p: Pt| pos2(c.min.x + p.x * c.zoom, c.min.y + p.y * c.zoom);
+        let button = |p: Pt, pressed| egui::Event::PointerButton { pos: at(p), button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        dialog_checks::frame(ed, ctx, vec![egui::Event::PointerMoved(at(a)), button(a, true)]);
+        let mid = pt((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        dialog_checks::frame(ed, ctx, vec![egui::Event::PointerMoved(at(mid))]);
+        dialog_checks::frame(ed, ctx, vec![egui::Event::PointerMoved(at(b))]);
+        dialog_checks::frame(ed, ctx, vec![button(b, false)]);
+        dialog_checks::frame(ed, ctx, vec![]);
+    }
+
+    /// A Donut, a Cross or an Asterisk already in a picture still draws, and a click selects it:
+    /// the rail then shows Select (no tool of its own is lit, none is missing). It moves, resizes
+    /// (the donut stays round), takes a new style (remembered for no tool), is deleted and comes
+    /// back with undo, and the picture exported shows it.
+    #[test]
+    fn a_shape_the_rail_no_longer_makes_still_selects_moves_resizes_restyles_and_deletes() {
+        let (ed, ids) = editor_with_removed_kinds();
+        let flat = ed.doc.flatten();
+        for id in ids {
+            assert!(drawn_in(&flat, ed.doc.item(id).unwrap().shape.rect().unwrap().norm()), "item {id} is drawn");
+            assert_eq!(Tool::for_shape(&ed.doc.item(id).unwrap().shape), Tool::Select, "its style belongs to no tool");
+        }
+        for (n, id) in ids.into_iter().enumerate() {
+            let ctx = crate::theme::test_context();
+            let (mut ed, _) = editor_with_removed_kinds();
+            ed.set_tool(Tool::Rectangle);
+            dialog_checks::frame(&mut ed, &ctx, vec![]);
+            dialog_checks::frame(&mut ed, &ctx, vec![]);
+            let c = ed.last_canvas;
+            let p = a_point_on(&ed, id);
+            dialog_checks::click(&mut ed, &ctx, pos2(c.min.x + p.x * c.zoom, c.min.y + p.y * c.zoom));
+            assert_eq!(ed.selected, Some(id), "a click selects item {n}");
+            assert_eq!(ed.tool, Tool::Select, "the rail shows Select");
+            // The rail lights Select and nothing else.
+            let painted = dialog_checks::frame(&mut ed, &ctx, vec![]);
+            let lit = painted.editor.iter().filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == theme::PRIMARY && r.rect.right() <= RAIL && (r.rect.width() - TOOL_BUTTON).abs() < 1.0)).count();
+            assert_eq!(lit, 1, "one tool lit on the rail");
+            // Moved by a drag.
+            let before = ed.doc.item(id).unwrap().shape.rect().unwrap().norm();
+            drag(&mut ed, &ctx, p, pt(p.x + 6.0, p.y + 4.0));
+            let moved = ed.doc.item(id).unwrap().shape.rect().unwrap().norm();
+            assert!((moved.x0 - before.x0 - 6.0).abs() < 1.0 && (moved.y0 - before.y0 - 4.0).abs() < 1.0, "moved: {before:?} -> {moved:?}");
+            // Resized from its bottom-right corner.
+            let corner = pt(moved.x1, moved.y1);
+            drag(&mut ed, &ctx, corner, pt(corner.x + 10.0, corner.y + 6.0));
+            let resized = ed.doc.item(id).unwrap().shape.rect().unwrap().norm();
+            assert!(resized.x1 > moved.x1 + 4.0 && (resized.x0 - moved.x0).abs() < 0.01, "resized: {moved:?} -> {resized:?}");
+            if matches!(ed.doc.item(id).unwrap().shape, Shape::Donut(_)) {
+                assert!(((resized.x1 - resized.x0) - (resized.y1 - resized.y0)).abs() < 0.5, "the donut stays round: {resized:?}");
+            }
+            // A new style: the item takes it, no tool remembers it.
+            let before = (ed.style, ed.obfuscate);
+            ed.style.width = 9.0;
+            ed.style.stroke = Rgba::YELLOW;
+            assert!(ed.commit_style(before));
+            assert_eq!((ed.doc.item(id).unwrap().style.width, ed.doc.item(id).unwrap().style.stroke), (9.0, Rgba::YELLOW));
+            assert!(REMOVED_KEYS.iter().all(|k| !ed.prefs.styles.contains_key(*k)), "{:?}", ed.prefs.styles.keys().collect::<Vec<_>>());
+            // The exported picture shows it where it is now.
+            assert!(drawn_in(&ed.doc.flatten(), resized));
+            // Deleted with Delete, back with undo.
+            ed.run(EditorAction::Delete);
+            assert!(ed.doc.item(id).is_none());
+            ed.run(EditorAction::Undo);
+            assert!(ed.doc.item(id).is_some(), "undo brings it back");
+        }
+    }
+
+    /// The last tool of an older settings file was one of the three: the editor opens on Select
+    /// and keeps every remembered style.
+    #[test]
+    fn a_last_tool_that_was_removed_opens_on_select() {
+        for key in REMOVED_KEYS {
+            let mut prefs = EditorPrefs { tool: key.into(), ..EditorPrefs::default() };
+            prefs.styles.insert("arrow".into(), crate::settings::SavedStyle { width: 7.0, ..Default::default() });
+            prefs.styles.insert(key.into(), crate::settings::SavedStyle { width: 3.0, ..Default::default() });
+            let ed = editor(prefs.clone());
+            assert_eq!(ed.tool, Tool::Select, "{key}");
+            assert_eq!(ed.prefs.styles, prefs.styles, "{key}: every remembered style is kept");
+        }
+        // Another word nobody knows still falls back as before.
+        assert_eq!(editor(EditorPrefs { tool: "sculpt".into(), ..EditorPrefs::default() }).tool, Tool::Rectangle);
     }
 }

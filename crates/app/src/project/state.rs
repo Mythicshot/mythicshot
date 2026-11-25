@@ -1201,6 +1201,35 @@ pub(super) mod tests {
         assert!(blobs_again.iter().all(|b| blobs.contains(b)));
     }
 
+    /// Recordings saved before the Cross, Asterisk and Donut tools left the rail hold such
+    /// shapes: saved and loaded again they come back the same and draw the same, as in both
+    /// golden files above.
+    #[test]
+    fn shapes_the_rail_no_longer_makes_round_trip_and_draw_the_same() {
+        let rec = rec();
+        let mut kept: Vec<Item> = items().into_iter().filter(|i| matches!(i.shape, Shape::Donut(_) | Shape::Cross(_) | Shape::Asterisk(_))).collect();
+        // A file numbers its items from one.
+        kept.iter_mut().enumerate().for_each(|(i, it)| it.id = i as u64 + 1);
+        assert_eq!(kept.len(), 3);
+        let (file, blobs) = build(&rec, &Edit::new(&rec, OverlayStyle::default()), &[], &kept);
+        let project = tempfile::tempdir().unwrap();
+        write_blobs(project.path(), &blobs);
+        let back = from_file(parse(&to_text(&file).unwrap()).unwrap(), project.path(), &rec);
+        assert_eq!(back.dropped, Vec::<String>::new());
+        assert_same_items(&back.items, &kept);
+        let white = image::Rgba([255, 255, 255, 255]);
+        let draw = |items: &[Item]| {
+            let mut doc = mythicshot_editor::Document::new(RgbaImage::from_pixel(40, 40, white));
+            for it in items {
+                doc.add(it.shape.clone(), Style { stroke: Rgba::RED, width: 2.0, ..Style::default() });
+            }
+            doc.flatten()
+        };
+        let (before, after) = (draw(&kept), draw(&back.items));
+        assert!(before.pixels().any(|p| *p != white), "they are drawn");
+        assert!(before == after, "and drawn the same after the round trip");
+    }
+
     #[test]
     fn a_moved_hotspot_is_saved_restored_and_left_out_when_there_is_none() {
         let rec = rec();
