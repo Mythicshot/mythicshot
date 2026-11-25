@@ -66,6 +66,7 @@ pub struct Settings {
     /// An empty string means the action has no shortcut.
     pub hotkeys: BTreeMap<Action, String>,
     /// Editor action → shortcut, same syntax as `hotkeys`.
+    #[serde(deserialize_with = "editor_keys")]
     pub editor_keys: BTreeMap<EditorAction, String>,
     /// What the editor remembers between captures.
     pub editor: EditorPrefs,
@@ -134,6 +135,21 @@ const DEFAULT_WARN_GB: u32 = 5;
 
 /// The warning limit as the settings file holds it: a whole number no larger than the field in
 /// Preferences can hold. Anything else is refused, which costs only this value (see [`Settings::parse`]).
+/// Editor actions this version no longer has: the tools taken off the editor's rail (Cross,
+/// Asterisk and Donut). Every file written before they went names them (the defaults are written
+/// out), so their entries are left out without a word and the file loads whole.
+const RETIRED_EDITOR_ACTIONS: [&str; 3] = ["cross", "asterisk", "donut"];
+
+/// The editor's shortcuts, without the entries of [`RETIRED_EDITOR_ACTIONS`]. Any other action
+/// this version does not know is refused as before, and costs only itself (see [`Settings::parse`]).
+fn editor_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<EditorAction, String>, D::Error> {
+    BTreeMap::<String, String>::deserialize(d)?
+        .into_iter()
+        .filter(|(action, _)| !RETIRED_EDITOR_ACTIONS.contains(&action.as_str()))
+        .map(|(action, key)| EditorAction::deserialize(serde::de::value::StrDeserializer::<D::Error>::new(&action)).map(|a| (a, key)))
+        .collect()
+}
+
 fn warn_gb<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let gb = u32::deserialize(d)?;
     if gb > crate::project::LIMIT_MAX_GB {
@@ -596,8 +612,8 @@ impl Settings {
         for a in Action::ALL {
             s.hotkeys.entry(*a).or_insert_with(|| a.default_binding().to_string());
         }
-        // Version 1 gave F to the asterisk and C to the cone: the pen moved to W
-        // and crop to K. Keys still on the old default move; rebound ones stay.
+        // Version 1 gave F to the asterisk (since taken off the rail) and C to the cone: the
+        // pen moved to W and crop to K. Keys still on the old default move; rebound ones stay.
         if s.editor_keys_version < 1 {
             for (a, old) in [(EditorAction::Freehand, "KeyF"), (EditorAction::Crop, "KeyC")] {
                 if s.editor_keys.get(&a).is_some_and(|b| b == old) {
@@ -860,7 +876,6 @@ select = \"KeyQ\"
         assert_eq!(s.editor_binding(EditorAction::Freehand), "KeyW");
         assert_eq!(s.editor_binding(EditorAction::Crop), "KeyK");
         assert_eq!(s.editor_binding(EditorAction::Select), "KeyQ");
-        assert_eq!(s.editor_binding(EditorAction::Asterisk), "KeyF");
         assert_eq!(s.editor_binding(EditorAction::Cone), "KeyC");
         // Someone who moved crop to X keeps it, and a second load changes nothing.
         let mine: Settings = toml::from_str("[editor_keys]
@@ -1153,6 +1168,54 @@ publish_server = \"https://tours.example.com\"
         assert_eq!(s.editor.styles["arrow"].width, 7.0, "the other tool's style is untouched");
         let theme = &s.editor.tour_theme;
         assert_eq!((theme.accent.as_str(), theme.hotspot.as_str(), theme.zoom_percent), ("#6aa8f0", "dot", SavedTheme::default().zoom_percent));
+    }
+
+    /// A file saved before the Cross, Asterisk and Donut tools went: it holds their keys (as
+    /// every file did, the defaults are written out), one as the last tool used, and their
+    /// remembered styles. It loads whole and quietly: no problem to report, no copy made, every
+    /// other setting as it was; the three keys are gone, so Z, F and D are free.
+    #[test]
+    fn a_file_from_before_cross_asterisk_and_donut_went_loads_whole_and_quietly() {
+        for (last, keys) in [("cross", [("cross", "KeyZ"), ("asterisk", "KeyF"), ("donut", "KeyD")]), ("donut", [("cross", "shift+KeyX"), ("asterisk", "KeyF"), ("donut", "")]), ("asterisk", [("cross", "KeyZ"), ("asterisk", "alt+KeyA"), ("donut", "KeyD")])] {
+            let mut mine = Settings { output_dir: PathBuf::from("D:/Shots"), publish_server: "https://tours.example.com".into(), magnifier: false, ..Settings::default() };
+            mine.editor_keys.insert(EditorAction::Select, "KeyQ".into());
+            mine.editor.export_scale = 50;
+            mine.editor.styles.insert("arrow".into(), SavedStyle { width: 7.0, ..SavedStyle::default() });
+            let mut table: toml::Table = toml::from_str(&toml::to_string(&mine).unwrap()).unwrap();
+            let editor_keys = table.get_mut("editor_keys").and_then(|v| v.as_table_mut()).unwrap();
+            for (name, key) in keys {
+                editor_keys.insert(name.into(), toml::Value::String(key.into()));
+            }
+            let editor = table.get_mut("editor").and_then(|v| v.as_table_mut()).unwrap();
+            editor.insert("tool".into(), toml::Value::String(last.into()));
+            let styles = editor.get_mut("styles").and_then(|v| v.as_table_mut()).unwrap();
+            styles.insert(last.into(), toml::Value::try_from(SavedStyle { width: 3.0, ..SavedStyle::default() }).unwrap());
+            let text = toml::to_string(&table).unwrap();
+            assert!(text.contains(&format!("{last} = ")), "{text}");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("settings.toml");
+            std::fs::write(&path, &text).unwrap();
+            let s = Settings::load_with(&path, |p| std::fs::read(p), |_, _| panic!("a copy was made of a file that loaded whole"));
+            assert!(s.load_problem.is_none(), "{last}: {:?}", s.load_problem.as_ref().map(LoadProblem::sentence));
+            assert_eq!((s.output_dir.as_path(), s.publish_server.as_str(), s.magnifier), (std::path::Path::new("D:/Shots"), "https://tours.example.com", false));
+            assert_eq!(s.editor_binding(EditorAction::Select), "KeyQ");
+            assert_eq!((s.editor.tool.as_str(), s.editor.export_scale), (last, 50), "the editor reads the old last tool and opens on Select");
+            assert_eq!((s.editor.styles["arrow"].width, s.editor.styles[last].width), (7.0, 3.0));
+            assert_eq!(s.editor_keys.len(), EditorAction::ALL.len());
+            for (_, key) in keys.iter().filter(|(_, k)| !k.is_empty()) {
+                assert!(s.editor_keys.values().all(|k| k != key), "{key} is free: {:?}", s.editor_keys);
+            }
+            // Saved again, the file no longer names them, and loads as it was saved.
+            s.save_to(&path).unwrap();
+            let again = std::fs::read_to_string(&path).unwrap();
+            let keys_section = again.split("[editor_keys]").nth(1).unwrap().split("\n[").next().unwrap();
+            assert!(["cross", "asterisk", "donut"].iter().all(|k| !keys_section.contains(&format!("{k} ="))), "{keys_section}");
+            assert!(load_at(&path).load_problem.is_none());
+        }
+        // An action no version knew still costs only itself, as before.
+        assert!(toml::from_str::<Settings>("[editor_keys]\nsculpt = \"KeyS\"\n").is_err());
+        assert!(toml::from_str::<Settings>("[editor_keys]\ncross = \"KeyZ\"\nselect = \"KeyQ\"\n").is_ok());
     }
 
     fn when() -> chrono::NaiveDateTime {
