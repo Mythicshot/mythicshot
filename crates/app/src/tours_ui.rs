@@ -1866,18 +1866,23 @@ pub fn ui(ui: &mut egui::Ui, state: &mut ToursState, conn: &Conn, out: &mut Page
         if crate::profiles_ui::dropdown(ui, "tours", true) {
             ui.ctx().request_repaint();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(theme::primary_button(RECORD_A_TOUR)).on_hover_text("Go to Home, where a recording starts").clicked() {
-                clicks.push(Click::RecordTour);
-            }
-            let can_refresh = m.site.is_some() && !m.is_loading();
-            if refresh_button(ui, can_refresh).clicked() {
-                clicks.push(Click::Refresh);
-            }
-            if m.is_loading() && m.loaded_at.is_some() {
-                ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
-            }
-        });
+        theme::value_then_actions(
+            ui,
+            Layout::left_to_right(Align::Center),
+            |_| {},
+            |ui| {
+                if m.is_loading() && m.loaded_at.is_some() {
+                    ui.add(egui::Spinner::new().size(theme::CONTROL_TEXT_SIZE));
+                }
+                let can_refresh = m.site.is_some() && !m.is_loading();
+                if refresh_button(ui, can_refresh).clicked() {
+                    clicks.push(Click::Refresh);
+                }
+                if ui.add(theme::primary_button(RECORD_A_TOUR)).on_hover_text("Go to Home, where a recording starts").clicked() {
+                    clicks.push(Click::RecordTour);
+                }
+            },
+        );
     });
     theme::block_gap(ui);
 

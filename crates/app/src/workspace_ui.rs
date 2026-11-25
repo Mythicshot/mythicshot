@@ -651,7 +651,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                 match &conn.test_server {
                     Some(t) => {
                         let mut shown = t.clone();
-                        ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(ui.available_width()));
+                        ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
                         theme::caption(ui, "Debug build: set by MYTHICSHOT_TEST_PUBLISH for this run, not saved.");
                     }
                     // The address is the profile's own.
@@ -659,7 +659,7 @@ pub fn ui(ui: &mut egui::Ui, p: &mut WorkspaceState, server: &mut String, conn: 
                         theme::value(ui, crate::profiles::site_label(server));
                     }
                     None => {
-                        if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(ui.available_width())).changed() {
+                        if ui.add(egui::TextEdit::singleline(server).hint_text("https://tours.example.com").desired_width(f32::INFINITY)).changed() {
                             out.changed = true;
                             p.clear_message();
                             // A typed address is never asked on its own; see the module's first lines.

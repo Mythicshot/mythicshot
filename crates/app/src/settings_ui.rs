@@ -255,33 +255,43 @@ fn output_page(ui: &mut egui::Ui, view: View<'_>, saved: &mut SavedRecordings, h
         rows.full(|ui| {
             ui.label("Captures folder");
             ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Browse…").clicked() {
-                        if let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
-                            s.output_dir = p;
+                let mut browse = false;
+                theme::value_then_actions(
+                    ui,
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        let mut dir = s.output_dir.display().to_string();
+                        if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(f32::INFINITY)).changed() {
+                            s.output_dir = dir.into();
                             changed = true;
                         }
-                    }
-                    let mut dir = s.output_dir.display().to_string();
-                    if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(ui.available_width())).changed() {
-                        s.output_dir = dir.into();
-                        changed = true;
-                    }
-                });
+                    },
+                    |ui| browse = ui.button("Browse…").clicked(),
+                );
+                if browse && let Some(p) = crate::dialogs::pick_folder(rfd::FileDialog::new().set_directory(&s.output_dir), "captures folder") {
+                    s.output_dir = p;
+                    changed = true;
+                }
             });
         });
         rows.full(|ui| {
             ui.label("File name pattern");
             ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Default").clicked() {
-                        s.filename_pattern = DEFAULT_PATTERN.to_string();
-                        changed = true;
-                    }
-                    if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(ui.available_width()).font(egui::TextStyle::Monospace)).changed() {
-                        changed = true;
-                    }
-                });
+                let mut default = false;
+                theme::value_then_actions(
+                    ui,
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        if ui.add(egui::TextEdit::singleline(&mut s.filename_pattern).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace)).changed() {
+                            changed = true;
+                        }
+                    },
+                    |ui| default = ui.button("Default").clicked(),
+                );
+                if default {
+                    s.filename_pattern = DEFAULT_PATTERN.to_string();
+                    changed = true;
+                }
             });
             let example = expand_pattern(&s.filename_pattern, "Window title", chrono::Local::now());
             theme::caption(ui, format!("Example: {example}.{}", s.image_format.extension()));
@@ -897,15 +907,19 @@ pub fn click_style_label(c: mythicshot_editor::overlays::ClickStyle) -> &'static
 
 fn hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsState, view: View<'_>, out: &mut Vec<UiAction>) {
     ui.horizontal(|ui| {
-        ui.heading("Hotkeys");
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Reset all").clicked() {
-                out.push(UiAction::ResetAll);
-            }
-            if ui.button("Open settings file").on_hover_text("Keybinds are saved in settings.toml; copy it to move them to another PC").clicked() {
-                out.push(UiAction::OpenSettingsFolder);
-            }
-        });
+        theme::value_then_actions(
+            ui,
+            Layout::left_to_right(Align::Center),
+            |ui| drop(ui.heading("Hotkeys")),
+            |ui| {
+                if ui.button("Open settings file").on_hover_text("Keybinds are saved in settings.toml; copy it to move them to another PC").clicked() {
+                    out.push(UiAction::OpenSettingsFolder);
+                }
+                if ui.button("Reset all").clicked() {
+                    out.push(UiAction::ResetAll);
+                }
+            },
+        );
     });
     theme::block_gap(ui);
 
@@ -986,8 +1000,10 @@ fn row(rows: &mut theme::CardRows<'_>, state: &mut SettingsState, view: &View<'_
             ui.add(egui::Label::new(RichText::new(action.label()).color(theme::TEXT)).truncate());
         },
         |ui| {
-            if ui.button("Reset").on_hover_text("Reset to default").clicked() {
-                out.push(UiAction::SetBinding(action, action.default_binding().to_string()));
+            if listening {
+                ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(theme::SMALL_SIZE));
+            } else if let Some(e) = error {
+                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
             }
             let text = if listening {
                 "Press new keys…".to_string()
@@ -1007,10 +1023,8 @@ fn row(rows: &mut theme::CardRows<'_>, state: &mut SettingsState, view: &View<'_
             if ui.add(button).on_hover_text("Click, then press the new shortcut").clicked() {
                 out.push(if listening { UiAction::StopListening } else { UiAction::Listen(action) });
             }
-            if listening {
-                ui.label(RichText::new("Esc cancels · Backspace clears").color(theme::MUTED).size(theme::SMALL_SIZE));
-            } else if let Some(e) = error {
-                theme::caution_line(ui, e, theme::SMALL_SIZE, theme::Fit::Truncate).on_hover_text(e);
+            if ui.button("Reset").on_hover_text("Reset to default").clicked() {
+                out.push(UiAction::SetBinding(action, action.default_binding().to_string()));
             }
         },
     );

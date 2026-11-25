@@ -804,7 +804,7 @@ impl AddFlow {
                     rows.row(
                         profiles::SITE_ADDRESS,
                         |ui| {
-                            ui.add_enabled(!renewing && !signing, egui::TextEdit::singleline(address).hint_text("https://tours.example.com").desired_width(ui.available_width()));
+                            ui.add_enabled(!renewing && !signing, egui::TextEdit::singleline(address).hint_text("https://tours.example.com").desired_width(f32::INFINITY));
                             if !address.trim().is_empty()
                                 && let Err(e) = publish::check_server(address)
                             {
@@ -822,15 +822,19 @@ impl AddFlow {
                         // A site without Sign in: a token from its setup page, checked the same way.
                         if pasting {
                             ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if checking_paste {
-                                        ui.add(egui::Spinner::new());
-                                    }
-                                    if ui.add_enabled(can_check, egui::Button::new(CHECK_PASTE)).clicked() {
-                                        pressed = Some(CHECK_PASTE);
-                                    }
-                                    ui.add(egui::TextEdit::singleline(paste).password(true).hint_text(PASTE_HINT).desired_width(ui.available_width()));
-                                });
+                                theme::value_then_actions(
+                                    ui,
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| drop(ui.add(egui::TextEdit::singleline(paste).password(true).hint_text(PASTE_HINT).desired_width(f32::INFINITY))),
+                                    |ui| {
+                                        if ui.add_enabled(can_check, egui::Button::new(CHECK_PASTE)).clicked() {
+                                            pressed = Some(CHECK_PASTE);
+                                        }
+                                        if checking_paste {
+                                            ui.add(egui::Spinner::new());
+                                        }
+                                    },
+                                );
                             });
                         } else if ui.add_enabled(!working && !signing, egui::Link::new(crate::workspace_ui::PASTE_INSTEAD)).clicked() {
                             paste_instead = true;
@@ -857,7 +861,7 @@ impl AddFlow {
                 note(ui, Tone::Ok, &profiles::connected(candidate.account.as_deref(), &candidate.workspace));
                 theme::block_gap(ui);
                 theme::card(ui, |rows| {
-                    rows.row(profiles::PROFILE_NAME, |ui| drop(ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(ui.available_width()))), |_| {});
+                    rows.row(profiles::PROFILE_NAME, |ui| drop(ui.add(egui::TextEdit::singleline(name).char_limit(profiles::NAME_MAX).desired_width(f32::INFINITY))), |_| {});
                 });
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.working, egui::Button::new(profiles::CANCEL)).clicked() {
@@ -1174,15 +1178,11 @@ impl Panel {
                 rows.full(|ui| {
                     ui.horizontal(|ui| {
                         dot(ui, e.waiting);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(!working, egui::Button::new(profiles::REMOVE_PROFILE)).clicked() {
-                                remove = Some(e.id.clone());
-                            }
-                            if e.waiting && ui.add_enabled(!working, egui::Button::new(profiles::SIGN_IN_AGAIN)).clicked() {
-                                again = Some(e.id.clone());
-                            }
-                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
+                        theme::value_then_actions(
+                            ui,
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = theme::LINE_GAP;
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Label::new(RichText::new(&e.name).strong()).truncate());
                                     if e.active {
@@ -1190,8 +1190,16 @@ impl Panel {
                                     }
                                 });
                                 ui.add(egui::Label::new(RichText::new(&e.detail).size(theme::SMALL_SIZE).color(theme::MUTED)).truncate());
-                            });
-                        });
+                            },
+                            |ui| {
+                                if e.waiting && ui.add_enabled(!working, egui::Button::new(profiles::SIGN_IN_AGAIN)).clicked() {
+                                    again = Some(e.id.clone());
+                                }
+                                if ui.add_enabled(!working, egui::Button::new(profiles::REMOVE_PROFILE)).clicked() {
+                                    remove = Some(e.id.clone());
+                                }
+                            },
+                        );
                     });
                 });
             }

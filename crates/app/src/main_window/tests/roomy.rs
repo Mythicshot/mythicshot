@@ -404,3 +404,98 @@ fn roomy_renders() {
         }
     }
 }
+
+/// The rectangles keyboard focus visits, in order, pressing Tab `steps` times on what `draw` draws.
+fn focus_walk(ctx: &egui::Context, steps: usize, draw: &mut dyn FnMut(Vec<egui::Event>) -> egui::FullOutput) -> Vec<egui::Rect> {
+    let tab = egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+    let mut seen = Vec::new();
+    for _ in 0..steps {
+        draw(vec![tab.clone()]);
+        draw(vec![]);
+        if let Some(r) = ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)) {
+            seen.push(r.rect);
+        }
+    }
+    seen
+}
+
+/// Focus reaches the control around `a` before the control around `b`.
+fn assert_before(seen: &[egui::Rect], a: egui::Pos2, b: egui::Pos2, what: &str) {
+    let at = |p: egui::Pos2| seen.iter().position(|r| r.contains(p)).unwrap_or_else(|| panic!("{what}: focus never reached {p:?} in {seen:?}"));
+    assert!(at(a) < at(b), "{what}: Tab reaches {b:?} before {a:?}: {seen:?}");
+}
+
+/// Tab goes from a field to its button, as they are seen: the add form's address and Sign in,
+/// the pasted token and Test connection, Captures folder and Browse…, File name pattern and
+/// Default, and a shortcut's keys and its Reset.
+#[test]
+fn tab_goes_from_each_field_to_its_button() {
+    let size = egui::vec2(SIZE[0], 2400.0);
+    // The add form, with an address and a pasted token.
+    let ctx = crate::theme::test_context();
+    let mut f = fixture(Kind::Add);
+    frame(&ctx, &mut f, size);
+    let base = f._site.base.clone();
+    if let crate::profiles_ui::Mode::Add(flow) = &mut f.s.profiles.mode {
+        flow.address = base.clone();
+        flow.begin_paste();
+        flow.type_paste_for_test(TOKEN);
+    }
+    frame(&ctx, &mut f, size);
+    let out = frame(&ctx, &mut f, size);
+    let address = text_rect(&out, &base).expect("the address").center();
+    let sign_in = holder(&out, profiles::SIGN_IN).center();
+    let check = holder(&out, workspace_ui::TEST_CONNECTION);
+    let paste = check.left_center() - egui::vec2(30.0, 0.0);
+    let seen = focus_walk(&ctx, 30, &mut |events| {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+        let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+        let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, Some(&f.given)));
+        out.textures_delta.clear();
+        out
+    });
+    assert_before(&seen, address, sign_in, "the address");
+    assert_before(&seen, paste, check.center(), "the pasted token");
+
+    // Preferences: Output, then Hotkeys.
+    for tab in [settings_ui::Tab::Output, settings_ui::Tab::Hotkeys] {
+        let ctx = crate::theme::test_context();
+        let mut f = fixture(Kind::Add);
+        f.s.nav.request(Page::Preferences);
+        f.s.prefs.state.tab = tab;
+        let tours = crate::tours_ui::tests::conn(TokenStatus::Missing);
+        let mut draw = |events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| window_ui_given(ui, &mut f.s, &tours, None));
+            out.textures_delta.clear();
+            out
+        };
+        draw(vec![]);
+        let out = draw(vec![]);
+        let pairs: Vec<(egui::Pos2, egui::Pos2, &str)> = match tab {
+            settings_ui::Tab::Output => {
+                let folder = shapes_of(&out).into_iter().find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text().contains("mythicshot") || t.galley.text().contains(std::path::MAIN_SEPARATOR) => Some(t.visual_bounding_rect().center()),
+                    _ => None,
+                });
+                vec![(folder.expect("the captures folder"), holder(&out, "Browse…").center(), "Captures folder"), (text_rect(&out, mythicshot_destinations::DEFAULT_PATTERN).expect("the pattern").center(), holder(&out, "Default").center(), "File name pattern")]
+            }
+            _ => {
+                let keys = holder(&out, "PrtSc");
+                let reset = shapes_of(&out)
+                    .into_iter()
+                    .filter_map(|s| match s {
+                        egui::Shape::Text(t) if t.galley.text() == "Reset" => Some(t.visual_bounding_rect().center()),
+                        _ => None,
+                    })
+                    .find(|c| (c.y - keys.center().y).abs() < 2.0)
+                    .expect("the row's Reset");
+                vec![(keys.center(), reset, "a shortcut")]
+            }
+        };
+        let seen = focus_walk(&ctx, 60, &mut draw);
+        for (a, b, what) in pairs {
+            assert_before(&seen, a, b, what);
+        }
+    }
+}

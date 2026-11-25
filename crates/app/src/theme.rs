@@ -275,6 +275,8 @@ pub const CONTROL_TEXT_SIZE: f32 = 14.0;
 pub const CONTROL_RADIUS: u8 = RADIUS_MD;
 /// The gap between two controls side by side, and between stacked lines.
 pub const ITEM_GAP: f32 = 8.0;
+/// The gap between two lines of text that belong together (a name and the line under it).
+pub const LINE_GAP: f32 = 2.0;
 /// The least height of a row in a card.
 pub const ROW_HEIGHT: f32 = 44.0;
 /// The width of a row's label column.
@@ -450,17 +452,19 @@ impl CardRows<'_> {
                     ui.add(egui::Label::new(RichText::new(label).color(MUTED)).truncate());
                 });
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                actions(ui);
-                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            value_then_actions(
+                ui,
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
                     // A one-line value sits in the middle of the row: the space under it counts
                     // the gap the layout leaves after every item.
                     let pad = ((ROW_HEIGHT - ui.text_style_height(&TextStyle::Body)) / 2.0).max(0.0);
                     ui.add_space(pad);
                     value(ui);
                     ui.add_space((pad - ui.spacing().item_spacing.y).max(0.0));
-                });
-            });
+                },
+                actions,
+            );
         });
         if let Some(tint) = tint {
             let r = row.response.rect.expand2(egui::vec2(CARD_PAD_X / 2.0, -0.5));
@@ -482,6 +486,38 @@ impl CardRows<'_> {
             ui.add_space(ITEM_GAP / 2.0);
         });
     }
+}
+
+/// On a line laid out from the left: what `value` draws (in `layout`), taking the width the
+/// actions leave, then what `actions` draws, from the left, at the right end of the line. The
+/// value is made first and the actions after it, so the keyboard's Tab goes from a field to its
+/// buttons in the order they are seen. The actions' width is the one they took when last drawn
+/// (half the line the first time); when it changes, the window is drawn again at once.
+pub fn value_then_actions<R>(ui: &mut egui::Ui, layout: egui::Layout, value: impl FnOnce(&mut egui::Ui) -> R, actions: impl FnOnce(&mut egui::Ui)) -> R {
+    let id = ui.next_auto_id().with("value-then-actions");
+    let known: Option<f32> = ui.data(|d| d.get_temp(id));
+    let gap = ui.spacing().item_spacing.x;
+    let line = ui.available_rect_before_wrap();
+    // Before the actions were ever measured, half the line is kept for them, so they never push
+    // past the line's end while they are measured.
+    let kept = known.unwrap_or(line.width() / 2.0);
+    let width = (line.width() - kept - if kept > 0.0 { gap } else { 0.0 }).max(0.0);
+    let shown = ui.allocate_ui_with_layout(egui::vec2(width, line.height()), layout, |ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        value(ui)
+    });
+    // The actions, from the left, in the space at the line's end: as high as the line (or as the
+    // value, when that is taller), so they stand level with it.
+    let at = shown.response.rect;
+    let bottom = if line.height() <= 4.0 * ROW_HEIGHT { line.bottom().max(at.bottom()) } else { at.bottom() };
+    let space = egui::Rect::from_min_max(egui::pos2(line.right() - kept, line.top()), egui::pos2(line.right(), bottom));
+    let taken = ui.scope_builder(egui::UiBuilder::new().max_rect(space).layout(egui::Layout::left_to_right(egui::Align::Center)), actions).response.rect.width();
+    if known.is_none_or(|known| (taken - known).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(id, taken));
+        ui.ctx().request_repaint();
+    }
+    shown.inner
 }
 
 /// A row's value: `text` in the primary text colour, cut short with "…" when it does not fit.

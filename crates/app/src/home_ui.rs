@@ -261,17 +261,19 @@ fn tile(ui: &mut egui::Ui, t: &Tile, hotkey: &str, width: f32, enabled: bool) ->
 /// One recent capture, a row of the Recent card: its name, then Open and Show in folder at the right.
 fn recent_row(ui: &mut egui::Ui, f: &Recent) {
     ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Show in folder").clicked() {
-                platform::reveal(&f.path);
-            }
-            if ui.button("Open").clicked() {
-                platform::open_path(&f.path);
-            }
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                theme::value(ui, &f.name);
-            });
-        });
+        theme::value_then_actions(
+            ui,
+            Layout::left_to_right(Align::Center),
+            |ui| drop(theme::value(ui, &f.name)),
+            |ui| {
+                if ui.button("Open").clicked() {
+                    platform::open_path(&f.path);
+                }
+                if ui.button("Show in folder").clicked() {
+                    platform::reveal(&f.path);
+                }
+            },
+        );
     });
 }
 
