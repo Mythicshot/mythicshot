@@ -384,6 +384,53 @@ fn every_page_fits_the_smallest_window_on_the_roomy_sizes() {
     }
 }
 
+/// The five Home tiles at the usual and the smallest window, at 100% and 200%: each tile lies
+/// inside the page beside the menu, no two overlap, each name and caption sits inside its own
+/// tile, and at the smallest window they stand in two rows, the Open image tile on the second.
+#[test]
+fn the_five_tiles_fit_without_overlap_on_every_size_and_scale() {
+    for (name, size) in SIZES {
+        for ppp in [1.0, 2.0] {
+            let what = format!("{name} at {ppp}");
+            let ctx = crate::theme::test_context();
+            ctx.set_pixels_per_point(ppp);
+            let mut f = fixture(Kind::Add);
+            f.s.nav.request(Page::Home);
+            let size = egui::vec2(size[0], size[1]);
+            frame(&ctx, &mut f, size);
+            let out = frame(&ctx, &mut f, size);
+            let tiles: Vec<egui::Rect> = shapes_of(&out)
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Rect(r) if (r.rect.height() - home_ui::TILE_HEIGHT).abs() < 0.5 && r.stroke.color == theme::BORDER_STRONG => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tiles.len(), 5, "{what}: {tiles:?}");
+            for (i, a) in tiles.iter().enumerate() {
+                assert!(a.left() >= NAV_WIDTH + theme::PAGE_PAD - 0.5 && a.right() <= size.x - theme::PAGE_PAD + 0.5 && a.bottom() <= size.y, "{what}: tile {i} at {a:?}");
+                assert!(a.width() >= home_ui::TILE_MIN_WIDTH - 0.5, "{what}: tile {i} at {a:?}");
+                for b in &tiles[i + 1..] {
+                    assert!(!a.intersects(*b), "{what}: {a:?} overlaps {b:?}");
+                }
+            }
+            for (t, rect) in home_ui::TILES.iter().zip(&tiles) {
+                let words = text_rect(&out, t.name).unwrap_or_else(|| panic!("{what}: {}", t.name));
+                assert!(rect.contains_rect(words), "{what}: {} at {words:?} outside {rect:?}", t.name);
+            }
+            let caption = text_rect(&out, home_ui::OR_DROP_A_FILE).unwrap();
+            assert!(tiles[4].contains_rect(caption), "{what}: {caption:?} outside {:?}", tiles[4]);
+            let rows = if name == "smallest" { 2 } else { 1 };
+            let mut tops: Vec<i32> = tiles.iter().map(|r| r.top().round() as i32).collect();
+            tops.dedup();
+            assert_eq!(tops.len(), rows, "{what}: {tiles:?}");
+            assert!(theme::checks::assert_texts_fit(&out, &what) >= 4);
+            theme::checks::assert_no_overlaps(&out, &what);
+            assert_inside_across(&out, egui::Rect::from_min_size(egui::Pos2::ZERO, size), &what);
+        }
+    }
+}
+
 /// A clock that moves only when slept on, so a sign-in in a picture never waits.
 #[derive(Default)]
 struct FastClock(Mutex<Duration>);

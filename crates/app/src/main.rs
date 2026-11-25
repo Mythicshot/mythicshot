@@ -22,6 +22,7 @@ mod input;
 mod live_draw;
 mod main_window;
 mod menu_bar;
+mod open_image;
 mod overlay;
 mod placement;
 mod password;
@@ -1091,8 +1092,7 @@ impl App {
     }
 
     fn open_file(&mut self) {
-        let picked = dialogs::pick_file(rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"]).set_directory(&self.settings.output_dir), "open image");
-        let Some(path) = picked else { return };
+        let Some(path) = open_image::pick(&self.settings.output_dir) else { return };
         match image::open(&path) {
             Ok(img) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1425,13 +1425,18 @@ impl App {
             ctx.request_repaint_after(settings::SAVE_RETRY_AFTER);
         }
         // Pull what the window did since our last frame.
-        let (actions, edited, tab, capture, edit_project, requests) = {
+        let (actions, edited, tab, capture, edit_project, requests, open) = {
             let mut s = self.window.lock().expect("main window state");
             s.settle(ctx);
             let actions = std::mem::take(&mut s.prefs.actions);
             let edited = if actions.is_empty() { None } else { Some(s.prefs.settings.clone()) };
-            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests))
+            (actions, edited, s.prefs.state.tab, s.capture.take(), s.edit_project.take(), std::mem::take(&mut s.app_requests), s.open_image.take())
         };
+        // The Open image tile: exactly what the tray's "Open image from file…" runs. The window stays.
+        match open {
+            Some(open_image::OpenImage::Pick) => self.run(ctx, Command::OpenFile),
+            None => {}
+        }
         for request in requests {
             self.menu_request(ctx, request);
         }

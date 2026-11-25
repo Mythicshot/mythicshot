@@ -15,6 +15,7 @@ use eframe::egui::{self, RichText};
 use crate::theme;
 use crate::home_ui::{self, HomeState};
 use crate::menu_bar::{self, AppRequest, Entry};
+use crate::open_image::OpenImage;
 use crate::platform::{WindowId, WindowKind};
 use crate::project::ProjectKey;
 use crate::publish_ui::{self, TokenStatus};
@@ -188,6 +189,8 @@ pub struct PageOut {
     pub capture: Option<Command>,
     /// Open this saved recording in an editor: Edit on the Tours page.
     pub edit_project: Option<ProjectKey>,
+    /// Open a picture file in an editor: the Open image tile.
+    pub open_image: Option<OpenImage>,
 }
 
 /// State shared between the app and the window.
@@ -206,6 +209,9 @@ pub struct Shared {
     pub capture: Option<Command>,
     /// A saved recording the Tours page asked to edit; the app opens it in an editor.
     pub edit_project: Option<ProjectKey>,
+    /// A picture file to open, asked for by the Open image tile; the app opens it in an editor
+    /// and the window stays.
+    pub open_image: Option<OpenImage>,
     /// A capture or recording is going on: the tiles are greyed out.
     pub busy: bool,
     /// What the menu bar asked of the app, in order; the app takes them on its next frame.
@@ -219,7 +225,7 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -233,6 +239,9 @@ impl Shared {
         }
         if out.edit_project.is_some() {
             self.edit_project = out.edit_project;
+        }
+        if out.open_image.is_some() {
+            self.open_image = out.open_image;
         }
     }
 
@@ -409,7 +418,7 @@ pub fn show(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>, icon: Arc<egui::Ic
         window_ui(ui, s);
         s.settle(ui.ctx());
         // The app applies what was queued on its own frame: wake it instead of waiting for its slow tick.
-        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
+        if !s.nav.is_open() || s.capture.is_some() || s.edit_project.is_some() || s.open_image.is_some() || !s.app_requests.is_empty() || !s.update.asks.is_empty() || !s.prefs.actions.is_empty() || s.tours.unfinished().is_changed() || publish_ui::has_token_site_change() || publish_ui::has_book_change() {
             ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         }
     });
@@ -1185,7 +1194,7 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
             home = drawn(&ctx, &mut s);
         }
-        for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
+        for word in ["Home", "Tours", "Workspace", "Preferences", "Not connected", "Capture", "Region", "Window", "Full screen", "Record", "Open image", home_ui::OR_DROP_A_FILE, home_ui::RECORD_A_TOUR, "Recent", home_ui::NOTHING_RECENT] {
             assert!(home.lines().any(|l| l == word), "Home is missing {word:?} in:\n{home}");
         }
         // No token is saved in a test run, so Tours says it is not connected and asks nothing of any site.
@@ -1266,5 +1275,31 @@ pub(crate) mod tests {
             out.textures_delta.clear();
         }
         assert_eq!(s.capture, None);
+    }
+
+    /// The Open image tile asks the app for the tray's "Open image from file…", at the usual and
+    /// the smallest window (where it wraps to the second row), and also while a capture is going
+    /// on, as the tray's item does. The window stays open and no capture is asked for.
+    #[test]
+    fn the_open_image_tile_asks_for_the_file_dialog_and_the_window_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (size, busy) in [(SIZE, false), (MIN_SIZE, false), (SIZE, true)] {
+            let mut s = shared(tmp.path());
+            s.nav.request(Page::Home);
+            s.busy = busy;
+            let ctx = crate::theme::test_context();
+            let size = egui::vec2(size[0], size[1]);
+            window_frame(&ctx, &mut s, size, vec![]);
+            let out = window_frame(&ctx, &mut s, size, vec![]);
+            let at = crate::share_ui::tests::text_rect(&out, home_ui::TILES[4].name).expect("the tile is drawn").center();
+            assert!(crate::share_ui::tests::text_rect(&out, home_ui::OR_DROP_A_FILE).is_some_and(|r| r.top() > at.y), "its caption under its name");
+            let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            for events in [vec![egui::Event::PointerMoved(at)], vec![click(true)], vec![click(false)], vec![]] {
+                window_frame(&ctx, &mut s, size, events);
+            }
+            assert_eq!(s.open_image, Some(OpenImage::Pick), "{size:?} busy {busy}");
+            assert_eq!(s.capture, None);
+            assert!(s.nav.is_open() && s.app_requests.is_empty());
+        }
     }
 }

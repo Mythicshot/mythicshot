@@ -74,13 +74,15 @@ pub enum Icon {
     Tours,
     Workspace,
     Preferences,
+    /// A picture with an arrow up out of it: the Home tile that opens a picture file.
+    OpenImage,
 }
 
 impl Icon {
     /// Every icon, for the tests that draw them all.
     #[cfg(test)]
-    pub const ALL: [Icon; 59] = [
-        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Donut, Icon::Slice, Icon::Cross, Icon::Asterisk, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences,
+    pub const ALL: [Icon; 60] = [
+        Icon::Select, Icon::Rect, Icon::Ellipse, Icon::Line, Icon::Arrow, Icon::Freehand, Icon::Circle, Icon::Group, Icon::Cone, Icon::Donut, Icon::Slice, Icon::Cross, Icon::Asterisk, Icon::Text, Icon::Bubble, Icon::Step, Icon::Highlight, Icon::Obfuscate, Icon::Spotlight, Icon::Card, Icon::Crop, Icon::Undo, Icon::Redo, Icon::Save, Icon::SaveAs, Icon::Copy, Icon::Check, Icon::Send, Icon::Folder, Icon::Effects, Icon::Fit, Icon::Actual, Icon::Print, Icon::Email, Icon::Editor, Icon::Close, Icon::Delete, Icon::Front, Icon::EditText, Icon::Shadow, Icon::Pause, Icon::Play, Icon::Stop, Icon::Restart, Icon::StepBack, Icon::StepForward, Icon::Export, Icon::Region, Icon::Window, Icon::Screen, Icon::Record, Icon::Lock, Icon::Warning, Icon::Plus, Icon::ChevronDown, Icon::Home, Icon::Tours, Icon::Workspace, Icon::Preferences, Icon::OpenImage,
     ];
 }
 
@@ -410,6 +412,14 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
                 p.add(Shape::line_segment([at(0.5 + 0.3 * x, 0.5 + 0.3 * y), at(0.5 + 0.46 * x, 0.5 + 0.46 * y)], Stroke::new(s.width * 1.4, c)));
             }
         }
+        Icon::OpenImage => {
+            // A picture (its frame, a sun and two hills) with an arrow up beside it.
+            p.rect_stroke(rect(0.06, 0.32, 0.7, 0.92), 2.0, s, StrokeKind::Middle);
+            p.circle_filled(at(0.24, 0.5), r.width() * 0.055, c);
+            p.add(Shape::line(vec![at(0.12, 0.84), at(0.3, 0.64), at(0.42, 0.76), at(0.52, 0.66), at(0.64, 0.84)], thin));
+            p.add(line(&[(0.85, 0.66), (0.85, 0.1)]));
+            p.add(line(&[(0.73, 0.22), (0.85, 0.1), (0.97, 0.22)]));
+        }
     }
 }
 
@@ -433,7 +443,7 @@ mod tests {
                 assert!(inked.len() as f32 >= 8.0 * ppp * ppp, "{icon:?} at {ppp} draws almost nothing");
                 // The page icons stay inside their square (a pixel of slack for the line's
                 // width); some older toolbar icons reach a little past theirs on purpose.
-                if !matches!(icon, Icon::Plus | Icon::ChevronDown | Icon::Home | Icon::Tours | Icon::Workspace | Icon::Preferences) {
+                if !matches!(icon, Icon::Plus | Icon::ChevronDown | Icon::Home | Icon::Tours | Icon::Workspace | Icon::Preferences | Icon::OpenImage) {
                     continue;
                 }
                 let slack = 2.0 * ppp;
@@ -442,6 +452,29 @@ mod tests {
                     assert!(x >= 4.0 * ppp - slack && x <= (4.0 + side) * ppp + slack && y >= 4.0 * ppp - slack && y <= (4.0 + side) * ppp + slack, "{icon:?} at {ppp} draws outside its square at {x},{y}");
                 }
             }
+        }
+    }
+
+    /// The Open image tile's icon: a picture in the lower left and an arrow up at the right,
+    /// whose tip stands above the picture's top edge.
+    #[test]
+    fn the_open_image_icon_is_a_picture_with_an_arrow_up() {
+        for ppp in [1.0, 2.0] {
+            let side = 28.0;
+            let size = vec2(side, side);
+            let image = crate::snapshot::picture(&theme::test_context(), size, ppp, 1, |ui| {
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::ZERO, size), 0.0, theme::SURFACE);
+                paint(ui.painter(), Rect::from_min_size(Pos2::ZERO, size), Icon::OpenImage, theme::TEXT);
+            });
+            let inked = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                image.enumerate_pixels().filter(|(x, y, p)| {
+                    let (x, y) = (*x as f32 / (side * ppp), *y as f32 / (side * ppp));
+                    x >= x0 && x < x1 && y >= y0 && y < y1 && theme::contrast(Color32::from_rgb(p.0[0], p.0[1], p.0[2]), theme::SURFACE) >= 3.0
+                }).count()
+            };
+            assert!(inked(0.0, 0.3, 0.72, 1.0) as f32 >= 40.0 * ppp * ppp, "the picture at {ppp}");
+            assert!(inked(0.76, 0.0, 1.0, 0.3) as f32 >= 6.0 * ppp * ppp, "the arrow's head above the picture at {ppp}");
+            assert_eq!(inked(0.0, 0.0, 0.6, 0.25), 0, "nothing above the picture at the left at {ppp}");
         }
     }
 }
