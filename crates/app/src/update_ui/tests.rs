@@ -443,6 +443,26 @@ pub(crate) fn settle_for_test(u: &mut Updater) {
     settle(u);
 }
 
+/// With the setting off, the start only cleans old installers. A check asked for while that runs
+/// (before the clean has been taken in) is not lost: it runs, once, and its result is shown.
+#[test]
+fn check_now_during_the_clean_at_start_runs_its_check() {
+    let net = Arc::new(FakeNet::default());
+    *net.answer.lock().unwrap() = Some(Ok(Checked::UpToDate));
+    let mut u = updater(&net);
+    u.start(false);
+    assert!(u.busy(), "the clean is still running");
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Not checked yet.", "a clean is no check");
+    u.check_now();
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Checking now…");
+    // A second request while it runs starts nothing more.
+    u.check_now();
+    settle(&mut u);
+    assert_eq!(net.checks.load(Ordering::SeqCst), 1, "exactly one real check");
+    assert_eq!(net.cleans.load(Ordering::SeqCst), 1);
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Last checked today, 6:13 PM: up to date.");
+}
+
 #[test]
 fn check_now_while_the_check_at_start_runs_starts_no_second_check() {
     let net = Arc::new(FakeNet::default());

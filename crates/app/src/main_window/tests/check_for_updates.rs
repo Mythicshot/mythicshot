@@ -71,27 +71,118 @@ fn choosing_check_for_updates_with_the_mouse_shows_the_section_and_checks_once()
     }
 }
 
-/// In the smallest window the Updates section is below General's bottom edge: the entry scrolls
-/// the tab so the section's status line and Check now are in view, at every scale; once, so the
-/// tab can be scrolled back by hand.
+fn small() -> egui::Vec2 {
+    egui::vec2(MIN_SIZE[0], MIN_SIZE[1])
+}
+
+/// One frame of the window at its smallest size; whether the Updates section's status line, as it
+/// reads now, is drawn wholly inside the window.
+fn status_in_view(ctx: &egui::Context, s: &mut Shared, events: Vec<egui::Event>) -> bool {
+    let out = window_frame(ctx, s, small(), events);
+    status_at(s, &out).is_some_and(|at| egui::Rect::from_min_size(egui::Pos2::ZERO, small()).contains_rect(at))
+}
+
+/// Preferences › General, chosen from the Preferences menu as a plain visit.
+fn visit_general(ctx: &egui::Context, s: &mut Shared) {
+    choose(&mut |events| window_frame(ctx, s, small(), events), "Preferences", "General");
+    assert_eq!((s.nav.page(), s.prefs.state.tab), (Page::Preferences, settings_ui::Tab::General));
+}
+
+/// In the smallest window the Updates section is below General's bottom edge (proved first, on a
+/// plain visit): the entry scrolls the tab so the section's status line and Check now are in
+/// view, at every scale; once, so the tab scrolled back by hand stays where it was put.
 #[test]
 fn the_status_line_is_scrolled_into_view_at_the_smallest_window() {
     let tmp = tempfile::tempdir().unwrap();
-    let small = egui::vec2(MIN_SIZE[0], MIN_SIZE[1]);
+    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, small());
     for ppp in [1.0, 1.25, 2.0] {
         let ctx = crate::theme::test_context();
         ctx.set_pixels_per_point(ppp);
         let (mut s, _net) = window(tmp.path(), Page::Home, Some(Checked::UpToDate));
-        choose(&mut |events| window_frame(&ctx, &mut s, small, events), "Help", ENTRY);
-        let out = window_frame(&ctx, &mut s, small, vec![]);
-        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, small);
+        // Without the entry: the status line is out of view at this size.
+        visit_general(&ctx, &mut s);
+        assert!(!status_in_view(&ctx, &mut s, vec![]), "at {ppp} a plain visit to General does not show the status line: the test would prove nothing");
+        // With it: in view, Check now too.
+        choose(&mut |events| window_frame(&ctx, &mut s, small(), events), "Help", ENTRY);
+        let out = window_frame(&ctx, &mut s, small(), vec![]);
         for what in [s.update.status_line(chrono::Local::now().naive_local()), crate::update_ui::CHECK_NOW.to_string()] {
             let at = text_rect(&out, &what).unwrap_or_else(|| panic!("{what} at {ppp}"));
-            assert!(window.contains_rect(at), "{what} at {ppp}: {at:?} in {window:?}");
+            assert!(bounds.contains_rect(at), "{what} at {ppp}: {at:?} in {bounds:?}");
         }
-        assert!(!s.prefs.state.reveal_updates, "scrolled once");
+        assert!(!s.prefs.state.reveal_updates, "the reveal is used up");
+        // Scrolled back to the top by hand with the wheel: it stays there, frame after frame.
+        let page = egui::pos2(bounds.center().x + NAV_WIDTH / 2.0, bounds.center().y);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, 4000.0), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+        window_frame(&ctx, &mut s, small(), vec![egui::Event::PointerMoved(page), wheel]);
+        for frame in 0..4 {
+            assert!(!status_in_view(&ctx, &mut s, vec![]), "at {ppp}, frame {frame} after scrolling back: the reveal happened only once");
+        }
+        settle_for_test(&mut s.update);
+        assert!(!status_in_view(&ctx, &mut s, vec![]), "at {ppp}: the check's result does not scroll it either");
+    }
+}
+
+/// The reveal belongs to the request that set it. When that request is replaced by another page
+/// before General is drawn, or Preferences is opened on another tab, it is dropped, so a later
+/// plain visit to General does not jump to the bottom.
+#[test]
+fn a_reveal_whose_request_was_replaced_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = crate::theme::test_context();
+    type Replace = fn(&mut Shared);
+    let replacements: [(&str, Replace); 4] = [
+        ("another page", |s| s.apply_request(Request::Page(Page::Tours))),
+        ("the window opened as it is, on another page", |s| {
+            s.nav.go(Page::Home);
+            s.apply_request(Request::Open);
+        }),
+        ("another tab", |s| s.open_preferences(settings_ui::Tab::Output)),
+        ("the window closed", |s| s.close_window()),
+    ];
+    for (what, replace) in replacements {
+        let (mut s, _net) = window(tmp.path(), Page::Home, Some(Checked::UpToDate));
+        // As an editor's menu asks: the state is set at once, the window is shown a frame later.
+        s.check_for_updates();
+        assert!(s.prefs.state.reveal_updates, "{what}");
+        replace(&mut s);
+        s.settle(&ctx);
+        assert!(!s.prefs.state.reveal_updates, "{what}: dropped");
+        s.nav.request(Page::Home);
+        visit_general(&ctx, &mut s);
+        assert!(!status_in_view(&ctx, &mut s, vec![]), "{what}: a plain visit to General stays at the top");
         settle_for_test(&mut s.update);
     }
+    // The request that carried it, shown as asked: kept until General is drawn, then used.
+    let (mut s, _net) = window(tmp.path(), Page::Home, Some(Checked::UpToDate));
+    s.check_for_updates();
+    s.apply_request(Request::Page(Page::Preferences));
+    s.settle(&ctx);
+    assert!(s.prefs.state.reveal_updates, "kept for its own page");
+    window_frame(&ctx, &mut s, small(), vec![]);
+    assert!(!s.prefs.state.reveal_updates, "used on the first frame General is drawn");
+    // The scroll eases in over the next frames, as the app keeps drawing while it moves.
+    window_frame(&ctx, &mut s, small(), vec![]);
+    window_frame(&ctx, &mut s, small(), vec![]);
+    assert!(status_in_view(&ctx, &mut s, vec![]), "and scrolled to the status line");
+    settle_for_test(&mut s.update);
+}
+
+/// With the setting off, the start's clean of old installers may still be running when the entry
+/// is chosen: the check is not lost.
+#[test]
+fn the_entry_during_the_clean_at_start_runs_its_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = crate::theme::test_context();
+    let mut s = shared(tmp.path());
+    s.prefs.settings.check_for_updates = false;
+    let (mut u, net) = on_fake_net(Some(Checked::UpToDate));
+    u.start(false);
+    s.update = u;
+    s.nav.request(Page::Home);
+    choose(&mut |events| window_frame(&ctx, &mut s, size(), events), "Help", ENTRY);
+    assert_ends_on_the_section_with_one_check(&ctx, &mut s, &net, "during the clean");
+    let out = window_frame(&ctx, &mut s, size(), vec![]);
+    assert!(status_at(&s, &out).is_some(), "the result is shown in the section");
 }
 
 /// The menu bar is reached with Tab and opened with Enter or Space; the arrow keys move inside the

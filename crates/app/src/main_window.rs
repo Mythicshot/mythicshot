@@ -346,6 +346,12 @@ impl Shared {
         if self.nav.take_left_workspace() {
             self.workspace.leave(ctx);
         }
+        // The reveal Check for updates set is for Preferences › General only: dropped when what
+        // is shown, or about to be, is anything else (the request that carried it was replaced,
+        // another tab was opened, the window closed), so a later plain visit stays at the top.
+        if !(self.nav.is_open() && self.nav.page() == Page::Preferences && self.prefs.state.tab == settings_ui::Tab::General) {
+            self.prefs.state.reveal_updates = false;
+        }
     }
 }
 
