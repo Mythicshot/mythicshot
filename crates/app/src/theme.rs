@@ -407,6 +407,11 @@ impl CardRows<'_> {
         self.count
     }
 
+    /// Ask for the card's window to be drawn again after `after`.
+    pub fn repaint_after(&self, after: std::time::Duration) {
+        self.ui.ctx().request_repaint_after(after);
+    }
+
     /// The hairline above every row but the first.
     fn hairline(&mut self) {
         if self.count > 0 {

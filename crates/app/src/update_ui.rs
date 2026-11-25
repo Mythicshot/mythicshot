@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use chrono::NaiveDateTime;
 use eframe::egui::{self, RichText};
 
-use crate::theme::{self, Strong as _};
+use crate::theme;
 use crate::update::{self, Checked, Downloaded, Release, Version};
 
 // ---- Approved wording ----
@@ -512,9 +512,12 @@ pub fn banner_ui(ui: &mut egui::Ui, u: &mut Updater) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
     let mut pressed = None;
-    egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(theme::SPACE_3 as i8, theme::SPACE_2 as i8)).show(ui, |ui| {
+    egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(theme::CARD_PAD_X as i8, theme::ITEM_GAP as i8)).show(ui, |ui| {
+        // Outside the page, but on its sizes: the buttons match the pages' buttons.
+        theme::roomy(ui);
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
+            ui.set_min_height(theme::CONTROL_HEIGHT);
             ui.label(RichText::new(&banner.text).color(theme::ACCENT));
             for b in &banner.buttons {
                 let clicked = match b {
@@ -539,23 +542,32 @@ pub fn banner_ui(ui: &mut egui::Ui, u: &mut Updater) {
 /// The Updates section of Preferences: the setting, its helper text, the status line and Check
 /// now. True when the setting changed.
 pub fn prefs_ui(ui: &mut egui::Ui, u: &mut Updater, settings: &mut crate::settings::Settings, now: NaiveDateTime) -> bool {
-    ui.label(RichText::new(SECTION).size(theme::SMALL_SIZE).color(theme::MUTED).bold());
-    ui.add_space(theme::SPACE_1);
-    let changed = ui.checkbox(&mut settings.check_for_updates, CHECKBOX).changed();
-    // The helper text stands under the checkbox's label.
-    ui.horizontal(|ui| {
-        ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
-        ui.add(egui::Label::new(RichText::new(HELPER).size(theme::SMALL_SIZE).color(theme::MUTED)).wrap());
-    });
-    ui.add_space(theme::SPACE_2);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(u.status_line(now)).size(theme::SMALL_SIZE).color(theme::MUTED));
+    let mut changed = false;
+    theme::section_heading(ui, SECTION);
+    theme::card(ui, |rows| {
+        rows.full(|ui| {
+            changed = ui.checkbox(&mut settings.check_for_updates, CHECKBOX).changed();
+            // The helper text stands under the checkbox's label.
+            ui.horizontal(|ui| {
+                ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
+                theme::caption(ui, HELPER);
+            });
+        });
         let checking = u.checking();
-        if ui.add_enabled(!checking, egui::Button::new(CHECK_NOW)).clicked() {
+        let status = u.status_line(now);
+        let mut check = false;
+        rows.row(
+            "",
+            |ui| {
+                ui.add(egui::Label::new(RichText::new(status).size(theme::SMALL_SIZE).color(theme::MUTED)).wrap());
+            },
+            |ui| check = ui.add_enabled(!checking, egui::Button::new(CHECK_NOW)).clicked(),
+        );
+        if check {
             u.check_now();
         }
         if checking {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            rows.repaint_after(std::time::Duration::from_millis(200));
         }
     });
     changed
