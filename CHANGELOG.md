@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.40 (2026-11-25)
+
+- The Help menu has "Check for updates". It opens Preferences at the Updates section and runs the same check as "Check now", so the result shows in the line that is already there. With a check already running it opens the section and starts no second one. The entry is in the main window and in every editor window.
+- Preferences › General scrolls when the window is too short for it. Before, in the smallest window the Updates section ran off the bottom and "Check now" could not be reached.
+- "Check now" is no longer greyed for a moment after Mythicshot starts when checking at start is switched off.
+
 ## 0.2.39 (2026-11-25)
 
 - After Mythicshot updates itself and restarts, it says so: a small window, "Mythicshot is up to date", names the version it came from and the one it is now, with a "What's new" button that opens that version's entry on the website. It shows once and then Mythicshot goes back to the tray.

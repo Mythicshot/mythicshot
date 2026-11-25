@@ -3495,7 +3495,7 @@ pub(crate) mod tests {
         assert!(ed.confirm_close && !ed.closed);
         // What only the app can do goes to it, as the hotkeys and the tray menu ask for it.
         let mut ed = make();
-        for (menu, entry) in [("File", "Capture region"), ("File", "Record region"), ("File", "Open tours"), ("Preferences", "Hotkeys"), ("Preferences", "Workspace"), ("Help", "About Mythicshot"), ("Help", "Open the log folder"), ("File", "Quit Mythicshot")] {
+        for (menu, entry) in [("File", "Capture region"), ("File", "Record region"), ("File", "Open tours"), ("Preferences", "Hotkeys"), ("Preferences", "Workspace"), ("Help", "About Mythicshot"), ("Help", "Open the log folder"), ("Help", "Check for updates"), ("File", "Quit Mythicshot")] {
             choose(&mut ed, menu, entry);
         }
         use crate::tray::Command;
@@ -3507,15 +3507,16 @@ pub(crate) mod tests {
             AppRequest::Page(crate::main_window::Page::Workspace),
             AppRequest::Preferences(crate::settings_ui::Tab::General),
             AppRequest::LogFolder,
+            AppRequest::CheckForUpdates,
             AppRequest::Run(Command::Exit),
         ]);
         assert!(!ed.closed && ed.doc.items().is_empty(), "nothing else happened in the editor");
         // A disabled entry does nothing: Export here.
         choose(&mut ed, "File", "Export…");
-        assert!(!ed.open_export && !ed.prefs_changed && ed.app_requests.len() == 8);
+        assert!(!ed.open_export && !ed.prefs_changed && ed.app_requests.len() == 9);
         // Properties opens and closes the panel, as the toolbar's button does.
         choose(&mut ed, "Edit", "Properties");
-        assert!(ed.properties_open() && ed.prefs.image_properties_open && ed.prefs_changed && ed.app_requests.len() == 8);
+        assert!(ed.properties_open() && ed.prefs.image_properties_open && ed.prefs_changed && ed.app_requests.len() == 9);
     }
 
     /// The menu bar takes no keys: with a menu open or not, the editor's own shortcuts work and a

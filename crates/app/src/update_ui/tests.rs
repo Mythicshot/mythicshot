@@ -418,6 +418,67 @@ pub(crate) fn showing(state: &str) -> (Updater, Arc<FakeNetHandle>) {
 /// Keeps the stand-in network of [`showing`] alive.
 pub(crate) struct FakeNetHandle(#[allow(dead_code)] Arc<FakeNet>);
 
+impl FakeNetHandle {
+    /// How many times the site was asked for the current version.
+    pub(crate) fn checks(&self) -> usize {
+        self.0.checks.load(Ordering::SeqCst)
+    }
+
+    /// The `capture.log` lines written so far.
+    pub(crate) fn logged(&self) -> Vec<String> {
+        self.0.logged.lock().unwrap().clone()
+    }
+}
+
+/// An updater on the stand-in network, for the windows' tests: every check answers `answer`
+/// (None: the site cannot be reached). Nothing is asked of any real site.
+pub(crate) fn on_fake_net(answer: Option<Checked>) -> (Updater, FakeNetHandle) {
+    let net = Arc::new(FakeNet::default());
+    *net.answer.lock().unwrap() = answer.map(Ok);
+    (updater(&net), FakeNetHandle(net))
+}
+
+/// Poll `u` until the background work it started has ended and been taken in, at 6:13 PM.
+pub(crate) fn settle_for_test(u: &mut Updater) {
+    settle(u);
+}
+
+/// With the setting off, the start only cleans old installers. A check asked for while that runs
+/// (before the clean has been taken in) is not lost: it runs, once, and its result is shown.
+#[test]
+fn check_now_during_the_clean_at_start_runs_its_check() {
+    let net = Arc::new(FakeNet::default());
+    *net.answer.lock().unwrap() = Some(Ok(Checked::UpToDate));
+    let mut u = updater(&net);
+    u.start(false);
+    assert!(u.busy(), "the clean is still running");
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Not checked yet.", "a clean is no check");
+    u.check_now();
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Checking now…");
+    // A second request while it runs starts nothing more.
+    u.check_now();
+    settle(&mut u);
+    assert_eq!(net.checks.load(Ordering::SeqCst), 1, "exactly one real check");
+    assert_eq!(net.cleans.load(Ordering::SeqCst), 1);
+    assert_eq!(u.status_line(at(19, 0)), "Version 0.2.34. Last checked today, 6:13 PM: up to date.");
+}
+
+#[test]
+fn check_now_while_the_check_at_start_runs_starts_no_second_check() {
+    let net = Arc::new(FakeNet::default());
+    *net.answer.lock().unwrap() = Some(Ok(Checked::UpToDate));
+    let mut u = updater(&net);
+    u.start(true);
+    // The check at start is still running (not taken in yet): Check now is greyed out, and a
+    // request for one, from the Help menu, starts nothing more.
+    u.check_now();
+    settle(&mut u);
+    assert_eq!(net.checks.load(Ordering::SeqCst), 1, "one check at a time");
+    u.check_now();
+    settle(&mut u);
+    assert_eq!(net.checks.load(Ordering::SeqCst), 2, "once it has ended, another may start");
+}
+
 // ---- After an update: the popup at the next start ----
 
 use crate::update::pending::AfterUpdate;
