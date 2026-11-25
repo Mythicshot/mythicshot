@@ -526,8 +526,9 @@ fn a_picture_named_by_the_environment_opens() {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        // Windows hides a cloud placeholder's reparse attribute from a process that has not opted in, so this may not show it.
         let attributes = std::fs::symlink_metadata(&path).unwrap().file_attributes();
-        eprintln!("{}: attributes 0x{attributes:08x}, reparse point: {}", path.display(), attributes & 0x400 != 0);
+        eprintln!("{}: attributes as this process sees them (cloud placeholders may be disguised): 0x{attributes:08x}", path.display());
     }
     let img = load(&path).unwrap_or_else(|e| panic!("{}", could_not_open(&path, &e)));
     eprintln!("opened: {} x {}", img.width(), img.height());
