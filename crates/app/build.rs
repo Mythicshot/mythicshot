@@ -9,7 +9,7 @@ fn main() {
         res.set_icon("../../assets/mythicshot.ico")
             .set("ProductName", "Mythicshot")
             .set("CompanyName", "Mythicshot, LLC")
-            .set("FileDescription", "Mythicshot - screenshots and GIF recordings")
+            .set("FileDescription", "Mythicshot: screenshots, recordings and tours")
             .set("LegalCopyright", "Copyright (c) 2026 Mythicshot, LLC. Licensed under the GNU AGPL 3.0 or later.");
         if let Err(e) = res.compile() {
             // A missing Windows SDK should not stop a build; the exe just has no icon.

@@ -164,5 +164,16 @@ mod tests {
         assert!(build.contains(r#".set("CompanyName", "Mythicshot, LLC")"#), "{build}");
         assert!(build.contains(r#".set("LegalCopyright", "Copyright (c) 2026 Mythicshot, LLC. Licensed under the GNU AGPL 3.0 or later.")"#), "{build}");
         assert_eq!(env!("CARGO_PKG_DESCRIPTION"), "Screenshots, screen recordings and click-through tours for Windows");
+        assert!(build.contains(r#".set("FileDescription", "Mythicshot: screenshots, recordings and tours")"#), "{build}");
+    }
+
+    /// The installer describes the product with the same sentence as the program's file properties.
+    #[test]
+    fn the_installer_describes_the_product_as_the_program_does() {
+        let wxs = include_str!("../../../installer/mythicshot.wxs");
+        assert!(wxs.contains(r#"<SummaryInformation Description="Mythicshot: screenshots, recordings and tours" />"#), "the installer's summary");
+        let shortcut = wxs.split_once(r#"<Shortcut Id="MythicshotShortcut""#).unwrap().1.split("/>").next().unwrap();
+        assert!(shortcut.contains(r#"Description="Mythicshot: screenshots, recordings and tours""#), "{shortcut}");
+        assert!(!wxs.contains("GIF recordings"));
     }
 }

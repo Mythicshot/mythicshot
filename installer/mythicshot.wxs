@@ -15,7 +15,7 @@
            UpgradeCode="41EFFDDF-DEBA-4B83-A653-893B2EF06D69"
            Scope="perUser"
            Compressed="yes">
-    <SummaryInformation Description="Mythicshot - screenshots and GIF recordings" />
+    <SummaryInformation Description="Mythicshot: screenshots, recordings and tours" />
 
     <!-- Installing this or a newer version replaces the old one. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Mythicshot is already installed." />
@@ -77,7 +77,7 @@
       <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="7F64D9FB-8823-4244-B7E2-F8CC91A8E17D">
         <Shortcut Id="MythicshotShortcut"
                   Name="Mythicshot"
-                  Description="Screenshots and GIF recordings"
+                  Description="Mythicshot: screenshots, recordings and tours"
                   Target="[INSTALLFOLDER]mythicshot.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="MythicshotIcon" />
