@@ -58,7 +58,7 @@ pub const OPEN_TOURS: &str = "Open Tours";
 /// The most characters of an account name "Signed in as" shows.
 pub const ACCOUNT_SHOWN_MAX: usize = 30;
 
-/// "Signed in as alex.": the account that confirmed the code, cleaned as plain text and at most
+/// "Signed in as robin.": the account that confirmed the code, cleaned as plain text and at most
 /// [`ACCOUNT_SHOWN_MAX`] characters. None when there is nothing to show.
 pub fn signed_in_as(account: &str) -> Option<String> {
     let name = publish::share::plain_text(account);
@@ -855,7 +855,7 @@ fn shown_name(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| publish_ui::short_title(&name, ACCOUNT_SHOWN_MAX))
 }
 
-/// "Signed in as alex", under the profile's name. None when the site named no account.
+/// "Signed in as robin", under the profile's name. None when the site named no account.
 pub fn signed_in_line(account: Option<&str>) -> Option<String> {
     account.and_then(shown_name).map(|name| format!("Signed in as {name}"))
 }
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[test]
     fn signed_in_as_names_the_account_until_the_token_changes_and_not_you_signs_out() {
-        assert_eq!(signed_in_as("alex").as_deref(), Some("Signed in as alex."));
+        assert_eq!(signed_in_as("robin").as_deref(), Some("Signed in as robin."));
         assert_eq!(signed_in_as(" mallory\u{202e}\u{200b}\n").as_deref(), Some("Signed in as mallory."));
         assert_eq!(signed_in_as(&"a".repeat(40)).as_deref(), Some(format!("Signed in as {}….", "a".repeat(29)).as_str()));
         assert_eq!(signed_in_as(&"a".repeat(30)).as_deref(), Some(format!("Signed in as {}.", "a".repeat(30)).as_str()));
@@ -1656,18 +1656,18 @@ mod tests {
         let (ctx, mut p, c) = (crate::theme::test_context(), WorkspaceState { vault, bind: Arc::new(|_| {}), ..page() }, bound_to(&s, TokenStatus::Saved));
         let mut server = s.base.clone();
         // What the window hands the page after a sign-in the site named an account for.
-        p.account = Some(("alex".into(), None));
+        p.account = Some(("robin".into(), None));
         let text = until(&ctx, &mut p, &mut server, &c, connected);
-        assert!(has_line(&text, "Signed in as alex.") && has_line(&text, NOT_YOU), "{text}");
+        assert!(has_line(&text, "Signed in as robin.") && has_line(&text, NOT_YOU), "{text}");
         // Still there on later frames with the same token.
         let text = drawn(&ctx, &mut p, &mut server, &c);
-        assert!(has_line(&text, "Signed in as alex."), "{text}");
+        assert!(has_line(&text, "Signed in as robin."), "{text}");
         // Another token (saved, replaced or forgotten): gone.
         let other = Conn { epoch: 2, ..c.clone() };
         let text = drawn(&ctx, &mut p, &mut server, &other);
         assert!(!text.contains("Signed in as") && !has_line(&text, NOT_YOU), "{text}");
         // Leaving the page: gone too.
-        p.account = Some(("alex".into(), None));
+        p.account = Some(("robin".into(), None));
         drawn(&ctx, &mut p, &mut server, &c);
         p.leave(&ctx);
         let text = drawn(&ctx, &mut p, &mut server, &c);
@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn a_sign_in_whose_answer_named_an_account_shows_it_on_the_page() {
-        let s = connect_stub(|_| reply(200, &format!(r#"{{"status":"connected","token":"{NEW_TOKEN}","workspace":{{"name":"Cowfee"}},"account":{{"username":"alex"}}}}"#)));
+        let s = connect_stub(|_| reply(200, &format!(r#"{{"status":"connected","token":"{NEW_TOKEN}","workspace":{{"name":"Cowfee"}},"account":{{"username":"robin"}}}}"#)));
         let record = Arc::new(Record::default());
         let (ctx, mut p, c) = (crate::theme::test_context(), signing_page(&record), conn(TokenStatus::Missing));
         let mut server = s.base.clone();
@@ -1699,10 +1699,10 @@ mod tests {
             assert!(Instant::now() < deadline, "the sign-in did not end");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(p.account.as_ref().map(|(n, _)| n.as_str()), Some("alex"));
+        assert_eq!(p.account.as_ref().map(|(n, _)| n.as_str()), Some("robin"));
         // The page now holds the saved token (the fake store does not change the status, so the test does).
         let saved = Conn { bound: Some(s.base.clone()), ..conn(TokenStatus::Saved) };
         let text = drawn(&ctx, &mut p, &mut server, &saved);
-        assert!(has_line(&text, "Signed in as alex.") && has_line(&text, NOT_YOU), "{text}");
+        assert!(has_line(&text, "Signed in as robin.") && has_line(&text, NOT_YOU), "{text}");
     }
 }

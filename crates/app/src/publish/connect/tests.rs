@@ -87,7 +87,7 @@ fn anon(s: &Stub) -> Client {
 
 /// Start, then wait with the fake clock, never cancelled.
 fn sign_in(s: &Stub, clock: &FakeClock) -> Result<Connected, ConnectError> {
-    let started = start_with(&anon(s), "ALEX-DESKTOP").expect("a code");
+    let started = start_with(&anon(s), "ROBIN-DESKTOP").expect("a code");
     wait_with(&anon(s), &started, &|| false, clock)
 }
 
@@ -105,7 +105,7 @@ fn no_credential_sent(s: &Stub) {
 #[test]
 fn pending_then_connected_answers_the_token_asking_every_interval_without_a_credential() {
     let ((s, clock, times), slowed) = site_with(600, |seen| if seen < 2 { reply(200, PENDING) } else { reply(200, &connected_body()) });
-    let started = start_with(&anon(&s), "ALEX-DESKTOP").unwrap();
+    let started = start_with(&anon(&s), "ROBIN-DESKTOP").unwrap();
     assert_eq!(started.user_code, USER_CODE);
     assert_eq!(started.page.as_deref(), Some("https://app.example.com/connections"));
     assert_eq!((started.expires_in, started.interval), (Duration::from_secs(600), Duration::from_secs(5)));
@@ -120,7 +120,7 @@ fn pending_then_connected_answers_the_token_asking_every_interval_without_a_cred
     // What each request carried: the computer's name, then the device code and nothing else.
     let reqs = s.requests();
     let start_body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
-    assert_eq!(start_body, json!({ "device_name": "ALEX-DESKTOP" }));
+    assert_eq!(start_body, json!({ "device_name": "ROBIN-DESKTOP" }));
     assert_eq!(reqs[0].content_type.as_deref(), Some("application/json"));
     for r in &reqs[1..] {
         let body: Value = serde_json::from_slice(&r.body).unwrap();
@@ -410,8 +410,8 @@ fn neither_the_device_code_nor_the_token_is_in_any_error_or_debug_print() {
 
 #[test]
 fn the_computers_name_is_cleaned_and_cut_to_60_characters() {
-    assert_eq!(clean_device_name("ALEX-DESKTOP"), "ALEX-DESKTOP");
-    assert_eq!(clean_device_name("  Alex's PC \n"), "Alex's PC");
+    assert_eq!(clean_device_name("ROBIN-DESKTOP"), "ROBIN-DESKTOP");
+    assert_eq!(clean_device_name("  Robin's PC \n"), "Robin's PC");
     assert_eq!(clean_device_name("PC\u{202e}evil\u{200b}\u{0007}"), "PCevil");
     assert_eq!(clean_device_name(&"x".repeat(80)).chars().count(), 60);
     assert_eq!(clean_device_name(&format!("{}  y", "x".repeat(59))), "x".repeat(59));
@@ -435,12 +435,12 @@ fn a_name_the_site_refuses_is_tried_once_more_as_this_computer() {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
         if body["device_name"] == "This computer" { reply(201, &started_body(600, 5, "/c")) } else { bad_name() }
     });
-    assert_eq!(start_with(&anon(&s), "ALEX-DESKTOP").unwrap().user_code, USER_CODE);
+    assert_eq!(start_with(&anon(&s), "ROBIN-DESKTOP").unwrap().user_code, USER_CODE);
     let names: Vec<Value> = s.requests().iter().map(|r| serde_json::from_slice::<Value>(&r.body).unwrap()["device_name"].clone()).collect();
-    assert_eq!(names, [json!("ALEX-DESKTOP"), json!("This computer")]);
+    assert_eq!(names, [json!("ROBIN-DESKTOP"), json!("This computer")]);
     // Refused again: the general failure, and no third try.
     let s = stub(move |_, _| bad_name());
-    assert_eq!(start_with(&anon(&s), "ALEX-DESKTOP").unwrap_err(), ConnectError::Failed("Could not sign in: the server answered HTTP 400.".into()));
+    assert_eq!(start_with(&anon(&s), "ROBIN-DESKTOP").unwrap_err(), ConnectError::Failed("Could not sign in: the server answered HTTP 400.".into()));
     assert_eq!(s.lines(), [START, START]);
     // Already the fallback: tried once.
     let s = stub(move |_, _| bad_name());
@@ -455,7 +455,7 @@ fn a_name_the_site_refuses_is_tried_once_more_as_this_computer() {
 #[test]
 fn the_account_that_confirmed_the_code_comes_back_cleaned_and_an_older_site_still_works() {
     for (account, want) in [
-        (json!({ "username": "alex" }), Some("alex")),
+        (json!({ "username": "robin" }), Some("robin")),
         (json!({ "username": "  mallory\u{202e}\u{200b} " }), Some("mallory")),
         (json!({ "username": null }), None),
         (json!({ "username": "" }), None),

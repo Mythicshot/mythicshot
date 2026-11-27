@@ -156,7 +156,7 @@ fn a_confirmed_code_closes_the_window_as_connected() {
     // With the account the site named, which the page shows.
     let (mut d, tx, _, _, _) = dialog(Some(code(Some(PAGE), Some("10 minutes"))));
     until_code(&mut d);
-    assert_eq!(finish(&mut d, &tx, Ok(Some("alex".into()))), Some(SignInAction::Connected(Some("alex".into()))));
+    assert_eq!(finish(&mut d, &tx, Ok(Some("robin".into()))), Some(SignInAction::Connected(Some("robin".into()))));
 }
 
 #[test]

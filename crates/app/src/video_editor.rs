@@ -4744,7 +4744,7 @@ mod tests {
         let mut ed = editor_of(&st);
         let server = "https://tours.example.com";
         // Two profiles on the same site: the address alone does not decide.
-        let book = |active: &str| Book { list: vec![on_site(MIGRATED_ID, "Alex · mythicshot.com", server), on_site("pb", "Sandbox admin", server)], active: Some(active.into()), legacy: Some(MIGRATED_ID.into()) };
+        let book = |active: &str| Book { list: vec![on_site(MIGRATED_ID, "Robin · mythicshot.com", server), on_site("pb", "Sandbox admin", server)], active: Some(active.into()), legacy: Some(MIGRATED_ID.into()) };
         let key = ProjectKey { server: server.into(), tour_id: TOUR.into(), chapter_id: CH.into() };
         let target = EditTarget { tour_id: TOUR.into(), chapter_id: CH.into(), tour_title: TOUR_TITLE.into() };
         let replace = Dialog::Replace { title: "Typed chapter".into(), target: target.clone(), logo_missing: false };

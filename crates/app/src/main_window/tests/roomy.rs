@@ -19,7 +19,7 @@ use crate::settings::Settings;
 use crate::share_ui::tests::{shapes_of, text_rect};
 
 const TOKEN: &str = "dp_0123456789abcdef0123456789abcdef01234567";
-const ACCOUNT: &str = "alex@mythicshot.test";
+const ACCOUNT: &str = "robin@mythicshot.test";
 
 /// Profiles in memory: nothing is stored, switched or ended anywhere.
 struct MemShelf(Mutex<Book>);
@@ -453,7 +453,7 @@ fn dead_end_fixture() -> (Fixture, Stub) {
     const WS: &str = "ws_0123456789abcdef01234567";
     let s = stub(|req, _| match req.line.as_str() {
         "POST /api/v1/connect/start" => reply(201, r#"{"device_code":"dpd_0123456789abcdef0123456789abcdef01234567","user_code":"K7QM-2HXD","verify_url":"/connections","expires_in":600,"interval":5}"#),
-        "POST /api/v1/connect/token" => reply(200, r#"{"status":"connected","token":"dp_c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff","workspace":{"name":"Sandbox test"},"account":{"username":"alex@mythicshot.test"}}"#),
+        "POST /api/v1/connect/token" => reply(200, r#"{"status":"connected","token":"dp_c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff","workspace":{"name":"Sandbox test"},"account":{"username":"robin@mythicshot.test"}}"#),
         "GET /api/v1/me" => reply(200, &format!(r#"{{"workspace":"Sandbox test","workspace_id":"{WS}","account_id":"acc-a"}}"#)),
         _ => reply(404, r#"{"error":"not_found"}"#),
     });

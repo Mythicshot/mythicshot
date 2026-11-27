@@ -88,7 +88,7 @@ pub fn connected(account: Option<&str>, workspace: &str) -> String {
     }
 }
 
-/// "You already have a profile for this account: "Alex · mythicshot.com"."
+/// "You already have a profile for this account: "Robin · mythicshot.com"."
 pub fn exists(name: &str) -> String {
     format!("You already have a profile for this account: \"{name}\".")
 }
@@ -208,7 +208,7 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// The line under the name in the dropdown: "alex's workspace · app.mythicshot.com".
+    /// The line under the name in the dropdown: "robin's workspace · app.mythicshot.com".
     pub fn detail(&self) -> String {
         let site = site_label(&self.server);
         match &self.workspace {
