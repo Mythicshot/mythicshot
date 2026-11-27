@@ -2,6 +2,10 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.42 (2026-11-26)
+
+- Sample names in the tests are now neutral, and some code comments were reworded. Nothing changes in what Mythicshot does.
+
 ## 0.2.41 (2026-11-25)
 
 - The Mythicshot window opens larger: 920 by 740 instead of 760 by 520, so the Workspace page shows whole with room under it. Home, Tours and Preferences › General fit without scrolling too.
