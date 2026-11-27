@@ -1308,7 +1308,7 @@ impl Editor {
 
     // ---- panels -------------------------------------------------------------
 
-    /// Two rows like Greenshot's editor: actions on top, then the properties of
+    /// Two rows: actions on top, then the properties of
     /// the selected item (or of the next one drawn).
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("editor-toolbar").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(6, 4))).show(ui, |ui| {
@@ -1664,7 +1664,7 @@ impl Editor {
         if b.is_empty() { action.label().to_string() } else { format!("{}  ({})", action.label(), hotkeys::display(b)) }
     }
 
-    /// A narrow column of tool icons, grouped like Greenshot's.
+    /// A narrow column of tool icons, in groups of related tools.
     fn tool_rail(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("editor-tools").resizable(false).exact_size(RAIL).frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(4, 6))).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -1715,7 +1715,7 @@ impl Editor {
         }
     }
 
-    /// Size, last action with its time, and zoom, like Greenshot's status bar.
+    /// A status bar: size, last action with its time, and zoom.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("editor-status").frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| {
             ui.horizontal(|ui| {

@@ -322,7 +322,7 @@ impl Default for SavedStyle {
     }
 }
 
-/// The editor's remembered choices: a style per tool (like Greenshot), the
+/// The editor's remembered choices: a style per tool, the
 /// last tool used, and the GIF editor's export settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

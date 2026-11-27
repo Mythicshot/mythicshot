@@ -1664,7 +1664,7 @@ pub(crate) mod tests {
                         egui::ComboBox::from_id_salt("pick").selected_text("PNG").show_ui(ui, |_| {});
                         card(ui, |rows| {
                             rows.row("Site", |ui| drop(value(ui, "tours.example.com")), |ui| drop(ui.button("Open site")));
-                            rows.row("Account", |ui| drop(value(ui, "alex")), |_| {});
+                            rows.row("Account", |ui| drop(value(ui, "robin")), |_| {});
                             rows.full(|ui| drop(caption(ui, "A line.")));
                             assert_eq!(rows.count(), 3);
                         });
@@ -1744,7 +1744,7 @@ pub(crate) mod tests {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     menu_row(ui, true, false, "Sandbox admin", |ui| drop(ui.label("Sandbox admin")));
                     menu_row(ui, false, false, "Not now", |ui| drop(ui.label("Not now")));
-                    menu_row(ui, true, true, "Alex", |ui| drop(ui.label("Alex")));
+                    menu_row(ui, true, true, "Robin", |ui| drop(ui.label("Robin")));
                     let mut fps = 30;
                     ui.selectable_value(&mut fps, 30, "30 fps");
                     ui.selectable_value(&mut fps, 60, "60 fps");
@@ -1778,7 +1778,7 @@ pub(crate) mod tests {
         // Nothing hovered: no row is lit, the selected one is on the selection fill.
         let out = menu_frames(&ctx, None, vec![]);
         assert!(checks::fills(&out).iter().all(|(_, c, _)| *c != MENU_HOVER), "nothing is lit with no pointer");
-        assert!(fill_at(&out, "Alex", SELECTION).is_some(), "the selected row");
+        assert!(fill_at(&out, "Robin", SELECTION).is_some(), "the selected row");
         // Every row is at least the compact choice height.
         let a = row_middle(&ctx, "Sandbox admin");
         let b = row_middle(&ctx, "Not now");
@@ -1801,8 +1801,8 @@ pub(crate) mod tests {
         assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::PointingHand);
         // The selected row under the pointer stays on the selection fill: told from a hovered one.
         let ctx = test_context();
-        let out = menu_frames(&ctx, Some(row_middle(&test_context(), "Alex")), vec![]);
-        assert!(fill_at(&out, "Alex", SELECTION).is_some() && fill_at(&out, "Alex", MENU_HOVER).is_none());
+        let out = menu_frames(&ctx, Some(row_middle(&test_context(), "Robin")), vec![]);
+        assert!(fill_at(&out, "Robin", SELECTION).is_some() && fill_at(&out, "Robin", MENU_HOVER).is_none());
         assert_ne!(MENU_HOVER, SELECTION);
     }
 
@@ -1875,7 +1875,7 @@ pub(crate) mod tests {
     fn initials_are_of_the_first_two_words_or_letters() {
         assert_eq!(initials("Sandbox test"), "ST");
         assert_eq!(initials("customer1"), "CU");
-        assert_eq!(initials("Alex · mythicshot.com"), "AM");
+        assert_eq!(initials("Robin · mythicshot.com"), "RM");
         assert_eq!(initials("  "), "");
         assert_eq!(initials("élan vital"), "ÉV");
     }

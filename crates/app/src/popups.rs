@@ -94,7 +94,7 @@ impl Picker {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.pick = Pick::Cancelled;
         }
-        // A compact menu like Greenshot's destination menu.
+        // A compact menu of destinations.
         theme::window_card(ui, 6.0, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(RichText::new(format!("  Send capture ({} × {}) to", self.img.width(), self.img.height())).weak().size(12.0));

@@ -4,7 +4,7 @@
 //! stay editable until export. Everything that reaches the screen or a file is
 //! drawn by [`render`], so what you see is what you save. Crop keeps items
 //! editable (they move with the crop); effects, resize and rotate flatten the
-//! items into the base image first, like Greenshot.
+//! items into the base image first.
 //!
 //! Undo is snapshot based: the base image is shared through an `Arc`, so a
 //! snapshot costs only the item list unless the base itself changed.

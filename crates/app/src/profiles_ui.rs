@@ -231,7 +231,7 @@ fn end_counted(shelf: &dyn Shelf, endings: &Endings, ending: Ending, after: Afte
 pub struct Entry {
     pub id: String,
     pub name: String,
-    /// "alex's workspace · app.mythicshot.com".
+    /// "robin's workspace · app.mythicshot.com".
     pub detail: String,
     pub active: bool,
     /// Amber, "Sign in again": it cannot be used until it is signed in again.

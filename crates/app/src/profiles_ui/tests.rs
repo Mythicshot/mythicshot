@@ -140,8 +140,8 @@ fn the_dropdown_lists_every_profile_with_its_state_and_the_active_one() {
     let book = Book {
         legacy: None,
         list: vec![
-            profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, Some("alex's workspace"), State::Ready),
-            profile("pb", "Sandbox admin", "http://localhost:3000", None, Some("alex's workspace"), State::Ready),
+            profile("pa", "Robin · mythicshot.com", "https://app.mythicshot.com", None, Some("robin's workspace"), State::Ready),
+            profile("pb", "Sandbox admin", "http://localhost:3000", None, Some("robin's workspace"), State::Ready),
             profile("pc", "customer1 test", "http://localhost:3000", None, Some("customer1's workspace"), State::SignInAgain),
         ],
         active: Some("pa".into()),
@@ -150,8 +150,8 @@ fn the_dropdown_lists_every_profile_with_its_state_and_the_active_one() {
     assert_eq!(
         rows,
         vec![
-            Entry { id: "pa".into(), name: "Alex · mythicshot.com".into(), detail: "alex's workspace · app.mythicshot.com".into(), active: true, waiting: false },
-            Entry { id: "pb".into(), name: "Sandbox admin".into(), detail: "alex's workspace · localhost:3000".into(), active: false, waiting: false },
+            Entry { id: "pa".into(), name: "Robin · mythicshot.com".into(), detail: "robin's workspace · app.mythicshot.com".into(), active: true, waiting: false },
+            Entry { id: "pb".into(), name: "Sandbox admin".into(), detail: "robin's workspace · localhost:3000".into(), active: false, waiting: false },
             Entry { id: "pc".into(), name: "customer1 test".into(), detail: "customer1's workspace · localhost:3000".into(), active: false, waiting: true },
         ]
     );
@@ -505,7 +505,7 @@ fn a_save_the_store_cannot_confirm_says_why_and_leaves_nothing() {
 fn a_sign_in_into_a_profile_that_is_there_offers_switch_to_it() {
     let s = ids_site("acc-c");
     let pc = Profile { identity: Some(ided(WS_ID, "acc-c")), ..profile("pc", "customer1 test", &s.base, Some(ACCOUNT), Some("customer1"), State::Ready) };
-    let book = Book { legacy: None, list: vec![profile("pa", "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), pc], active: Some("pa".into()) };
+    let book = Book { legacy: None, list: vec![profile("pa", "Robin · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), pc], active: Some("pa".into()) };
     let shelf = TestShelf::with(book.clone(), FakeKeys::with(&[("profile-pc", TOKEN_B)]));
     let mut f = flow(&shelf, Purpose::New, &s.base);
     sign_in(&mut f);
@@ -712,7 +712,7 @@ fn a_profile_with_no_identity_is_renewed_after_the_confirmation_and_records_what
 
 #[test]
 fn remove_asks_first_and_takes_only_that_profile_and_its_token() {
-    let book = Book { legacy: None, list: vec![profile(MIGRATED_ID, "Alex · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pb", "Sandbox admin", "http://localhost:3000", None, None, State::Ready)], active: Some("pb".into()) };
+    let book = Book { legacy: None, list: vec![profile(MIGRATED_ID, "Robin · mythicshot.com", "https://app.mythicshot.com", None, None, State::Ready), profile("pb", "Sandbox admin", "http://localhost:3000", None, None, State::Ready)], active: Some("pb".into()) };
     let shelf = TestShelf::with(book, FakeKeys::with(&[("profile-first", TOKEN_A), ("profile-pb", TOKEN_B)]));
     let make_shelf: Arc<dyn Shelf> = shelf.clone();
     let mut panel = Panel::with(make_shelf, Arc::new(|_, _| panic!("no form here")));

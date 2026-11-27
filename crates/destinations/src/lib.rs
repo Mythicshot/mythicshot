@@ -1,4 +1,4 @@
-//! Destinations: where a finished capture goes (Greenshot's model).
+//! Destinations: where a finished capture goes.
 //!
 //! The app calls [`send`] with a [`DestId`]. Two destinations live in the app
 //! instead, because they open windows: `Editor` and `Picker` (the "ask every
