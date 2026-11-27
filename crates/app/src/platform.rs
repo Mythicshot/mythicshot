@@ -465,8 +465,8 @@ pub fn take_foreground(_hwnd: WindowId) -> bool {
     false
 }
 
-/// Keep a window out of every screen capture, ours and other apps' (OBS
-/// included), so the recording controls never appear in a recording.
+/// Keep a window out of every screen capture, ours and every other app's
+/// (screen recorders included), so the recording controls never appear in a recording.
 #[cfg(windows)]
 pub fn exclude_from_capture(hwnd: WindowId) -> bool {
     use windows::Win32::Foundation::HWND;

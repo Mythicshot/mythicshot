@@ -1,4 +1,4 @@
-//! File name patterns, Greenshot style: `${YYYY}-${MM}-${DD} ${hh}-${mm}-${ss}`.
+//! File name patterns made of tokens: `${YYYY}-${MM}-${DD} ${hh}-${mm}-${ss}`.
 //!
 //! Tokens: `${YYYY}` `${MM}` `${DD}` `${hh}` `${mm}` `${ss}` `${title}` `${user}`.
 //! Unknown tokens are kept as written. `/` and `\` make subfolders; each part

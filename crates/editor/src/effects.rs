@@ -1,4 +1,4 @@
-//! Whole-image effects (Greenshot's Effects menu). Each takes the flattened
+//! Whole-image effects (the Effects menu). Each takes the flattened
 //! image and returns a new one; [`crate::Document::apply`] handles undo.
 
 use image::{Rgba as Px, RgbaImage, imageops};
