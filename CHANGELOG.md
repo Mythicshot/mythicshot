@@ -2,6 +2,12 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.43 (2026-11-27)
+
+- Mythicshot no longer closes when the set of monitors changes, for example when a game goes full screen and turns the other monitors off, or when the monitors go to sleep. Before, it could close at that moment.
+- A monitor that disappears while Mythicshot is checking the screens no longer cancels a capture or moves the hidden capture window by mistake; Mythicshot checks again a moment later.
+- If Mythicshot ever closes without being asked to, it now says so in its crash log ("Open the log folder" in the Help menu). Before, some of those closes left nothing behind.
+
 ## 0.2.42 (2026-11-26)
 
 - Sample names in the tests are now neutral, and some code comments were reworded. Nothing changes in what Mythicshot does.
