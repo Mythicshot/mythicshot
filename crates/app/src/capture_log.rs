@@ -149,6 +149,34 @@ pub fn displays_changed_line(frame: u32, was: &str, now: &str) -> String {
     format!("frame {frame}: displays changed during the capture (was {was}; now {now}): capture cancelled")
 }
 
+/// A check of the parked window found a monitor listed that could not be read (its handle no
+/// longer valid: it went while it was read), and compared nothing.
+pub fn unread_line(time: &str, code: u32, read: &str) -> String {
+    let why = if code == crate::platform::INVALID_MONITOR_HANDLE { ", monitor handle no longer valid" } else { "" };
+    format!("-- {time} parked window not checked: a monitor could not be read (error {code}{why}), read {read}; the displays are read again at the next check")
+}
+
+/// A close request reached the root window and was answered with `done`.
+pub fn close_request_line(time: &str, done: &str) -> String {
+    format!("-- {time} close request to the capture window (Alt+F4 or another program): {done}; the app stays open")
+}
+
+/// A suspicion only: the input hook may no longer get input. Nothing is done about it.
+pub fn hook_suspect_line(time: &str, lag_ms: u32) -> String {
+    format!("-- {time} input hook may no longer get input (a suspicion; nothing was changed): Windows recorded input {lag_ms} ms newer than the hook's last event, on 3 checks in a row; the sign-in or consent screen, or an elevated or remote window in front, looks the same")
+}
+
+/// The input hook could not be put in at start.
+pub fn hook_failed_line(time: &str, error: &str) -> String {
+    format!("-- {time} input hook not installed ({error}); the shortcuts it takes do not work this run")
+}
+
+/// A monitor listed cannot be read for a reason other than having gone: it is left out of the
+/// displays, as it always was. Said once while it lasts.
+pub fn left_out_line(time: &str, code: u32, read: &str) -> String {
+    format!("-- {time} a monitor could not be read (error {code}) and is left out of the displays: {read}")
+}
+
 /// At the start of a capture, something in which the parked window disagrees with the displays.
 pub fn capture_note_line(problem: &str, action: NoteAction) -> String {
     let what = match action {

@@ -14,6 +14,7 @@
 
 use rdev::EventType;
 
+use crate::crash_log::HookKind;
 use crate::hotkeys::Action;
 
 /// A shortcut the hook takes: modifier bits (see [`mods`]), a Windows
@@ -50,9 +51,304 @@ pub fn listen(mut callback: impl FnMut(EventType) + Send + 'static) -> Result<()
     rdev::listen(move |e| callback(e.event_type)).map_err(|e| format!("{e:?}"))
 }
 
+/// Run one hook callback of `kind`, catching a panic in it: false (the event is not taken) when it
+/// panicked. While it runs the panic hook knows it is in a hook callback, and writes only one short
+/// line (see [`crate::crash_log::in_hook`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn guarded(kind: HookKind, f: impl FnOnce() -> bool) -> bool {
+    crate::crash_log::in_hook(kind, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(false))
+}
+
+/// What a hook procedure answers Windows: 1 when the callback took the event (swallowed), else
+/// what the next hook answers, which passes the event on; a callback that panicked passes it on.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn answer(kind: HookKind, action: bool, event: impl FnOnce() -> bool, next: impl FnOnce() -> isize) -> isize {
+    if action && guarded(kind, event) { 1 } else { next() }
+}
+
+/// The lock, also when a callback panicked while it held it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lock_or_recover<T: ?Sized>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Checks of the hook against Windows' own record of input are this far apart at least.
+pub const CHECK_EVERY_MS: u32 = 1000;
+/// Input this much newer than the hook's last event is input the hook did not see.
+pub const LAG_MS: u32 = 3000;
+/// Checks in a row, each with new input the hook did not see, before the suspicion is noted.
+pub const STRIKES: u8 = 3;
+/// While the suspicion lasts it is noted at most this often.
+pub const NOTE_EVERY_MS: u32 = 10 * 60_000;
+
+/// Whether the hook may no longer get input: detection only, nothing is changed. Windows removes
+/// a low-level hook that answers too slowly and says nothing; after that the shortcuts the hook
+/// takes do nothing. Windows' record of the last input (keyboard and mouse) is compared with the
+/// hook's last event (either hook): new input arriving on [`STRIKES`] checks in a row, each time
+/// more than [`LAG_MS`] past the hook's last event, is a suspicion, noted at most every
+/// [`NOTE_EVERY_MS`] while it lasts. Any check without such input starts the count again. Times
+/// are Windows' millisecond ticks, which wrap.
+///
+/// Blind spots: one hook removed while the other still gets events is not seen (the mouse hook
+/// keeps the last event fresh while the keyboard hook is gone); and input that low-level hooks do
+/// not get although Windows records it, as on the secure desktop (sign-in, consent prompts) or,
+/// it seems, in a window of an elevated program or a remote session, looks like a dead hook. An
+/// elevated foreground window is not told apart: telling it needs the foreground process opened
+/// and its token read, rights this process may not have, so it is left.
+#[derive(Debug, Default)]
+pub struct Liveness {
+    last_check: Option<u32>,
+    last_system: Option<u32>,
+    strikes: u8,
+    /// When the present suspicion was last noted; None while there is none.
+    noted: Option<u32>,
+}
+
+/// What a check of the hook found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Fine,
+    /// Note it: Windows has input `lag_ms` newer than the hook's last event, on [`STRIKES`]
+    /// checks in a row.
+    Suspect { lag_ms: u32 },
+}
+
+impl Liveness {
+    /// At tick `now`: Windows' last input at `system`, the hook's last event at `hook`.
+    pub fn check(&mut self, now: u32, system: u32, hook: u32) -> Verdict {
+        if self.last_check.is_some_and(|t| now.wrapping_sub(t) < CHECK_EVERY_MS) {
+            return Verdict::Fine;
+        }
+        self.last_check = Some(now);
+        let fresh = self.last_system.is_some_and(|s| s != system);
+        self.last_system = Some(system);
+        let lag = system.wrapping_sub(hook) as i32;
+        if lag <= LAG_MS as i32 {
+            // The hook saw the input: whatever was suspected is over.
+            self.strikes = 0;
+            self.noted = None;
+            return Verdict::Fine;
+        }
+        if !fresh {
+            self.strikes = 0;
+            return Verdict::Fine;
+        }
+        self.strikes = self.strikes.saturating_add(1);
+        if self.strikes >= STRIKES && self.noted.is_none_or(|t| now.wrapping_sub(t) >= NOTE_EVERY_MS) {
+            self.noted = Some(now);
+            return Verdict::Suspect { lag_ms: lag as u32 };
+        }
+        Verdict::Fine
+    }
+}
+
+/// The tick of the hook's last event (or of its installing), None before it runs.
+#[cfg(windows)]
+pub fn last_event_tick() -> Option<u32> {
+    win::last_event_tick()
+}
+
+#[cfg(not(windows))]
+pub fn last_event_tick() -> Option<u32> {
+    None
+}
+
+/// One key event against the taken shortcuts: `took` is the key whose press was taken (0 for
+/// none); `take_press` says whether this press is a taken shortcut (asked for presses only).
+/// The answer: whether the event is swallowed, and the key whose press is taken now. A release
+/// is swallowed only after its own press was; a press that is not taken lets go of that key, so
+/// a press taken long ago can never swallow a later release the shortcut never saw.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn taken_step(took: u32, vk: u32, pressed: bool, take_press: impl FnOnce() -> bool) -> (bool, u32) {
+    match (pressed, took == vk) {
+        (false, true) => (true, 0),
+        (false, false) => (false, took),
+        (true, _) if take_press() => (true, vk),
+        (true, true) => (false, 0),
+        (true, false) => (false, took),
+    }
+}
+
+/// Put in the keyboard hook and then the mouse hook; when the mouse hook fails, the keyboard hook
+/// is taken out again before the error is returned, so no hook is left behind.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn install_both<H>(keyboard: impl FnOnce() -> Result<H, String>, mouse: impl FnOnce() -> Result<H, String>, unhook: impl FnOnce(H)) -> Result<(H, H), String> {
+    let k = keyboard()?;
+    match mouse() {
+        Ok(m) => Ok((k, m)),
+        Err(e) => {
+            unhook(k);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_a_hook_callback_is_caught_and_the_callback_keeps_working() {
+        assert!(guarded(HookKind::Keyboard, || true));
+        assert!(!guarded(HookKind::Keyboard, || false));
+        assert!(!guarded(HookKind::Mouse, || panic!("a hook callback of this test panics")), "caught: the key is let through");
+        // The callback's lock was held when it panicked: the next event still reaches it.
+        let calls = std::sync::Mutex::new(0);
+        assert!(!guarded(HookKind::Keyboard, || {
+            let _held = calls.lock().unwrap();
+            panic!("panics holding the lock");
+        }));
+        assert!(calls.is_poisoned());
+        *lock_or_recover(&calls) += 1;
+        assert_eq!(*lock_or_recover(&calls), 1);
+    }
+
+    /// A key or mouse event whose callback panics is passed on to the next hook, as one that is
+    /// not taken; one that is taken is swallowed; and the callback runs marked as a hook's.
+    #[test]
+    fn an_event_whose_callback_panics_is_passed_on() {
+        let passed = std::cell::Cell::new(0);
+        let next = || {
+            passed.set(passed.get() + 1);
+            0
+        };
+        assert_eq!(answer(HookKind::Keyboard, true, || panic!("a keyboard callback of this test panics"), next), 0);
+        assert_eq!(answer(HookKind::Mouse, true, || panic!("a mouse callback of this test panics"), next), 0);
+        assert_eq!(passed.get(), 2, "both passed on");
+        assert_eq!(answer(HookKind::Keyboard, true, || true, next), 1, "taken: swallowed");
+        assert_eq!(answer(HookKind::Keyboard, false, || true, next), 0, "not an action: passed on, the callback not run");
+        assert_eq!(passed.get(), 3);
+        assert_eq!(answer(HookKind::Mouse, true, || crate::crash_log::current_hook() == Some(HookKind::Mouse), || 0), 1);
+        assert_eq!(crate::crash_log::current_hook(), None);
+    }
+
+    /// The hook sees every input: nothing to note, however long the check runs.
+    #[test]
+    fn a_hook_that_sees_the_input_is_left_alone() {
+        let mut l = Liveness::default();
+        for s in 0..120u32 {
+            let t = 10_000 + s * 1000;
+            assert_eq!(l.check(t, t - 10, t - 5), Verdict::Fine);
+        }
+        // Nobody touches anything: Windows' input is old, the hook's too.
+        let mut l = Liveness::default();
+        for s in 0..120u32 {
+            assert_eq!(l.check(100_000 + s * 1000, 5_000, 5_000), Verdict::Fine);
+        }
+    }
+
+    /// The hook gets nothing while input goes on: after three checks in a row it is suspected,
+    /// once, and again only ten minutes later while it lasts; when the hook sees input again a new
+    /// suspicion is noted at once.
+    #[test]
+    fn a_hook_that_misses_new_input_on_three_checks_is_suspected_once_every_ten_minutes() {
+        let mut l = Liveness::default();
+        let hook = 1_000;
+        let at = |s: u32| 10_000 + s * 1000;
+        let verdicts: Vec<Verdict> = (0..5).map(|s| l.check(at(s), at(s) - 100, hook)).collect();
+        assert_eq!(verdicts[..3], [Verdict::Fine, Verdict::Fine, Verdict::Fine], "the first check has nothing to compare with");
+        assert_eq!(verdicts[3], Verdict::Suspect { lag_ms: at(3) - 100 - hook });
+        assert_eq!(verdicts[4], Verdict::Fine);
+        for s in 5..603u32 {
+            assert_eq!(l.check(at(s), at(s) - 100, hook), Verdict::Fine, "check {s}: not again within ten minutes");
+        }
+        assert!(matches!(l.check(at(603), at(603) - 100, hook), Verdict::Suspect { .. }), "ten minutes later");
+        // The hook sees input: over. Missed again later: noted at once.
+        assert_eq!(l.check(at(604), at(604) - 100, at(604) - 50), Verdict::Fine);
+        let again: Vec<Verdict> = (605..609).map(|s| l.check(at(s), at(s) - 100, hook)).collect();
+        assert!(matches!(again[2], Verdict::Suspect { .. }), "{again:?}");
+        // Checks closer than a second apart are not counted.
+        let mut l = Liveness::default();
+        for i in 0..20u32 {
+            let t = 10_000 + i * 100;
+            assert_eq!(l.check(t, t - 50, hook), Verdict::Fine);
+        }
+    }
+
+    /// Strikes must be in a row: a check without new input, or one where the hook saw it, starts
+    /// the count again.
+    #[test]
+    fn a_check_without_fresh_unseen_input_starts_the_count_again() {
+        let hook = 1_000;
+        let at = |s: u32| 20_000 + s * 1000;
+        // Two misses, a check with no new input, two misses: never three in a row.
+        let mut l = Liveness::default();
+        let mut system = 0;
+        for s in 0..20u32 {
+            if s % 3 != 2 {
+                system = at(s) - 100;
+            }
+            assert_eq!(l.check(at(s), system, hook), Verdict::Fine, "check {s}");
+        }
+        // The same old input every check.
+        let mut l = Liveness::default();
+        for s in 0..10u32 {
+            assert_eq!(l.check(at(s), 15_000, hook), Verdict::Fine, "the same old input, check {s}");
+        }
+        // Input the hook sees in between.
+        let mut l = Liveness::default();
+        for s in 0..10u32 {
+            let h = if s % 2 == 0 { at(s) - 50 } else { hook };
+            assert_eq!(l.check(at(s), at(s) - 100, h), Verdict::Fine, "check {s}");
+        }
+    }
+
+    #[test]
+    fn the_ticks_may_wrap() {
+        let mut l = Liveness::default();
+        let start = u32::MAX - 2_500;
+        let got: Vec<Verdict> = (0..5u32).map(|s| start.wrapping_add(s * 1000)).map(|t| l.check(t, t.wrapping_sub(100), t.wrapping_sub(50))).collect();
+        assert!(got.iter().all(|v| *v == Verdict::Fine), "seen input across the wrap: {got:?}");
+    }
+
+    const PRTSC: u32 = 0x2C;
+    const KEY_A: u32 = 0x41;
+
+    #[test]
+    fn a_taken_press_and_its_release_are_both_swallowed() {
+        let (swallow, took) = taken_step(0, PRTSC, true, || true);
+        assert_eq!((swallow, took), (true, PRTSC));
+        assert_eq!(taken_step(took, PRTSC, false, || unreachable!("a release is never asked")), (true, 0));
+        // Other keys meanwhile pass and leave it be.
+        assert_eq!(taken_step(PRTSC, KEY_A, true, || false), (false, PRTSC));
+        assert_eq!(taken_step(PRTSC, KEY_A, false, || false), (false, PRTSC));
+    }
+
+    /// A press was taken, its release never came to the hook (the hook was stalled, or the key
+    /// went up on the secure desktop). The next press of that key is not taken (a shortcut being
+    /// recorded, or other modifiers): it and its release both pass on, and the key stays usable.
+    #[test]
+    fn a_stale_taken_key_never_swallows_a_release_of_a_press_that_was_not_taken() {
+        let stale = PRTSC;
+        let (swallow, took) = taken_step(stale, PRTSC, true, || false);
+        assert_eq!((swallow, took), (false, 0), "the press passes and the old take is let go");
+        assert_eq!(taken_step(took, PRTSC, false, || false), (false, 0), "its release passes too");
+        // The same key taken again later works as before.
+        let (swallow, took) = taken_step(took, PRTSC, true, || true);
+        assert!(swallow);
+        assert_eq!(taken_step(took, PRTSC, false, || false), (true, 0));
+    }
+
+    /// The mouse hook fails after the keyboard hook went in: the keyboard hook is taken out again.
+    #[test]
+    fn a_failed_mouse_hook_takes_the_keyboard_hook_out_again() {
+        let unhooked = std::cell::Cell::new(None);
+        let r = install_both(|| Ok(7), || Err("mouse hook: access denied".to_string()), |h| unhooked.set(Some(h)));
+        assert_eq!(r, Err("mouse hook: access denied".to_string()));
+        assert_eq!(unhooked.get(), Some(7));
+        let unhooked = std::cell::Cell::new(None);
+        assert_eq!(install_both(|| Err("keyboard hook: no".to_string()), || -> Result<i32, String> { unreachable!("not tried") }, |h| unhooked.set(Some(h))), Err("keyboard hook: no".to_string()));
+        assert_eq!(unhooked.get(), None, "nothing went in");
+        assert_eq!(install_both(|| Ok(1), || Ok(2), |_| unreachable!("both went in")), Ok((1, 2)));
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::HookKind;
+    use windows::Win32::System::SystemInformation::GetTickCount;
     use std::sync::{Mutex, OnceLock, RwLock};
 
     use rdev::{Button, EventType, Key};
@@ -63,7 +359,7 @@ mod win {
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
@@ -77,6 +373,17 @@ mod win {
     static TAKEN: RwLock<Option<Taken>> = RwLock::new(None);
     /// The key whose press was taken, so its release is taken too (0: none).
     static TOOK_VK: AtomicU32 = AtomicU32::new(0);
+    /// The tick of the last event either hook got, or of the hooks' installing (0: not yet).
+    static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn last_event_tick() -> Option<u32> {
+        let t = LAST_EVENT.load(Ordering::Relaxed);
+        (t != 0).then_some(t)
+    }
+
+    fn touch() {
+        LAST_EVENT.store(unsafe { GetTickCount() }.max(1), Ordering::Relaxed);
+    }
 
     pub fn set_taken_keys(keys: Vec<super::TakenKey>, on_press: Box<dyn Fn(Action) -> bool + Send + Sync>) {
         if let Ok(mut t) = TAKEN.write() {
@@ -102,82 +409,109 @@ mod win {
         m
     }
 
-    /// Take a key event if it is one of the taken shortcuts.
+    /// Take a key event if it is one of the taken shortcuts (see [`super::taken_step`]).
     fn take(vk: u32, pressed: bool) -> bool {
-        if !pressed {
-            return TOOK_VK.compare_exchange(vk, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok();
-        }
+        let (swallow, took) = super::taken_step(TOOK_VK.load(Ordering::Relaxed), vk, pressed, || press_is_taken(vk));
+        TOOK_VK.store(took, Ordering::Relaxed);
+        swallow
+    }
+
+    /// Whether a press of `vk` is a taken shortcut, its action run (which may decline it).
+    fn press_is_taken(vk: u32) -> bool {
         let Ok(guard) = TAKEN.read() else { return false };
         let Some(t) = guard.as_ref() else { return false };
         if !t.keys.iter().any(|(_, k, _)| *k == vk) {
             return false;
         }
         let held = held_mods();
-        match t.keys.iter().find(|(m, k, _)| *k == vk && *m == held) {
-            Some((_, _, action)) if (t.on_press)(*action) => {
-                TOOK_VK.store(vk, Ordering::Relaxed);
-                true
-            }
-            _ => false,
-        }
+        matches!(t.keys.iter().find(|(m, k, _)| *k == vk && *m == held), Some((_, _, action)) if (t.on_press)(*action))
     }
 
     fn emit(ev: EventType) {
         if let Some(cb) = CALLBACK.get() {
-            if let Ok(mut cb) = cb.lock() {
-                cb(ev);
-            }
+            // A callback that panicked once (the panic was caught, see `guarded`) still gets
+            // the events after it.
+            (super::lock_or_recover(cb))(ev);
         }
     }
 
+    /// The hooks are called by Windows: a panic must never unwind into it, which would end the
+    /// process at once. Caught here, the panic is in `crash.log` as any other (the panic hook
+    /// writes it), the event passes on to the other apps, and the hook keeps running.
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code == HC_ACTION as i32 {
-            let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            if take(info.vkCode, pressed) {
-                // Swallowed: no other app, and not Windows, sees this key.
-                return LRESULT(1);
-            }
-            let key = vk_to_key(info.vkCode);
-            match wparam.0 as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => emit(EventType::KeyPress(key)),
-                WM_KEYUP | WM_SYSKEYUP => emit(EventType::KeyRelease(key)),
-                _ => {}
-            }
+        let action = code == HC_ACTION as i32;
+        let vk = if action {
+            touch();
+            unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode }
+        } else {
+            0
+        };
+        // 1: swallowed, no other app and not Windows sees this key.
+        LRESULT(super::answer(HookKind::Keyboard, action, || keyboard_event(wparam.0 as u32, vk), || unsafe { CallNextHookEx(None, code, wparam, lparam) }.0))
+    }
+
+    /// One key event: true when it is taken (swallowed).
+    fn keyboard_event(message: u32, vk: u32) -> bool {
+        let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if take(vk, pressed) {
+            return true;
         }
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        let key = vk_to_key(vk);
+        match message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => emit(EventType::KeyPress(key)),
+            WM_KEYUP | WM_SYSKEYUP => emit(EventType::KeyRelease(key)),
+            _ => {}
+        }
+        false
     }
 
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code == HC_ACTION as i32 {
-            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            let ev = match wparam.0 as u32 {
-                WM_MOUSEMOVE => Some(EventType::MouseMove { x: info.pt.x as f64, y: info.pt.y as f64 }),
-                WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
-                WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),
-                WM_RBUTTONDOWN => Some(EventType::ButtonPress(Button::Right)),
-                WM_RBUTTONUP => Some(EventType::ButtonRelease(Button::Right)),
-                WM_MBUTTONDOWN => Some(EventType::ButtonPress(Button::Middle)),
-                WM_MBUTTONUP => Some(EventType::ButtonRelease(Button::Middle)),
-                _ => None,
-            };
-            if let Some(ev) = ev {
-                // Buttons carry no position in rdev's types; send the position first.
-                if !matches!(ev, EventType::MouseMove { .. }) {
-                    emit(EventType::MouseMove { x: info.pt.x as f64, y: info.pt.y as f64 });
-                }
-                emit(ev);
+        let action = code == HC_ACTION as i32;
+        let (x, y) = if action {
+            touch();
+            let pt = unsafe { (*(lparam.0 as *const MSLLHOOKSTRUCT)).pt };
+            (pt.x, pt.y)
+        } else {
+            (0, 0)
+        };
+        LRESULT(super::answer(HookKind::Mouse, action, || mouse_event(wparam.0 as u32, x, y), || unsafe { CallNextHookEx(None, code, wparam, lparam) }.0))
+    }
+
+    /// One mouse event; never taken.
+    fn mouse_event(message: u32, x: i32, y: i32) -> bool {
+        let at = EventType::MouseMove { x: x as f64, y: y as f64 };
+        let ev = match message {
+            WM_MOUSEMOVE => Some(at),
+            WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
+            WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),
+            WM_RBUTTONDOWN => Some(EventType::ButtonPress(Button::Right)),
+            WM_RBUTTONUP => Some(EventType::ButtonRelease(Button::Right)),
+            WM_MBUTTONDOWN => Some(EventType::ButtonPress(Button::Middle)),
+            WM_MBUTTONUP => Some(EventType::ButtonRelease(Button::Middle)),
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            // Buttons carry no position in rdev's types; send the position first.
+            if !matches!(ev, EventType::MouseMove { .. }) {
+                emit(at);
             }
+            emit(ev);
         }
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        false
     }
 
     pub fn listen(callback: Callback) -> Result<(), String> {
         CALLBACK.set(Mutex::new(callback)).map_err(|_| "the input hook is already running".to_string())?;
         unsafe {
             let module = GetModuleHandleW(None).map_err(|e| e.to_string())?;
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(module.into()), 0).map_err(|e| format!("keyboard hook: {e}"))?;
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module.into()), 0).map_err(|e| format!("mouse hook: {e}"))?;
+            super::install_both(
+                || SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(module.into()), 0).map_err(|e| format!("keyboard hook: {e}")),
+                || SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module.into()), 0).map_err(|e| format!("mouse hook: {e}")),
+                |k| {
+                    let _ = UnhookWindowsHookEx(k);
+                },
+            )?;
+            touch();
             // Low-level hooks run inside this thread's message loop.
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {}

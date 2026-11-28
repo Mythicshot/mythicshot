@@ -34,6 +34,10 @@ sha2 = "0.11"
 # Verifies the Ed25519 signature of the release file before an update is offered. Pinned to the
 # version rustls already brings in, so nothing new is fetched.
 ring = { version = "=0.17.14", default-features = false }
+# Errors and warnings of the UI framework and the window library, written to crash.log. The
+# window library reports through `tracing`; its "log" feature hands those reports to `log`.
+log = "0.4"
+tracing = { version = "0.1", default-features = false, features = ["log"] }
 
 [dev-dependencies]
 # Tests never reach the desktop: the destinations' file dialog, clipboard, printer, mail and

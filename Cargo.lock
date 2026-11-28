@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "arboard",
  "chrono",
@@ -2981,6 +2981,7 @@ dependencies = [
  "global-hotkey",
  "image",
  "keyring",
+ "log",
  "mythicshot-capture",
  "mythicshot-destinations",
  "mythicshot-editor",
@@ -2994,6 +2995,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml 0.8.2",
+ "tracing",
  "tray-icon",
  "ureq",
  "windows",
@@ -3002,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-capture"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "image",
  "xcap",
@@ -3010,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-destinations"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "arboard",
  "chrono",
@@ -3022,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-editor"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "ab_glyph",
  "epaint_default_fonts",
@@ -3033,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "mythicshot-recording"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "gifski",
  "image",
@@ -3918,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "phase0"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "eframe",
  "gifski",
@@ -6353,8 +6355,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
  "ahash",
  "android-activity",

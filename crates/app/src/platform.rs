@@ -179,32 +179,129 @@ pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
     (dpi != 0).then_some(dpi)
 }
 
+/// Whether the Escape key is down now, as the OS reports it.
+#[cfg(windows)]
+pub fn escape_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+    (unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) }) as u16 & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+pub fn escape_down() -> bool {
+    false
+}
+
+/// Windows' tick (milliseconds since start, wrapping) of the last keyboard or mouse input in this
+/// session, from `GetLastInputInfo`, and the tick now, from `GetTickCount`.
+#[cfg(windows)]
+pub fn input_ticks() -> Option<(u32, u32)> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe { GetLastInputInfo(&mut info) }.as_bool().then(|| (info.dwTime, unsafe { GetTickCount() }))
+}
+
+#[cfg(not(windows))]
+pub fn input_ticks() -> Option<(u32, u32)> {
+    None
+}
+
+/// Windows' error for a monitor handle whose monitor has gone: ERROR_INVALID_MONITOR_HANDLE.
+pub const INVALID_MONITOR_HANDLE: u32 = 1461;
+
+/// One reading of the monitors: each one's rectangle in desktop pixels and its effective DPI, the
+/// error of a monitor that went while it was read, and the error of a monitor left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub monitors: Vec<(mythicshot_capture::PxRect, u32)>,
+    /// [`INVALID_MONITOR_HANDLE`]: a monitor listed went before it could be read (as monitors do
+    /// while a full-screen game switches display modes), so the reading is incomplete.
+    pub unread: Option<u32>,
+    /// Windows' error for a monitor listed that cannot be read for another reason (a DPI query
+    /// that always fails on a virtual display, say), or one that failed the same way twice: it is
+    /// left out of the reading, which counts as complete, as before readings were checked.
+    pub left_out: Option<u32>,
+}
+
+/// Read every monitor `list` gives with `read`. Only a handle that is no longer valid
+/// ([`INVALID_MONITOR_HANDLE`]) makes the reading incomplete; any other failure leaves that monitor
+/// out. An incomplete reading is taken once more from a fresh listing; a second one that is the
+/// same as the first (the same monitors read, the same one failing) is taken as the layout, its
+/// failing monitor left out, so one monitor that always fails cannot switch every check off. A
+/// second reading still incomplete otherwise is returned marked, for the caller to leave aside.
+/// Never a panic, whatever the handles.
+pub fn read_layout<H: Copy>(list: impl Fn() -> Vec<H>, read: impl Fn(H) -> Result<(mythicshot_capture::PxRect, u32), u32>) -> Layout {
+    let once = || {
+        let mut layout = Layout::default();
+        for h in list() {
+            match read(h) {
+                Ok(m) => layout.monitors.push(m),
+                Err(INVALID_MONITOR_HANDLE) => {
+                    layout.unread = Some(INVALID_MONITOR_HANDLE);
+                }
+                Err(code) => {
+                    layout.left_out.get_or_insert(code);
+                }
+            }
+        }
+        layout
+    };
+    let first = once();
+    if first.unread.is_none() {
+        return first;
+    }
+    let second = once();
+    if second.unread.is_some() && second == first {
+        return Layout { unread: None, left_out: second.left_out.or(second.unread), ..second };
+    }
+    second
+}
+
 /// The monitors as Windows' window manager knows them, cheaply: each one's rectangle in desktop
 /// pixels and its effective DPI, from `EnumDisplayMonitors`, `GetMonitorInfoW` and
 /// `GetDpiForMonitor` only. Unlike the full monitor listing it asks the display driver nothing
 /// (no display settings) and loads no library, so it can be read while a selection is dragged.
 /// The rectangle and DPI are the ones the full listing reports for a process aware of each
-/// monitor's DPI, as this one is.
+/// monitor's DPI, as this one is. See [`read_layout`] for a monitor that goes while it is read.
 #[cfg(windows)]
-pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
+pub fn monitor_layout() -> Layout {
+    read_layout(monitor_handles, read_monitor)
+}
+
+/// The monitors' handles, from `EnumDisplayMonitors`. A handle is only good while its monitor is
+/// there: each is read at once, and never kept.
+#[cfg(windows)]
+fn monitor_handles() -> Vec<isize> {
     use windows::Win32::Foundation::{LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
-    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
     unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows::core::BOOL {
-        let out = unsafe { &mut *(data.0 as *mut Vec<(mythicshot_capture::PxRect, u32)>) };
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let (mut dx, mut dy) = (0u32, 0u32);
-        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() && unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok() {
-            let r = info.rcMonitor;
-            out.push((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx));
-        }
+        let out = unsafe { &mut *(data.0 as *mut Vec<isize>) };
+        out.push(monitor.0 as isize);
         true.into()
     }
-    let mut out: Vec<(mythicshot_capture::PxRect, u32)> = Vec::new();
+    let mut out: Vec<isize> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut out as *mut _ as isize));
     }
     out
+}
+
+/// One monitor's rectangle and effective DPI, or Windows' error code when its handle is no
+/// longer valid ([`INVALID_MONITOR_HANDLE`]) or its DPI cannot be read.
+#[cfg(windows)]
+fn read_monitor(handle: isize) -> Result<(mythicshot_capture::PxRect, u32), u32> {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    let monitor = HMONITOR(handle as *mut _);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(unsafe { GetLastError() }.0);
+    }
+    let (mut dx, mut dy) = (0u32, 0u32);
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.map_err(|e| e.code().0 as u32)?;
+    let r = info.rcMonitor;
+    Ok((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx))
 }
 
 /// The primary monitor's work area (the monitor less the taskbar and docked bars) in desktop
@@ -326,8 +423,8 @@ pub fn find_visible_own_window(_title: &str, _client: (i32, i32), _tolerance: i3
 }
 
 #[cfg(not(windows))]
-pub fn monitor_layout() -> Vec<(mythicshot_capture::PxRect, u32)> {
-    mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect()
+pub fn monitor_layout() -> Layout {
+    Layout { monitors: mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect(), ..Layout::default() }
 }
 
 /// Move and size a window to an outer rectangle in desktop pixels, without showing it,
@@ -945,6 +1042,128 @@ mod tests {
     fn the_file_to_open_is_quoted_whole() {
         assert_eq!(open_arg(Path::new(r"C:\Users\me\Raid guides, v2\index.html")), r#""C:\Users\me\Raid guides, v2\index.html""#);
         assert_eq!(open_arg(Path::new(r"D:\Führung & Co\演示.html")), r#""D:\Führung & Co\演示.html""#);
+    }
+
+    use mythicshot_capture::PxRect;
+    use std::cell::Cell;
+
+    /// The owner's three monitors, as handles 1, 2 and 3.
+    fn three(h: u8) -> Result<(PxRect, u32), u32> {
+        match h {
+            1 => Ok((PxRect::new(0, 0, 2560, 1440), 96)),
+            2 => Ok((PxRect::new(2560, 0, 2560, 1440), 96)),
+            3 => Ok((PxRect::new(5120, 0, 3840, 2160), 192)),
+            _ => Err(INVALID_MONITOR_HANDLE),
+        }
+    }
+
+    /// Three monitors become one while they are read, as when a game switches display modes:
+    /// the first listing still names all three, but two have gone by the time they are read, and
+    /// the monitor left has a new handle. The reading is taken again, from a fresh listing.
+    #[test]
+    fn a_monitor_that_goes_between_the_listing_and_its_read_is_listed_and_read_again() {
+        let calls = Cell::new(0);
+        let list = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { vec![1u8, 2, 3] } else { vec![4] }
+        };
+        let read = |h: u8| match h {
+            1 => Ok((PxRect::new(0, 0, 2560, 1440), 96)),
+            4 => Ok((PxRect::new(0, 0, 3840, 2160), 192)),
+            _ => Err(INVALID_MONITOR_HANDLE),
+        };
+        let layout = read_layout(list, read);
+        assert_eq!(calls.get(), 2, "listed again once");
+        assert_eq!(layout, Layout { monitors: vec![(PxRect::new(0, 0, 3840, 2160), 192)], unread: None, left_out: None });
+    }
+
+    #[test]
+    fn a_reading_that_works_the_first_time_is_listed_once() {
+        let calls = Cell::new(0);
+        let layout = read_layout(
+            || {
+                calls.set(calls.get() + 1);
+                vec![1u8, 2, 3]
+            },
+            three,
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(layout.monitors.len(), 3);
+        assert_eq!(layout.unread, None);
+    }
+
+    /// Still changing on the second reading: what could be read, marked with the error, for the
+    /// caller to leave aside; never a panic.
+    #[test]
+    fn a_reading_still_changing_the_second_time_is_marked_with_the_error() {
+        let calls = Cell::new(0);
+        let list = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { vec![1u8, 9, 3] } else { vec![1u8, 8] }
+        };
+        let layout = read_layout(list, three);
+        assert_eq!(layout, Layout { monitors: vec![(PxRect::new(0, 0, 2560, 1440), 96)], unread: Some(INVALID_MONITOR_HANDLE), left_out: None });
+        assert_eq!(read_layout(Vec::<u8>::new, three), Layout::default(), "no monitors listed: empty, not incomplete");
+    }
+
+    /// The same incomplete reading twice in a row is the layout: a monitor whose handle always
+    /// fails is left out instead of switching every check off.
+    #[test]
+    fn the_same_incomplete_reading_twice_is_taken_with_the_failing_monitor_left_out() {
+        let layout = read_layout(|| vec![1u8, 9, 3], three);
+        assert_eq!(layout.unread, None);
+        assert_eq!(layout.left_out, Some(INVALID_MONITOR_HANDLE));
+        assert_eq!(layout.monitors, vec![(PxRect::new(0, 0, 2560, 1440), 96), (PxRect::new(5120, 0, 3840, 2160), 192)]);
+    }
+
+    /// A monitor that fails for another reason (its DPI query, on a virtual display) is left out
+    /// as before readings were checked: listed once, the reading complete.
+    #[test]
+    fn a_monitor_that_fails_for_another_reason_is_left_out_and_the_reading_is_complete() {
+        const E_INVALIDARG: u32 = 0x8007_0057;
+        let calls = Cell::new(0);
+        let read = |h: u8| if h == 7 { Err(E_INVALIDARG) } else { three(h) };
+        let layout = read_layout(
+            || {
+                calls.set(calls.get() + 1);
+                vec![1u8, 7, 3]
+            },
+            read,
+        );
+        assert_eq!(calls.get(), 1, "not listed again");
+        assert_eq!(layout.unread, None);
+        assert_eq!(layout.left_out, Some(E_INVALIDARG));
+        assert_eq!(layout.monitors.len(), 2);
+    }
+
+    /// The fix for the crash of 2026-11-25 lives in the vendored window library: the build must
+    /// still use that copy (one `winit` in `Cargo.lock`, with no registry source) and the copy
+    /// must still hold the patched readers. The fallback itself is tested in the vendored file;
+    /// the library's public interface gives a monitor handle only from a running event loop or a
+    /// window, which these tests never open (see `vendor/winit/PATCHES.md`).
+    #[test]
+    fn the_window_library_in_the_build_is_the_patched_copy() {
+        let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        let winit: Vec<&str> = lock.split("[[package]]").filter(|p| p.lines().any(|l| l.trim() == "name = \"winit\"")).collect();
+        assert_eq!(winit.len(), 1, "exactly one window library in the build");
+        assert!(!winit[0].lines().any(|l| l.trim_start().starts_with("source =")), "the vendored copy, not the published one:\n{}", winit[0]);
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+        assert!(manifest.contains("[patch.crates-io]\nwinit = { path = \"vendor/winit\" }"), "the patch entry");
+        let monitor = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/winit/src/platform_impl/windows/monitor.rs"));
+        assert!(monitor.contains("pub(crate) fn info_or_primary("), "the fallback");
+        assert!(!monitor.contains("get_monitor_info(self.0).unwrap()"), "no unwrap of a monitor's information");
+        let window = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/winit/src/platform_impl/windows/window.rs"));
+        assert!(window.contains("// Patched: a monitor gone since the video mode was listed ends the change"), "the exclusive-fullscreen change");
+        assert!(!window.contains("get_monitor_info(monitor.hmonitor()).unwrap()"), "no unwrap of a monitor's information in the window code");
+    }
+
+    /// On this machine: a handle no monitor has (as one whose monitor has gone) is answered with
+    /// ERROR_INVALID_MONITOR_HANDLE, the error of the crash record, as an error and not a panic.
+    /// Its handle-table index (the low 16 bits) is 0, an entry Windows never hands out.
+    #[cfg(windows)]
+    #[test]
+    fn a_handle_no_monitor_has_is_answered_with_the_invalid_monitor_error() {
+        assert_eq!(read_monitor(0x7ead_0000), Err(INVALID_MONITOR_HANDLE));
     }
 
     /// Only a window in its normal state gives a size: not maximized, not minimized, and with its
