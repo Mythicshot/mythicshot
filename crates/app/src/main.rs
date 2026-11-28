@@ -1738,6 +1738,9 @@ impl eframe::App for App {
             self.hidden_at_start = true;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
+        // Ctrl and plus, minus or 0 zoom every window, or none, as the setting says; egui reads
+        // the switch at the end of each pass.
+        settings_ui::set_zoom_keys(&ctx, self.settings.zoom_with_keys);
         self.handle_events(&ctx);
         self.tick_update(&ctx);
 

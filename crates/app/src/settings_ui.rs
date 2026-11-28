@@ -15,6 +15,18 @@ use crate::project::{self, ConvertState, FfmpegState, Form, ProjectInfo, Removed
 use crate::publish_ui::size_text;
 use crate::settings::{Settings, TrayLeftClick};
 
+/// The General tab's switch for egui's keyboard zoom (see [`set_zoom_keys`]).
+pub const ZOOM_WITH_KEYS: &str = "Zoom with Ctrl + and Ctrl -";
+
+/// Switch egui's own keyboard zoom (Ctrl and plus, minus or 0, which egui runs at the end of every
+/// pass of every window of `ctx`) to the setting. Off, egui leaves those keys alone: they do
+/// nothing in Mythicshot and stay in the input like any other key.
+pub fn set_zoom_keys(ctx: &egui::Context, on: bool) {
+    if ctx.options(|o| o.zoom_with_keyboard) != on {
+        ctx.options_mut(|o| o.zoom_with_keyboard = on);
+    }
+}
+
 const BAR_HEIGHT: f32 = 8.0;
 /// How long until the page looks again whether ffmpeg was found, while it is being looked for.
 const FFMPEG_LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
@@ -199,6 +211,9 @@ fn general_page(ui: &mut egui::Ui, view: View<'_>, out: &mut Vec<UiAction>) {
                     out.push(UiAction::SetAutostart(autostart));
                 }
                 if ui.checkbox(&mut s.magnifier, "Show the magnifier when selecting a region").changed() {
+                    out.push(UiAction::SettingsChanged);
+                }
+                if ui.checkbox(&mut s.zoom_with_keys, ZOOM_WITH_KEYS).changed() {
                     out.push(UiAction::SettingsChanged);
                 }
             });
@@ -1083,6 +1098,82 @@ mod tests {
         let texts: Vec<String> = crate::share_ui::tests::shapes_of(&out).into_iter().filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect();
         assert!(texts.iter().any(|t| t == "Picture tool"), "{texts:?}");
         assert_eq!(Bind::Editor(EditorAction::Picture).label(), "Picture tool");
+    }
+
+    /// One pass of `ctx` with `key` pressed with Ctrl, and whether the key was still in the
+    /// input after the page was drawn (where a text field would take it).
+    fn ctrl_key_pass(ctx: &egui::Context, key: egui::Key) -> bool {
+        let press = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+        let input = egui::RawInput { events: vec![press], ..Default::default() };
+        let mut seen = false;
+        ctx.run_ui(input, |ui| {
+            ui.label("page");
+            seen = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, .. } if *k == key)));
+        })
+        .textures_delta
+        .clear();
+        // The zoom egui asked for applies from the next pass.
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        seen
+    }
+
+    /// On (the default), Ctrl and plus or minus zoom and Ctrl and 0 resets, as egui does. Off,
+    /// the same keys change nothing and stay in the input for the page.
+    #[test]
+    fn the_zoom_keys_follow_the_setting() {
+        let ctx = crate::theme::test_context();
+        assert!(Settings::default().zoom_with_keys);
+        set_zoom_keys(&ctx, true);
+        assert!(ctrl_key_pass(&ctx, egui::Key::Plus));
+        assert!(ctx.zoom_factor() > 1.0, "zoomed in: {}", ctx.zoom_factor());
+        ctrl_key_pass(&ctx, egui::Key::Num0);
+        assert_eq!(ctx.zoom_factor(), 1.0, "reset");
+        ctrl_key_pass(&ctx, egui::Key::Minus);
+        assert!(ctx.zoom_factor() < 1.0, "zoomed out: {}", ctx.zoom_factor());
+        ctrl_key_pass(&ctx, egui::Key::Num0);
+        // Off: nothing zooms, nothing resets, and every press reaches the page.
+        set_zoom_keys(&ctx, false);
+        assert!(!ctx.options(|o| o.zoom_with_keyboard));
+        for key in [egui::Key::Plus, egui::Key::Equals, egui::Key::Minus] {
+            assert!(ctrl_key_pass(&ctx, key), "{key:?} reaches the page");
+            assert_eq!(ctx.zoom_factor(), 1.0, "{key:?} does not zoom");
+        }
+        ctx.set_zoom_factor(1.5);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        assert!(ctrl_key_pass(&ctx, egui::Key::Num0));
+        assert_eq!(ctx.zoom_factor(), 1.5, "Ctrl and 0 does not reset either");
+        // On again.
+        set_zoom_keys(&ctx, true);
+        ctrl_key_pass(&ctx, egui::Key::Num0);
+        assert_eq!(ctx.zoom_factor(), 1.0);
+    }
+
+    /// The switch is on the General tab, under its exact words, and a click on it turns the
+    /// setting off and asks for the settings to be saved.
+    #[test]
+    fn the_general_tab_has_the_zoom_switch() {
+        let ctx = crate::theme::test_context();
+        let mut settings = Settings::default();
+        let mut state = SettingsState::default();
+        let errors = HashMap::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 2000.0));
+        let mut frame = |settings: &mut Settings, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(input, |ui| {
+                let view = View { settings, errors: &errors, snipping_tool: None, autostart: false, updates: None };
+                actions = super::ui(ui, &mut state, view);
+            });
+            out.textures_delta.clear();
+            (out, actions)
+        };
+        let (out, _) = frame(&mut settings, Vec::new());
+        let at = crate::menu_bar::tests::last_text_rect(&out, ZOOM_WITH_KEYS).expect("the switch");
+        let click = |pressed| egui::Event::PointerButton { pos: at.center(), button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut settings, vec![egui::Event::PointerMoved(at.center())]);
+        let (_, actions) = frame(&mut settings, vec![click(true), click(false)]);
+        assert!(!settings.zoom_with_keys, "turned off");
+        assert!(actions.iter().any(|a| matches!(a, UiAction::SettingsChanged)));
     }
     use crate::project::{Problem, ProjectKey};
     use std::sync::mpsc::channel;
