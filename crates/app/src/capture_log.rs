@@ -161,9 +161,14 @@ pub fn close_request_line(time: &str, done: &str) -> String {
     format!("-- {time} close request to the capture window (Alt+F4 or another program): {done}; the app stays open")
 }
 
-/// The input hook missed input for several checks and was put in again.
-pub fn hook_reinstalled_line(time: &str, lag_ms: u32) -> String {
-    format!("-- {time} input hook put in again: Windows had input {lag_ms} ms newer than the hook's last event on 3 checks in a row (removed by Windows?)")
+/// A suspicion only: the input hook may no longer get input. Nothing is done about it.
+pub fn hook_suspect_line(time: &str, lag_ms: u32) -> String {
+    format!("-- {time} input hook may no longer get input (a suspicion; nothing was changed): Windows recorded input {lag_ms} ms newer than the hook's last event, on 3 checks in a row; the sign-in or consent screen, or an elevated or remote window in front, looks the same")
+}
+
+/// The input hook could not be put in at start.
+pub fn hook_failed_line(time: &str, error: &str) -> String {
+    format!("-- {time} input hook not installed ({error}); the shortcuts it takes do not work this run")
 }
 
 /// A monitor listed cannot be read for a reason other than having gone: it is left out of the

@@ -1464,8 +1464,9 @@ impl App {
                     let _ = tx.send(AppEvent::Input(ev));
                 }
             });
+            // The release build has no console: the capture log says it.
             if let Err(e) = result {
-                eprintln!("input hook unavailable: {e}");
+                capture_log::append(&[capture_log::hook_failed_line(&capture_log::now(), &e)]);
             }
         });
     }
@@ -1793,13 +1794,12 @@ impl eframe::App for App {
         if self.overlay.is_none() && self.session.is_none() {
             self.parking.tick(self.root);
         }
-        // Once a second: the input hook against Windows' record of input; put in again if gone.
+        // Once a second: the input hook against Windows' record of input. Only noted, nothing done.
         if self.key_hook_started
             && let (Some((system, now)), Some(hook_tick)) = (platform::input_ticks(), hook::last_event_tick())
-            && let hook::Verdict::Reinstall { lag_ms } = self.hook_watch.check(now, system, hook_tick)
+            && let hook::Verdict::Suspect { lag_ms } = self.hook_watch.check(now, system, hook_tick)
         {
-            hook::reinstall();
-            capture_log::append(&[capture_log::hook_reinstalled_line(&capture_log::now(), lag_ms)]);
+            capture_log::append(&[capture_log::hook_suspect_line(&capture_log::now(), lag_ms)]);
         }
         self.tick_recording(&ctx);
         self.show_editors(&ctx);
