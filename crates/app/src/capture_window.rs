@@ -373,11 +373,6 @@ impl Parking {
         vec![capture_log::parked_check_line(time, &problems, r.settle)]
     }
 
-    /// Why it is due to be parked, if it is.
-    pub fn due(&self) -> Option<&'static str> {
-        self.due
-    }
-
     /// At the start of a capture: lines for the log about anything in which the parked window
     /// disagrees with the displays `now`, and whether it should be settled again (by way of
     /// another monitor) before the selector is shown. As with the checks while parked, that is
@@ -1162,7 +1157,7 @@ mod tests {
             p.observe(&torn, Some(parked(192)), "t1"),
             ["-- t1 parked window not checked: a monitor could not be read (error 1461, monitor handle no longer valid), read 0,0 2560x1440 @96; the displays are read again at the next check"]
         );
-        assert_eq!(p.due(), None, "not parked again on a reading that is incomplete");
+        assert_eq!(p.due, None, "not parked again on a reading that is incomplete");
         assert_eq!(p.observe(&torn, Some(parked(192)), "t2"), Vec::<String>::new(), "said once while it lasts");
         assert!(check_parked(Some(&three), &torn, Some(parked(192))).is_empty(), "compared with nothing");
         // One monitor, read completely: parked again for it.
@@ -1170,7 +1165,7 @@ mod tests {
         let lines = p.observe(&one, Some(parked(192)), "t3");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("-- t3 parked window checked: display set-up changed since parking (parked for 0,0 2560x1440 @96, 2560,0 2560x1440 @96, 5120,0 3840x2160 @192; now 0,0 3840x2160 @192)"), "{}", lines[0]);
-        assert_eq!(p.due(), Some("display set-up changed"));
+        assert_eq!(p.due, Some("display set-up changed"));
         // A capture started meanwhile is not cancelled by an incomplete reading either.
         assert!(!displays_changed(&three, &torn) && !displays_changed(&torn, &three));
         assert!(displays_changed(&three, &one));

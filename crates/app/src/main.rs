@@ -11,6 +11,7 @@
 mod app_icon;
 mod capture_log;
 mod capture_window;
+mod crash_log;
 mod dialogs;
 mod editor_ui;
 mod glass_band;
@@ -238,6 +239,9 @@ struct App {
     /// closes for it: msiexec is started on it as the very last thing the app does.
     install_on_exit: Option<update::Verified>,
     update_close_at: Option<Instant>,
+    /// What asked the app to close (Quit, an update), for `on_exit`: a close nobody asked for
+    /// leaves a line in `crash.log`.
+    closing: Option<&'static str>,
 }
 
 /// How long "Checked. Mythicshot will close..." stands before the app closes for the installer.
@@ -391,6 +395,7 @@ impl App {
             update_quit: None,
             install_on_exit: None,
             update_close_at: None,
+            closing: None,
             wake: {
                 let (wake, woken) = mpsc::channel::<()>();
                 let relay = ctx.clone();
@@ -557,10 +562,16 @@ impl App {
         let start = editor_ui::start_quit(&mut guards, running);
         drop(guards);
         match start {
-            editor_ui::QuitStart::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
+            editor_ui::QuitStart::Exit => self.close_app(ctx, "quit"),
             editor_ui::QuitStart::Asked => self.quitting = true,
             editor_ui::QuitStart::StillRunning => self.notify(editor_ui::STILL_RUNNING.into()),
         }
+    }
+
+    /// Close the app, `why` being what asked (see `closing`).
+    fn close_app(&mut self, ctx: &egui::Context, why: &'static str) {
+        self.closing = Some(why);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     /// While Quit waits for the editors' answers: go once all agreed, stay on a Cancel.
@@ -586,7 +597,7 @@ impl App {
                 self.quitting = false;
                 match self.update_quit.take() {
                     Some((release, path)) => self.close_for_update(release, path),
-                    None => ctx.send_viewport_cmd(ViewportCommand::Close),
+                    None => self.close_app(ctx, "quit"),
                 }
             }
         }
@@ -646,7 +657,7 @@ impl App {
                 let start = editor_ui::start_quit(&mut guards, running);
                 drop(guards);
                 match start {
-                    editor_ui::QuitStart::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                    editor_ui::QuitStart::Exit => self.close_app(ctx, "update"),
                     // Something to lose or something running after all: the installer is let go and waits again.
                     editor_ui::QuitStart::Asked | editor_ui::QuitStart::StillRunning => {
                         self.install_on_exit = None;
@@ -1612,6 +1623,10 @@ impl eframe::App for App {
     /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The UI framework comes here on every way out it takes, an error of its own included.
+        if let Some(line) = crash_log::unexpected_exit_line(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), self.closing) {
+            crash_log::append_at(&crash_log::path(), &line);
+        }
         // A size the main window was given by hand in the last moments is saved first, before
         // the waits below.
         let window_size = self.window.lock().ok().and_then(|mut s| s.size_at_exit());
@@ -1795,22 +1810,6 @@ fn open_loaded(loaded: project::Loaded, settings: &Settings) -> Result<editor_ui
     })
 }
 
-/// Write panics to `crash.log` next to the settings file; release builds have
-/// no console to show them.
-fn install_crash_log() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let path = Settings::path().with_file_name("crash.log");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        let text = format!("{}\n{info}\n{backtrace}\n\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
-        default(info);
-    }));
-}
-
 fn main() -> eframe::Result {
     // A build with the test stubs answers every file dialog, clipboard, print, mail and browser
     // call with a stub: it must never run as the app.
@@ -1818,7 +1817,10 @@ fn main() -> eframe::Result {
         eprintln!("This is a test build of Mythicshot; it does not run as the app.");
         std::process::exit(2);
     }
-    install_crash_log();
+    // Before any other thread starts: panics on every thread, and the errors the UI framework
+    // ends the app on without one, go to `crash.log` (see `crash_log`).
+    crash_log::install_panic_hook();
+    crash_log::install_logger();
     // Steps the installer runs; these never start the app.
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--installer") {

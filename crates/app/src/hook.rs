@@ -50,6 +50,39 @@ pub fn listen(mut callback: impl FnMut(EventType) + Send + 'static) -> Result<()
     rdev::listen(move |e| callback(e.event_type)).map_err(|e| format!("{e:?}"))
 }
 
+/// Run one hook callback, catching a panic in it: false (the event is not taken) when it panicked.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn guarded(f: impl FnOnce() -> bool) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(false)
+}
+
+/// The lock, also when a callback panicked while it held it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lock_or_recover<T: ?Sized>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_a_hook_callback_is_caught_and_the_callback_keeps_working() {
+        assert!(guarded(|| true));
+        assert!(!guarded(|| false));
+        assert!(!guarded(|| panic!("a hook callback of this test panics")), "caught: the key is let through");
+        // The callback's lock was held when it panicked: the next event still reaches it.
+        let calls = std::sync::Mutex::new(0);
+        assert!(!guarded(|| {
+            let _held = calls.lock().unwrap();
+            panic!("panics holding the lock");
+        }));
+        assert!(calls.is_poisoned());
+        *lock_or_recover(&calls) += 1;
+        assert_eq!(*lock_or_recover(&calls), 1);
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -124,52 +157,70 @@ mod win {
 
     fn emit(ev: EventType) {
         if let Some(cb) = CALLBACK.get() {
-            if let Ok(mut cb) = cb.lock() {
-                cb(ev);
-            }
+            // A callback that panicked once (the panic was caught, see `guarded`) still gets
+            // the events after it.
+            (super::lock_or_recover(cb))(ev);
         }
     }
 
+    /// The hooks are called by Windows: a panic must never unwind into it, which would end the
+    /// process at once. Caught here, the panic is in `crash.log` as any other (the panic hook
+    /// writes it), the event passes on to the other apps, and the hook keeps running.
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
-            let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            if take(info.vkCode, pressed) {
+            let info = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if super::guarded(|| keyboard_event(wparam.0 as u32, info.vkCode)) {
                 // Swallowed: no other app, and not Windows, sees this key.
                 return LRESULT(1);
             }
-            let key = vk_to_key(info.vkCode);
-            match wparam.0 as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => emit(EventType::KeyPress(key)),
-                WM_KEYUP | WM_SYSKEYUP => emit(EventType::KeyRelease(key)),
-                _ => {}
-            }
         }
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    /// One key event: true when it is taken (swallowed).
+    fn keyboard_event(message: u32, vk: u32) -> bool {
+        let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if take(vk, pressed) {
+            return true;
+        }
+        let key = vk_to_key(vk);
+        match message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => emit(EventType::KeyPress(key)),
+            WM_KEYUP | WM_SYSKEYUP => emit(EventType::KeyRelease(key)),
+            _ => {}
+        }
+        false
     }
 
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
-            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            let ev = match wparam.0 as u32 {
-                WM_MOUSEMOVE => Some(EventType::MouseMove { x: info.pt.x as f64, y: info.pt.y as f64 }),
-                WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
-                WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),
-                WM_RBUTTONDOWN => Some(EventType::ButtonPress(Button::Right)),
-                WM_RBUTTONUP => Some(EventType::ButtonRelease(Button::Right)),
-                WM_MBUTTONDOWN => Some(EventType::ButtonPress(Button::Middle)),
-                WM_MBUTTONUP => Some(EventType::ButtonRelease(Button::Middle)),
-                _ => None,
-            };
-            if let Some(ev) = ev {
-                // Buttons carry no position in rdev's types; send the position first.
-                if !matches!(ev, EventType::MouseMove { .. }) {
-                    emit(EventType::MouseMove { x: info.pt.x as f64, y: info.pt.y as f64 });
-                }
-                emit(ev);
-            }
+            let info = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
+            super::guarded(|| mouse_event(wparam.0 as u32, info.pt.x, info.pt.y));
         }
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    /// One mouse event; never taken.
+    fn mouse_event(message: u32, x: i32, y: i32) -> bool {
+        let at = EventType::MouseMove { x: x as f64, y: y as f64 };
+        let ev = match message {
+            WM_MOUSEMOVE => Some(at),
+            WM_LBUTTONDOWN => Some(EventType::ButtonPress(Button::Left)),
+            WM_LBUTTONUP => Some(EventType::ButtonRelease(Button::Left)),
+            WM_RBUTTONDOWN => Some(EventType::ButtonPress(Button::Right)),
+            WM_RBUTTONUP => Some(EventType::ButtonRelease(Button::Right)),
+            WM_MBUTTONDOWN => Some(EventType::ButtonPress(Button::Middle)),
+            WM_MBUTTONUP => Some(EventType::ButtonRelease(Button::Middle)),
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            // Buttons carry no position in rdev's types; send the position first.
+            if !matches!(ev, EventType::MouseMove { .. }) {
+                emit(at);
+            }
+            emit(ev);
+        }
+        false
     }
 
     pub fn listen(callback: Callback) -> Result<(), String> {
