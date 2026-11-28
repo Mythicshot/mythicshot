@@ -19,7 +19,7 @@ opt-level = 2
 
 # The window library, patched where it ended the program on a monitor that had just gone (it
 # unwrapped ERROR_INVALID_MONITOR_HANDLE while reading the size of the monitor a window is on,
-# which eframe does every frame). The published 0.30.13, with only the lines marked "Patched".
+# which the UI framework does every frame). The published 0.30.13, with only the lines marked "Patched".
 # Drop this once a published version reads a vanished monitor without panicking.
 [patch.crates-io]
 winit = { path = "vendor/winit" }

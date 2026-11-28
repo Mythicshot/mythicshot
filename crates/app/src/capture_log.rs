@@ -149,6 +149,13 @@ pub fn displays_changed_line(frame: u32, was: &str, now: &str) -> String {
     format!("frame {frame}: displays changed during the capture (was {was}; now {now}): capture cancelled")
 }
 
+/// A check of the parked window found a monitor listed that could not be read (its handle no
+/// longer valid: it went while it was read), and compared nothing.
+pub fn unread_line(time: &str, code: u32, read: &str) -> String {
+    let why = if code == crate::platform::INVALID_MONITOR_HANDLE { ", monitor handle no longer valid" } else { "" };
+    format!("-- {time} parked window not checked: a monitor could not be read (error {code}{why}), read {read}; the displays are read again at the next check")
+}
+
 /// At the start of a capture, something in which the parked window disagrees with the displays.
 pub fn capture_note_line(problem: &str, action: NoteAction) -> String {
     let what = match action {

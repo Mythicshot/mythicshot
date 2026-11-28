@@ -61,6 +61,9 @@ const DISPLAY_CHECK_PARKED: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone)]
 pub struct DisplaySet {
     mons: Vec<MonitorInfo>,
+    /// A monitor was listed but could not be read, twice (see [`platform::read_layout`]): Windows'
+    /// error. Such a reading is incomplete while the monitors change, and is compared with nothing.
+    unread: Option<u32>,
 }
 
 impl PartialEq for DisplaySet {
@@ -73,7 +76,7 @@ impl DisplaySet {
     pub fn from_monitors(monitors: &[MonitorInfo]) -> Self {
         let mut mons = monitors.to_vec();
         mons.sort_by_key(|m| (m.rect.x, m.rect.y, m.rect.w, m.rect.h));
-        Self { mons }
+        Self { mons, unread: None }
     }
 
     /// From the light reading: rectangles and effective DPIs.
@@ -87,7 +90,17 @@ impl DisplaySet {
     /// between two light readings; the full listing is only compared with it once per capture
     /// (see [`listings_disagree`]).
     pub fn now() -> Self {
-        Self::from_layout(&platform::monitor_layout())
+        Self::from_reading(&platform::monitor_layout())
+    }
+
+    /// From a reading that may be incomplete: a monitor that went while it was read.
+    pub fn from_reading(layout: &platform::Layout) -> Self {
+        Self { unread: layout.unread, ..Self::from_layout(&layout.monitors) }
+    }
+
+    /// Every monitor listed could be read: the reading can be compared with another.
+    pub fn readable(&self) -> bool {
+        self.unread.is_none()
     }
 
     fn key(&self) -> Vec<(PxRect, u32)> {
@@ -170,7 +183,8 @@ impl Mismatch {
 /// was parked for (`parked_for`, None when it was never parked).
 pub fn check_parked(parked_for: Option<&DisplaySet>, now: &DisplaySet, win: Option<WinState>) -> Vec<Mismatch> {
     let mut out = Vec::new();
-    if now.is_empty() {
+    // No reading, or one a monitor went from while it was read: nothing to compare.
+    if now.is_empty() || !now.readable() {
         return out;
     }
     if let Some(p) = parked_for
@@ -264,6 +278,8 @@ pub struct Parking {
     /// The last parking got it onto its target.
     reached: bool,
     checked: Option<Instant>,
+    /// The last check found a monitor that could not be read, and said so in the log.
+    unread_logged: bool,
 }
 
 impl Parking {
@@ -301,6 +317,10 @@ impl Parking {
             return;
         }
         let displays = DisplaySet::now();
+        // A monitor went while it was read: parked on the next frame's reading instead.
+        if !displays.readable() {
+            return;
+        }
         let Some(target) = displays.target() else { return };
         self.frames += 1;
         if std::mem::take(&mut self.settle) {
@@ -334,12 +354,28 @@ impl Parking {
         if platform::is_window_visible(hwnd) {
             return;
         }
-        let now = DisplaySet::now();
-        let mismatches = check_parked(self.parked_for.as_ref(), &now, state(hwnd));
-        let Some(r) = recheck(&mismatches, self.settled_for.as_ref() == Some(&now), self.reached) else { return };
+        let lines = self.observe(&DisplaySet::now(), state(hwnd), &capture_log::now());
+        capture_log::append(&lines);
+    }
+
+    /// One check of the parked window `win` against the displays `now`: the lines for the log,
+    /// and a parking again when they disagree. A reading a monitor went from while it was read is
+    /// said once in the log and compared with nothing; the next check reads the displays afresh.
+    pub fn observe(&mut self, now: &DisplaySet, win: Option<WinState>, time: &str) -> Vec<String> {
+        if let Some(code) = now.unread {
+            return if std::mem::replace(&mut self.unread_logged, true) { Vec::new() } else { vec![capture_log::unread_line(time, code, &now.describe())] };
+        }
+        self.unread_logged = false;
+        let mismatches = check_parked(self.parked_for.as_ref(), now, win);
+        let Some(r) = recheck(&mismatches, self.settled_for.as_ref() == Some(now), self.reached) else { return Vec::new() };
         let problems: Vec<String> = mismatches.iter().map(Mismatch::describe).collect();
-        capture_log::append(&[capture_log::parked_check_line(&capture_log::now(), &problems, r.settle)]);
         self.restart(r.why, r.settle, 0);
+        vec![capture_log::parked_check_line(time, &problems, r.settle)]
+    }
+
+    /// Why it is due to be parked, if it is.
+    pub fn due(&self) -> Option<&'static str> {
+        self.due
     }
 
     /// At the start of a capture: lines for the log about anything in which the parked window
@@ -429,7 +465,7 @@ pub fn placed_when_shown(before: Stage, after: Stage, on_target: bool, so_far: b
 /// light one every check compares with. Both read rectangles in desktop pixels and the effective
 /// DPI; a scale is turned back into a DPI by rounding scale × 96.
 pub fn listings_disagree(full: &[MonitorInfo], light: &DisplaySet) -> bool {
-    !full.is_empty() && !light.is_empty() && DisplaySet::from_monitors(full) != *light
+    !full.is_empty() && !light.is_empty() && light.readable() && DisplaySet::from_monitors(full) != *light
 }
 
 /// The stage for correction `n`: cloaked again, waiting for a right frame, when Windows cloaked
@@ -539,9 +575,10 @@ pub struct Presenting {
 }
 
 /// Whether the displays changed during a capture, so its frozen picture is no longer of the
-/// screens there are. A reading with no monitors at all (it failed) changes nothing.
+/// screens there are. A reading with no monitors at all (it failed), or one a monitor went from
+/// while it was read, changes nothing: the next reading, a quarter of a second later, decides.
 pub fn displays_changed(start: &DisplaySet, now: &DisplaySet) -> bool {
-    !now.is_empty() && !start.is_empty() && start != now
+    !now.is_empty() && !start.is_empty() && now.readable() && start.readable() && start != now
 }
 
 impl Presenting {
@@ -1106,6 +1143,41 @@ mod tests {
         assert_eq!(recheck(&m, true, false), None, "the last parking could not reach the target");
         // A failed reading of the displays (no monitors) never re-parks.
         assert_eq!(check_parked(Some(&now), &DisplaySet::from_monitors(&[]), Some(parked(288))), Vec::new());
+    }
+
+    /// The crash record's evening: the parked window is checked once a second while three
+    /// monitors become one (a game going full screen) and come back. A reading taken while a
+    /// monitor goes is incomplete: it is said once, compares with nothing and moves nothing; the
+    /// next complete readings re-park the window for one monitor.
+    #[test]
+    fn a_monitor_that_goes_while_the_parked_window_is_checked_is_logged_once_and_moves_nothing() {
+        use crate::platform::{INVALID_MONITOR_HANDLE, Layout};
+        let three = DisplaySet::from_monitors(&owners());
+        let mut p = Parking { parked_for: Some(three.clone()), reached: true, ..Parking::default() };
+        assert_eq!(p.observe(&three, Some(parked(192)), "t0"), Vec::<String>::new(), "nothing changed");
+        // Two monitors listed but gone by the time they are read.
+        let torn = DisplaySet::from_reading(&Layout { monitors: vec![(PxRect::new(0, 0, 2560, 1440), 96)], unread: Some(INVALID_MONITOR_HANDLE) });
+        assert!(!torn.readable());
+        assert_eq!(
+            p.observe(&torn, Some(parked(192)), "t1"),
+            ["-- t1 parked window not checked: a monitor could not be read (error 1461, monitor handle no longer valid), read 0,0 2560x1440 @96; the displays are read again at the next check"]
+        );
+        assert_eq!(p.due(), None, "not parked again on a reading that is incomplete");
+        assert_eq!(p.observe(&torn, Some(parked(192)), "t2"), Vec::<String>::new(), "said once while it lasts");
+        assert!(check_parked(Some(&three), &torn, Some(parked(192))).is_empty(), "compared with nothing");
+        // One monitor, read completely: parked again for it.
+        let one = DisplaySet::from_reading(&Layout { monitors: vec![(PxRect::new(0, 0, 3840, 2160), 192)], unread: None });
+        let lines = p.observe(&one, Some(parked(192)), "t3");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("-- t3 parked window checked: display set-up changed since parking (parked for 0,0 2560x1440 @96, 2560,0 2560x1440 @96, 5120,0 3840x2160 @192; now 0,0 3840x2160 @192)"), "{}", lines[0]);
+        assert_eq!(p.due(), Some("display set-up changed"));
+        // A capture started meanwhile is not cancelled by an incomplete reading either.
+        assert!(!displays_changed(&three, &torn) && !displays_changed(&torn, &three));
+        assert!(displays_changed(&three, &one));
+        assert!(!listings_disagree(&owners(), &torn), "an incomplete light reading says nothing about the full one");
+        // A later incomplete reading is said again: the last one was complete.
+        p.due = None;
+        assert_eq!(p.observe(&torn, Some(parked(192)), "t4").len(), 1);
     }
 
     #[test]
