@@ -20,10 +20,14 @@ pub const ZOOM_WITH_KEYS: &str = "Zoom with Ctrl + and Ctrl -";
 
 /// Switch egui's own keyboard zoom (Ctrl and plus, minus or 0, which egui runs at the end of every
 /// pass of every window of `ctx`) to the setting. Off, egui leaves those keys alone: they do
-/// nothing in Mythicshot and stay in the input like any other key.
+/// nothing in Mythicshot and stay in the input like any other key. Switched from on to off, the
+/// zoom goes back to 100%, since Ctrl and 0 can no longer reset it.
 pub fn set_zoom_keys(ctx: &egui::Context, on: bool) {
     if ctx.options(|o| o.zoom_with_keyboard) != on {
         ctx.options_mut(|o| o.zoom_with_keyboard = on);
+        if !on {
+            ctx.set_zoom_factor(1.0);
+        }
     }
 }
 
@@ -1146,6 +1150,31 @@ mod tests {
         set_zoom_keys(&ctx, true);
         ctrl_key_pass(&ctx, egui::Key::Num0);
         assert_eq!(ctx.zoom_factor(), 1.0);
+    }
+
+    /// Zoomed with the keys and then switched off: Ctrl and 0 is off too, so the zoom goes back to
+    /// 100% at once instead of staying until a restart. Switched on again, or set to what it is
+    /// already, it leaves the zoom alone.
+    #[test]
+    fn turning_the_zoom_keys_off_puts_the_zoom_back_to_100_percent() {
+        let ctx = crate::theme::test_context();
+        set_zoom_keys(&ctx, true);
+        ctrl_key_pass(&ctx, egui::Key::Plus);
+        ctrl_key_pass(&ctx, egui::Key::Plus);
+        assert!(ctx.zoom_factor() > 1.1, "zoomed in: {}", ctx.zoom_factor());
+        set_zoom_keys(&ctx, false);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        assert_eq!(ctx.zoom_factor(), 1.0, "back to 100%");
+        // Every frame calls it with the setting: off again changes nothing more.
+        ctx.set_zoom_factor(1.3);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        set_zoom_keys(&ctx, false);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        assert_eq!(ctx.zoom_factor(), 1.3, "only the change from on to off resets");
+        set_zoom_keys(&ctx, true);
+        set_zoom_keys(&ctx, true);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        assert_eq!(ctx.zoom_factor(), 1.3, "turning it on keeps the zoom");
     }
 
     /// The switch is on the General tab, under its exact words, and a click on it turns the
