@@ -1771,9 +1771,9 @@ impl eframe::App for App {
             match ov.ui(ui, client, moved) {
                 Outcome::Continue => {
                     let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
-                    if after == Some(capture_window::After::Abort) {
+                    if let Some(capture_window::After::Abort(why)) = after {
                         self.finish_overlay(&ctx, Outcome::Cancel);
-                        self.notify("The region selector could not be shown.".into());
+                        self.notify(why.message().into());
                     }
                 }
                 outcome => self.finish_overlay(&ctx, outcome),
