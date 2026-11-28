@@ -304,28 +304,37 @@ fn read_monitor(handle: isize) -> Result<(mythicshot_capture::PxRect, u32), u32>
     Ok((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx))
 }
 
-/// The primary monitor's work area (the monitor less the taskbar and docked bars) in desktop
-/// pixels, and its effective DPI, from `MonitorFromPoint`, `GetMonitorInfoW` and
-/// `GetDpiForMonitor`, as [`monitor_layout`] reads them. The primary monitor is where Windows
-/// creates a new window that is given no monitor of its own, as the main window is.
+/// Every monitor's work area (the monitor less the taskbar and docked bars) in desktop pixels,
+/// its effective DPI and whether it is the primary monitor, from `EnumDisplayMonitors`,
+/// `GetMonitorInfoW` and `GetDpiForMonitor`, as [`monitor_layout`] reads them. A monitor that
+/// cannot be read (one that went while it was read, its handle no longer valid) is left out;
+/// nothing here panics, whatever the handles. For placing the main window on the primary monitor.
 #[cfg(windows)]
-pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+pub fn monitor_work_areas() -> Vec<crate::main_window::MonitorArea> {
+    monitor_handles().into_iter().filter_map(read_work_area).collect()
+}
+
+#[cfg(windows)]
+fn read_work_area(handle: isize) -> Option<crate::main_window::MonitorArea> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    // MONITORINFOF_PRIMARY in `dwFlags`.
+    const PRIMARY: u32 = 1;
+    let monitor = HMONITOR(handle as *mut _);
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    let (mut dx, mut dy) = (0u32, 0u32);
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() || unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_err() || dx == 0 {
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         return None;
     }
+    let (mut dx, mut dy) = (0u32, 0u32);
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.ok()?;
     let r = info.rcWork;
-    Some((mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32), dx))
+    let work = mythicshot_capture::PxRect::new(r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32);
+    Some(crate::main_window::MonitorArea { work, dpi: dx, primary: info.dwFlags & PRIMARY != 0 })
 }
 
 #[cfg(not(windows))]
-pub fn primary_work_area() -> Option<(mythicshot_capture::PxRect, u32)> {
-    None
+pub fn monitor_work_areas() -> Vec<crate::main_window::MonitorArea> {
+    Vec::new()
 }
 
 /// The client size to take as a window's size, from what Windows says about it, or None when the

@@ -36,8 +36,13 @@ pub enum Command {
     OpenFolder,
     /// The first entry while a newer version is available: what "Update now" does.
     Update,
+    /// Let go of the global shortcuts and register them again, on a click in the menu only.
+    ReconnectShortcuts,
     Exit,
 }
+
+/// The menu's last entries, in order: "Reconnect shortcuts" just above Exit.
+pub const FOOT: [(&str, Command); 2] = [("Reconnect shortcuts", Command::ReconnectShortcuts), ("Exit", Command::Exit)];
 
 impl Command {
     /// Whether running the command puts something new on the screen or takes a picture of it: a
@@ -45,7 +50,7 @@ impl Command {
     /// is waiting for the main window to be gone is dropped when one of these runs, so the two
     /// never both fire and the waiting one never photographs what the other opened.
     pub fn changes_the_screen(self) -> bool {
-        !matches!(self, Command::PauseRecording | Command::LiveDraw | Command::ToggleDestination(_) | Command::ToggleMagnifier)
+        !matches!(self, Command::PauseRecording | Command::LiveDraw | Command::ToggleDestination(_) | Command::ToggleMagnifier | Command::ReconnectShortcuts)
     }
 
     pub fn from_action(a: Action) -> Command {
@@ -159,7 +164,7 @@ impl Tray {
         }
         let prefs = item("Preferences…", Command::Preferences, true);
         let folder = item("Open captures folder", Command::OpenFolder, true);
-        let exit = item("Exit", Command::Exit, true);
+        let foot: Vec<MenuItem> = FOOT.iter().map(|(text, cmd)| item(text, *cmd, true)).collect();
 
         let magnifier = CheckMenuItem::new("Show magnifier", true, settings.magnifier, None);
         commands.insert(magnifier.id().clone(), Command::ToggleMagnifier);
@@ -198,7 +203,9 @@ impl Tray {
             menu.append(it).map_err(|e| e.to_string())?;
         }
         menu.append(&sep()).map_err(|e| e.to_string())?;
-        menu.append(&exit).map_err(|e| e.to_string())?;
+        for it in &foot {
+            menu.append(it).map_err(|e| e.to_string())?;
+        }
 
         labelled.push((Action::CaptureRegion, region));
         labelled.push((Action::CaptureLastRegion, last));
@@ -316,9 +323,23 @@ mod tests {
         for cmd in [Command::Region, Command::LastRegion, Command::Window, Command::FullScreen, Command::Record, Command::RecordLastRegion, Command::RecordWindow, Command::RecordFullScreen, Command::Display(0), Command::FromClipboard, Command::OpenFile, Command::OpenApp, Command::Preferences, Command::OpenFolder, Command::Update, Command::Exit] {
             assert!(cmd.changes_the_screen(), "{cmd:?}");
         }
-        for cmd in [Command::PauseRecording, Command::LiveDraw, Command::ToggleMagnifier, Command::ToggleDestination(DestId::File)] {
+        for cmd in [Command::PauseRecording, Command::LiveDraw, Command::ToggleMagnifier, Command::ToggleDestination(DestId::File), Command::ReconnectShortcuts] {
             assert!(!cmd.changes_the_screen(), "{cmd:?}");
         }
+    }
+
+    /// "Reconnect shortcuts" is the entry just above Exit, and the menu is its only way in: no
+    /// left click, shortcut or busy state runs it, and nothing holds it back.
+    #[test]
+    fn reconnect_shortcuts_sits_just_above_exit_and_only_a_click_on_it_runs_it() {
+        assert_eq!(FOOT, [("Reconnect shortcuts", Command::ReconnectShortcuts), ("Exit", Command::Exit)]);
+        for a in Action::ALL {
+            assert_ne!(Command::from_action(*a), Command::ReconnectShortcuts, "{a:?}");
+        }
+        for choice in TrayLeftClick::ALL {
+            assert_ne!(left_click(choice, IDLE), Some(Command::ReconnectShortcuts));
+        }
+        assert!(allowed(Command::ReconnectShortcuts, IDLE) && allowed(Command::ReconnectShortcuts, Activity { overlay: true, session: true, picker: true, pending: true }));
     }
 
     #[test]

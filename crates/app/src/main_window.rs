@@ -27,6 +27,8 @@ use crate::tray::Command;
 
 mod opening;
 
+pub use opening::MonitorArea;
+
 pub const TITLE: &str = "Mythicshot";
 /// The size the window opens at when the user has not given it one, in points: every page shows
 /// whole beside the menu except Preferences' Output and Hotkeys tabs, which scroll, and the
@@ -248,21 +250,18 @@ pub struct Shared {
     size_memory: opening::SizeMemory,
     /// A size the user gave the window by hand, for the app to save (as `main_window_size`).
     pub size_to_save: Option<[f32; 2]>,
-    /// The work area of the monitor the window opens on, in points; tests give their own.
-    work_area: fn() -> Option<egui::Rect>,
+    /// The monitors' work areas, read when the window opens; tests give their own.
+    monitors: fn() -> Vec<MonitorArea>,
+    /// Where the window that is opening must be, in desktop pixels, until it has been seen there
+    /// or moved there once (see [`keep_on_primary`]).
+    place_at: Option<(i32, i32)>,
     /// Where the open window's normal size is read from; tests give their own.
     normal_size: Box<dyn opening::NormalSize>,
 }
 
-/// The primary monitor's work area in points, as Windows reports it now.
-fn primary_work_area() -> Option<egui::Rect> {
-    let (r, dpi) = crate::platform::primary_work_area()?;
-    opening::work_area_points(r.x, r.y, r.w, r.h, dpi)
-}
-
 impl Shared {
     pub fn new(prefs: settings_ui::Shared) -> Self {
-        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false, opening: None, size_memory: opening::SizeMemory::default(), size_to_save: None, work_area: primary_work_area, normal_size: Box::new(opening::WindowsNormalSize::default()) }
+        Self { nav: Nav::default(), prefs, home: HomeState::default(), tours: ToursState::default(), workspace: WorkspaceState::default(), profiles: crate::profiles_ui::Panel::default(), capture: None, edit_project: None, open_image: None, drop: DropState::default(), busy: false, app_requests: Vec::new(), update: crate::update_ui::Updater::default(), title_dark: false, opening: None, size_memory: opening::SizeMemory::default(), size_to_save: None, monitors: crate::platform::monitor_work_areas, place_at: None, normal_size: Box::new(opening::WindowsNormalSize::default()) }
     }
 
     /// Keep what a page asked of the window or the app in this frame. A frame that asks for
@@ -387,12 +386,20 @@ impl Shared {
     }
 
     /// The opening of the window that is opening now: the saved size, or the default, fitted to
-    /// the work area, with egui's zoom at `zoom`. Worked out once per opening.
+    /// the primary monitor's work area and centred on it, with egui's zoom at `zoom`. Worked out
+    /// once per opening. When the primary monitor cannot be read, Windows places the window, and
+    /// one line in the capture log says so.
     fn opening(&mut self, zoom: f32) -> opening::Opening {
         if let Some(o) = self.opening.filter(|_| self.size_memory.is_open()) {
             return o;
         }
-        let o = opening::opening(self.prefs.settings.main_window_size, (self.work_area)(), zoom);
+        let monitors = (self.monitors)();
+        let primary = opening::primary_work(&monitors);
+        if primary.is_none() {
+            crate::capture_log::append(&[crate::capture_log::no_primary_line(&crate::capture_log::now(), monitors.len())]);
+        }
+        let o = opening::opening(self.prefs.settings.main_window_size, primary.map(|(work, _)| work), zoom);
+        self.place_at = primary.and_then(|(_, scale)| opening::target_px(&o, scale, zoom));
         self.opening = Some(o);
         self.size_memory.open(o.window);
         self.normal_size.forget();
@@ -553,9 +560,26 @@ fn viewport_ui(ui: &mut egui::Ui, s: &mut Shared) {
         // Only the window goes; the app stays in the tray.
         s.close_window();
     }
+    keep_on_primary(ui.ctx(), s);
     window_ui(ui, s);
     watch_size(ui.ctx(), s);
     s.settle(ui.ctx());
+}
+
+/// The first frame the window's place is known: a window that is not where its opening put it
+/// (the window library turned the place into pixels at the scale of another monitor, the one
+/// Windows made it on) is moved there, once, in pixels, with one capture log line. Later frames
+/// leave it where the person puts it.
+fn keep_on_primary(ctx: &egui::Context, s: &mut Shared) {
+    let Some(target) = s.place_at else { return };
+    let (outer, ppp) = ctx.input(|i| (i.viewport().outer_rect, i.pixels_per_point));
+    let Some(outer) = outer else { return };
+    s.place_at = None;
+    let now = outer.min * ppp;
+    if ppp > 0.0 && opening::misplaced(now, target) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(target.0 as f32 / ppp, target.1 as f32 / ppp)));
+        crate::capture_log::append(&[crate::capture_log::main_window_moved_line(&crate::capture_log::now(), (now.x.round() as i32, now.y.round() as i32), target)]);
+    }
 }
 
 /// A size the user gave the window by hand is queued for the app to save once it has settled.

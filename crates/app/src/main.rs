@@ -553,8 +553,22 @@ impl App {
                     self.window_request = Some(main_window::Request::Open);
                 }
             }
+            Command::ReconnectShortcuts => self.reconnect_shortcuts(),
             Command::Exit => self.quit(ctx),
         }
+    }
+
+    /// The tray's "Reconnect shortcuts", run only when the person clicks it: every global shortcut
+    /// is let go of and registered again now, the input hook is handed its table of taken keys
+    /// again (the hook itself is left as it is), and one log line says how it went. A shortcut
+    /// that cannot be had again is shown on the Hotkeys tab, as after start-up, and named in a
+    /// notice.
+    fn reconnect_shortcuts(&mut self) {
+        self.hotkeys.take_print_screen = self.settings.take_print_screen;
+        let done = self.hotkeys.reconnect(|a| self.settings.binding(a).to_string());
+        self.publish_taken_keys();
+        capture_log::append(&[capture_log::shortcuts_reconnected_line(&capture_log::now(), &done)]);
+        self.notify(done.notice());
     }
 
     /// Quit from the File menu or the tray: at once when nothing would be lost; otherwise each
@@ -1738,6 +1752,9 @@ impl eframe::App for App {
             self.hidden_at_start = true;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
+        // Ctrl and plus, minus or 0 zoom every window, or none, as the setting says; egui reads
+        // the switch at the end of each pass.
+        settings_ui::set_zoom_keys(&ctx, self.settings.zoom_with_keys);
         self.handle_events(&ctx);
         self.tick_update(&ctx);
 
@@ -1768,9 +1785,9 @@ impl eframe::App for App {
             match ov.ui(ui, client, moved) {
                 Outcome::Continue => {
                     let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
-                    if after == Some(capture_window::After::Abort) {
+                    if let Some(notice) = capture_window::abort_notice(after) {
                         self.finish_overlay(&ctx, Outcome::Cancel);
-                        self.notify("The region selector could not be shown.".into());
+                        self.notify(notice.into());
                     }
                 }
                 outcome => self.finish_overlay(&ctx, outcome),

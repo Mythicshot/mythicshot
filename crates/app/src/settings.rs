@@ -121,6 +121,10 @@ pub struct Settings {
     /// Ask mythicshot.com once at start whether a newer version exists. On by default, also for
     /// a file without the key. Off: no request is made at start (Check now still works).
     pub check_for_updates: bool,
+    /// Ctrl and plus, Ctrl and minus, and Ctrl and 0 zoom Mythicshot's windows. On by default, also
+    /// for a file without the key. Off: those keys do nothing in Mythicshot and reach the field
+    /// being typed in, as any other key.
+    pub zoom_with_keys: bool,
     /// What went wrong reading the settings file at start-up, if anything. Never written to the file.
     #[serde(skip)]
     pub load_problem: Option<LoadProblem>,
@@ -424,6 +428,7 @@ impl Default for Settings {
             profiles_migrated: false,
             legacy_profile: None,
             check_for_updates: true,
+            zoom_with_keys: true,
             load_problem: None,
             open_editor: None,
             save_to_file: None,
@@ -760,6 +765,7 @@ impl Settings {
             store_recordings_as_video,
             saved_recordings_warn_gb,
             check_for_updates,
+            zoom_with_keys,
             // Not edited by a page.
             take_print_screen: _,
             last_region: _,
@@ -797,6 +803,7 @@ impl Settings {
         self.store_recordings_as_video = *store_recordings_as_video;
         self.saved_recordings_warn_gb = *saved_recordings_warn_gb;
         self.check_for_updates = *check_for_updates;
+        self.zoom_with_keys = *zoom_with_keys;
     }
 
     pub fn dest_context(&self, title: &str) -> Context {
@@ -1053,6 +1060,36 @@ publish_server = \"https://tours.example.com\"
         let edited = Settings { check_for_updates: false, ..Settings::default() };
         mine.take_edited(&edited);
         assert!(!mine.check_for_updates);
+    }
+
+    #[test]
+    fn zooming_with_the_keys_is_on_by_default_also_for_an_old_file_and_turning_it_off_is_remembered() {
+        assert!(Settings::default().zoom_with_keys);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // A file from before the setting existed, and an empty one: on, and the rest as it was.
+        std::fs::write(&path, "magnifier = false
+publish_server = \"https://tours.example.com\"
+").unwrap();
+        let old = load_at(&path);
+        assert!(old.load_problem.is_none() && old.zoom_with_keys && !old.magnifier && old.publish_server == "https://tours.example.com");
+        std::fs::write(&path, "").unwrap();
+        assert!(load_at(&path).zoom_with_keys);
+        // Off, saved and read again: off, under the name the file uses.
+        let mut s = old;
+        s.zoom_with_keys = false;
+        s.save_to(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("zoom_with_keys = false"));
+        assert!(!load_at(&path).zoom_with_keys);
+        // A value that is not on or off costs only this setting.
+        let s = Settings::parse("zoom_with_keys = 3
+magnifier = false
+").unwrap();
+        assert!(s.zoom_with_keys && !s.magnifier);
+        // The Preferences page's copy carries it over.
+        let mut mine = Settings::default();
+        mine.take_edited(&Settings { zoom_with_keys: false, ..Settings::default() });
+        assert!(!mine.zoom_with_keys);
     }
 
     #[test]

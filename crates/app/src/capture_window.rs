@@ -563,15 +563,49 @@ pub fn move_budget(stage: Stage, used: u8) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum After {
     Continue,
-    /// The window could not be uncloaked: it was hidden, and the capture ends as cancelled,
-    /// so no invisible window is left over the desktop.
-    Abort,
+    /// The capture ends as cancelled, for the reason given.
+    Abort(Abort),
+}
+
+/// Why a capture ended before the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abort {
+    /// The window could not be uncloaked: it was hidden, so no invisible window is left over the
+    /// desktop.
+    NotShown,
+    /// The displays changed under the capture (see [`displays_changed`]): its frozen picture is
+    /// no longer of the screens there are.
+    DisplaysChanged,
+}
+
+/// What the person is told when the selector could not be shown.
+pub const NOT_SHOWN: &str = "The region selector could not be shown.";
+/// What the person is told when the displays changed during a capture.
+pub const DISPLAYS_CHANGED: &str = "The capture was cancelled because the screens changed (a full-screen game or a monitor switched mode). Try again.";
+
+impl Abort {
+    /// The notice for the person.
+    pub fn message(self) -> &'static str {
+        match self {
+            Abort::NotShown => NOT_SHOWN,
+            Abort::DisplaysChanged => DISPLAYS_CHANGED,
+        }
+    }
+}
+
+/// What the app tells the person after a frame of the selector: the abort's words when the
+/// capture ended, nothing while it goes on (or without a window to present).
+pub fn abort_notice(after: Option<After>) -> Option<&'static str> {
+    match after? {
+        After::Continue => None,
+        After::Abort(why) => Some(why.message()),
+    }
 }
 
 /// After an uncloak that worked or did not: a window Windows will not uncloak is shown but never
 /// seen, a topmost window over every monitor that takes every click; it is hidden at once.
 pub fn after_uncloak(ok: bool) -> After {
-    if ok { After::Continue } else { After::Abort }
+    if ok { After::Continue } else { After::Abort(Abort::NotShown) }
 }
 
 /// One capture's window, from the frozen desktop to the end of the selection.
@@ -729,7 +763,7 @@ impl Presenting {
         self.frame += 1;
         if let Some(line) = self.abort.take() {
             self.lines.push(line);
-            return After::Abort;
+            return After::Abort(Abort::DisplaysChanged);
         }
         let Some(hwnd) = self.hwnd else { return After::Continue };
         let now = state(hwnd);
@@ -1366,8 +1400,27 @@ mod tests {
         let mut pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), start, false);
         pres.abort = Some(capture_log::displays_changed_line(5, "a", "b"));
         let ctx = egui::Context::default();
-        assert_eq!(pres.after_frame(&ctx, &FrameNote::default()), After::Abort);
+        assert_eq!(pres.after_frame(&ctx, &FrameNote::default()), After::Abort(Abort::DisplaysChanged));
         assert_eq!(pres.lines, ["frame 5: displays changed during the capture (was a; now b): capture cancelled"]);
+    }
+
+    /// The person is told the screens changed when that ended the capture, and that the
+    /// selector could not be shown when it could not be.
+    #[test]
+    fn a_capture_cancelled_by_a_display_change_says_so_and_another_failure_keeps_its_words() {
+        let start = DisplaySet::from_monitors(&owners());
+        let mut pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), Instant::now(), Vec::new(), start, false);
+        pres.poll_displays(3, Instant::now() + DISPLAY_CHECK_CAPTURE, || DisplaySet::from_monitors(&owners()[..2]));
+        let ctx = egui::Context::default();
+        let After::Abort(why) = pres.after_frame(&ctx, &FrameNote::default()) else { panic!("the capture ends") };
+        assert_eq!(why.message(), "The capture was cancelled because the screens changed (a full-screen game or a monitor switched mode). Try again.");
+        let After::Abort(why) = after_uncloak(false) else { panic!("the capture ends") };
+        assert_eq!(why.message(), "The region selector could not be shown.");
+        // What the app shows, from the frame's result.
+        assert_eq!(abort_notice(Some(After::Abort(Abort::DisplaysChanged))), Some(DISPLAYS_CHANGED));
+        assert_eq!(abort_notice(Some(after_uncloak(false))), Some(NOT_SHOWN));
+        assert_eq!(abort_notice(Some(After::Continue)), None);
+        assert_eq!(abort_notice(None), None);
     }
 
     /// The overlay is told the window moved before a frame exactly when `before_frame` placed,
@@ -1385,7 +1438,7 @@ mod tests {
     #[test]
     fn a_window_that_cannot_be_uncloaked_ends_the_capture() {
         assert_eq!(after_uncloak(true), After::Continue);
-        assert_eq!(after_uncloak(false), After::Abort);
+        assert_eq!(after_uncloak(false), After::Abort(Abort::NotShown));
     }
 
     #[test]

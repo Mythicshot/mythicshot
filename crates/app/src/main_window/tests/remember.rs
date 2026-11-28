@@ -14,12 +14,12 @@ use eframe::egui;
 use super::super::*;
 use super::shared;
 
-fn work_1080_at_150() -> Option<egui::Rect> {
-    Some(opening::tests::work(1920, 1080, 1.5))
+fn work_1080_at_150() -> Vec<MonitorArea> {
+    vec![opening::tests::primary(1920, 1080, 1.5)]
 }
 
-fn work_4k_at_150() -> Option<egui::Rect> {
-    Some(opening::tests::work(3840, 2160, 1.5))
+fn work_4k_at_150() -> Vec<MonitorArea> {
+    vec![opening::tests::primary(3840, 2160, 1.5)]
 }
 
 /// The window's normal size as the test says Windows holds it.
@@ -41,10 +41,10 @@ struct Run {
 }
 
 impl Run {
-    fn new(work: fn() -> Option<egui::Rect>, saved: Option<[f32; 2]>) -> Self {
+    fn new(work: fn() -> Vec<MonitorArea>, saved: Option<[f32; 2]>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut s = shared(dir.path());
-        s.work_area = work;
+        s.monitors = work;
         s.prefs.settings.main_window_size = saved;
         let normal = Arc::new(Mutex::new(None));
         s.normal_size = Box::new(FakeNormal(normal.clone()));
@@ -157,7 +157,7 @@ fn a_size_saved_on_a_large_monitor_opens_fitted_on_a_small_one_and_stays_saved()
     let mut r = Run::new(work_1080_at_150, Some(big));
     r.app_frame(Some(Request::Open));
     let fitted = r.opened_at();
-    let work = work_1080_at_150().unwrap();
+    let work = opening::tests::work(1920, 1080, 1.5);
     assert!(fitted.x < big[0] && fitted.y < big[1] && fitted.x + 16.0 + 16.0 <= work.width() && fitted.y + 39.0 + 16.0 <= work.height() + 0.01, "{fitted:?}");
     // Left at that size, closed: the preference is still the large size.
     r.normal_frames(90, fitted);
@@ -390,4 +390,71 @@ fn quitting_right_after_a_resize_keeps_the_size() {
     r.normal_frames(5, a);
     r.close();
     assert_eq!((take_saves(), r.shared.lock().unwrap().size_at_exit()), (vec![[a.x, a.y]], None));
+}
+
+fn beside_a_monitor_at_100() -> Vec<MonitorArea> {
+    vec![MonitorArea { work: mythicshot_capture::PxRect::new(-1920, 0, 1920, 1040), dpi: 96, primary: false }, opening::tests::primary(1920, 1080, 1.5)]
+}
+
+impl Run {
+    /// One frame of the open window with its outer corner at `corner` (in egui's points, at
+    /// `ppp` pixels per point, as egui-winit reports it): the commands the window sent.
+    fn frame_at(&mut self, corner: Option<egui::Pos2>, ppp: f32) -> Vec<egui::ViewportCommand> {
+        self.t += 1.0 / 60.0;
+        let size = self.opened_at();
+        let mut input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(self.t), ..Default::default() };
+        let outer_rect = corner.map(|c| egui::Rect::from_min_size(c, size));
+        input.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { native_pixels_per_point: Some(ppp), outer_rect, inner_rect: outer_rect, ..Default::default() });
+        let mut s = self.shared.lock().unwrap();
+        let mut out = self.ctx.run_ui(input, |ui| viewport_ui(ui, &mut s));
+        out.textures_delta.clear();
+        out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+    }
+}
+
+fn moves(commands: &[egui::ViewportCommand]) -> Vec<egui::Pos2> {
+    commands.iter().filter_map(|c| if let egui::ViewportCommand::OuterPosition(p) = c { Some(*p) } else { None }).collect()
+}
+
+/// The window opens centred on the primary monitor, at the place in pixels its opening worked
+/// out. Where it is there, it is left alone; where Windows made it on another monitor and the
+/// place was turned into pixels at that monitor's scale, it is moved there once, in pixels; later
+/// frames, and a window moved by the person, are left alone.
+#[test]
+fn the_window_is_put_on_the_primary_monitor_once_when_it_opens_elsewhere() {
+    let mut r = Run::new(beside_a_monitor_at_100, None);
+    r.app_frame(Some(Request::Open));
+    let o = r.opening();
+    let target = r.shared.lock().unwrap().place_at.expect("a place on the primary monitor");
+    let pos = o.pos.unwrap();
+    assert_eq!(target, ((pos.x * 1.5).round() as i32, (pos.y * 1.5).round() as i32), "the place in points at the primary's 150%");
+    // Its place not known yet: nothing, and it is still to be checked.
+    assert!(moves(&r.frame_at(None, 1.5)).is_empty());
+    assert_eq!(r.shared.lock().unwrap().place_at, Some(target));
+    // Where it should be, on the primary at 150%: left alone.
+    assert!(moves(&r.frame_at(Some(pos), 1.5)).is_empty());
+    assert_eq!(r.shared.lock().unwrap().place_at, None, "checked");
+    assert!(moves(&r.frame_at(Some(egui::pos2(-1500.0, 10.0)), 1.0)).is_empty(), "moved by the person later: left alone");
+    // Made on the monitor at 100%: the same place in points is two thirds of the pixels.
+    r.close();
+    r.app_frame(Some(Request::Open));
+    let sent = moves(&r.frame_at(Some(pos), 1.0));
+    assert_eq!(sent, vec![egui::pos2(target.0 as f32, target.1 as f32)], "in points at the scale it is at now, so in pixels the target");
+    assert!(moves(&r.frame_at(Some(pos), 1.0)).is_empty(), "once");
+    // Made on the monitor to the left, wherever Windows put it there.
+    r.close();
+    r.app_frame(Some(Request::Open));
+    let sent = moves(&r.frame_at(Some(egui::pos2(-1700.0, 120.0)), 1.0));
+    assert_eq!(sent, vec![egui::pos2(target.0 as f32, target.1 as f32)]);
+}
+
+/// No primary monitor to read: Windows places the window, and nothing moves it.
+#[test]
+fn without_a_primary_monitor_the_window_is_placed_by_windows_and_never_moved() {
+    let mut r = Run::new(Vec::new, Some([1000.0, 700.0]));
+    r.app_frame(Some(Request::Open));
+    assert_eq!(r.opening().pos, None);
+    assert_eq!(r.opening().window, egui::vec2(1000.0, 700.0), "at its size");
+    assert_eq!(r.shared.lock().unwrap().place_at, None);
+    assert!(moves(&r.frame_at(Some(egui::pos2(3000.0, 40.0)), 1.25)).is_empty());
 }

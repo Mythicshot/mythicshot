@@ -2,6 +2,13 @@
 
 Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on) and one entry here, newest first. The version shows in Mythicshot under Preferences.
 
+## 0.2.44 (2026-11-28)
+
+- Preferences › General has "Zoom with Ctrl + and Ctrl -", on by default. Turned off, Ctrl and plus, minus or 0 no longer zoom Mythicshot's windows, and reach the field you type in like any other key. Turning it off also puts the zoom back to 100%.
+- The Mythicshot window opens on the main monitor, at the size you last gave it, cut to fit that monitor and centred on it, also when Windows makes it on another monitor first. If the main monitor cannot be read, Windows places the window and the capture log says so. Not confirmed on a real screen yet.
+- A capture cancelled because the screens changed now says so: "The capture was cancelled because the screens changed (a full-screen game or a monitor switched mode). Try again." When the region selector cannot be shown for another reason, the message is the same as before.
+- The tray menu has "Reconnect shortcuts", just above Exit. When you click it, Mythicshot registers its shortcuts with Windows again, as it does at start, and says so in a notice. It does not restart what takes the Print Screen key from other apps, so the notice then says to restart Mythicshot if Print Screen still does nothing. A shortcut it cannot register is named in the notice and shown in Preferences › Hotkeys, as at start, and one line in the capture log says how it went.
+
 ## 0.2.43 (2026-11-27)
 
 - Mythicshot no longer closes when the set of monitors changes, for example when a game goes full screen and turns the other monitors off, or when the monitors go to sleep. Before, it could close at that moment.
