@@ -145,6 +145,42 @@ pub(crate) fn get_monitor_info(hmonitor: HMONITOR) -> Result<MONITORINFOEXW, io:
     }
 }
 
+/// Patched: the information of `hmonitor`, or of the monitor that is primary now when
+/// `hmonitor` is no longer valid. A monitor handle is only good while its monitor is there: one
+/// taken a moment ago (the monitor a window is on, read every frame) fails with
+/// ERROR_INVALID_MONITOR_HANDLE (1461) once that monitor has gone, as monitors do while a
+/// full-screen program switches display modes or the displays sleep. The published version
+/// unwrapped that error, which ended the program. The primary monitor is read afresh, so it is
+/// one that is there now; None only when no monitor can be read at all.
+pub(crate) fn info_or_primary(hmonitor: HMONITOR) -> Option<MONITORINFOEXW> {
+    info_or_fallback(hmonitor, get_monitor_info, || primary_monitor().0)
+}
+
+/// [`info_or_primary`] with its readers given, so the fallback can be tested with a handle that
+/// fails.
+pub(crate) fn info_or_fallback<T>(
+    hmonitor: HMONITOR,
+    read: impl Fn(HMONITOR) -> Result<T, io::Error>,
+    primary: impl Fn() -> HMONITOR,
+) -> Option<T> {
+    match read(hmonitor) {
+        Ok(info) => Some(info),
+        Err(error) => {
+            tracing::warn!(
+                "monitor handle no longer valid ({error}); the primary monitor is used instead"
+            );
+            read(primary()).ok()
+        },
+    }
+}
+
+/// Patched: the primary screen's size from the system metrics, when no monitor can be read.
+fn primary_screen_size() -> PhysicalSize<u32> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    PhysicalSize { width: w.max(0) as u32, height: h.max(0) as u32 }
+}
+
 impl MonitorHandle {
     pub(crate) fn new(hmonitor: HMONITOR) -> Self {
         MonitorHandle(hmonitor)
@@ -152,13 +188,14 @@ impl MonitorHandle {
 
     #[inline]
     pub fn name(&self) -> Option<String> {
-        let monitor_info = get_monitor_info(self.0).unwrap();
+        // Patched: None for a monitor that is gone, instead of a panic (see `info_or_primary`).
+        let monitor_info = get_monitor_info(self.0).ok()?;
         Some(decode_wide(&monitor_info.szDevice).to_string_lossy().to_string())
     }
 
     #[inline]
     pub fn native_identifier(&self) -> String {
-        self.name().unwrap()
+        self.name().unwrap_or_default()
     }
 
     #[inline]
@@ -168,10 +205,16 @@ impl MonitorHandle {
 
     #[inline]
     pub fn size(&self) -> PhysicalSize<u32> {
-        let rc_monitor = get_monitor_info(self.0).unwrap().monitorInfo.rcMonitor;
-        PhysicalSize {
-            width: (rc_monitor.right - rc_monitor.left) as u32,
-            height: (rc_monitor.bottom - rc_monitor.top) as u32,
+        // Patched: a monitor that is gone gives the primary monitor's size, instead of a panic.
+        match info_or_primary(self.0) {
+            Some(info) => {
+                let rc_monitor = info.monitorInfo.rcMonitor;
+                PhysicalSize {
+                    width: (rc_monitor.right - rc_monitor.left).max(0) as u32,
+                    height: (rc_monitor.bottom - rc_monitor.top).max(0) as u32,
+                }
+            },
+            None => primary_screen_size(),
         }
     }
 
@@ -252,5 +295,34 @@ impl MonitorHandle {
         }
 
         modes.into_iter().map(mod_map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handle no monitor has (as one whose monitor has gone): Windows answers it with
+    /// ERROR_INVALID_MONITOR_HANDLE, and the patched readers fall back instead of panicking.
+    #[test]
+    fn a_monitor_handle_that_is_no_longer_valid_falls_back_instead_of_panicking() {
+        let gone = MonitorHandle::new(0x7ead_0001 as HMONITOR);
+        assert_eq!(get_monitor_info(gone.hmonitor()).err().and_then(|e| e.raw_os_error()), Some(1461));
+        assert_eq!(gone.name(), None);
+        assert_eq!(gone.native_identifier(), "");
+        let primary = primary_monitor();
+        assert_eq!(gone.size(), primary.size(), "the primary monitor's size");
+        assert_eq!(gone.position(), PhysicalPosition { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn the_fallback_reads_the_primary_monitor_once_and_gives_up_when_that_fails_too() {
+        let invalid = || io::Error::from_raw_os_error(1461);
+        let (gone, primary) = (1 as HMONITOR, 2 as HMONITOR);
+        let read = |h: HMONITOR| if h == primary { Ok("primary") } else { Err(invalid()) };
+        assert_eq!(info_or_fallback(gone, read, || primary), Some("primary"));
+        assert_eq!(info_or_fallback(primary, read, || primary), Some("primary"));
+        let none = |_: HMONITOR| -> Result<&str, io::Error> { Err(invalid()) };
+        assert_eq!(info_or_fallback(gone, none, || primary), None);
     }
 }

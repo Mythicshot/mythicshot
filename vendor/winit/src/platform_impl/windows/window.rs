@@ -725,7 +725,15 @@ impl Window {
             match (&old_fullscreen, &fullscreen) {
                 (_, Some(Fullscreen::Exclusive(video_mode))) => {
                     let monitor = video_mode.monitor();
-                    let monitor_info = monitor::get_monitor_info(monitor.hmonitor()).unwrap();
+                    // Patched: a monitor gone since the video mode was listed ends the change
+                    // here, instead of a panic.
+                    let monitor_info = match monitor::get_monitor_info(monitor.hmonitor()) {
+                        Ok(info) => info,
+                        Err(error) => {
+                            tracing::warn!("exclusive fullscreen not set: {error}");
+                            return;
+                        },
+                    };
 
                     let res = unsafe {
                         ChangeDisplaySettingsExW(
