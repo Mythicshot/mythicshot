@@ -1,10 +1,18 @@
 //! The size and place the main window opens at, and remembering the size the user gives it.
 //!
 //! The window opens at the size the user last gave it by hand, or at [`super::SIZE`] when there is
-//! none, made to fit the work area of the monitor it opens on (the primary monitor: Windows
-//! creates a window given no monitor there) with its title bar and borders on screen, and
-//! centred in it. Sizes are in points, so Windows scaling is in them already: a 1920×1080
-//! monitor at 150% is a work area of about 1280×672 points.
+//! none, on the primary monitor, whatever monitor it was on before and wherever Windows would put
+//! it: made to fit that monitor's work area with its title bar and borders on screen, and centred
+//! in it ([`primary_work`], [`opening`]). Sizes are in points, so Windows scaling is in them
+//! already: a 1920×1080 monitor at 150% is a work area of about 1280×672 points. When the primary
+//! monitor cannot be read, Windows places the window, as it would any other.
+//!
+//! The window library turns the place asked for into pixels at the scale of the monitor Windows
+//! first made the window on, which is not always the primary monitor (Windows may make it on the
+//! monitor the app was started from). So the place is also kept in desktop pixels
+//! ([`target_px`]), and once the window is there, a window that is not at that place is moved
+//! there once ([`misplaced`]); moving it onto the primary monitor gives it that monitor's scale,
+//! at the same size in points.
 //!
 //! Two kinds of points meet here. Windows' points are pixels at the monitor's scale (96 DPI is
 //! 100%): the work area, the window's frame, the size saved and the size read back from Windows
@@ -28,6 +36,55 @@
 use eframe::egui;
 
 use super::{MIN_SIZE, SIZE};
+
+/// A monitor as Windows reports it, for placing the window: its work area (the monitor less the
+/// taskbar and docked bars) in desktop pixels, its effective DPI (96 is 100%), and whether it is
+/// the primary monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorArea {
+    pub work: mythicshot_capture::PxRect,
+    pub dpi: u32,
+    pub primary: bool,
+}
+
+/// The primary monitor's work area in its own points, and its scale (1.0 is 100%). Every other
+/// monitor is left aside, wherever it is and whatever its scale. None when there is no monitor,
+/// none is marked primary, or the one marked cannot be used (no area, no DPI); and when more than
+/// one is marked (which Windows never does), unless one of them is at the desktop's origin, where
+/// Windows keeps the primary monitor.
+pub fn primary_work(monitors: &[MonitorArea]) -> Option<(egui::Rect, f32)> {
+    let marked: Vec<&MonitorArea> = monitors.iter().filter(|m| m.primary).collect();
+    let primary = match marked[..] {
+        [] => return None,
+        [one] => one,
+        _ => marked.into_iter().find(|m| m.work.contains(0, 0))?,
+    };
+    let w = primary.work;
+    let work = work_area_points(w.x, w.y, w.w, w.h, primary.dpi)?;
+    Some((work, primary.dpi as f32 / 96.0))
+}
+
+/// Where the window's outer top-left corner must be once it is made, in desktop pixels: the
+/// opening's place on a monitor at `scale`, with egui's zoom at `zoom`. None when the opening has
+/// no place (Windows picks it) or the numbers are no use.
+pub fn target_px(o: &Opening, scale: f32, zoom: f32) -> Option<(i32, i32)> {
+    let pos = o.pos?;
+    let zoom = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+    let (x, y) = (pos.x * zoom * scale, pos.y * zoom * scale);
+    let usable = |v: f32| v.is_finite() && v.abs() < i32::MAX as f32 / 2.0;
+    (usable(x) && usable(y) && scale > 0.0).then(|| (x.round() as i32, y.round() as i32))
+}
+
+/// How far off its place, in pixels on either axis, the window may be and still be where it was
+/// put: the rounding between points and pixels.
+pub const PLACE_SLACK: f32 = 2.0;
+
+/// Whether a window whose outer top-left corner is at `now` (desktop pixels, as egui reads it)
+/// is off `target` by more than [`PLACE_SLACK`], so it is to be moved there. A reading that is no
+/// number moves nothing.
+pub fn misplaced(now: egui::Pos2, target: (i32, i32)) -> bool {
+    now.x.is_finite() && now.y.is_finite() && ((now.x - target.0 as f32).abs() > PLACE_SLACK || (now.y - target.1 as f32).abs() > PLACE_SLACK)
+}
 
 /// The window's frame around its inner size, in points: the borders (with the invisible resize
 /// edges Windows counts in a window's outer rectangle) and the title bar. Windows scales these
@@ -481,6 +538,150 @@ pub(crate) mod tests {
         // A zoom that is no number is taken as none.
         assert_eq!(opening(None, None, f32::NAN), opening(None, None, 1.0));
         assert_eq!(opening(None, None, 0.0), opening(None, None, 1.0));
+    }
+
+    fn area(x: i32, y: i32, w: u32, h: u32, dpi: u32, primary: bool) -> MonitorArea {
+        MonitorArea { work: mythicshot_capture::PxRect::new(x, y, w, h), dpi, primary }
+    }
+
+    /// A primary monitor of `w`×`h` pixels at `scale` with the taskbar along its bottom, as
+    /// Windows reports it.
+    pub(crate) fn primary(w: u32, h: u32, scale: f32) -> MonitorArea {
+        area(0, 0, w, h - (TASKBAR * scale).round() as u32, (scale * 96.0).round() as u32, true)
+    }
+
+    /// Where the window lands in desktop pixels, as the window library and Windows put it on the
+    /// primary monitor: its outer rectangle, from [`target_px`] and the opening's size.
+    fn outer_px(o: &Opening, scale: f32, zoom: f32) -> egui::Rect {
+        let (x, y) = target_px(o, scale, zoom).expect("a place");
+        let outer = (o.window + egui::vec2(FRAME.left + FRAME.right, FRAME.top + FRAME.bottom)) * scale;
+        egui::Rect::from_min_size(egui::pos2(x as f32, y as f32), outer)
+    }
+
+    fn px_rect(r: mythicshot_capture::PxRect) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(r.x as f32, r.y as f32), egui::vec2(r.w as f32, r.h as f32))
+    }
+
+    /// The window opens whole on the primary monitor's work area, in pixels, at every scale and
+    /// zoom, saved size or not, and never on another monitor.
+    fn assert_whole_on_primary(monitors: &[MonitorArea], saved: Option<[f32; 2]>, zoom: f32, what: &str) {
+        let (work, scale) = primary_work(monitors).unwrap_or_else(|| panic!("{what}: a primary monitor"));
+        let o = opening(saved, Some(work), zoom);
+        let r = outer_px(&o, scale, zoom);
+        let p = monitors.iter().find(|m| m.primary).unwrap();
+        assert!(px_rect(p.work).expand(1.0).contains_rect(r), "{what}: {r:?} inside the primary's work area {:?}", p.work);
+        for m in monitors.iter().filter(|m| !m.primary) {
+            assert!(!px_rect(m.work).shrink(1.0).intersects(r), "{what}: {r:?} not on {:?}", m.work);
+        }
+    }
+
+    /// Other monitors left of and above the primary (negative origins) are left aside: the window
+    /// opens on the primary, in its points.
+    #[test]
+    fn the_window_opens_on_the_primary_monitor_beside_monitors_with_negative_origins() {
+        let monitors = [area(-1920, 0, 1920, 1040, 96, false), area(-2560, -1440, 2560, 1392, 144, false), area(0, 0, 2560, 1380, 120, true)];
+        let (work, scale) = primary_work(&monitors).unwrap();
+        assert_eq!(scale, 1.25);
+        assert_eq!(work, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2048.0, 1104.0)));
+        for zoom in [1.0, 1.25] {
+            assert_whole_on_primary(&monitors, None, zoom, "default");
+            assert_whole_on_primary(&monitors, Some([1400.0, 900.0]), zoom, "saved");
+        }
+        // Centred on it, in pixels.
+        let o = opening(None, Some(work), 1.0);
+        let r = outer_px(&o, scale, 1.0);
+        assert!((r.center() - px_rect(monitors[2].work).center()).length() < 1.0, "{r:?}");
+        // Listed first or last, it is the same.
+        let mut reversed = monitors;
+        reversed.reverse();
+        assert_eq!(primary_work(&reversed), primary_work(&monitors));
+        // A taskbar on the left moves the work area's corner: still whole on it.
+        assert_whole_on_primary(&[area(-1920, -300, 1920, 1080, 96, false), area(62, 0, 1858, 1080, 96, true)], None, 1.0, "taskbar on the left");
+        // A primary whose work area does not start at the origin, as a taskbar on the top or left
+        // makes it, even at a negative place: whole on it.
+        assert_whole_on_primary(&[area(-1280, -720, 1280, 680, 96, true), area(0, 0, 1920, 1040, 96, false)], None, 1.0, "primary up and left");
+    }
+
+    /// The primary monitor's own scale decides, whatever the others' are: the same window on a
+    /// primary at 100% beside one at 200%, and on one at 150% beside one at 100%.
+    #[test]
+    fn the_primary_monitors_scale_decides_with_mixed_scales() {
+        let at_100 = [area(0, 0, 1920, 1032, 96, true), area(1920, 0, 3840, 2064, 192, false)];
+        let at_150 = [area(-1920, 0, 1920, 1032, 96, false), area(0, 0, 3840, 2088, 144, true)];
+        assert_eq!(primary_work(&at_100).unwrap().1, 1.0);
+        assert_eq!(primary_work(&at_150).unwrap().1, 1.5);
+        let o = opening(Some([1000.0, 700.0]), Some(primary_work(&at_100).unwrap().0), 1.0);
+        assert_eq!(o.window, egui::vec2(1000.0, 700.0));
+        assert_eq!(outer_px(&o, 1.0, 1.0).size(), egui::vec2(1016.0, 739.0));
+        let o = opening(Some([1000.0, 700.0]), Some(primary_work(&at_150).unwrap().0), 1.0);
+        assert_eq!(o.window, egui::vec2(1000.0, 700.0), "the same size in points");
+        assert_eq!(outer_px(&o, 1.5, 1.0).size(), egui::vec2(1524.0, 1108.5), "at the primary's scale");
+        for (name, monitors) in [("100% beside 200%", &at_100[..]), ("150% beside 100%", &at_150[..])] {
+            for zoom in [0.8, 1.0, 1.1, 1.25] {
+                assert_whole_on_primary(monitors, None, zoom, name);
+                assert_whole_on_primary(monitors, Some([1200.0, 800.0]), zoom, name);
+            }
+        }
+        // Every scale Windows offers on a 4K primary, beside a 1080p one at 100% on its left.
+        for dpi in [96, 120, 144, 168, 192, 240] {
+            let monitors = [area(-1920, 0, 1920, 1040, 96, false), area(0, 0, 3840, 2160 - 48 * dpi / 96, dpi, true)];
+            assert_whole_on_primary(&monitors, Some([1800.0, 1100.0]), 1.0, &format!("4K at {dpi} DPI"));
+        }
+    }
+
+    /// A remembered size larger than the primary monitor keeps its place in the settings but
+    /// opens cut down to the work area, whole on it.
+    #[test]
+    fn a_remembered_size_larger_than_the_primary_monitor_is_cut_to_its_work_area() {
+        let monitors = [primary(1920, 1080, 1.5), area(1920, 0, 3840, 2112, 96, false)];
+        let (work, _) = primary_work(&monitors).unwrap();
+        let saved = [3600.0, 2000.0];
+        let o = opening(Some(saved), Some(work), 1.0);
+        assert!(o.window.x < saved[0] && o.window.y < saved[1], "{o:?}");
+        assert_whole_on_primary(&monitors, Some(saved), 1.0, "larger than the monitor");
+        assert_whole_on_primary(&monitors, Some([MAX_REMEMBERED, MAX_REMEMBERED]), 1.0, "the largest kept");
+        // One wider only, or taller only: cut on that side.
+        let o = opening(Some([3000.0, 500.0]), Some(work), 1.0);
+        assert_eq!(o.window.y, 500.0);
+        assert!(o.window.x < 3000.0);
+        assert_whole_on_primary(&monitors, Some([3000.0, 500.0]), 1.0, "wider only");
+        assert_whole_on_primary(&monitors, Some([700.0, 5000.0]), 1.0, "taller only");
+    }
+
+    /// No monitor, none marked primary, or a primary that cannot be used: no place, so Windows
+    /// places the window and the app logs it.
+    #[test]
+    fn without_a_usable_primary_monitor_windows_places_the_window() {
+        assert_eq!(primary_work(&[]), None, "no monitors");
+        assert_eq!(primary_work(&[area(0, 0, 1920, 1040, 96, false), area(1920, 0, 1920, 1040, 96, false)]), None, "none marked primary");
+        assert_eq!(primary_work(&[area(0, 0, 1920, 1040, 0, true)]), None, "no DPI");
+        assert_eq!(primary_work(&[area(0, 0, 0, 1040, 96, true)]), None, "no area");
+        assert_eq!(primary_work(&[area(-1920, 0, 1920, 1040, 96, true), area(1920, 0, 1920, 1040, 96, true)]), None, "two marked, neither at the origin");
+        assert_eq!(primary_work(&[area(-1920, 0, 1920, 1040, 96, true), area(0, 0, 1920, 1040, 96, true)]).unwrap().0.min, egui::Pos2::ZERO, "two marked: the one at the origin");
+        let o = opening(Some([1000.0, 700.0]), primary_work(&[]).map(|(w, _)| w), 1.0);
+        assert_eq!(o.pos, None);
+        assert_eq!(o.window, egui::vec2(1000.0, 700.0), "the size kept");
+        assert_eq!(target_px(&o, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn the_place_in_pixels_is_the_place_in_points_at_the_scale_and_zoom() {
+        let o = Opening { pos: Some(egui::pos2(100.0, 50.0)), size: egui::vec2(800.0, 600.0), window: egui::vec2(800.0, 600.0) };
+        assert_eq!(target_px(&o, 1.0, 1.0), Some((100, 50)));
+        assert_eq!(target_px(&o, 1.5, 1.0), Some((150, 75)));
+        assert_eq!(target_px(&o, 1.25, 1.2), Some((150, 75)));
+        assert_eq!(target_px(&Opening { pos: Some(egui::pos2(-100.4, 0.6)), ..o }, 1.0, 1.0), Some((-100, 1)));
+        assert_eq!(target_px(&o, 1.0, f32::NAN), Some((100, 50)), "a zoom that is no number is none");
+        assert_eq!(target_px(&o, f32::NAN, 1.0), None);
+        assert_eq!(target_px(&o, 0.0, 1.0), None);
+        assert_eq!(target_px(&Opening { pos: Some(egui::pos2(f32::INFINITY, 0.0)), ..o }, 1.0, 1.0), None);
+        // Within the rounding it stays; further off it is moved.
+        assert!(!misplaced(egui::pos2(150.0, 75.0), (150, 75)));
+        assert!(!misplaced(egui::pos2(151.6, 73.2), (150, 75)));
+        assert!(misplaced(egui::pos2(225.0, 75.0), (150, 75)), "made at another monitor's scale");
+        assert!(misplaced(egui::pos2(150.0, 60.0), (150, 75)));
+        assert!(misplaced(egui::pos2(-1500.0, 200.0), (150, 75)), "made on a monitor to the left");
+        assert!(!misplaced(egui::pos2(f32::NAN, 75.0), (150, 75)));
     }
 
     #[test]

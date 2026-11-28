@@ -166,6 +166,16 @@ pub fn hook_suspect_line(time: &str, lag_ms: u32) -> String {
     format!("-- {time} input hook may no longer get input (a suspicion; nothing was changed): Windows recorded input {lag_ms} ms newer than the hook's last event, on 3 checks in a row; the sign-in or consent screen, or an elevated or remote window in front, looks the same")
 }
 
+/// The main window opened with no primary monitor to put it on: Windows placed it.
+pub fn no_primary_line(time: &str, monitors: usize) -> String {
+    format!("-- {time} main window: the primary monitor could not be read ({monitors} monitors read); Windows places the window")
+}
+
+/// The main window was not where its opening put it on the primary monitor, and was moved there.
+pub fn main_window_moved_line(time: &str, was: (i32, i32), to: (i32, i32)) -> String {
+    format!("-- {time} main window opened at {},{} and was moved to {},{} on the primary monitor", was.0, was.1, to.0, to.1)
+}
+
 /// The tray's "Reconnect shortcuts" was clicked, and what it did.
 pub fn shortcuts_reconnected_line(time: &str, done: &crate::hotkeys::Reconnected) -> String {
     let failed = if done.failed.is_empty() {
