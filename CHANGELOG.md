@@ -5,8 +5,11 @@ Every merged fix or update gets the next version number (0.2.1, 0.2.2, and so on
 ## 0.2.43 (2026-11-27)
 
 - Mythicshot no longer closes when the set of monitors changes, for example when a game goes full screen and turns the other monitors off, or when the monitors go to sleep. Before, it could close at that moment.
-- A monitor that disappears while Mythicshot is checking the screens no longer cancels a capture or moves the hidden capture window by mistake; Mythicshot checks again a moment later.
-- If Mythicshot ever closes without being asked to, it now says so in its crash log ("Open the log folder" in the Help menu). Before, some of those closes left nothing behind.
+- Mythicshot stays open when a game or another program sends it a request to close, for example Alt+F4 pressed while the capture overlay or the recording bar was in front. Before, that closed Mythicshot. Now it cancels the capture on screen, or stops the recording and keeps it as the Stop button does; with nothing on screen it does nothing. Mythicshot closes only through Quit or an update.
+- Escape no longer cancels a capture by accident. An Escape held down as the capture overlay appears, or pressed for a game just before, used to cancel the capture a moment after it opened. Now only a press made once the overlay is on screen cancels it, at once as before.
+- The capture shortcuts recover by themselves when Windows stops passing keys to Mythicshot, which it can do while a demanding game runs. Before, they did nothing until Mythicshot was restarted.
+- A monitor that disappears while Mythicshot is checking the screens no longer cancels a capture or moves the hidden capture window by mistake; Mythicshot checks again a moment later. A monitor that can never be read is left out, as before.
+- If Mythicshot ever closes without being asked to, it now says why in its crash log ("Open the log folder" in the Help menu). Before, some of those closes left nothing behind.
 
 ## 0.2.42 (2026-11-26)
 
