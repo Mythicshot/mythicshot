@@ -568,9 +568,7 @@ impl App {
         let done = self.hotkeys.reconnect(|a| self.settings.binding(a).to_string());
         self.publish_taken_keys();
         capture_log::append(&[capture_log::shortcuts_reconnected_line(&capture_log::now(), &done)]);
-        if let Some(notice) = done.notice() {
-            self.notify(notice);
-        }
+        self.notify(done.notice());
     }
 
     /// Quit from the File menu or the tray: at once when nothing would be lost; otherwise each
