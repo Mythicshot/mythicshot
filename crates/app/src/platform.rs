@@ -182,36 +182,52 @@ pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
 /// Windows' error for a monitor handle whose monitor has gone: ERROR_INVALID_MONITOR_HANDLE.
 pub const INVALID_MONITOR_HANDLE: u32 = 1461;
 
-/// One reading of the monitors: each one's rectangle in desktop pixels and its effective DPI, and
-/// the error of a monitor that was listed but could not be read, if one was.
+/// One reading of the monitors: each one's rectangle in desktop pixels and its effective DPI, the
+/// error of a monitor that went while it was read, and the error of a monitor left out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Layout {
     pub monitors: Vec<(mythicshot_capture::PxRect, u32)>,
-    /// Windows' error code for the first monitor listed that could not be read (the reading is
-    /// then incomplete): [`INVALID_MONITOR_HANDLE`] for one that went between the listing and its
-    /// read, as monitors do while a full-screen game switches display modes.
+    /// [`INVALID_MONITOR_HANDLE`]: a monitor listed went before it could be read (as monitors do
+    /// while a full-screen game switches display modes), so the reading is incomplete.
     pub unread: Option<u32>,
+    /// Windows' error for a monitor listed that cannot be read for another reason (a DPI query
+    /// that always fails on a virtual display, say), or one that failed the same way twice: it is
+    /// left out of the reading, which counts as complete, as before readings were checked.
+    pub left_out: Option<u32>,
 }
 
-/// Read every monitor `list` gives with `read`. A monitor that cannot be read went between the
-/// listing and the read (its handle is no longer valid), so the monitors are listed and read once
-/// more; a second reading that is still incomplete is returned as it is, marked by its error, for
-/// the caller to leave aside. Never a panic, whatever the handles.
+/// Read every monitor `list` gives with `read`. Only a handle that is no longer valid
+/// ([`INVALID_MONITOR_HANDLE`]) makes the reading incomplete; any other failure leaves that monitor
+/// out. An incomplete reading is taken once more from a fresh listing; a second one that is the
+/// same as the first (the same monitors read, the same one failing) is taken as the layout, its
+/// failing monitor left out, so one monitor that always fails cannot switch every check off. A
+/// second reading still incomplete otherwise is returned marked, for the caller to leave aside.
+/// Never a panic, whatever the handles.
 pub fn read_layout<H: Copy>(list: impl Fn() -> Vec<H>, read: impl Fn(H) -> Result<(mythicshot_capture::PxRect, u32), u32>) -> Layout {
     let once = || {
         let mut layout = Layout::default();
         for h in list() {
             match read(h) {
                 Ok(m) => layout.monitors.push(m),
+                Err(INVALID_MONITOR_HANDLE) => {
+                    layout.unread = Some(INVALID_MONITOR_HANDLE);
+                }
                 Err(code) => {
-                    layout.unread.get_or_insert(code);
+                    layout.left_out.get_or_insert(code);
                 }
             }
         }
         layout
     };
     let first = once();
-    if first.unread.is_none() { first } else { once() }
+    if first.unread.is_none() {
+        return first;
+    }
+    let second = once();
+    if second.unread.is_some() && second == first {
+        return Layout { unread: None, left_out: second.left_out.or(second.unread), ..second };
+    }
+    second
 }
 
 /// The monitors as Windows' window manager knows them, cheaply: each one's rectangle in desktop
@@ -381,7 +397,7 @@ pub fn find_visible_own_window(_title: &str, _client: (i32, i32), _tolerance: i3
 
 #[cfg(not(windows))]
 pub fn monitor_layout() -> Layout {
-    Layout { monitors: mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect(), unread: None }
+    Layout { monitors: mythicshot_capture::list_monitors().iter().map(|m| (m.rect, (m.scale * 96.0).round() as u32)).collect(), ..Layout::default() }
 }
 
 /// Move and size a window to an outer rectangle in desktop pixels, without showing it,
@@ -1031,7 +1047,7 @@ mod tests {
         };
         let layout = read_layout(list, read);
         assert_eq!(calls.get(), 2, "listed again once");
-        assert_eq!(layout, Layout { monitors: vec![(PxRect::new(0, 0, 3840, 2160), 192)], unread: None });
+        assert_eq!(layout, Layout { monitors: vec![(PxRect::new(0, 0, 3840, 2160), 192)], unread: None, left_out: None });
     }
 
     #[test]
@@ -1052,21 +1068,54 @@ mod tests {
     /// Still changing on the second reading: what could be read, marked with the error, for the
     /// caller to leave aside; never a panic.
     #[test]
-    fn a_reading_still_incomplete_the_second_time_is_marked_with_the_error() {
-        let layout = read_layout(|| vec![1u8, 9, 3], three);
-        assert_eq!(layout.unread, Some(INVALID_MONITOR_HANDLE));
-        assert_eq!(layout.monitors, vec![(PxRect::new(0, 0, 2560, 1440), 96), (PxRect::new(5120, 0, 3840, 2160), 192)]);
-        let nothing = read_layout(|| vec![9u8], three);
-        assert_eq!(nothing, Layout { monitors: vec![], unread: Some(INVALID_MONITOR_HANDLE) });
+    fn a_reading_still_changing_the_second_time_is_marked_with_the_error() {
+        let calls = Cell::new(0);
+        let list = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { vec![1u8, 9, 3] } else { vec![1u8, 8] }
+        };
+        let layout = read_layout(list, three);
+        assert_eq!(layout, Layout { monitors: vec![(PxRect::new(0, 0, 2560, 1440), 96)], unread: Some(INVALID_MONITOR_HANDLE), left_out: None });
         assert_eq!(read_layout(Vec::<u8>::new, three), Layout::default(), "no monitors listed: empty, not incomplete");
+    }
+
+    /// The same incomplete reading twice in a row is the layout: a monitor whose handle always
+    /// fails is left out instead of switching every check off.
+    #[test]
+    fn the_same_incomplete_reading_twice_is_taken_with_the_failing_monitor_left_out() {
+        let layout = read_layout(|| vec![1u8, 9, 3], three);
+        assert_eq!(layout.unread, None);
+        assert_eq!(layout.left_out, Some(INVALID_MONITOR_HANDLE));
+        assert_eq!(layout.monitors, vec![(PxRect::new(0, 0, 2560, 1440), 96), (PxRect::new(5120, 0, 3840, 2160), 192)]);
+    }
+
+    /// A monitor that fails for another reason (its DPI query, on a virtual display) is left out
+    /// as before readings were checked: listed once, the reading complete.
+    #[test]
+    fn a_monitor_that_fails_for_another_reason_is_left_out_and_the_reading_is_complete() {
+        const E_INVALIDARG: u32 = 0x8007_0057;
+        let calls = Cell::new(0);
+        let read = |h: u8| if h == 7 { Err(E_INVALIDARG) } else { three(h) };
+        let layout = read_layout(
+            || {
+                calls.set(calls.get() + 1);
+                vec![1u8, 7, 3]
+            },
+            read,
+        );
+        assert_eq!(calls.get(), 1, "not listed again");
+        assert_eq!(layout.unread, None);
+        assert_eq!(layout.left_out, Some(E_INVALIDARG));
+        assert_eq!(layout.monitors.len(), 2);
     }
 
     /// On this machine: a handle no monitor has (as one whose monitor has gone) is answered with
     /// ERROR_INVALID_MONITOR_HANDLE, the error of the crash record, as an error and not a panic.
+    /// Its handle-table index (the low 16 bits) is 0, an entry Windows never hands out.
     #[cfg(windows)]
     #[test]
     fn a_handle_no_monitor_has_is_answered_with_the_invalid_monitor_error() {
-        assert_eq!(read_monitor(0x7ead_0001), Err(INVALID_MONITOR_HANDLE));
+        assert_eq!(read_monitor(0x7ead_0000), Err(INVALID_MONITOR_HANDLE));
     }
 
     /// Only a window in its normal state gives a size: not maximized, not minimized, and with its

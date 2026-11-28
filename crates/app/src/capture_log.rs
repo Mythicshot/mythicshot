@@ -156,6 +156,12 @@ pub fn unread_line(time: &str, code: u32, read: &str) -> String {
     format!("-- {time} parked window not checked: a monitor could not be read (error {code}{why}), read {read}; the displays are read again at the next check")
 }
 
+/// A monitor listed cannot be read for a reason other than having gone: it is left out of the
+/// displays, as it always was. Said once while it lasts.
+pub fn left_out_line(time: &str, code: u32, read: &str) -> String {
+    format!("-- {time} a monitor could not be read (error {code}) and is left out of the displays: {read}")
+}
+
 /// At the start of a capture, something in which the parked window disagrees with the displays.
 pub fn capture_note_line(problem: &str, action: NoteAction) -> String {
     let what = match action {

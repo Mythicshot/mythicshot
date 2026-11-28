@@ -737,7 +737,9 @@ impl App {
         // are logged and settled again before the selector is shown.
         // The light reading every check compares with; the full listing taken for the picture is
         // compared with it once here, so a disagreement between the two shows in the log.
-        let displays = capture_window::DisplaySet::now();
+        // A monitor going as it is read leaves the reading incomplete: read again, else compare
+        // with the listing the picture was taken with, so the check for changed displays stays on.
+        let displays = capture_window::DisplaySet::capture_baseline(capture_window::DisplaySet::now, &desktop.monitors);
         if capture_window::listings_disagree(&desktop.monitors, &displays) {
             lines.push(capture_log::listings_line(&capture_window::DisplaySet::from_monitors(&desktop.monitors).describe(), &displays.describe()));
         }
