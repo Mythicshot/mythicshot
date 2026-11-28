@@ -156,6 +156,16 @@ pub fn unread_line(time: &str, code: u32, read: &str) -> String {
     format!("-- {time} parked window not checked: a monitor could not be read (error {code}{why}), read {read}; the displays are read again at the next check")
 }
 
+/// A close request reached the root window and was answered with `done`.
+pub fn close_request_line(time: &str, done: &str) -> String {
+    format!("-- {time} close request to the capture window (Alt+F4 or another program): {done}; the app stays open")
+}
+
+/// The input hook missed input for several checks and was put in again.
+pub fn hook_reinstalled_line(time: &str, lag_ms: u32) -> String {
+    format!("-- {time} input hook put in again: Windows had input {lag_ms} ms newer than the hook's last event on 3 checks in a row (removed by Windows?)")
+}
+
 /// A monitor listed cannot be read for a reason other than having gone: it is left out of the
 /// displays, as it always was. Said once while it lasts.
 pub fn left_out_line(time: &str, code: u32, read: &str) -> String {

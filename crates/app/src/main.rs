@@ -242,6 +242,10 @@ struct App {
     /// What asked the app to close (Quit, an update), for `on_exit`: a close nobody asked for
     /// leaves a line in `crash.log`.
     closing: Option<&'static str>,
+    /// When a close request last reached the root window (see `logic`), for `on_exit`.
+    last_close_request: Option<Instant>,
+    /// Whether the input hook still gets input (see `hook::Liveness`).
+    hook_watch: hook::Liveness,
 }
 
 /// How long "Checked. Mythicshot will close..." stands before the app closes for the installer.
@@ -396,6 +400,8 @@ impl App {
             install_on_exit: None,
             update_close_at: None,
             closing: None,
+            last_close_request: None,
+            hook_watch: hook::Liveness::default(),
             wake: {
                 let (wake, woken) = mpsc::channel::<()>();
                 let relay = ctx.clone();
@@ -1620,13 +1626,77 @@ impl App {
     }
 }
 
+/// What a close request to the root window does. The root window is the capture overlay, the
+/// recording bar, or hidden; Alt+F4 or a WM_CLOSE meant for another program can reach it. The app
+/// itself ends only through Quit or an update (`closing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAnswer {
+    /// Quit or an update asked: the app closes.
+    Allow,
+    /// The capture on screen ends as cancelled, as Escape ends it.
+    CancelCapture,
+    /// The recording stops and is kept, as the bar's Stop button does (the bar has no close).
+    StopRecording,
+    /// Nothing on screen: nothing to do.
+    Ignore,
+}
+
+fn close_answer(closing: Option<&str>, overlay: bool, recording: bool) -> CloseAnswer {
+    match (closing, overlay, recording) {
+        (Some(_), _, _) => CloseAnswer::Allow,
+        (None, true, _) => CloseAnswer::CancelCapture,
+        (None, false, true) => CloseAnswer::StopRecording,
+        (None, false, false) => CloseAnswer::Ignore,
+    }
+}
+
+/// How long before `on_exit` a close request counts as what ended the app.
+const CLOSE_REQUEST_ENDS: Duration = Duration::from_secs(2);
+
+/// What ended the app: `closing` what asked, `since_close_request` how long ago a close request last
+/// reached the root window.
+fn exit_cause(closing: Option<&str>, since_close_request: Option<Duration>) -> crash_log::ExitCause {
+    match (closing, since_close_request) {
+        (Some(_), _) => crash_log::ExitCause::Asked,
+        (None, Some(t)) if t < CLOSE_REQUEST_ENDS => crash_log::ExitCause::CloseRequest,
+        _ => crash_log::ExitCause::Error,
+    }
+}
+
 impl eframe::App for App {
+    /// Runs before every frame, and also while nothing is shown: a close request to the root
+    /// window is answered here, so it never ends the app unasked.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        self.last_close_request = Some(Instant::now());
+        let answer = close_answer(self.closing, self.overlay.is_some(), self.session.is_some());
+        if answer == CloseAnswer::Allow {
+            return;
+        }
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        let done = match answer {
+            CloseAnswer::CancelCapture => {
+                self.finish_overlay(ctx, Outcome::Cancel);
+                "capture cancelled"
+            }
+            CloseAnswer::StopRecording => {
+                self.recording_action(ctx, recorder_ui::BarAction::Stop);
+                "recording stopped and kept, as its Stop button does"
+            }
+            _ => "ignored, nothing on screen",
+        };
+        capture_log::append(&[capture_log::close_request_line(&capture_log::now(), done)]);
+    }
+
     /// A publish or tour export still running is cancelled and given a few seconds to remove what it
     /// wrote (a tour export's temporary file or partial folder); a publish's temporary folder goes if it
     /// has not ended in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // The UI framework comes here on every way out it takes, an error of its own included.
-        if let Some(line) = crash_log::unexpected_exit_line(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), self.closing) {
+        crash_log::flush_repeats();
+        if let Some(line) = crash_log::unexpected_exit_line(&crash_log::now(), exit_cause(self.closing, self.last_close_request.map(|t| t.elapsed()))) {
             crash_log::append_at(&crash_log::path(), &line);
         }
         // A size the main window was given by hand in the last moments is saved first, before
@@ -1705,6 +1775,7 @@ impl eframe::App for App {
 
         if let Some(ov) = self.overlay.as_mut() {
             let client = self.presenting.as_mut().and_then(|p| p.before_frame(&ctx, self.root));
+            ov.on_screen = self.presenting.as_ref().is_none_or(capture_window::Presenting::on_screen);
             let moved = self.presenting.as_ref().is_some_and(capture_window::Presenting::moved);
             match ov.ui(ui, client, moved) {
                 Outcome::Continue => {
@@ -1721,6 +1792,14 @@ impl eframe::App for App {
         }
         if self.overlay.is_none() && self.session.is_none() {
             self.parking.tick(self.root);
+        }
+        // Once a second: the input hook against Windows' record of input; put in again if gone.
+        if self.key_hook_started
+            && let (Some((system, now)), Some(hook_tick)) = (platform::input_ticks(), hook::last_event_tick())
+            && let hook::Verdict::Reinstall { lag_ms } = self.hook_watch.check(now, system, hook_tick)
+        {
+            hook::reinstall();
+            capture_log::append(&[capture_log::hook_reinstalled_line(&capture_log::now(), lag_ms)]);
         }
         self.tick_recording(&ctx);
         self.show_editors(&ctx);
@@ -1879,6 +1958,35 @@ mod tests {
     fn job(store: &project::Store, key: &project::ProjectKey, codec: FakeCodec, temp: &Path, tx: Sender<AppEvent>) -> OpenJob {
         let codec: &'static FakeCodec = Box::leak(Box::new(codec));
         OpenJob { store: Some(store.clone()), key: key.clone(), codec: Box::new(move || Some(codec as &dyn mythicshot_recording::VideoCodec)), free: |_| None, temp: temp.to_path_buf(), cancel: Arc::default(), rows: tours_ui::OpenRows::default(), tx, wake: Box::new(|| {}) }
+    }
+
+    /// A close request (Alt+F4, or a WM_CLOSE meant for another program) to the root window: on
+    /// the capture overlay it cancels the capture, on the recording bar it stops and keeps the
+    /// recording, hidden it is ignored; the app closes only for Quit or an update.
+    #[test]
+    fn a_close_request_ends_what_is_on_screen_and_never_the_app_unasked() {
+        assert_eq!(close_answer(None, true, false), CloseAnswer::CancelCapture);
+        assert_eq!(close_answer(None, true, true), CloseAnswer::CancelCapture, "the overlay is in front");
+        assert_eq!(close_answer(None, false, true), CloseAnswer::StopRecording);
+        assert_eq!(close_answer(None, false, false), CloseAnswer::Ignore);
+        for (overlay, recording) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(close_answer(Some("quit"), overlay, recording), CloseAnswer::Allow);
+            assert_eq!(close_answer(Some("update"), overlay, recording), CloseAnswer::Allow);
+        }
+        assert_eq!(
+            capture_log::close_request_line("t", "capture cancelled"),
+            "-- t close request to the capture window (Alt+F4 or another program): capture cancelled; the app stays open"
+        );
+    }
+
+    #[test]
+    fn the_exit_line_says_a_close_request_only_when_one_just_came() {
+        use crash_log::ExitCause;
+        assert_eq!(exit_cause(Some("quit"), Some(Duration::ZERO)), ExitCause::Asked);
+        assert_eq!(exit_cause(Some("update"), None), ExitCause::Asked);
+        assert_eq!(exit_cause(None, Some(Duration::from_millis(30))), ExitCause::CloseRequest);
+        assert_eq!(exit_cause(None, Some(Duration::from_secs(60))), ExitCause::Error);
+        assert_eq!(exit_cause(None, None), ExitCause::Error);
     }
 
     #[test]

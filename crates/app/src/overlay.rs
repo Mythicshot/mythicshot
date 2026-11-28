@@ -15,6 +15,7 @@ use geometry::Mapping;
 const MAGNIFIER: f32 = 128.0;
 const ZOOM: f32 = 8.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Continue,
     Cancel,
@@ -57,6 +58,43 @@ pub struct Overlay {
     pub magnifier: bool,
     /// Selecting an area to record rather than to screenshot.
     pub record: bool,
+    /// The selector is on screen and seen (set by the app before each frame).
+    pub on_screen: bool,
+    /// Whether Escape is down, as the OS reports it (a stand-in in tests).
+    os_escape_down: fn() -> bool,
+    escape: EscapeGate,
+}
+
+/// Escape ends a capture only when it is pressed on purpose, once the selector is on screen with
+/// the keyboard: not an Escape held down as the selector appears, whose auto-repeats egui takes
+/// for a first press (it marks a repeat only for a key it saw go down), nor one pressed for another
+/// program just before. Until it is armed every Escape is ignored; it is armed once the selector
+/// is ready, no Escape event of its own is still down, and the OS says Escape is up. Then a press
+/// that is not an auto-repeat cancels at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EscapeGate {
+    armed: bool,
+    /// An Escape press reached the selector before it was armed, and no release yet.
+    held: bool,
+}
+
+impl EscapeGate {
+    /// One frame: `ready`, the selector is on screen with the keyboard; `events`, this frame's
+    /// Escape events as (pressed, repeat); `down`, the OS says Escape is down. True: cancel.
+    pub fn frame(&mut self, ready: bool, events: &[(bool, bool)], down: bool) -> bool {
+        let mut cancel = false;
+        for &(pressed, repeat) in events {
+            if self.armed {
+                cancel |= pressed && !repeat;
+            } else {
+                self.held = pressed;
+            }
+        }
+        if !self.armed && ready && !self.held && !down {
+            self.armed = true;
+        }
+        cancel
+    }
 }
 
 impl Overlay {
@@ -73,6 +111,9 @@ impl Overlay {
             os_cursor: platform::cursor_pos,
             magnifier,
             record,
+            on_screen: false,
+            os_escape_down: platform::escape_down,
+            escape: EscapeGate::default(),
         }
     }
 
@@ -100,7 +141,7 @@ impl Overlay {
         let response = ui.interact(full, ui.scope_id().with("overlay"), Sense::click_and_drag());
         ctx.set_cursor_icon(CursorIcon::Crosshair);
 
-        let (esc, space, z, enter, tab, arrows) = ctx.input(|i| {
+        let esc_space = ctx.input(|i| {
             let step = if i.modifiers.shift { 10 } else { 1 };
             let mut a = (0, 0);
             if i.key_pressed(Key::ArrowLeft) {
@@ -115,8 +156,20 @@ impl Overlay {
             if i.key_pressed(Key::ArrowDown) {
                 a.1 += step;
             }
-            (i.key_pressed(Key::Escape), i.key_pressed(Key::Space), i.key_pressed(Key::Z), i.key_pressed(Key::Enter), i.key_pressed(Key::Tab), a)
+            (i.key_pressed(Key::Space), i.key_pressed(Key::Z), i.key_pressed(Key::Enter), i.key_pressed(Key::Tab), a)
         });
+        let (space, z, enter, tab, arrows) = (esc_space.0, esc_space.1, esc_space.2, esc_space.3, esc_space.4);
+        let escapes: Vec<(bool, bool)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key: Key::Escape, pressed, repeat, .. } => Some((*pressed, *repeat)),
+                    _ => None,
+                })
+                .collect()
+        });
+        let ready = self.on_screen && ctx.input(|i| i.focused);
+        let esc = self.escape.frame(ready, &escapes, (self.os_escape_down)());
         if esc {
             return Outcome::Cancel;
         }
@@ -321,6 +374,70 @@ mod tests {
         let mut out = ctx.run_ui(input, |ui| outcome = ov.ui(ui, Some(client), moved));
         out.textures_delta.clear();
         outcome
+    }
+
+    fn escape(pressed: bool) -> egui::Event {
+        egui::Event::Key { key: Key::Escape, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn os_down() -> bool {
+        true
+    }
+
+    fn os_up() -> bool {
+        false
+    }
+
+    /// The owner's capture: Escape is held down (for the game) as the selector comes on screen
+    /// and takes the keyboard. Its auto-repeats reach the selector looking like first presses;
+    /// none cancels. Once it is let go, a new press cancels.
+    #[test]
+    fn an_escape_held_as_the_selector_appears_does_not_cancel_and_a_new_press_does() {
+        let bounds = PxRect::new(0, 0, 400, 200);
+        let ctx = egui::Context::default();
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        ov.os_escape_down = os_down;
+        ov.on_screen = true;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, Vec::new()), Outcome::Continue, "on screen, Escape down");
+        for _ in 0..10 {
+            assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Continue, "an auto-repeat of the held key");
+        }
+        ov.os_escape_down = os_up;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(false)]), Outcome::Continue, "let go");
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Cancel, "pressed again: cancelled");
+    }
+
+    /// An Escape pressed before the selector is on screen (for another program, or while it is
+    /// still cloaked) is not taken for one meant for it; the next press is.
+    #[test]
+    fn an_escape_pressed_before_the_selector_is_on_screen_is_ignored() {
+        let bounds = PxRect::new(0, 0, 400, 200);
+        let ctx = egui::Context::default();
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        ov.os_escape_down = os_up;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Continue, "not on screen yet");
+        ov.on_screen = true;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Continue, "still the press from before: no release seen");
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(false)]), Outcome::Continue);
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Cancel);
+    }
+
+    /// The ordinary case: the selector is up and Escape is pressed: cancelled at once, as before.
+    #[test]
+    fn an_escape_pressed_once_the_selector_is_up_cancels_at_once() {
+        let bounds = PxRect::new(0, 0, 400, 200);
+        let ctx = egui::Context::default();
+        let mut ov = Overlay::new(desktop(bounds), false, false);
+        ov.os_escape_down = os_up;
+        ov.on_screen = true;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, Vec::new()), Outcome::Continue);
+        ov.os_escape_down = os_down;
+        assert_eq!(step(&ctx, &mut ov, 1.0, bounds, vec![escape(true)]), Outcome::Cancel);
+        // A repeat never cancels, also once armed.
+        let mut gate = EscapeGate::default();
+        assert!(!gate.frame(true, &[], false));
+        assert!(!gate.frame(true, &[(true, true)], true));
+        assert!(gate.frame(true, &[(true, false)], true));
     }
 
     fn button(pos: Pos2, pressed: bool) -> egui::Event {

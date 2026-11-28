@@ -712,9 +712,9 @@ impl Presenting {
         }
     }
 
-    /// Whether the capture is to end because the displays changed.
-    pub fn aborting(&self) -> bool {
-        self.abort.is_some()
+    /// Whether the selector is on screen and seen: shown and uncloaked, or shown by points.
+    pub fn on_screen(&self) -> bool {
+        matches!(self.stage, Stage::Shown { .. })
     }
 
     /// Whether [`Self::before_frame`] moved the window (placed it, settled it or put it back) just
@@ -1251,14 +1251,14 @@ mod tests {
         let one = DisplaySet::from_reading(&Layout { monitors: vec![(PxRect::new(0, 0, 3840, 2160), 192)], unread: None, left_out: None });
         let mut pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), t0, Vec::new(), start, false);
         pres.poll_displays(1, t0 + Duration::from_millis(100), || one.clone());
-        assert!(!pres.aborting(), "not read before the next check is due");
+        assert!(!pres.abort.is_some(), "not read before the next check is due");
         pres.poll_displays(2, t0 + DISPLAY_CHECK_CAPTURE, || one.clone());
-        assert!(pres.aborting(), "the capture ends");
+        assert!(pres.abort.is_some(), "the capture ends");
         assert_eq!(pres.abort.as_deref(), Some("frame 2: displays changed during the capture (was 0,0 2560x1440 @96, 2560,0 2560x1440 @96, 5120,0 3840x2160 @192; now 0,0 3840x2160 @192): capture cancelled"));
         // The same with a start that was complete.
         let mut pres = Presenting::new(PxRect::new(0, 0, 8960, 2160), t0, Vec::new(), DisplaySet::from_monitors(&owners()), false);
         pres.poll_displays(2, t0 + DISPLAY_CHECK_CAPTURE, || one.clone());
-        assert!(pres.aborting());
+        assert!(pres.abort.is_some());
     }
 
     /// A monitor that cannot ever be read (a DPI query failing on a virtual display) is left out,

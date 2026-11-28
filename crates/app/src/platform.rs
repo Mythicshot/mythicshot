@@ -179,6 +179,33 @@ pub fn window_dpi(hwnd: WindowId) -> Option<u32> {
     (dpi != 0).then_some(dpi)
 }
 
+/// Whether the Escape key is down now, as the OS reports it.
+#[cfg(windows)]
+pub fn escape_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+    (unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) }) as u16 & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+pub fn escape_down() -> bool {
+    false
+}
+
+/// Windows' tick (milliseconds since start, wrapping) of the last keyboard or mouse input in this
+/// session, from `GetLastInputInfo`, and the tick now, from `GetTickCount`.
+#[cfg(windows)]
+pub fn input_ticks() -> Option<(u32, u32)> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe { GetLastInputInfo(&mut info) }.as_bool().then(|| (info.dwTime, unsafe { GetTickCount() }))
+}
+
+#[cfg(not(windows))]
+pub fn input_ticks() -> Option<(u32, u32)> {
+    None
+}
+
 /// Windows' error for a monitor handle whose monitor has gone: ERROR_INVALID_MONITOR_HANDLE.
 pub const INVALID_MONITOR_HANDLE: u32 = 1461;
 
