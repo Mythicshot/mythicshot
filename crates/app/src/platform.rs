@@ -1152,6 +1152,9 @@ mod tests {
         let monitor = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/winit/src/platform_impl/windows/monitor.rs"));
         assert!(monitor.contains("pub(crate) fn info_or_primary("), "the fallback");
         assert!(!monitor.contains("get_monitor_info(self.0).unwrap()"), "no unwrap of a monitor's information");
+        let window = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/winit/src/platform_impl/windows/window.rs"));
+        assert!(window.contains("// Patched: a monitor gone since the video mode was listed ends the change"), "the exclusive-fullscreen change");
+        assert!(!window.contains("get_monitor_info(monitor.hmonitor()).unwrap()"), "no unwrap of a monitor's information in the window code");
     }
 
     /// On this machine: a handle no monitor has (as one whose monitor has gone) is answered with
