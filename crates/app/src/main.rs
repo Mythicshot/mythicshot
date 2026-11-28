@@ -1651,19 +1651,6 @@ fn close_answer(closing: Option<&str>, overlay: bool, recording: bool) -> CloseA
     }
 }
 
-/// How long before `on_exit` a close request counts as what ended the app.
-const CLOSE_REQUEST_ENDS: Duration = Duration::from_secs(2);
-
-/// What ended the app: `closing` what asked, `since_close_request` how long ago a close request last
-/// reached the root window.
-fn exit_cause(closing: Option<&str>, since_close_request: Option<Duration>) -> crash_log::ExitCause {
-    match (closing, since_close_request) {
-        (Some(_), _) => crash_log::ExitCause::Asked,
-        (None, Some(t)) if t < CLOSE_REQUEST_ENDS => crash_log::ExitCause::CloseRequest,
-        _ => crash_log::ExitCause::Error,
-    }
-}
-
 impl eframe::App for App {
     /// Runs before every frame, and also while nothing is shown: a close request to the root
     /// window is answered here, so it never ends the app unasked.
@@ -1697,7 +1684,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // The UI framework comes here on every way out it takes, an error of its own included.
         crash_log::flush_repeats();
-        if let Some(line) = crash_log::unexpected_exit_line(&crash_log::now(), exit_cause(self.closing, self.last_close_request.map(|t| t.elapsed()))) {
+        if let Some(line) = crash_log::unexpected_exit_line(&crash_log::now(), self.closing.is_some(), self.last_close_request.map(|t| t.elapsed().as_secs()), crash_log::last_error().as_deref()) {
             crash_log::append_at(&crash_log::path(), &line);
         }
         // A size the main window was given by hand in the last moments is saved first, before
@@ -1977,16 +1964,6 @@ mod tests {
             capture_log::close_request_line("t", "capture cancelled"),
             "-- t close request to the capture window (Alt+F4 or another program): capture cancelled; the app stays open"
         );
-    }
-
-    #[test]
-    fn the_exit_line_says_a_close_request_only_when_one_just_came() {
-        use crash_log::ExitCause;
-        assert_eq!(exit_cause(Some("quit"), Some(Duration::ZERO)), ExitCause::Asked);
-        assert_eq!(exit_cause(Some("update"), None), ExitCause::Asked);
-        assert_eq!(exit_cause(None, Some(Duration::from_millis(30))), ExitCause::CloseRequest);
-        assert_eq!(exit_cause(None, Some(Duration::from_secs(60))), ExitCause::Error);
-        assert_eq!(exit_cause(None, None), ExitCause::Error);
     }
 
     #[test]

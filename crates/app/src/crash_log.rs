@@ -12,7 +12,8 @@
 //!   [`MAX_LINES`] lines a run; a line that comes again is counted, not written again, and the
 //!   counts are written when the app closes;
 //! - a close nobody asked for: `on_exit` runs on the UI framework's way out, Quit or not, and
-//!   says what ended the app when no Quit or update did.
+//!   when no Quit or update closed the app says so, with the age of the last close request to its
+//!   window and the last error reported, if there were any; it names no cause.
 //!
 //! What stays out of reach: an abort (a panic inside a panic, a stack overflow), a crash in
 //! native code (a graphics driver), and the process being ended from outside.
@@ -122,7 +123,7 @@ pub fn install_panic_hook() {
     }));
 }
 
-static LOGGER: Logger = Logger { limiter: Mutex::new(Limiter::new()) };
+static LOGGER: Logger = Logger::new();
 
 /// Hand the `log` crate's errors and warnings to `crash.log`, from now on.
 pub fn install_logger() {
@@ -152,24 +153,28 @@ pub fn log_line(time: &str, level: log::Level, target: &str, message: &str) -> S
     format!("{time} {what} from {target}: {message}\n")
 }
 
-/// What ended the app, as `on_exit` sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitCause {
-    /// Quit or an update asked for it: nothing to say.
-    Asked,
-    /// A close request reached a window of the app and was not answered in time.
-    CloseRequest,
-    /// Nothing asked: the UI framework stopped after an error of its own.
-    Error,
+/// The line `on_exit` writes when no Quit or update closed the app (`asked`), None when one did.
+/// It asserts no cause: it gives how long before the last close request to the app's window came
+/// (`close_request_secs`, if one came this run), and the last error reported through the `log`
+/// crate (`last_error`, if any).
+pub fn unexpected_exit_line(time: &str, asked: bool, close_request_secs: Option<u64>, last_error: Option<&str>) -> Option<String> {
+    if asked {
+        return None;
+    }
+    let mut line = format!("{time} closed without Quit or an update");
+    if let Some(s) = close_request_secs {
+        line.push_str(&format!("; the last close request to its window came {s} s before"));
+    }
+    if let Some(e) = last_error {
+        line.push_str(&format!("; the last error reported: {e}"));
+    }
+    line.push_str("\n\n");
+    Some(line)
 }
 
-/// The line `on_exit` writes, None when the close was asked for.
-pub fn unexpected_exit_line(time: &str, cause: ExitCause) -> Option<String> {
-    match cause {
-        ExitCause::Asked => None,
-        ExitCause::CloseRequest => Some(format!("{time} closed without Quit or an update: a window close request ended the app\n\n")),
-        ExitCause::Error => Some(format!("{time} closed without Quit or an update: the UI framework ended the app after an error (the line before says which, if it said)\n\n")),
-    }
+/// The last error reported through the `log` crate this run, as written (without its time).
+pub fn last_error() -> Option<String> {
+    LOGGER.last_error()
 }
 
 /// Which lines from the `log` crate are written: a line that is one of the last [`REMEMBERED`]
@@ -236,15 +241,30 @@ impl Default for Limiter {
 
 pub struct Logger {
     limiter: Mutex<Limiter>,
+    /// The last error it was given, for the exit line.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Logger {
+    pub const fn new() -> Self {
+        Self { limiter: Mutex::new(Limiter::new()), last_error: Mutex::new(None) }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|e| e.clone())
+    }
+
     /// Write `record` to the log at `path`, as the limiter allows.
     pub fn write_to(&self, path: &Path, record: &log::Record) {
         if !log::Log::enabled(self, record.metadata()) {
             return;
         }
         let message = record.args().to_string();
+        if record.level() == log::Level::Error
+            && let Ok(mut last) = self.last_error.lock()
+        {
+            *last = Some(format!("{}: {message}", record.target()));
+        }
         let line = log_line(&now(), record.level(), record.target(), &message);
         let text = match self.limiter.lock() {
             Ok(mut l) => l.admit(&format!("{} {message}", record.target()), line),
@@ -317,7 +337,7 @@ mod tests {
     fn the_log_crate_reports_errors_from_all_and_warnings_from_two() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("crash.log");
-        let logger = Logger { limiter: Mutex::new(Limiter::new()) };
+        let logger = Logger::new();
         for (level, target, text) in [
             (log::Level::Error, "eframe::native::run", "Exiting because of error: the frame could not be shown"),
             (log::Level::Warn, "eframe::native::run", "a warning"),
@@ -370,12 +390,20 @@ mod tests {
     }
 
     #[test]
-    fn the_exit_line_names_what_ended_the_app() {
-        assert_eq!(unexpected_exit_line("t", ExitCause::Asked), None);
-        assert_eq!(unexpected_exit_line("t", ExitCause::CloseRequest).as_deref(), Some("t closed without Quit or an update: a window close request ended the app\n\n"));
+    fn the_exit_line_gives_the_last_close_request_and_error_without_a_cause() {
+        assert_eq!(unexpected_exit_line("t", true, Some(0), Some("x")), None, "Quit or an update");
+        assert_eq!(unexpected_exit_line("t", false, None, None).as_deref(), Some("t closed without Quit or an update\n\n"));
         assert_eq!(
-            unexpected_exit_line("t", ExitCause::Error).as_deref(),
-            Some("t closed without Quit or an update: the UI framework ended the app after an error (the line before says which, if it said)\n\n")
+            unexpected_exit_line("t", false, Some(42), Some("eframe::native::run: Exiting because of error: swap failed")).as_deref(),
+            Some("t closed without Quit or an update; the last close request to its window came 42 s before; the last error reported: eframe::native::run: Exiting because of error: swap failed\n\n")
         );
+    }
+
+    #[test]
+    fn the_last_error_is_kept_for_the_exit_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Logger::new();
+        logger.write_to(&dir.path().join("crash.log"), &log::Record::builder().level(log::Level::Error).target("test_target").args(format_args!("kept for the exit line")).build());
+        assert_eq!(logger.last_error().as_deref(), Some("test_target: kept for the exit line"));
     }
 }
