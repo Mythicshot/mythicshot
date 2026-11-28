@@ -303,10 +303,11 @@ mod tests {
     use super::*;
 
     /// A handle no monitor has (as one whose monitor has gone): Windows answers it with
-    /// ERROR_INVALID_MONITOR_HANDLE, and the patched readers fall back instead of panicking.
+    /// ERROR_INVALID_MONITOR_HANDLE, and the patched readers fall back instead of panicking. Its
+    /// handle-table index (the low 16 bits) is 0, an entry Windows never hands out.
     #[test]
     fn a_monitor_handle_that_is_no_longer_valid_falls_back_instead_of_panicking() {
-        let gone = MonitorHandle::new(0x7ead_0001 as HMONITOR);
+        let gone = MonitorHandle::new(0x7ead_0000 as HMONITOR);
         assert_eq!(get_monitor_info(gone.hmonitor()).err().and_then(|e| e.raw_os_error()), Some(1461));
         assert_eq!(gone.name(), None);
         assert_eq!(gone.native_identifier(), "");

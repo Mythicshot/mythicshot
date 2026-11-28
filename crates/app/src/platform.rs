@@ -1136,6 +1136,24 @@ mod tests {
         assert_eq!(layout.monitors.len(), 2);
     }
 
+    /// The fix for the crash of 2026-11-25 lives in the vendored window library: the build must
+    /// still use that copy (one `winit` in `Cargo.lock`, with no registry source) and the copy
+    /// must still hold the patched readers. The fallback itself is tested in the vendored file;
+    /// the library's public interface gives a monitor handle only from a running event loop or a
+    /// window, which these tests never open (see `vendor/winit/PATCHES.md`).
+    #[test]
+    fn the_window_library_in_the_build_is_the_patched_copy() {
+        let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        let winit: Vec<&str> = lock.split("[[package]]").filter(|p| p.lines().any(|l| l.trim() == "name = \"winit\"")).collect();
+        assert_eq!(winit.len(), 1, "exactly one window library in the build");
+        assert!(!winit[0].lines().any(|l| l.trim_start().starts_with("source =")), "the vendored copy, not the published one:\n{}", winit[0]);
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+        assert!(manifest.contains("[patch.crates-io]\nwinit = { path = \"vendor/winit\" }"), "the patch entry");
+        let monitor = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/winit/src/platform_impl/windows/monitor.rs"));
+        assert!(monitor.contains("pub(crate) fn info_or_primary("), "the fallback");
+        assert!(!monitor.contains("get_monitor_info(self.0).unwrap()"), "no unwrap of a monitor's information");
+    }
+
     /// On this machine: a handle no monitor has (as one whose monitor has gone) is answered with
     /// ERROR_INVALID_MONITOR_HANDLE, the error of the crash record, as an error and not a panic.
     /// Its handle-table index (the low 16 bits) is 0, an entry Windows never hands out.
