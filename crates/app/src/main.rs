@@ -1785,9 +1785,9 @@ impl eframe::App for App {
             match ov.ui(ui, client, moved) {
                 Outcome::Continue => {
                     let after = self.presenting.as_mut().map(|p| p.after_frame(&ctx, &ov.note));
-                    if let Some(capture_window::After::Abort(why)) = after {
+                    if let Some(notice) = capture_window::abort_notice(after) {
                         self.finish_overlay(&ctx, Outcome::Cancel);
-                        self.notify(why.message().into());
+                        self.notify(notice.into());
                     }
                 }
                 outcome => self.finish_overlay(&ctx, outcome),

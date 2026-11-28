@@ -593,6 +593,15 @@ impl Abort {
     }
 }
 
+/// What the app tells the person after a frame of the selector: the abort's words when the
+/// capture ended, nothing while it goes on (or without a window to present).
+pub fn abort_notice(after: Option<After>) -> Option<&'static str> {
+    match after? {
+        After::Continue => None,
+        After::Abort(why) => Some(why.message()),
+    }
+}
+
 /// After an uncloak that worked or did not: a window Windows will not uncloak is shown but never
 /// seen, a topmost window over every monitor that takes every click; it is hidden at once.
 pub fn after_uncloak(ok: bool) -> After {
@@ -1407,6 +1416,11 @@ mod tests {
         assert_eq!(why.message(), "The capture was cancelled because the screens changed (a full-screen game or a monitor switched mode). Try again.");
         let After::Abort(why) = after_uncloak(false) else { panic!("the capture ends") };
         assert_eq!(why.message(), "The region selector could not be shown.");
+        // What the app shows, from the frame's result.
+        assert_eq!(abort_notice(Some(After::Abort(Abort::DisplaysChanged))), Some(DISPLAYS_CHANGED));
+        assert_eq!(abort_notice(Some(after_uncloak(false))), Some(NOT_SHOWN));
+        assert_eq!(abort_notice(Some(After::Continue)), None);
+        assert_eq!(abort_notice(None), None);
     }
 
     /// The overlay is told the window moved before a frame exactly when `before_frame` placed,
