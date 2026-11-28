@@ -166,6 +166,24 @@ pub fn hook_suspect_line(time: &str, lag_ms: u32) -> String {
     format!("-- {time} input hook may no longer get input (a suspicion; nothing was changed): Windows recorded input {lag_ms} ms newer than the hook's last event, on 3 checks in a row; the sign-in or consent screen, or an elevated or remote window in front, looks the same")
 }
 
+/// The tray's "Reconnect shortcuts" was clicked, and what it did.
+pub fn shortcuts_reconnected_line(time: &str, done: &crate::hotkeys::Reconnected) -> String {
+    let failed = if done.failed.is_empty() {
+        String::new()
+    } else {
+        let each: Vec<String> = done.failed.iter().map(|(a, why)| format!("{}: {why}", a.label())).collect();
+        format!(": {}", each.join("; "))
+    };
+    format!(
+        "-- {time} shortcuts reconnected on a click: {} let go of, {} already let go of by Windows; {} registered, {} taken by the input hook (not put in again), {} could not be had{failed}",
+        done.released,
+        done.already_gone,
+        done.registered,
+        done.taken,
+        done.failed.len()
+    )
+}
+
 /// The input hook could not be put in at start.
 pub fn hook_failed_line(time: &str, error: &str) -> String {
     format!("-- {time} input hook not installed ({error}); the shortcuts it takes do not work this run")
@@ -293,6 +311,19 @@ mod tests {
         assert_eq!(uncloak_line(4, false, false, false, 0, Some(192)), "UNCLOAK FAILED: window hidden, capture cancelled after frame 4: settled · dpi 192");
         assert_eq!(limit_line(9, 6, None, Some(PxRect::new(0, 0, 10, 10))), "frame 9: placement stopped (6 moves used); not on target, mapping follows client 0,0 10x10");
         assert_eq!(header("2026-11-21 10:00:00.000", "hotkey", false), "== 2026-11-21 10:00:00.000 region capture · trigger hotkey · screenshot");
+    }
+
+    /// One line per click on "Reconnect shortcuts", with what was let go of, what was had again
+    /// and what could not be, and why.
+    #[test]
+    fn a_reconnect_of_the_shortcuts_is_one_line() {
+        use crate::hotkeys::{Action, Reconnected};
+        let fine = Reconnected { released: 2, already_gone: 1, registered: 5, taken: 2, failed: vec![] };
+        assert_eq!(shortcuts_reconnected_line("t", &fine), "-- t shortcuts reconnected on a click: 2 let go of, 1 already let go of by Windows; 5 registered, 2 taken by the input hook (not put in again), 0 could not be had");
+        let partly = Reconnected { failed: vec![(Action::CaptureWindow, "Windows or another app already uses this shortcut".into()), (Action::RecordRegion, "taken".into())], ..fine };
+        let line = shortcuts_reconnected_line("t", &partly);
+        assert!(line.ends_with("2 could not be had: Capture window: Windows or another app already uses this shortcut; Record region (press again to stop): taken"), "{line}");
+        assert!(!line.contains('\n'));
     }
 
     #[test]

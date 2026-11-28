@@ -274,8 +274,54 @@ fn key_name(code: &str) -> String {
     c.into()
 }
 
+/// Who holds shortcuts for the app with the system: [`GlobalHotKeyManager`] in the app, a stand-in
+/// in tests.
+pub trait Registrar {
+    fn register(&self, hotkey: HotKey) -> Result<(), String>;
+    fn unregister(&self, hotkey: HotKey) -> Result<(), String>;
+}
+
+impl Registrar for GlobalHotKeyManager {
+    fn register(&self, hotkey: HotKey) -> Result<(), String> {
+        GlobalHotKeyManager::register(self, hotkey).map_err(|e| e.to_string())
+    }
+
+    fn unregister(&self, hotkey: HotKey) -> Result<(), String> {
+        GlobalHotKeyManager::unregister(self, hotkey).map_err(|e| e.to_string())
+    }
+}
+
+/// What "Reconnect shortcuts" did ([`Hotkeys::reconnect`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reconnected {
+    /// Shortcuts the app held that the system let go of.
+    pub released: usize,
+    /// Shortcuts the app held that the system no longer had for it (let go of already).
+    pub already_gone: usize,
+    /// Shortcuts held with the system afterwards.
+    pub registered: usize,
+    /// Shortcuts the input hook takes afterwards.
+    pub taken: usize,
+    /// The actions whose shortcut could not be had afterwards, and why, in [`Action::ALL`] order.
+    pub failed: Vec<(Action, String)>,
+}
+
+impl Reconnected {
+    /// What the person is told when a shortcut could not be had again: which ones, and where the
+    /// reason is shown (beside each, on the Hotkeys tab, as after a start-up that could not have
+    /// one). None when every shortcut was had.
+    pub fn notice(&self) -> Option<String> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = self.failed.iter().map(|(a, _)| format!("\"{}\"", a.label())).collect();
+        let what = if self.failed.len() == 1 { "This shortcut could not be reconnected" } else { "These shortcuts could not be reconnected" };
+        Some(format!("{what}: {}. Preferences › Hotkeys says why.", names.join(", ")))
+    }
+}
+
 pub struct Hotkeys {
-    manager: Option<GlobalHotKeyManager>,
+    manager: Option<Box<dyn Registrar>>,
     active: HashMap<Action, HotKey>,
     by_id: HashMap<u32, Action>,
     /// Why an action's shortcut could not be registered.
@@ -359,7 +405,7 @@ pub fn print_screen_mods(binding: &str) -> Option<u8> {
 impl Hotkeys {
     pub fn new() -> Self {
         let manager = match GlobalHotKeyManager::new() {
-            Ok(m) => Some(m),
+            Ok(m) => Some(Box::new(m) as Box<dyn Registrar>),
             Err(e) => {
                 eprintln!("global shortcuts unavailable: {e}");
                 None
@@ -407,6 +453,31 @@ impl Hotkeys {
             self.active.insert(action, hotkey);
             self.by_id.insert(hotkey.id(), action);
         }
+    }
+
+    /// "Reconnect shortcuts", on the person's click only: every shortcut the app holds with the
+    /// system is let go of (one the system let go of already is counted, not an error), and every
+    /// action is given its shortcut from `binding` again, as at start-up, with the reasons of any
+    /// that cannot be had in [`Self::errors`]. Only the registrations change: the input hook is
+    /// not touched (its table of taken keys is rebuilt here, for the caller to hand to it), no key
+    /// is sent, and recording shortcuts stay held only while a recording runs.
+    pub fn reconnect(&mut self, binding: impl Fn(Action) -> String) -> Reconnected {
+        let mut done = Reconnected::default();
+        let held: Vec<HotKey> = self.active.drain().map(|(_, h)| h).collect();
+        self.by_id.clear();
+        for hotkey in held {
+            match self.manager.as_ref().map(|m| m.unregister(hotkey)) {
+                Some(Ok(())) => done.released += 1,
+                _ => done.already_gone += 1,
+            }
+        }
+        for a in Action::ALL {
+            self.apply(*a, &binding(*a));
+        }
+        done.registered = self.active.len();
+        done.taken = self.taken.len();
+        done.failed = Action::ALL.iter().filter_map(|a| self.errors.get(a).map(|e| (*a, e.clone()))).collect();
+        done
     }
 
     /// Whether the input hook handles `action`'s shortcut.
@@ -645,6 +716,169 @@ mod tests {
         assert_eq!(binding_vk("F13"), Some((0, 0x7C)));
         assert_eq!(binding_vk("alt+Digit5"), Some((mods::ALT, 0x35)));
         assert_eq!(binding_vk("control+Quote"), None);
+    }
+
+    /// The system as a test sees it: the shortcuts held, the ones it refuses to give, and every
+    /// call made of it.
+    #[derive(Default)]
+    struct FakeSystem {
+        held: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+        refuse: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    struct Fake(std::sync::Arc<FakeSystem>);
+
+    impl Registrar for Fake {
+        fn register(&self, hotkey: HotKey) -> Result<(), String> {
+            self.0.calls.lock().unwrap().push(format!("register {}", hotkey.id()));
+            if self.0.refuse.lock().unwrap().contains(&hotkey.id()) || !self.0.held.lock().unwrap().insert(hotkey.id()) {
+                return Err("taken".into());
+            }
+            Ok(())
+        }
+
+        fn unregister(&self, hotkey: HotKey) -> Result<(), String> {
+            self.0.calls.lock().unwrap().push(format!("unregister {}", hotkey.id()));
+            if self.0.held.lock().unwrap().remove(&hotkey.id()) { Ok(()) } else { Err("not registered".into()) }
+        }
+    }
+
+    fn id(binding: &str) -> u32 {
+        HotKey::from_str(binding).unwrap().id()
+    }
+
+    /// Bindings with no Print Screen key and no recording key, so that every one is registered
+    /// with the system on every platform.
+    fn plain(a: Action) -> String {
+        match a {
+            Action::CaptureRegion => "control+shift+KeyA",
+            Action::CaptureWindow => "control+shift+KeyB",
+            Action::RecordRegion => "control+shift+KeyC",
+            _ => "",
+        }
+        .to_string()
+    }
+
+    fn hotkeys(system: &std::sync::Arc<FakeSystem>, take_print_screen: bool) -> Hotkeys {
+        Hotkeys { manager: Some(Box::new(Fake(system.clone()))), active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen, taken: HashMap::new(), recording: false }
+    }
+
+    fn with_fake() -> (Hotkeys, std::sync::Arc<FakeSystem>) {
+        let system = std::sync::Arc::new(FakeSystem::default());
+        let mut h = hotkeys(&system, false);
+        for a in Action::ALL {
+            h.apply(*a, &plain(*a));
+        }
+        assert!(h.errors.is_empty(), "{:?}", h.errors);
+        system.calls.lock().unwrap().clear();
+        (h, system)
+    }
+
+    /// Everything held is let go of before anything is asked for again, and the app's ids still
+    /// find their actions.
+    #[test]
+    fn reconnecting_lets_go_of_every_shortcut_and_asks_for_it_again() {
+        let (mut h, system) = with_fake();
+        let r = h.reconnect(plain);
+        assert_eq!(r, Reconnected { released: 3, already_gone: 0, registered: 3, taken: 0, failed: vec![] });
+        let calls = system.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 6, "{calls:?}");
+        assert!(calls[..3].iter().all(|c| c.starts_with("unregister ")) && calls[3..].iter().all(|c| c.starts_with("register ")), "{calls:?}");
+        assert_eq!(*system.held.lock().unwrap(), [id("control+shift+KeyA"), id("control+shift+KeyB"), id("control+shift+KeyC")].into_iter().collect());
+        assert_eq!(h.action_for(id("control+shift+KeyB")), Some(Action::CaptureWindow));
+        assert_eq!(r.notice(), None);
+    }
+
+    /// The system dropped the shortcuts already (what the person reconnects after): letting go
+    /// of them fails, which is counted and nothing more, and they are had again.
+    #[test]
+    fn reconnecting_shortcuts_the_system_let_go_of_already_has_them_again() {
+        let (mut h, system) = with_fake();
+        system.held.lock().unwrap().clear();
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.already_gone, r.registered), (0, 3, 3));
+        assert!(r.failed.is_empty() && h.errors.is_empty());
+        assert_eq!(system.held.lock().unwrap().len(), 3);
+        // One of three dropped: two let go of, one counted as gone.
+        system.held.lock().unwrap().remove(&id("control+shift+KeyA"));
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.already_gone, r.registered), (2, 1, 3));
+    }
+
+    /// The system gives none back: every action is left without its shortcut, each with the
+    /// reason start-up gives, and the notice names them all.
+    #[test]
+    fn reconnecting_when_the_system_refuses_every_shortcut_says_so_for_each() {
+        let (mut h, system) = with_fake();
+        system.refuse.lock().unwrap().extend([id("control+shift+KeyA"), id("control+shift+KeyB"), id("control+shift+KeyC")]);
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.registered), (3, 0));
+        assert_eq!(r.failed.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [Action::CaptureRegion, Action::CaptureWindow, Action::RecordRegion]);
+        for (a, why) in &r.failed {
+            assert_eq!(why, "Windows or another app already uses this shortcut", "{a:?}");
+            assert_eq!(h.errors.get(a), Some(why), "the Hotkeys tab shows it, as after start-up");
+        }
+        assert_eq!(h.action_for(id("control+shift+KeyA")), None);
+        assert_eq!(r.notice().unwrap(), "These shortcuts could not be reconnected: \"Capture region\", \"Capture window\", \"Record region (press again to stop)\". Preferences › Hotkeys says why.");
+        assert!(system.held.lock().unwrap().is_empty(), "nothing is left half held");
+    }
+
+    /// One is refused, the others come back; a later reconnect that gets it clears its error.
+    #[test]
+    fn reconnecting_with_one_shortcut_refused_keeps_the_others() {
+        let (mut h, system) = with_fake();
+        system.refuse.lock().unwrap().insert(id("control+shift+KeyB"));
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.registered), (3, 2));
+        assert_eq!(r.failed, vec![(Action::CaptureWindow, "Windows or another app already uses this shortcut".to_string())]);
+        assert_eq!(r.notice().unwrap(), "This shortcut could not be reconnected: \"Capture window\". Preferences › Hotkeys says why.");
+        assert_eq!(h.action_for(id("control+shift+KeyA")), Some(Action::CaptureRegion));
+        assert_eq!(h.action_for(id("control+shift+KeyB")), None);
+        system.refuse.lock().unwrap().clear();
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.already_gone, r.registered), (2, 0, 3));
+        assert!(r.failed.is_empty() && h.errors.is_empty());
+    }
+
+    /// Without a way to hold shortcuts at all, reconnecting holds nothing and says why for each.
+    #[test]
+    fn reconnecting_without_a_registrar_says_shortcuts_are_unavailable() {
+        let mut h = Hotkeys { manager: None, active: HashMap::new(), by_id: HashMap::new(), errors: HashMap::new(), take_print_screen: false, taken: HashMap::new(), recording: false };
+        let r = h.reconnect(plain);
+        assert_eq!((r.released, r.registered, r.failed.len()), (0, 0, 3));
+        assert!(r.failed.iter().all(|(_, why)| why == "Global shortcuts are not available on this system"));
+    }
+
+    /// The keys the input hook takes come out the same, and recording keys are held and taken
+    /// only while a recording runs, before and after.
+    #[test]
+    fn reconnecting_keeps_what_the_hook_takes_and_the_recording_state() {
+        let system = std::sync::Arc::new(FakeSystem::default());
+        let mut h = hotkeys(&system, true);
+        let defaults = |a: Action| a.default_binding().to_string();
+        for a in Action::ALL {
+            h.apply(*a, &defaults(*a));
+        }
+        let sorted = |mut v: Vec<crate::hook::TakenKey>| {
+            v.sort();
+            v
+        };
+        let before = sorted(h.taken());
+        let held_before = system.held.lock().unwrap().clone();
+        let r = h.reconnect(defaults);
+        assert_eq!(sorted(h.taken()), before);
+        assert_eq!(*system.held.lock().unwrap(), held_before);
+        assert_eq!(r.taken, h.taken.len());
+        assert!(h.taken().iter().all(|(_, _, a)| !a.while_recording()), "no recording key taken while not recording");
+        h.set_recording(true);
+        let recording = sorted(h.taken());
+        let held_recording = system.held.lock().unwrap().clone();
+        h.reconnect(defaults);
+        assert_eq!(sorted(h.taken()), recording, "still recording: its keys stay taken");
+        assert_eq!(*system.held.lock().unwrap(), held_recording);
+        h.set_recording(false);
+        assert_eq!(*system.held.lock().unwrap(), held_before, "given back when the recording ends");
     }
 
     #[test]

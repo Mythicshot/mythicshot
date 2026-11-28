@@ -553,7 +553,23 @@ impl App {
                     self.window_request = Some(main_window::Request::Open);
                 }
             }
+            Command::ReconnectShortcuts => self.reconnect_shortcuts(),
             Command::Exit => self.quit(ctx),
+        }
+    }
+
+    /// The tray's "Reconnect shortcuts", run only when the person clicks it: every global shortcut
+    /// is let go of and registered again now, the input hook is handed its table of taken keys
+    /// again (the hook itself is left as it is), and one log line says how it went. A shortcut
+    /// that cannot be had again is shown on the Hotkeys tab, as after start-up, and named in a
+    /// notice.
+    fn reconnect_shortcuts(&mut self) {
+        self.hotkeys.take_print_screen = self.settings.take_print_screen;
+        let done = self.hotkeys.reconnect(|a| self.settings.binding(a).to_string());
+        self.publish_taken_keys();
+        capture_log::append(&[capture_log::shortcuts_reconnected_line(&capture_log::now(), &done)]);
+        if let Some(notice) = done.notice() {
+            self.notify(notice);
         }
     }
 
